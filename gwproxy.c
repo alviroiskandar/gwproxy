@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Author: Alviro Iskandar Setiawan <alviro.iskandar@gnuweeb.org>
- * -- (( Year: 2025 )) --
+ * Link: https://t.me/GNUWeeb/1174779
  *
  * Simple TCP proxy.
+ *
+ * ./gwproxy --target 127.0.0.1:1111 --bind [::]:8080 -m 16
+ *
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
