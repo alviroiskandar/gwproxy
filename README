@@ -1,0 +1,31 @@
+gwproxy
+-------
+
+Simple TCP proxy for GNU/Weeb.
+
+Assignment from Chief Ammar. Link: https://t.me/GNUWeeb/1174779
+
+```
+  Usage: ./gwproxy [OPTIONS]
+  Options:
+    -b, --bind=ADDR:PORT       Bind to the specified address
+    -t, --target=ADDR:PORT     Connect to the target address
+    -w, --target-buf-size=SIZE Set target buffer size (default: 4096)
+    -x, --client-buf-size=SIZE Set client buffer size (default: 4096)
+    -m, --threads=NUM          Number of threads to use (default: 4)
+    -A, --nr-accept-spin=NUM   Number of accept spins per event (default: 32)
+    -T, --connect-timeout=SEC  Connection timeout in seconds (default: 5)
+    -h, --help                 Show this help message
+```
+
+Usage example:
+
+  ./gwproxy --target 127.0.0.1:1111 --bind [::]:8080 -m 16
+  curl -v http://127.0.0.1:1111
+
+The above example binds the proxy to port 8080 and connects to the
+target at 127.0.0.1:1111.
+
+2025-06-15
+
+-- Viro
