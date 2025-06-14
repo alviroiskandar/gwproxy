@@ -46,7 +46,7 @@ enum {
 				EV_BIT_TIMER)
 #define GET_EV_BIT(X)	((X) & ALL_EV_BITS)
 #define CLEAR_EV_BIT(X)	((X) & ~ALL_EV_BITS)
-#define NR_EPL_EVENTS	16
+#define NR_EPL_EVENTS	512
 
 #define CFG_DEF_CONNECT_TIMEOUT	5U
 #define CFG_DEF_NR_THREADS	4U
@@ -335,7 +335,7 @@ static int del_sock_pair(struct gwp_thread *t, struct gwp_sock_pair *sp)
 		/*
 		 * Shirk the capacity if many sock pairs have been freed.
 		 */
-		uint32_t new_cap = gsb->nr_pairs;
+		uint32_t new_cap = gsb->nr_pairs + 2;
 		struct gwp_sock_pair **new_pairs;
 
 		new_pairs = realloc(gsb->pairs, new_cap * sizeof(*new_pairs));
@@ -354,7 +354,7 @@ static int add_sock_pair(struct gwp_thread *t, struct gwp_sock_pair *sp)
 	struct gwp_sock_bucket *gsb = &t->gsb;
 
 	if (gsb->nr_pairs >= gsb->cap_pairs) {
-		uint32_t new_cap = gsb->cap_pairs * 2;
+		uint32_t new_cap = (gsb->cap_pairs + 1) * 2;
 		struct gwp_sock_pair **new_pairs;
 
 		new_pairs = realloc(gsb->pairs, new_cap * sizeof(*new_pairs));
