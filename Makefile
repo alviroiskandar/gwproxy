@@ -1,5 +1,5 @@
 
-CFLAGS = -Wall -Wextra -O0 -ggdb3 -fsanitize=address -fsanitize=undefined
+CFLAGS = -Wall -Wextra -Os -ggdb3
 LIBS = -lpthread
 
 all: gwproxy
