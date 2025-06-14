@@ -708,7 +708,7 @@ static int process_event_target_conn(struct gwp_thread *t,
 	}
 
 	if (sp->client.len) {
-		r = do_forward(&sp->target, &sp->client, false, true);
+		r = do_forward(&sp->client, &sp->target, false, true);
 		if (r < 0)
 			return r;
 	}
