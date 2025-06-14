@@ -31,35 +31,53 @@
 #include <sys/eventfd.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
+#include <sys/resource.h>
+
+#define DEBUG_LEVEL 3
+#define pr_debug(LEVEL, FMT, ...)	\
+do {					\
+	if (DEBUG_LEVEL >= (LEVEL)) {	\
+		fprintf(stderr, FMT "\n", __VA_ARGS__);	\
+	}				\
+} while (0)
 
 enum {
-	EV_BIT_ACCEPT = (0x0001ULL << 48ULL),
-	EV_BIT_EVFD   = (0x0002ULL << 48ULL),
-	EV_BIT_TARGET = (0x0003ULL << 48ULL),
-	EV_BIT_CLIENT = (0x0004ULL << 48ULL),
-	EV_BIT_TIMER  = (0x0005ULL << 48ULL),
+	EV_BIT_ACCEPT		= (0x0001ULL << 48ULL),
+	EV_BIT_EVFD		= (0x0002ULL << 48ULL),
+	EV_BIT_TARGET_DATA	= (0x0003ULL << 48ULL),
+	EV_BIT_CLIENT_DATA	= (0x0004ULL << 48ULL),
+	EV_BIT_TIMER		= (0x0005ULL << 48ULL),
 };
 
-#define ALL_EV_BITS	(EV_BIT_ACCEPT|EV_BIT_EVFD|EV_BIT_TARGET|EV_BIT_CLIENT|EV_BIT_TIMER)
+#define ALL_EV_BITS	(EV_BIT_ACCEPT | EV_BIT_EVFD | \
+				EV_BIT_TARGET_DATA | EV_BIT_CLIENT_DATA | \
+				EV_BIT_TIMER)
 #define GET_EV_BIT(X)	((X) & ALL_EV_BITS)
 #define CLEAR_EV_BIT(X)	((X) & ~ALL_EV_BITS)
-#define NR_EPL_EVENTS	128
-#define NET_BUF_SIZE	4096
+#define NR_EPL_EVENTS	16
 
-#define CFG_DEF_CONNECT_TIMEOUT 5U
+#define CFG_DEF_CONNECT_TIMEOUT	5U
+#define CFG_DEF_NR_THREADS	4U
+#define CFG_DEF_SEND_BUF_SIZE	4096
+#define CFG_DEF_RECV_BUF_SIZE	4096
+
+struct gwp_sock {
+	int		fd;
+	uint32_t	ep_msk;
+	uint32_t	len;
+	uint32_t	cap;
+	char		*buf;
+};
 
 struct gwp_sock_pair {
-	bool		is_target_connected;
+	bool		is_target_alive;
+	bool		is_setup_done;
 	uint32_t	idx;
-	int		tfd;		/* Target TCP fd. */
-	uint32_t	tfd_emsk;	/* Target fd epoll mask. */
-	int		cfd;		/* Client TCP fd. */
-	uint32_t	cfd_emsk;	/* Client fd epoll mask. */
-	int		tmfd;		/* Timer fd. */
+	struct gwp_sock	client;
+	struct gwp_sock	target;
+	int		tmfd;
 	uint32_t	tfb_len;
 	uint32_t	cfb_len;
-	char		tbuf[NET_BUF_SIZE];
-	char		cbuf[NET_BUF_SIZE];
 	struct sockaddr_storage addr;
 };
 
@@ -67,12 +85,12 @@ struct gwp_sock_bucket {
 	struct gwp_sock_pair	**pairs;
 	uint32_t		nr_pairs;
 	uint32_t		cap_pairs;
-	pthread_mutex_t		lock;
 };
 
 struct gwp_ctx;
 
 struct gwp_thread {
+	int			tcp_fd;
 	int			epl_fd;
 	int			evp_fd;
 	struct gwp_sock_bucket	gsb;
@@ -86,6 +104,8 @@ struct gwp_thread {
 struct gwp_cfg {
 	char		bind_addr[256];
 	char		target_addr[256];
+	uint32_t	client_buf;
+	uint32_t	target_buf;
 	uint16_t	nr_threads;
 	int		connect_timeout;	/* In seconds. */
 };
@@ -93,7 +113,6 @@ struct gwp_cfg {
 struct gwp_ctx {
 	volatile bool			stop;
 	uint32_t			rr_counter;
-	int				tcp_fd;
 	socklen_t			bind_addr_len;
 	struct sockaddr_storage		target_addr;
 	socklen_t			target_addr_len;
@@ -104,12 +123,37 @@ struct gwp_ctx {
 static const struct option long_opts[] = {
 	{ "bind",		required_argument,	NULL, 'b' },
 	{ "target",		required_argument,	NULL, 't' },
-	{ "threads",		required_argument,	NULL, 'n' },
+	{ "target-buf-size",	required_argument,	NULL, 'w' },
+	{ "client-buf-size",	required_argument,	NULL, 'x' },
+	{ "threads",		required_argument,	NULL, 'm' },
 	{ "connect-timeout",	required_argument,	NULL, 'T' },
 	{ "help",		no_argument,		NULL, 'h' },
 	{ NULL, 0, NULL, 0 }
 };
-static const char short_opts[] = "b:t:n:T:h";
+static const char short_opts[] = "b:t:w:x:m:T:h";
+
+static int prepare_rlimit(void)
+{
+	struct rlimit rl;
+	int r;
+
+	if (getrlimit(RLIMIT_NOFILE, &rl) < 0) {
+		r = -errno;
+		fprintf(stderr, "Failed to get RLIMIT_NOFILE: %s\n", strerror(-r));
+		return r;
+	}
+
+	rl.rlim_cur = rl.rlim_max;
+	if (setrlimit(RLIMIT_NOFILE, &rl) < 0) {
+		r = -errno;
+		fprintf(stderr, "Failed to set RLIMIT_NOFILE: %s\n", strerror(-r));
+		return r;
+	}
+
+	printf("RLIMIT_NOFILE set to %lu\n", (unsigned long)rl.rlim_cur);
+
+	return 0;
+}
 
 static void show_usage(const char *progname)
 {
@@ -117,39 +161,65 @@ static void show_usage(const char *progname)
 	fprintf(stderr, "Options:\n");
 	fprintf(stderr, "  -b, --bind=ADDR:PORT       Bind to the specified address\n");
 	fprintf(stderr, "  -t, --target=ADDR:PORT     Connect to the target address\n");
-	fprintf(stderr, "  -n, --threads=NUM          Number of threads to use\n");
-	fprintf(stderr, "  -T, --connect-timeout=SEC  Set connection timeout in seconds (default: %u)\n", CFG_DEF_CONNECT_TIMEOUT);
+	fprintf(stderr, "  -w, --target-buf-size=SIZE Set target buffer size (default: %d)\n", CFG_DEF_SEND_BUF_SIZE);
+	fprintf(stderr, "  -x, --client-buf-size=SIZE Set client buffer size (default: %d)\n", CFG_DEF_RECV_BUF_SIZE);
+	fprintf(stderr, "  -m, --threads=NUM          Number of threads to use (default: %d)\n", CFG_DEF_NR_THREADS);
+	fprintf(stderr, "  -T, --connect-timeout=SEC  Connection timeout in seconds (default: %d)\n", CFG_DEF_CONNECT_TIMEOUT);
 	fprintf(stderr, "  -h, --help                 Show this help message\n");
 	exit(EXIT_FAILURE);
 }
 
 static int process_option(const char *progname, int c, struct gwp_cfg *cfg)
 {
-	size_t len;
+	size_t l;
 
 	switch (c) {
 	case 'b':
-		len = sizeof(cfg->bind_addr) - 1;
-		strncpy(cfg->bind_addr, optarg, len);
-		cfg->bind_addr[len] = '\0';
+		l = sizeof(cfg->bind_addr) - 1;
+		strncpy(cfg->bind_addr, optarg, l);
+		cfg->bind_addr[l] = '\0';
 		break;
 	case 't':
-		len = sizeof(cfg->target_addr) - 1;
-		strncpy(cfg->target_addr, optarg, len);
-		cfg->target_addr[len] = '\0';
+		l = sizeof(cfg->target_addr) - 1;
+		strncpy(cfg->target_addr, optarg, l);
+		cfg->target_addr[l] = '\0';
 		break;
-	case 'n':
+	case 'w':
 		c = atoi(optarg);
 		if (c <= 0) {
-			fprintf(stderr, "Invalid number of threads: %s\n",
-				optarg);
+			fprintf(stderr, "Invalid target buffer size: %s\n", optarg);
 			return -EINVAL;
 		}
-		cfg->nr_threads = c;
+		cfg->target_buf = (uint32_t)c;
 		break;
-	case 'h':
+	case 'x':
+		c = atoi(optarg);
+		if (c <= 0) {
+			fprintf(stderr, "Invalid client buffer size: %s\n", optarg);
+			return -EINVAL;
+		}
+		cfg->client_buf = (uint32_t)c;
+		break;
+	case 'm':
+		c = atoi(optarg);
+		if (c <= 0) {
+			fprintf(stderr, "Invalid number of threads: %s\n", optarg);
+			return -EINVAL;
+		}
+		cfg->nr_threads = (uint16_t)c;
+		break;
+	case 'T':
+		c = atoi(optarg);
+		if (c < 0) {
+			fprintf(stderr, "Invalid connect timeout: %s\n", optarg);
+			return -EINVAL;
+		}
+		cfg->connect_timeout = c;
+		break;
 	default:
+	case 'h':
 		show_usage(progname);
+		break;
 	}
 	return 0;
 }
@@ -161,7 +231,11 @@ static int prepare_gwp_ctx_from_argv(int argc, char *argv[],
 	int ret;
 
 	memset(ctx, 0, sizeof(*ctx));
-	ctx->tcp_fd = -1;
+	cfg->nr_threads = CFG_DEF_NR_THREADS;
+	cfg->connect_timeout = CFG_DEF_CONNECT_TIMEOUT;
+	cfg->client_buf = CFG_DEF_RECV_BUF_SIZE;
+	cfg->target_buf = CFG_DEF_SEND_BUF_SIZE;
+	ctx->stop = false;
 	while (1) {
 		ret = getopt_long(argc, argv, short_opts, long_opts, NULL);
 		if (ret == -1)
@@ -210,22 +284,165 @@ static int create_sock_target(struct gwp_ctx *c)
 	return fd;
 }
 
-static int pass_fd_to_thread(struct gwp_thread *t, int cfd, int tg_fd,
-			     int tm_fd, const struct sockaddr_storage *addr)
+static void close_sock(struct gwp_sock *s)
 {
-	struct gwp_ctx *ctx = t->ctx;
-	struct gwp_sock_pair *sp;
+	if (s->fd >= 0) {
+		close(s->fd);
+		s->fd = -1;
+	}
+	s->ep_msk = 0;
+	s->len = 0;
+}
 
-	sp = malloc(sizeof(*sp));
+static void gwp_free_thread_sock_pair(struct gwp_sock_pair *sp)
+{
+	if (!sp)
+		return;
+
+	if (sp->tmfd >= 0)
+		close(sp->tmfd);
+
+	free(sp->client.buf);
+	free(sp->target.buf);
+	close_sock(&sp->client);
+	close_sock(&sp->target);
+	free(sp);
+}
+
+static int del_sock_pair(struct gwp_thread *t, struct gwp_sock_pair *sp)
+{
+	struct gwp_sock_bucket *gsb = &t->gsb;
+	struct gwp_sock_pair *sq;
+	uint32_t i = sp->idx;
+
+	sq = gsb->pairs[i];
+	assert(sq == sp);
+	if (sq != sp)
+		return -EINVAL;
+
+	gsb->pairs[i] = gsb->pairs[gsb->nr_pairs - 1];
+	gsb->pairs[i]->idx = i;
+	gsb->pairs[gsb->nr_pairs - 1] = NULL;
+	gsb->nr_pairs--;
+	gwp_free_thread_sock_pair(sp);
+	return 0;
+}
+
+static int add_sock_pair(struct gwp_thread *t, struct gwp_sock_pair *sp)
+{
+	struct gwp_sock_bucket *gsb = &t->gsb;
+
+	if (gsb->nr_pairs >= gsb->cap_pairs) {
+		uint32_t new_cap = gsb->cap_pairs * 2;
+		struct gwp_sock_pair **new_pairs;
+
+		new_pairs = realloc(gsb->pairs, new_cap * sizeof(*new_pairs));
+		if (!new_pairs)
+			return -ENOMEM;
+
+		gsb->pairs = new_pairs;
+		gsb->cap_pairs = new_cap;
+	}
+
+	sp->idx = gsb->nr_pairs;
+	gsb->pairs[gsb->nr_pairs++] = sp;
+	return 0;
+}
+
+static int gwp_send_signal_thread(struct gwp_thread *t)
+{
+	uint64_t val = 1;
+
+	assert(t->evp_fd >= 0);
+	if (write(t->evp_fd, &val, sizeof(val)) != (ssize_t)sizeof(val))
+		return -EIO;
+
+	return 0;
+}
+
+static int alloc_sock_pair(struct gwp_thread *t, int cfd, int tg_fd,
+			   int tm_fd, const struct sockaddr_storage *addr)
+{
+	struct gwp_cfg *cfg = &t->ctx->cfg;
+	struct gwp_sock_pair *sp;
+	struct epoll_event ev;
+	int r;
+
+	sp = calloc(1, sizeof(*sp));
 	if (!sp)
 		return -ENOMEM;
 
-	sp->tfd = tg_fd;
-	sp->cfd = cfd;
+	sp->client.fd = cfd;
+	sp->client.ep_msk = EPOLLIN | EPOLLRDHUP;
+	sp->client.len = 0;
+	sp->client.cap = cfg->client_buf;
+	sp->client.buf = malloc(cfg->client_buf);
+	if (!sp->client.buf) {
+		free(sp);
+		return -ENOMEM;
+	}
+
+	sp->target.fd = tg_fd;
+	sp->target.ep_msk = EPOLLOUT | EPOLLIN | EPOLLRDHUP;
+	sp->target.len = 0;
+	sp->target.cap = cfg->target_buf;
+	sp->target.buf = malloc(cfg->target_buf);
+	if (!sp->target.buf) {
+		free(sp->client.buf);
+		free(sp);
+		return -ENOMEM;
+	}
+
 	sp->tmfd = tm_fd;
 	sp->addr = *addr;
-	sp->is_target_connected = false;
-	return 0;
+	sp->is_target_alive = false;
+	r = add_sock_pair(t, sp);
+	if (r < 0) {
+		free(sp->client.buf);
+		free(sp->target.buf);
+		free(sp);
+		return r;
+	}
+
+	ev.events = sp->target.ep_msk;
+	ev.data.u64 = 0;
+	ev.data.ptr = sp;
+	ev.data.u64 |= EV_BIT_TARGET_DATA;
+	r = epoll_ctl(t->epl_fd, EPOLL_CTL_ADD, tg_fd, &ev);
+	if (r < 0) {
+		r = -errno;
+		goto out_del_pair;
+	}
+
+	ev.events = sp->client.ep_msk;
+	ev.data.u64 = 0;
+	ev.data.ptr = sp;
+	ev.data.u64 |= EV_BIT_CLIENT_DATA;
+	r = epoll_ctl(t->epl_fd, EPOLL_CTL_ADD, cfd, &ev);
+	if (r < 0) {
+		r = -errno;
+		goto out_del_pair;
+	}
+
+	if (tm_fd >= 0) {
+		ev.events = EPOLLIN;
+		ev.data.u64 = 0;
+		ev.data.ptr = sp;
+		ev.data.u64 |= EV_BIT_TIMER;
+		r = epoll_ctl(t->epl_fd, EPOLL_CTL_ADD, tm_fd, &ev);
+		if (r < 0) {
+			r = -errno;
+			goto out_del_pair;
+		}
+	}
+
+	sp->is_setup_done = true;
+	return r;
+
+out_del_pair:
+	sp->client.fd = sp->target.fd = sp->tmfd = -1;
+	del_sock_pair(t, sp);
+	return r;
 }
 
 static int create_connect_timer(struct gwp_ctx *ctx)
@@ -261,7 +478,7 @@ static int create_connect_timer(struct gwp_ctx *ctx)
 	return tm_fd;
 }
 
-static int process_event_accept(struct gwp_thread *t)
+static int __process_event_accept(struct gwp_thread *t)
 {
 	static const int flg = SOCK_CLOEXEC | SOCK_NONBLOCK;
 	struct gwp_ctx *ctx = t->ctx;
@@ -269,14 +486,9 @@ static int process_event_accept(struct gwp_thread *t)
 	struct sockaddr_storage addr;
 	int cfd, ret, tg_fd, tm_fd;
 
-	cfd = accept4(ctx->tcp_fd, (struct sockaddr *)&addr, &addr_len, flg);
-	if (cfd < 0) {
-		ret = -errno;
-		if (ret == -EAGAIN)
-			return 0;
-
-		return ret;
-	}
+	cfd = accept4(t->tcp_fd, (struct sockaddr *)&addr, &addr_len, flg);
+	if (cfd < 0)
+		return -errno;
 
 	sock_set_options(cfd);
 
@@ -288,13 +500,31 @@ static int process_event_accept(struct gwp_thread *t)
 	if (tm_fd < 0 && tm_fd != -ENOSYS)
 		goto close_tg_fd;
 
-	return pass_fd_to_thread(t, cfd, tg_fd, tm_fd, &addr);
+	ret = alloc_sock_pair(t, cfd, tg_fd, tm_fd, &addr);
+	if (!ret)
+		return 0;
 
+	if (tm_fd >= 0)
+		close(tm_fd);
 close_tg_fd:
 	close(tg_fd);
 close_cfd:
 	close(cfd);
 	return ret;
+}
+
+static int process_event_accept(struct gwp_thread *t)
+{
+	uint32_t n = 5;
+	int r = 0;
+
+	while (n--) {
+		r = __process_event_accept(t);
+		if (r)
+			break;
+	}
+
+	return (r == -EAGAIN || r == -EINTR) ? 0 : r;
 }
 
 static int gwp_recv_signal_thread(struct gwp_thread *t)
@@ -314,8 +544,215 @@ static int gwp_recv_signal_thread(struct gwp_thread *t)
 	return 0;
 }
 
+static int do_forward(struct gwp_sock *src, struct gwp_sock *dst,
+		      bool do_recv, bool do_send)
+{
+	ssize_t recv_ret, send_ret;
+	uint32_t len, uret;
+	char *buf;
+	int err;
+
+	buf = src->buf + src->len;
+	len = src->cap - src->len;
+	if (len > 0 && do_recv) {
+		recv_ret = recv(src->fd, buf, len, MSG_NOSIGNAL);
+		if (recv_ret < 0) {
+			err = -errno;
+			if (err != -EAGAIN && err != -EINTR)
+				return err;
+			recv_ret = 0;
+		} else if (!recv_ret) {
+			return -ECONNRESET;
+		}
+
+		src->len += (uint32_t)recv_ret;
+	}
+
+	buf = src->buf;
+	len = src->len;
+	if (len > 0 && do_send) {
+		send_ret = send(dst->fd, buf, len, MSG_NOSIGNAL);
+		if (send_ret < 0) {
+			err = -errno;
+			if (err != -EAGAIN && err != -EINTR)
+				return err;
+			send_ret = 0;
+		} else if (!send_ret) {
+			return -ECONNRESET;
+		}
+
+		uret = (uint32_t)send_ret;
+		assert(uret <= len);
+		src->len -= uret;
+		if (src->len > 0)
+			memmove(buf, &buf[uret], src->len);
+	}
+
+	return 0;
+}
+
+static void adjust_epoll_out(struct gwp_sock *a, struct gwp_sock *b,
+			     int *changed)
+{
+	if (a->len > 0) {
+		if (!(b->ep_msk & EPOLLOUT)) {
+			b->ep_msk |= EPOLLOUT;
+			*changed |= 1;
+		}
+	} else {
+		if (b->ep_msk & EPOLLOUT) {
+			b->ep_msk &= ~EPOLLOUT;
+			*changed |= 1;
+		}
+	}
+}
+
+static void adjust_epoll_in(struct gwp_sock *s, int *changed)
+{
+	if (s->cap != s->len) {
+		if (!(s->ep_msk & EPOLLIN)) {
+			s->ep_msk |= EPOLLIN;
+			*changed |= 1;
+		}
+	} else {
+		if (s->ep_msk & EPOLLIN) {
+			s->ep_msk &= ~EPOLLIN;
+			*changed |= 1;
+		}
+	}
+}
+
+static int adjust_epoll_events(struct gwp_thread *t,
+			       struct gwp_sock_pair *sp)
+{
+	int client_need_ctl = 0;
+	int target_need_ctl = 0;
+	struct epoll_event ev;
+	int r;
+
+	adjust_epoll_out(&sp->target, &sp->client, &client_need_ctl);
+	adjust_epoll_out(&sp->client, &sp->target, &target_need_ctl);
+	adjust_epoll_in(&sp->client, &client_need_ctl);
+	adjust_epoll_in(&sp->target, &target_need_ctl);
+
+	if (client_need_ctl) {
+		ev.events = sp->client.ep_msk;
+		ev.data.u64 = 0;
+		ev.data.ptr = sp;
+		ev.data.u64 |= EV_BIT_CLIENT_DATA;
+		r = epoll_ctl(t->epl_fd, EPOLL_CTL_MOD, sp->client.fd, &ev);
+		if (r < 0) {
+			r = -errno;
+			return r;
+		}
+	}
+
+	if (target_need_ctl) {
+		ev.events = sp->target.ep_msk;
+		ev.data.u64 = 0;
+		ev.data.ptr = sp;
+		ev.data.u64 |= EV_BIT_TARGET_DATA;
+		r = epoll_ctl(t->epl_fd, EPOLL_CTL_MOD, sp->target.fd, &ev);
+		if (r < 0) {
+			r = -errno;
+			return r;
+		}
+	}
+
+	return 0;
+}
+
+static int process_event_target_conn(struct gwp_thread *t,
+				     struct gwp_sock_pair *sp)
+{
+	int err = 0, r;
+	socklen_t len = sizeof(err);
+
+	if (!sp->is_setup_done)
+		return 0;
+
+	r = getsockopt(sp->target.fd, SOL_SOCKET, SO_ERROR, &err, &len);
+	if (r < 0) {
+		r = -errno;
+		goto out_del_pair;
+	}
+
+	if (err) {
+		r = -err;
+		goto out_del_pair;
+	}
+
+	if (sp->client.len) {
+		r = do_forward(&sp->target, &sp->client, false, true);
+		if (r < 0)
+			return r;
+	}
+
+	if (sp->tmfd >= 0) {
+		close(sp->tmfd);
+		sp->tmfd = -1;
+	}
+
+	sp->is_target_alive = true;
+	return adjust_epoll_events(t, sp);
+
+out_del_pair:
+	t->need_reload = true;
+	return del_sock_pair(t, sp);
+}
+
+static int process_event_target_data(struct gwp_thread *t,
+				     struct gwp_sock_pair *sp, uint32_t events)
+{
+	int r;
+
+	if (!sp->is_target_alive)
+		return process_event_target_conn(t, sp);
+
+	if (events & EPOLLIN) {
+		r = do_forward(&sp->target, &sp->client, true, true);
+		if (r)
+			return r;
+	}
+
+	if (events & EPOLLOUT) {
+		r = do_forward(&sp->client, &sp->target, true, sp->is_target_alive);
+		if (r)
+			return r;
+	}
+
+	if (events & (EPOLLHUP | EPOLLRDHUP | EPOLLERR))
+		return -ECONNRESET;
+
+	return adjust_epoll_events(t, sp);
+}
+
+static int process_event_client_data(struct gwp_thread *t,
+				     struct gwp_sock_pair *sp, uint32_t events)
+{
+	int r;
+
+	if (events & EPOLLIN) {
+		r = do_forward(&sp->client, &sp->target, true, sp->is_target_alive);
+		if (r)
+			return r;
+	}
+
+	if (events & EPOLLOUT) {
+		r = do_forward(&sp->target, &sp->client, true, true);
+		if (r)
+			return r;
+	}
+
+	if (events & (EPOLLHUP | EPOLLRDHUP | EPOLLERR))
+		return -ECONNRESET;
+
+	return adjust_epoll_events(t, sp);
+}
+
 static int process_event(struct gwp_thread *t, struct epoll_event *ev)
 {
+	uint64_t orig_bit = ev->data.u64;
 	uint64_t ev_bit = GET_EV_BIT(ev->data.u64);
 	void *data;
 	int ret = 0;
@@ -330,18 +767,32 @@ static int process_event(struct gwp_thread *t, struct epoll_event *ev)
 	case EV_BIT_EVFD:
 		ret = gwp_recv_signal_thread(t);
 		break;
-	case EV_BIT_TARGET:
-		// ret = process_event_target(t, data);
+	case EV_BIT_TARGET_DATA:
+		ret = process_event_target_data(t, data, ev->events);
 		break;
-	case EV_BIT_CLIENT:
-		// ret = process_event_client(t, data);
+	case EV_BIT_CLIENT_DATA:
+		ret = process_event_client_data(t, data, ev->events);
 		break;
 	case EV_BIT_TIMER:
-		// ret = process_event_timer(t, data);
+		ret = -ETIMEDOUT;
 		break;
 	default:
-		fprintf(stderr, "Unknown event bit: %" PRIu64 "\n", ev_bit);
+		fprintf(stderr, "Unknown event bit: %#" PRIx64 "\n", ev_bit);
+		fprintf(stderr, "Original event bit: %#" PRIx64 "\n", orig_bit);
+		fprintf(stderr, "Thread index: %u\n", t->idx);
 		ret = -EINVAL;
+	}
+
+	if (ret) {
+		switch (ev_bit) {
+		case EV_BIT_TARGET_DATA:
+		case EV_BIT_CLIENT_DATA:
+		case EV_BIT_TIMER:
+			del_sock_pair(t, data);
+			t->need_reload = true;
+			ret = 0;
+			break;
+		}
 	}
 
 	return ret;
@@ -391,6 +842,7 @@ static void *gwp_thread_entry(void *arg)
 			break;
 	}
 
+	ctx->stop = true;
 	return (void *)(intptr_t)ret;
 }
 
@@ -445,12 +897,13 @@ static int parse_str_addr(struct sockaddr_storage *addr,
 	return 0;
 }
 
-static int gwp_init_sock(struct gwp_ctx *ctx)
+static int gwp_init_thread_sock(struct gwp_thread *t)
 {
 	static const int flg = SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK;
+	struct gwp_ctx *ctx = t->ctx;
 	struct sockaddr_storage addr;
 	socklen_t addr_len;
-	int fd, err;
+	int fd, err, v;
 
 	err = parse_str_addr(&ctx->target_addr, &ctx->target_addr_len,
 			     ctx->cfg.target_addr);
@@ -463,6 +916,9 @@ static int gwp_init_sock(struct gwp_ctx *ctx)
 	fd = socket(addr.ss_family, flg, 0);
 	if (fd < 0)
 		return -errno;
+	v = 1;
+	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &v, sizeof(v));
+	setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &v, sizeof(v));
 	err = bind(fd, (struct sockaddr *)&addr, addr_len);
 	if (err < 0)
 		goto err;
@@ -470,7 +926,7 @@ static int gwp_init_sock(struct gwp_ctx *ctx)
 	if (err < 0)
 		goto err;
 
-	ctx->tcp_fd = fd;
+	t->tcp_fd = fd;
 	return 0;
 
 err:
@@ -479,11 +935,11 @@ err:
 	return err;
 }
 
-static void gwp_free_sock(struct gwp_ctx *ctx)
+static void gwp_free_thread_sock(struct gwp_thread *t)
 {
-	if (ctx->tcp_fd >= 0) {
-		close(ctx->tcp_fd);
-		ctx->tcp_fd = -1;
+	if (t->tcp_fd >= 0) {
+		close(t->tcp_fd);
+		t->tcp_fd = -1;
 	}
 }
 
@@ -510,14 +966,12 @@ static int gwp_init_thread_epoll(struct gwp_thread *t)
 		goto err_ev;
 	}
 
-	if (!t->idx) {
-		ev_ee.events = EPOLLIN;
-		ev_ee.data.u64 = EV_BIT_ACCEPT;
-		err = epoll_ctl(ep, EPOLL_CTL_ADD, t->ctx->tcp_fd, &ev_ee);
-		if (err < 0) {
-			err = -errno;
-			goto err_ev;
-		}
+	ev_ee.events = EPOLLIN;
+	ev_ee.data.u64 = EV_BIT_ACCEPT;
+	err = epoll_ctl(ep, EPOLL_CTL_ADD, t->tcp_fd, &ev_ee);
+	if (err < 0) {
+		err = -errno;
+		goto err_ev;
 	}
 
 	t->epl_fd = ep;
@@ -547,7 +1001,6 @@ static int gwp_init_thread_sock_bucket(struct gwp_thread *t)
 {
 	struct gwp_sock_bucket *gsb = &t->gsb;
 	uint32_t cap_pairs = 16;
-	int ret;
 
 	gsb->pairs = calloc(cap_pairs, sizeof(*gsb->pairs));
 	if (!gsb->pairs)
@@ -555,26 +1008,7 @@ static int gwp_init_thread_sock_bucket(struct gwp_thread *t)
 
 	gsb->nr_pairs = 0;
 	gsb->cap_pairs = cap_pairs;
-	ret = pthread_mutex_init(&gsb->lock, NULL);
-	if (ret) {
-		free(gsb->pairs);
-		gsb->pairs = NULL;
-		return -ret;
-	}
-
 	return 0;
-}
-
-static void gwp_free_thread_sock_pair(struct gwp_sock_pair *sp)
-{
-	if (!sp)
-		return;
-
-	if (sp->tfd >= 0)
-		close(sp->tfd);
-	if (sp->cfd >= 0)
-		close(sp->cfd);
-	free(sp);
 }
 
 static void gwp_free_thread_sock_bucket(struct gwp_thread *t)
@@ -592,34 +1026,35 @@ static void gwp_free_thread_sock_bucket(struct gwp_thread *t)
 	gsb->pairs = NULL;
 	gsb->nr_pairs = 0;
 	gsb->cap_pairs = 0;
-	pthread_mutex_destroy(&gsb->lock);
 	memset(gsb, 0, sizeof(*gsb));
 }
 
 static int gwp_init_thread(struct gwp_thread *t)
 {
-	int ret = gwp_init_thread_epoll(t);
+	int ret = gwp_init_thread_sock(t);
 	if (ret)
 		return ret;
-
+	ret = gwp_init_thread_epoll(t);
+	if (ret)
+		goto out_free_sock;
 	ret = gwp_init_thread_sock_bucket(t);
-	if (ret) {
-		gwp_free_thread_epoll(t);
-		return ret;
-	}
+	if (ret)
+		goto out_free_epoll;
+	if (t->idx == 0)
+		return 0;
+	ret = pthread_create(&t->thread, NULL, gwp_thread_entry, t);
+	if (ret)
+		goto out_free_sock_bucket;
 
 	return 0;
-}
 
-static int gwp_send_signal_thread(struct gwp_thread *t)
-{
-	uint64_t val = 1;
-
-	assert(t->evp_fd >= 0);
-	if (write(t->evp_fd, &val, sizeof(val)) != (ssize_t)sizeof(val))
-		return -EIO;
-
-	return 0;
+out_free_sock_bucket:
+	gwp_free_thread_sock_bucket(t);
+out_free_epoll:
+	gwp_free_thread_epoll(t);
+out_free_sock:
+	gwp_free_thread_sock(t);
+	return ret;
 }
 
 static void gwp_free_thread(struct gwp_thread *t)
@@ -632,6 +1067,7 @@ static void gwp_free_thread(struct gwp_thread *t)
 	pthread_join(t->thread, NULL);
 	gwp_free_thread_epoll(t);
 	gwp_free_thread_sock_bucket(t);
+	gwp_free_thread_sock(t);
 }
 
 static int gwp_init_threads(struct gwp_ctx *ctx)
@@ -667,19 +1103,7 @@ static int gwp_init_threads(struct gwp_ctx *ctx)
 
 static int gwp_init(struct gwp_ctx *ctx)
 {
-	int ret;
-
-	ret = gwp_init_sock(ctx);
-	if (ret)
-		return ret;
-
-	ret = gwp_init_threads(ctx);
-	if (ret) {
-		gwp_free_sock(ctx);
-		return ret;
-	}
-
-	return 0;
+	return gwp_init_threads(ctx);
 }
 
 static void gwp_free(struct gwp_ctx *ctx)
@@ -697,8 +1121,6 @@ static void gwp_free(struct gwp_ctx *ctx)
 		free(ctx->threads);
 		ctx->threads = NULL;
 	}
-
-	gwp_free_sock(ctx);
 }
 
 static int gwp_run(struct gwp_ctx *ctx)
@@ -710,6 +1132,13 @@ int main(int argc, char *argv[])
 {
 	struct gwp_ctx ctx;
 	int ret;
+
+	ret = prepare_rlimit();
+	if (ret) {
+		fprintf(stderr, "Failed to set resource limits: %s\n",
+			strerror(-ret));
+		return -ret;
+	}
 
 	ret = prepare_gwp_ctx_from_argv(argc, argv, &ctx);
 	if (ret)
