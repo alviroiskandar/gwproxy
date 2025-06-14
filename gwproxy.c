@@ -60,6 +60,7 @@ enum {
 #define CFG_DEF_NR_THREADS	4U
 #define CFG_DEF_SEND_BUF_SIZE	4096
 #define CFG_DEF_RECV_BUF_SIZE	4096
+#define CFG_DEF_NR_ACCEPT_SPIN	32U
 
 struct gwp_sock {
 	int		fd;
@@ -107,6 +108,7 @@ struct gwp_cfg {
 	uint32_t	client_buf;
 	uint32_t	target_buf;
 	uint16_t	nr_threads;
+	uint16_t	nr_accept_spin;
 	int		connect_timeout;	/* In seconds. */
 };
 
@@ -126,11 +128,12 @@ static const struct option long_opts[] = {
 	{ "target-buf-size",	required_argument,	NULL, 'w' },
 	{ "client-buf-size",	required_argument,	NULL, 'x' },
 	{ "threads",		required_argument,	NULL, 'm' },
+	{ "nr-accept-spin",	required_argument,	NULL, 'A' },
 	{ "connect-timeout",	required_argument,	NULL, 'T' },
 	{ "help",		no_argument,		NULL, 'h' },
 	{ NULL, 0, NULL, 0 }
 };
-static const char short_opts[] = "b:t:w:x:m:T:h";
+static const char short_opts[] = "b:t:w:x:m:A:T:h";
 
 static int prepare_rlimit(void)
 {
@@ -164,6 +167,7 @@ static void show_usage(const char *progname)
 	fprintf(stderr, "  -w, --target-buf-size=SIZE Set target buffer size (default: %d)\n", CFG_DEF_SEND_BUF_SIZE);
 	fprintf(stderr, "  -x, --client-buf-size=SIZE Set client buffer size (default: %d)\n", CFG_DEF_RECV_BUF_SIZE);
 	fprintf(stderr, "  -m, --threads=NUM          Number of threads to use (default: %d)\n", CFG_DEF_NR_THREADS);
+	fprintf(stderr, "  -A, --nr-accept-spin=NUM   Number of accept spins per event (default: %d)\n", CFG_DEF_NR_ACCEPT_SPIN);
 	fprintf(stderr, "  -T, --connect-timeout=SEC  Connection timeout in seconds (default: %d)\n", CFG_DEF_CONNECT_TIMEOUT);
 	fprintf(stderr, "  -h, --help                 Show this help message\n");
 	exit(EXIT_FAILURE);
@@ -208,6 +212,14 @@ static int process_option(const char *progname, int c, struct gwp_cfg *cfg)
 		}
 		cfg->nr_threads = (uint16_t)c;
 		break;
+	case 'A':
+		c = atoi(optarg);
+		if (c <= 0) {
+			fprintf(stderr, "Invalid number of accept spins: %s\n", optarg);
+			return -EINVAL;
+		}
+		cfg->nr_accept_spin = (uint16_t)c;
+		break;
 	case 'T':
 		c = atoi(optarg);
 		if (c < 0) {
@@ -235,6 +247,7 @@ static int prepare_gwp_ctx_from_argv(int argc, char *argv[],
 	cfg->connect_timeout = CFG_DEF_CONNECT_TIMEOUT;
 	cfg->client_buf = CFG_DEF_RECV_BUF_SIZE;
 	cfg->target_buf = CFG_DEF_SEND_BUF_SIZE;
+	cfg->nr_accept_spin = CFG_DEF_NR_ACCEPT_SPIN;
 	ctx->stop = false;
 	while (1) {
 		ret = getopt_long(argc, argv, short_opts, long_opts, NULL);
@@ -325,6 +338,22 @@ static int del_sock_pair(struct gwp_thread *t, struct gwp_sock_pair *sp)
 	gsb->pairs[gsb->nr_pairs - 1] = NULL;
 	gsb->nr_pairs--;
 	gwp_free_thread_sock_pair(sp);
+
+	if ((gsb->cap_pairs - gsb->nr_pairs) >= 64) {
+		/*
+		 * Shirk the capacity if many sock pairs have been freed.
+		 */
+		uint32_t new_cap = gsb->nr_pairs;
+		struct gwp_sock_pair **new_pairs;
+
+		new_pairs = realloc(gsb->pairs, new_cap * sizeof(*new_pairs));
+		if (!new_pairs)
+			return -ENOMEM;
+
+		gsb->pairs = new_pairs;
+		gsb->cap_pairs = new_cap;
+	}
+
 	return 0;
 }
 
@@ -515,9 +544,10 @@ close_cfd:
 
 static int process_event_accept(struct gwp_thread *t)
 {
-	uint32_t n = 5;
+	uint32_t n = t->ctx->cfg.nr_accept_spin;
 	int r = 0;
 
+	assert(n);
 	while (n--) {
 		r = __process_event_accept(t);
 		if (r)
