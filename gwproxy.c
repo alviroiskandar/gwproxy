@@ -33,14 +33,6 @@
 #include <pthread.h>
 #include <sys/resource.h>
 
-#define DEBUG_LEVEL 3
-#define pr_debug(LEVEL, FMT, ...)	\
-do {					\
-	if (DEBUG_LEVEL >= (LEVEL)) {	\
-		fprintf(stderr, FMT "\n", __VA_ARGS__);	\
-	}				\
-} while (0)
-
 enum {
 	EV_BIT_ACCEPT		= (0x0001ULL << 48ULL),
 	EV_BIT_EVFD		= (0x0002ULL << 48ULL),
@@ -782,7 +774,6 @@ static int process_event_client_data(struct gwp_thread *t,
 
 static int process_event(struct gwp_thread *t, struct epoll_event *ev)
 {
-	uint64_t orig_bit = ev->data.u64;
 	uint64_t ev_bit = GET_EV_BIT(ev->data.u64);
 	void *data;
 	int ret = 0;
@@ -807,9 +798,6 @@ static int process_event(struct gwp_thread *t, struct epoll_event *ev)
 		ret = -ETIMEDOUT;
 		break;
 	default:
-		fprintf(stderr, "Unknown event bit: %#" PRIx64 "\n", ev_bit);
-		fprintf(stderr, "Original event bit: %#" PRIx64 "\n", orig_bit);
-		fprintf(stderr, "Thread index: %u\n", t->idx);
 		ret = -EINVAL;
 	}
 
