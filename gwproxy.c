@@ -666,10 +666,8 @@ static int adjust_epoll_events(struct gwp_thread *t,
 		ev.data.ptr = sp;
 		ev.data.u64 |= EV_BIT_CLIENT_DATA;
 		r = epoll_ctl(t->epl_fd, EPOLL_CTL_MOD, sp->client.fd, &ev);
-		if (r < 0) {
-			r = -errno;
-			return r;
-		}
+		if (r < 0)
+			return -errno;
 	}
 
 	if (target_need_ctl) {
@@ -678,10 +676,8 @@ static int adjust_epoll_events(struct gwp_thread *t,
 		ev.data.ptr = sp;
 		ev.data.u64 |= EV_BIT_TARGET_DATA;
 		r = epoll_ctl(t->epl_fd, EPOLL_CTL_MOD, sp->target.fd, &ev);
-		if (r < 0) {
-			r = -errno;
-			return r;
-		}
+		if (r < 0)
+			return -errno;
 	}
 
 	return 0;
