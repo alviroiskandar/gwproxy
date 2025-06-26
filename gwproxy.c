@@ -329,6 +329,11 @@ static int prepare_gwp_ctx_from_argv(int argc, char *argv[],
 			fprintf(stderr, "Client buffer size must be at least 512 bytes for SOCKS5 proxy mode\n");
 			return -EINVAL;
 		}
+	} else {
+		if (!*cfg->target_addr) {
+			fprintf(stderr, "Target address is required for non-SOCKS5 mode\n");
+			return -EINVAL;
+		}
 	}
 
 	return 0;
