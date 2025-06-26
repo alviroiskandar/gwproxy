@@ -105,6 +105,8 @@ struct gwp_cfg {
 	uint16_t	nr_threads;
 	uint16_t	nr_accept_spin;
 	int		connect_timeout;	/* In seconds. */
+	bool		socks5;			/* Enable SOCKS5 proxy mode. */
+	char		auth_file[256];	/* Authentication file for SOCKS5. */
 };
 
 struct gwp_ctx {
@@ -125,10 +127,12 @@ static const struct option long_opts[] = {
 	{ "threads",		required_argument,	NULL, 'm' },
 	{ "nr-accept-spin",	required_argument,	NULL, 'A' },
 	{ "connect-timeout",	required_argument,	NULL, 'T' },
+	{ "socks5",		no_argument,		NULL, 'S' },
+	{ "auth-file",		required_argument,	NULL, 'a' },
 	{ "help",		no_argument,		NULL, 'h' },
 	{ NULL, 0, NULL, 0 }
 };
-static const char short_opts[] = "b:t:w:x:m:A:T:h";
+static const char short_opts[] = "b:t:w:x:m:A:T:a:h";
 
 static int prepare_rlimit(void)
 {
@@ -164,6 +168,8 @@ static void show_usage(const char *progname)
 	fprintf(stderr, "  -m, --threads=NUM          Number of threads to use (default: %d)\n", CFG_DEF_NR_THREADS);
 	fprintf(stderr, "  -A, --nr-accept-spin=NUM   Number of accept spins per event (default: %d)\n", CFG_DEF_NR_ACCEPT_SPIN);
 	fprintf(stderr, "  -T, --connect-timeout=SEC  Connection timeout in seconds (default: %d)\n", CFG_DEF_CONNECT_TIMEOUT);
+	fprintf(stderr, "  -S, --socks5               Enable SOCKS5 proxy mode\n");
+	fprintf(stderr, "  -a, --auth-file=FILE       Specify authentication file for SOCKS5 proxy\n");
 	fprintf(stderr, "  -h, --help                 Show this help message\n");
 	exit(EXIT_FAILURE);
 }
@@ -222,6 +228,18 @@ static int process_option(const char *progname, int c, struct gwp_cfg *cfg)
 			return -EINVAL;
 		}
 		cfg->connect_timeout = c;
+		break;
+	case 'S':
+		cfg->socks5 = true;
+		break;
+	case 'a':
+		l = sizeof(cfg->auth_file) - 1;
+		strncpy(cfg->auth_file, optarg, l);
+		cfg->auth_file[l] = '\0';
+		if (cfg->socks5 && !*cfg->auth_file) {
+			fprintf(stderr, "Authentication file is required for SOCKS5 proxy mode\n");
+			return -EINVAL;
+		}
 		break;
 	default:
 	case 'h':
