@@ -5,7 +5,6 @@ Simple TCP proxy for GNU/Weeb.
 
 Assignment from Chief Ammar. Link: https://t.me/GNUWeeb/1174779
 
-```
   Usage: ./gwproxy [OPTIONS]
   Options:
     -b, --bind=ADDR:PORT       Bind to the specified address
@@ -15,16 +14,40 @@ Assignment from Chief Ammar. Link: https://t.me/GNUWeeb/1174779
     -m, --threads=NUM          Number of threads to use (default: 4)
     -A, --nr-accept-spin=NUM   Number of accept spins per event (default: 32)
     -T, --connect-timeout=SEC  Connection timeout in seconds (default: 5)
+    -S, --socks5               Enable SOCKS5 proxy mode
+    -a, --auth-file=FILE       Specify authentication file for SOCKS5 proxy
+    -P, --socks5-timeout=SEC   SOCKS5 auth and command timeout in seconds (default: 10)
     -h, --help                 Show this help message
-```
 
-Usage example:
+Usage examples:
 
-  ./gwproxy --target 127.0.0.1:1111 --bind [::]:8080 -m 16
-  curl -v http://127.0.0.1:1111
+1) Predefined target TCP proxy:
 
-The above example binds the proxy to port 8080 and connects to the
-target at 127.0.0.1:1111.
+    ./gwproxy --target 127.0.0.1:1111 --bind [::]:8080 -m 16;
+    curl -v http://127.0.0.1:1111;
+
+2) Socks5 proxy mode (without authentication):
+
+    ./gwproxy --socks5 --bind [::]:8080;
+    curl -v -x socks5://127.0.0.1:8080 https://google.com;
+
+3) Socks5 proxy mode with authentication:
+
+    ./gwproxy --socks5 --bind [::]:8080 --auth-file /tmp/auth.txt;
+    curl -v -x socks5://user1:pass1@127.0.0.1:8080 https://google.com;
+
+---
+
+Authentication file format:
+For each line, there is a username and password separated by a colon.
+
+user1:pass1
+user2:pass2
+user3:pass3
+user4:pass4
+  
+The maximum number of characters for a line is 255 + 255 + 1 (LF
+excluded).
 
 2025-06-15
 
