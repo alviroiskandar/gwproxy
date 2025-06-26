@@ -297,13 +297,13 @@ static int prepare_gwp_ctx_from_argv(int argc, char *argv[],
 	}
 
 	if (cfg->socks5) {
-		if (cfg->target_buf < 128) {
-			fprintf(stderr, "Target buffer size must be at least 128 bytes for SOCKS5 proxy mode\n");
+		if (cfg->target_buf < 512) {
+			fprintf(stderr, "Target buffer size must be at least 512 bytes for SOCKS5 proxy mode\n");
 			return -EINVAL;
 		}
 
-		if (cfg->client_buf < 128) {
-			fprintf(stderr, "Client buffer size must be at least 128 bytes for SOCKS5 proxy mode\n");
+		if (cfg->client_buf < 512) {
+			fprintf(stderr, "Client buffer size must be at least 512 bytes for SOCKS5 proxy mode\n");
 			return -EINVAL;
 		}
 	}
