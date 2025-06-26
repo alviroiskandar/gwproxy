@@ -36,6 +36,9 @@
 #include <pthread.h>
 #include <sys/resource.h>
 #include <netdb.h>
+#include <sys/file.h>
+#include <sys/inotify.h>
+#include <linux/limits.h>
 
 enum {
 	EV_BIT_ACCEPT		= (0x0001ULL << 48ULL),
@@ -43,20 +46,26 @@ enum {
 	EV_BIT_TARGET_DATA	= (0x0003ULL << 48ULL),
 	EV_BIT_CLIENT_DATA	= (0x0004ULL << 48ULL),
 	EV_BIT_TIMER		= (0x0005ULL << 48ULL),
+	EV_BIT_INOTIFY		= (0x0006ULL << 48ULL),
 };
 
 enum {
-	SP_STATE_INIT			= 0,
-	SP_STATE_FWD			= 1,
-	SP_STATE_SOCKS5_AUTH		= 2,
-	SP_STATE_SOCKS5_CMD		= 3,
-	SP_STATE_SOCKS5_CMD_CONNECT	= 4,
-	SP_STATE_SOCKS5_ERR		= 30,
+	SP_STATE_INIT			= 0x00,
+
+	SP_STATE_FWD			= 0x10,
+
+	SP_STATE_SOCKS5_AUTH		= 0x20,
+	SP_STATE_SOCKS5_AUTH_USER_PASS	= 0x21,
+
+	SP_STATE_SOCKS5_CMD		= 0x30,
+	SP_STATE_SOCKS5_CMD_CONNECT	= 0x31,
+
+	SP_STATE_SOCKS5_ERR		= 0xff,
 };
 
 #define ALL_EV_BITS	(EV_BIT_ACCEPT | EV_BIT_EVFD | \
-				EV_BIT_TARGET_DATA | EV_BIT_CLIENT_DATA | \
-				EV_BIT_TIMER)
+			 EV_BIT_TARGET_DATA | EV_BIT_CLIENT_DATA | \
+			 EV_BIT_TIMER | EV_BIT_INOTIFY)
 #define GET_EV_BIT(X)	((X) & ALL_EV_BITS)
 #define CLEAR_EV_BIT(X)	((X) & ~ALL_EV_BITS)
 #define NR_EPL_EVENTS	512
@@ -122,6 +131,19 @@ struct gwp_cfg {
 	int		socks5_timeout;	/* SOCKS5 auth and command timeout in seconds. */
 };
 
+struct gwp_socks5_auth_user {
+	char	*username;
+	char	*password;
+};
+
+struct gwp_socks5_auth {
+	FILE				*handle;
+	int				ino_fd;
+	pthread_mutex_t			lock;
+	struct gwp_socks5_auth_user	*users;
+	size_t				nr_users;
+};
+
 struct gwp_ctx {
 	volatile bool			stop;
 	uint32_t			rr_counter;
@@ -130,6 +152,7 @@ struct gwp_ctx {
 	socklen_t			target_addr_len;
 	struct gwp_thread		*threads;
 	struct gwp_cfg			cfg;
+	struct gwp_socks5_auth		*socks5_auth;
 };
 
 static const struct option long_opts[] = {
@@ -924,8 +947,11 @@ static int handle_socks5_state_auth(struct gwp_thread *t,
 {
 	struct gwp_cfg *cfg = &t->ctx->cfg;
 	struct gwp_sock *s = &sp->client;
-	uint8_t i, nr_methods, *buf = (uint8_t *)s->buf;
+	uint8_t nr_methods, *buf = (uint8_t *)s->buf;
 	uint32_t len = s->len;
+	uint8_t *methods;
+	bool found = false;
+	int expected_method;
 
 	/*
 	 * Must have at least 2 bytes for the version and number of methods.
@@ -944,36 +970,131 @@ static int handle_socks5_state_auth(struct gwp_thread *t,
 	if (len < (2u + nr_methods))
 		return -EAGAIN;
 
-	if (*cfg->auth_file) {
-		/*
-		 * TODO: Handle authentication using the provided
-		 * authentication file.
-		 */
-		return -ENOSYS;
-	} else {
-		/*
-		 * No authentication required, verify that the client
-		 * supports it.
-		 */
-		uint8_t *methods = &buf[2];
-		bool found = false;
+	methods = &buf[2];
+	if (*cfg->auth_file)
+		expected_method = 0x02; /* USERNAME/PASSWORD */
+	else
+		expected_method = 0x00; /* NO AUTHENTICATION REQUIRED */
 
-		for (i = 0; i < nr_methods; i++) {
-			if (methods[i] == 0x00) {
-				found = true;
-				break;
-			}
-		}
+	found = !!memchr(methods, expected_method, nr_methods);
+	buf = (uint8_t *)sp->target.buf;
+	sp->target.len = 2; /* VER, METHOD */
+	buf[0] = 0x05; /* VER */
+	buf[1] = found ? expected_method : 0xFF; /* METHOD */
+	sp->client.len -= (2u + nr_methods);
 
-		assert(sp->target.cap >= 2);
-		sp->target.len = 2;
-		buf = (uint8_t *)sp->target.buf;
-		buf[0] = 0x05;
-		buf[1] = found ? 0x00 : 0xFF;
-		sp->state = found ? SP_STATE_SOCKS5_CMD : SP_STATE_SOCKS5_ERR;
+	if (buf[1] == 0xFF)
+		sp->state = SP_STATE_SOCKS5_ERR;
+	else
+		sp->state = *cfg->auth_file ? SP_STATE_SOCKS5_AUTH_USER_PASS
+					    : SP_STATE_SOCKS5_CMD;
+
+	return 0;
+}
+
+static bool gwp_auth_check(struct gwp_socks5_auth *gsa, const char *username,
+			   const char *password);
+
+static bool gwp_auth_checkl(struct gwp_socks5_auth *gsa, const char *username,
+			    uint8_t ulen, const char *password, uint8_t plen)
+{
+	char u[256], p[256];
+
+	memcpy(u, username, ulen);
+	u[ulen] = '\0';
+
+	if (password) {
+		memcpy(p, password, plen);
+		p[plen] = '\0';
 	}
 
-	sp->client.len -= (2u + nr_methods);
+	return gwp_auth_check(gsa, u, password ? p : NULL);
+}
+
+/*
+ * RFC 1929, section 2:
+ *
+ *    Once the SOCKS V5 server has started, and the client has selected the
+ *    Username/Password Authentication protocol, the Username/Password
+ *    subnegotiation begins.  This begins with the client producing a
+ *    Username/Password request:
+ *
+ *            +----+------+----------+------+----------+
+ *            |VER | ULEN |  UNAME   | PLEN |  PASSWD  |
+ *            +----+------+----------+------+----------+
+ *            | 1  |  1   | 1 to 255 |  1   | 1 to 255 |
+ *            +----+------+----------+------+----------+
+ *
+ *    The VER field contains the current version of the subnegotiation,
+ *    which is X'01'. The ULEN field contains the length of the UNAME field
+ *    that follows. The UNAME field contains the username as known to the
+ *    source operating system. The PLEN field contains the length of the
+ *    PASSWD field that follows. The PASSWD field contains the password
+ *    association with the given UNAME.
+ *
+ *    The server verifies the supplied UNAME and PASSWD, and sends the
+ *    following response:
+ *
+ *                         +----+--------+
+ *                         |VER | STATUS |
+ *                         +----+--------+
+ *                         | 1  |   1    |
+ *                         +----+--------+
+ * 
+ *    A STATUS field of X'00' indicates success. If the server returns a
+ *    `failure' (STATUS value other than X'00') status, it MUST close the
+ *    connection.
+ */
+static int handle_socks5_state_auth_user_pass(struct gwp_thread *t,
+					      struct gwp_sock_pair *sp)
+{
+	struct gwp_sock *s = &sp->client;
+	uint32_t len = s->len, needed_len;
+	uint8_t *buf = (uint8_t *)s->buf;
+	uint8_t ulen, plen;
+	char *user, *pass;
+	bool auth_ok;
+
+	needed_len = 1;
+	if (len < needed_len)
+		return -EAGAIN;
+
+	if (buf[0] != 0x01) /* VER */
+		return -EINVAL;
+
+	needed_len += 1; /* ULEN */
+	if (len < needed_len)
+		return -EAGAIN;
+
+	ulen = buf[1];
+	if (!ulen)
+		return -EINVAL;
+
+	needed_len += ulen + 1; /* UNAME + PLEN */
+	if (len < needed_len)
+		return -EAGAIN;
+
+	user = (char *)&buf[2];
+	plen = buf[2 + ulen];
+	needed_len += plen; /* PASSWD */
+	if (len < needed_len)
+		return -EAGAIN;
+
+	pass = plen ? (char *)&buf[3 + ulen] : NULL;
+	s->len -= needed_len;
+	auth_ok = gwp_auth_checkl(t->ctx->socks5_auth, user, ulen, pass, plen);
+
+	sp->target.len = 2; /* VER, STATUS */
+	buf = (uint8_t *)sp->target.buf;
+	buf[0] = 0x01; /* VER */
+	if (auth_ok) {
+		buf[1] = 0x00; /* STATUS: success */
+		sp->state = SP_STATE_SOCKS5_CMD;
+	} else {
+		buf[1] = 0x01; /* STATUS: failure */
+		sp->state = SP_STATE_SOCKS5_ERR;
+	}
+
 	return 0;
 }
 
@@ -1342,9 +1463,13 @@ static int handle_socks5_state(struct gwp_thread *t,
 {
 	int r;
 
+again:
 	switch (sp->state) {
 	case SP_STATE_SOCKS5_AUTH:
 		r = handle_socks5_state_auth(t, sp);
+		break;
+	case SP_STATE_SOCKS5_AUTH_USER_PASS:
+		r = handle_socks5_state_auth_user_pass(t, sp);
 		break;
 	case SP_STATE_SOCKS5_CMD:
 		r = handle_socks5_state_cmd(t, sp);
@@ -1357,14 +1482,45 @@ static int handle_socks5_state(struct gwp_thread *t,
 	if (r == -EAGAIN)
 		return 0;
 
-	r = do_forward(&sp->target, &sp->client, false, true);
-	if (r < 0)
-		return r;
+	if (sp->target.len) {
+		r = do_forward(&sp->target, &sp->client, false, true);
+		if (r < 0)
+			return r;
+	}
 
 	if (sp->state == SP_STATE_SOCKS5_ERR)
 		return -ECONNRESET;
 
+	if (sp->client.len > 0)
+		goto again;
+
 	return 0;
+}
+
+static int gwp_load_auth_file(struct gwp_socks5_auth *gsa);
+
+static int process_event_inotify(struct gwp_thread *t)
+{
+	static const size_t req_sz = sizeof(struct inotify_event) + NAME_MAX + 1;
+	char buf[req_sz * 8];
+	struct gwp_socks5_auth *sa;
+	struct gwp_ctx *ctx = t->ctx;
+	ssize_t ret;
+
+	assert(ctx->cfg.socks5);
+	assert(ctx->socks5_auth);
+
+	sa = ctx->socks5_auth;
+	ret = read(sa->ino_fd, buf, sizeof(buf));
+	if (ret < 0) {
+		ret = -errno;
+		if (ret == -EAGAIN || ret == -EINTR)
+			return 0;
+		return ret;
+	}
+
+	printf("Reloading SOCKS5 authentication file: %s\n", ctx->cfg.auth_file);
+	return gwp_load_auth_file(sa);
 }
 
 static int process_event(struct gwp_thread *t, struct epoll_event *ev)
@@ -1391,6 +1547,9 @@ static int process_event(struct gwp_thread *t, struct epoll_event *ev)
 		break;
 	case EV_BIT_TIMER:
 		ret = -ETIMEDOUT;
+		break;
+	case EV_BIT_INOTIFY:
+		ret = process_event_inotify(t);
 		break;
 	default:
 		ret = -EINVAL;
@@ -1644,6 +1803,20 @@ static void gwp_free_thread_sock_bucket(struct gwp_thread *t)
 	memset(gsb, 0, sizeof(*gsb));
 }
 
+static int gwp_init_thread_add_inotify_to_epoll(struct gwp_thread *t)
+{
+	struct gwp_socks5_auth *gsa = t->ctx->socks5_auth;
+	struct epoll_event ev;
+
+	if (!gsa)
+		return 0;
+
+	assert(t->ctx->cfg.socks5);
+	ev.events = EPOLLIN;
+	ev.data.u64 = EV_BIT_INOTIFY;
+	return epoll_ctl(t->epl_fd, EPOLL_CTL_ADD, gsa->ino_fd, &ev);
+}
+
 static int gwp_init_thread(struct gwp_thread *t)
 {
 	int ret = gwp_init_thread_sock(t);
@@ -1656,7 +1829,7 @@ static int gwp_init_thread(struct gwp_thread *t)
 	if (ret)
 		goto out_free_epoll;
 	if (t->idx == 0)
-		return 0;
+		return gwp_init_thread_add_inotify_to_epoll(t);
 	ret = pthread_create(&t->thread, NULL, gwp_thread_entry, t);
 	if (ret)
 		goto out_free_sock_bucket;
@@ -1716,9 +1889,266 @@ static int gwp_init_threads(struct gwp_ctx *ctx)
 	return 0;
 }
 
+static void gwp_free_auth_users(struct gwp_socks5_auth *gsa)
+{
+	size_t i;
+
+	if (!gsa || !gsa->users)
+		return;
+
+	for (i = 0; i < gsa->nr_users; i++) {
+		if (gsa->users[i].username)
+			free(gsa->users[i].username);
+	}
+
+	free(gsa->users);
+	gsa->users = NULL;
+	gsa->nr_users = 0;
+}
+
+static int gwp_append_auth_user(struct gwp_socks5_auth *gsa, const char *line)
+{
+	struct gwp_socks5_auth_user *new_users, *cur_user;
+	char *colon, *user, *pass;
+
+	if (!gsa || !line)
+		return -EINVAL;
+
+	new_users = realloc(gsa->users, (gsa->nr_users + 1) * sizeof(*new_users));
+	if (!new_users)
+		return -ENOMEM;
+	gsa->users = new_users;
+
+	user = strdup(line);
+	if (!user) {
+		fprintf(stderr, "Failed to allocate memory for auth user: %s\n", line);
+		return -ENOMEM;
+	}
+
+	colon = strchr(user, ':');
+	if (colon)
+		*colon = '\0';
+
+	pass = colon ? colon + 1 : NULL;
+	if (pass && !*pass)
+		pass = NULL;
+
+	cur_user = &gsa->users[gsa->nr_users++];
+	cur_user->username = user;
+	cur_user->password = pass;
+	return 0;
+}
+
+static int __gwp_load_auth_file(struct gwp_socks5_auth *gsa)
+{
+	char buf[256 + 256], *p;
+	uint32_t line = 0;
+	size_t len;
+	int r;
+
+	gwp_free_auth_users(gsa);
+	while (1) {
+		p = fgets(buf, sizeof(buf), gsa->handle);
+		if (!p)
+			break;
+
+		line++;
+		len = strlen(p);
+		if (!len)
+			continue;
+
+		if (p[len - 1] == '\n')
+			p[--len] = '\0';
+
+		if (!len) {
+			/*
+			 * Skip empty lines.
+			 */
+			continue;
+		}
+
+		/*
+		 * A line is only allowed to have a maximum of 255 + 255 + 1
+		 * characters, which is 511 characters in total because the
+		 * max possible username and password length is 255 characters
+		 * each. Plus one character for the colon between them.
+		 */
+		if (len > 511) {
+			fprintf(stderr,
+				"Line too long in auth file: '%s' at line %d\n",
+				p, line);
+			return -EINVAL;
+		}
+
+		r = gwp_append_auth_user(gsa, p);
+		if (r < 0) {
+			fprintf(stderr, "Failed to add auth user: %s\n",
+				strerror(-r));
+			return r;
+		}
+	}
+
+	printf("Loaded %zu users from the auth file.\n", gsa->nr_users);
+	rewind(gsa->handle);
+	return 0;
+}
+
+static int gwp_load_auth_file(struct gwp_socks5_auth *gsa)
+{
+	int r, fd = fileno(gsa->handle);
+
+	/*
+	 * The mutex protects from other threads trying to read the
+	 * auth array.
+	 *
+	 * The flock() call protects from other processes trying to
+	 * write to the file while we read it (lock shared / LOCK_SH).
+	 *
+	 * Other processes SHOULD use flock() to lock the file
+	 * before writing to it, so that we can read it safely. 
+	 */
+	pthread_mutex_lock(&gsa->lock);
+	flock(fd, LOCK_SH);
+	r = __gwp_load_auth_file(gsa);
+	flock(fd, LOCK_UN);
+	pthread_mutex_unlock(&gsa->lock);
+	return r;
+}
+
+static bool __gwp_auth_check(struct gwp_socks5_auth *gsa, const char *username,
+			     const char *password)
+{
+	size_t i;
+
+	for (i = 0; i < gsa->nr_users; i++) {
+		const char *u = gsa->users[i].username;
+		const char *p = gsa->users[i].password;
+
+		if (strcmp(u, username))
+			continue;
+
+		if (!p && (!password || !*password))
+			return true;
+
+		if (p && password && !strcmp(p, password))
+			return true;
+	}
+
+	return false;
+}
+
+static bool gwp_auth_check(struct gwp_socks5_auth *gsa, const char *username,
+			   const char *password)
+{
+	bool r;
+	pthread_mutex_lock(&gsa->lock);
+	r = __gwp_auth_check(gsa, username, password);
+	pthread_mutex_unlock(&gsa->lock);
+	return r;
+}
+
+static int gwp_init_auth_file(struct gwp_ctx *ctx)
+{
+	struct gwp_socks5_auth *gsa;
+	int r;
+
+	if (!*ctx->cfg.auth_file)
+		return 0;
+
+	if (!ctx->cfg.socks5) {
+		fprintf(stderr, "Auth file is only supported with SOCKS5 mode\n");
+		return -EINVAL;
+	}
+
+	gsa = malloc(sizeof(*gsa));
+	if (!gsa) {
+		fprintf(stderr, "Failed to allocate memory for auth file\n");
+		return -ENOMEM;
+	}
+
+	gsa->handle = fopen(ctx->cfg.auth_file, "rb");
+	if (!gsa->handle) {
+		r = -errno;
+		fprintf(stderr, "Failed to open auth file '%s': %s\n",
+			ctx->cfg.auth_file, strerror(-r));
+		goto err_free_gsa;
+	}
+
+	gsa->ino_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+	if (gsa->ino_fd < 0) {
+		r = -errno;
+		fprintf(stderr, "Failed to create inotify fd for auth file '%s': %s\n",
+			ctx->cfg.auth_file, strerror(-r));
+		goto err_fclose_handle;
+	}
+
+	r = inotify_add_watch(gsa->ino_fd, ctx->cfg.auth_file,
+			      IN_MODIFY | IN_CLOSE_WRITE | IN_DELETE_SELF);
+	if (r < 0) {
+		r = -errno;
+		fprintf(stderr, "Failed to add inotify watch for auth file '%s': %s\n",
+			ctx->cfg.auth_file, strerror(-r));
+		goto err_close_ino_fd;
+	}
+
+	r = pthread_mutex_init(&gsa->lock, NULL);
+	if (r) {
+		fprintf(stderr, "Failed to initialize mutex for auth file '%s': %s\n",
+			ctx->cfg.auth_file, strerror(r));
+		goto err_close_ino_fd;
+	}
+
+	r = gwp_load_auth_file(gsa);
+	if (r < 0) {
+		fprintf(stderr, "Failed to load auth file '%s': %s\n",
+			ctx->cfg.auth_file, strerror(-r));
+		goto err_destroy_lock;
+	}
+
+	ctx->socks5_auth = gsa;
+	return 0;
+
+err_destroy_lock:
+	pthread_mutex_destroy(&gsa->lock);
+err_close_ino_fd:
+	close(gsa->ino_fd);
+err_fclose_handle:
+	fclose(gsa->handle);
+err_free_gsa:
+	free(gsa);
+	return r;
+}
+
+static void gwp_free_auth_file(struct gwp_ctx *ctx)
+{
+	struct gwp_socks5_auth *gsa = ctx->socks5_auth;
+
+	if (!gsa)
+		return;
+
+	fclose(gsa->handle);
+	close(gsa->ino_fd);
+	gwp_free_auth_users(gsa);
+	pthread_mutex_destroy(&gsa->lock);
+	free(gsa);
+	ctx->socks5_auth = NULL;
+}
+
 static int gwp_init(struct gwp_ctx *ctx)
 {
-	return gwp_init_threads(ctx);
+	int r;
+
+	r = gwp_init_auth_file(ctx);
+	if (r)
+		return r;
+
+	r = gwp_init_threads(ctx);
+	if (r) {
+		gwp_free_auth_file(ctx);
+		return r;
+	}
+
+	return 0;
 }
 
 static void gwp_free(struct gwp_ctx *ctx)
