@@ -35,6 +35,7 @@
 #include <netinet/tcp.h>
 #include <pthread.h>
 #include <sys/resource.h>
+#include <netdb.h>
 
 enum {
 	EV_BIT_ACCEPT		= (0x0001ULL << 48ULL),
@@ -1032,14 +1033,17 @@ static int handle_socks5_connect_reply(struct gwp_sock_pair *sp, int err)
 	uint8_t *buf;
 	int r;
 
-	if (sp->state != SP_STATE_SOCKS5_CMD_CONNECT)
-		return -EINVAL;
 	if (sp->target.len != 0)
 		return -EINVAL;
 
-	r = getsockname(sp->target.fd, (struct sockaddr *)&addr, &addr_len);
-	if (r < 0)
-		return -errno;
+	if (sp->target.fd >= 0) {
+		r = getsockname(sp->target.fd, (struct sockaddr *)&addr, &addr_len);
+		if (r < 0)
+			return -errno;
+	} else {
+		memset(&addr, 0, sizeof(addr));
+		addr.ss_family = AF_INET;
+	}
 
 	assert(sp->target.cap >= (4 + 16 + 2));
 	buf = (uint8_t *)sp->target.buf;
@@ -1089,7 +1093,7 @@ static int handle_socks5_connect_reply(struct gwp_sock_pair *sp, int err)
 		sp->tmfd = -1;
 	}
 
-	sp->state = SP_STATE_FWD;
+	sp->state = err ? SP_STATE_SOCKS5_ERR : SP_STATE_FWD;
 	return do_forward(&sp->target, &sp->client, false, true);
 }
 
@@ -1158,7 +1162,43 @@ out_close_tmfd:
 out_close_target:
 	close(sp->target.fd);
 	sp->target.fd = -1;
-	return r;
+	return handle_socks5_connect_reply(sp, -r);
+}
+
+static int resolve_domain_name(const char *name, uint16_t port,
+			       struct sockaddr_storage *addr_ss)
+{
+	struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)addr_ss;
+	struct sockaddr_in *in = (struct sockaddr_in *)addr_ss;
+	static const struct addrinfo hints = {
+		.ai_family = AF_UNSPEC,
+		.ai_socktype = SOCK_STREAM,
+		.ai_flags = AI_CANONNAME | AI_ADDRCONFIG
+	};
+	struct addrinfo *res, *ai;
+	bool found = false;
+	char port_str[6];
+	int r;
+
+	snprintf(port_str, sizeof(port_str), "%hu", port);
+	r = getaddrinfo(name, port_str, &hints, &res);
+	if (r || !res)
+		return -EHOSTUNREACH;
+
+	for (ai = res; ai; ai = ai->ai_next) {
+		if (ai->ai_family == AF_INET) {
+			*in = *(struct sockaddr_in *)ai->ai_addr;
+			found = true;
+			break;
+		} else if (ai->ai_family == AF_INET6) {
+			*in6 = *(struct sockaddr_in6 *)ai->ai_addr;
+			found = true;
+			break;
+		}
+	}
+
+	freeaddrinfo(res);
+	return found ? 0 : -EAFNOSUPPORT;
 }
 
 /*
@@ -1208,6 +1248,9 @@ static int handle_socks5_state_cmd(struct gwp_thread *t,
 	struct gwp_sock *s = &sp->client;
 	uint8_t *buf = (uint8_t *)s->buf;
 	uint32_t len = s->len;
+	char domain_name[256];
+	uint16_t port;
+	int r;
 
 	if (len < needed_len)
 		return -EAGAIN;
@@ -1267,6 +1310,7 @@ static int handle_socks5_state_cmd(struct gwp_thread *t,
 	if (len < needed_len)
 		return -EAGAIN;
 
+	sp->client.len -= needed_len;
 	memset(&addr_ss, 0, sizeof(addr_ss));
 	switch (buf[3]) {
 	case 0x01:
@@ -1275,10 +1319,14 @@ static int handle_socks5_state_cmd(struct gwp_thread *t,
 		memcpy(&in->sin_port, &buf[8], 2);
 		break;
 	case 0x03:
-		/*
-		 * TODO: Handle domain name address.
-		 */
-		return -ENOSYS;
+		memcpy(domain_name, &buf[5], buf[4]);
+		domain_name[buf[4]] = '\0';
+		memcpy(&port, &buf[5 + buf[4]], 2);
+		port = ntohs(port);
+		r = resolve_domain_name(domain_name, port, &addr_ss);
+		if (r < 0)
+			return handle_socks5_connect_reply(sp, -r);
+		break;
 	case 0x04:
 		in6->sin6_family = AF_INET6;
 		memcpy(&in6->sin6_addr, &buf[4], 16);
@@ -1286,7 +1334,6 @@ static int handle_socks5_state_cmd(struct gwp_thread *t,
 		break;
 	}
 
-	sp->client.len -= needed_len;
 	return do_connect_socks5_cmd(t, sp, &addr_ss);
 }
 
