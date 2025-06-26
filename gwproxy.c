@@ -44,6 +44,15 @@ enum {
 	EV_BIT_TIMER		= (0x0005ULL << 48ULL),
 };
 
+enum {
+	SP_STATE_INIT			= 0,
+	SP_STATE_FWD			= 1,
+	SP_STATE_SOCKS5_AUTH		= 2,
+	SP_STATE_SOCKS5_CMD		= 3,
+	SP_STATE_SOCKS5_CMD_CONNECT	= 4,
+	SP_STATE_SOCKS5_ERR		= 30,
+};
+
 #define ALL_EV_BITS	(EV_BIT_ACCEPT | EV_BIT_EVFD | \
 				EV_BIT_TARGET_DATA | EV_BIT_CLIENT_DATA | \
 				EV_BIT_TIMER)
@@ -51,11 +60,12 @@ enum {
 #define CLEAR_EV_BIT(X)	((X) & ~ALL_EV_BITS)
 #define NR_EPL_EVENTS	512
 
-#define CFG_DEF_CONNECT_TIMEOUT	5U
-#define CFG_DEF_NR_THREADS	4U
+#define CFG_DEF_CONNECT_TIMEOUT	5
+#define CFG_DEF_NR_THREADS	4
 #define CFG_DEF_SEND_BUF_SIZE	4096
 #define CFG_DEF_RECV_BUF_SIZE	4096
-#define CFG_DEF_NR_ACCEPT_SPIN	32U
+#define CFG_DEF_NR_ACCEPT_SPIN	32
+#define CFG_DEF_SOCKS5_TIMEOUT	10
 
 struct gwp_sock {
 	int		fd;
@@ -68,6 +78,7 @@ struct gwp_sock {
 struct gwp_sock_pair {
 	bool		is_target_alive;
 	bool		is_setup_done;
+	uint8_t		state;
 	uint32_t	idx;
 	struct gwp_sock	client;
 	struct gwp_sock	target;
@@ -107,6 +118,7 @@ struct gwp_cfg {
 	int		connect_timeout;	/* In seconds. */
 	bool		socks5;			/* Enable SOCKS5 proxy mode. */
 	char		auth_file[256];	/* Authentication file for SOCKS5. */
+	int		socks5_timeout;	/* SOCKS5 auth and command timeout in seconds. */
 };
 
 struct gwp_ctx {
@@ -129,10 +141,11 @@ static const struct option long_opts[] = {
 	{ "connect-timeout",	required_argument,	NULL, 'T' },
 	{ "socks5",		no_argument,		NULL, 'S' },
 	{ "auth-file",		required_argument,	NULL, 'a' },
+	{ "socks5-timeout",	required_argument,	NULL, 'P' },
 	{ "help",		no_argument,		NULL, 'h' },
 	{ NULL, 0, NULL, 0 }
 };
-static const char short_opts[] = "b:t:w:x:m:A:T:a:h";
+static const char short_opts[] = "b:t:w:x:m:A:T:Sa:P:h";
 
 static int prepare_rlimit(void)
 {
@@ -170,6 +183,7 @@ static void show_usage(const char *progname)
 	fprintf(stderr, "  -T, --connect-timeout=SEC  Connection timeout in seconds (default: %d)\n", CFG_DEF_CONNECT_TIMEOUT);
 	fprintf(stderr, "  -S, --socks5               Enable SOCKS5 proxy mode\n");
 	fprintf(stderr, "  -a, --auth-file=FILE       Specify authentication file for SOCKS5 proxy\n");
+	fprintf(stderr, "  -P, --socks5-timeout=SEC   SOCKS5 auth and command timeout in seconds (default: %d)\n", CFG_DEF_SOCKS5_TIMEOUT);
 	fprintf(stderr, "  -h, --help                 Show this help message\n");
 	exit(EXIT_FAILURE);
 }
@@ -241,6 +255,14 @@ static int process_option(const char *progname, int c, struct gwp_cfg *cfg)
 			return -EINVAL;
 		}
 		break;
+	case 'P':
+		c = atoi(optarg);
+		if (c < 0) {
+			fprintf(stderr, "Invalid SOCKS5 timeout: %s\n", optarg);
+			return -EINVAL;
+		}
+		cfg->socks5_timeout = c;
+		break;
 	default:
 	case 'h':
 		show_usage(progname);
@@ -261,6 +283,7 @@ static int prepare_gwp_ctx_from_argv(int argc, char *argv[],
 	cfg->client_buf = CFG_DEF_RECV_BUF_SIZE;
 	cfg->target_buf = CFG_DEF_SEND_BUF_SIZE;
 	cfg->nr_accept_spin = CFG_DEF_NR_ACCEPT_SPIN;
+	cfg->socks5_timeout = CFG_DEF_SOCKS5_TIMEOUT;
 	ctx->stop = false;
 	while (1) {
 		ret = getopt_long(argc, argv, short_opts, long_opts, NULL);
@@ -270,6 +293,18 @@ static int prepare_gwp_ctx_from_argv(int argc, char *argv[],
 		ret = process_option(argv[0], ret, cfg);
 		if (ret)
 			return ret;
+	}
+
+	if (cfg->socks5) {
+		if (cfg->target_buf < 128) {
+			fprintf(stderr, "Target buffer size must be at least 128 bytes for SOCKS5 proxy mode\n");
+			return -EINVAL;
+		}
+
+		if (cfg->client_buf < 128) {
+			fprintf(stderr, "Client buffer size must be at least 128 bytes for SOCKS5 proxy mode\n");
+			return -EINVAL;
+		}
 	}
 
 	return 0;
@@ -286,19 +321,18 @@ static void sock_set_options(int fd)
 	setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &flg, l);
 }
 
-static int create_sock_target(struct gwp_ctx *c)
+static int create_sock_target(const struct sockaddr_storage *addr_ss,
+			      socklen_t addr_len)
 {
 	static const int flg = SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK;
-	struct sockaddr *addr = (struct sockaddr *)&c->target_addr;
-	socklen_t addr_len = c->target_addr_len;
 	int fd, err;
 
-	fd = socket(c->target_addr.ss_family, flg, 0);
+	fd = socket(addr_ss->ss_family, flg, 0);
 	if (fd < 0)
 		return -errno;
 
 	sock_set_options(fd);
-	err = connect(fd, addr, addr_len);
+	err = connect(fd, (struct sockaddr *)addr_ss, addr_len);
 	if (err < 0) {
 		err = -errno;
 		if (err != -EINPROGRESS) {
@@ -446,14 +480,28 @@ static int alloc_sock_pair(struct gwp_thread *t, int cfd, int tg_fd,
 		return r;
 	}
 
-	ev.events = sp->target.ep_msk;
-	ev.data.u64 = 0;
-	ev.data.ptr = sp;
-	ev.data.u64 |= EV_BIT_TARGET_DATA;
-	r = epoll_ctl(t->epl_fd, EPOLL_CTL_ADD, tg_fd, &ev);
-	if (r < 0) {
-		r = -errno;
-		goto out_del_pair;
+	/*
+	 * At this state, the target host only exists if we are not
+	 * running as a socks5 proxy.
+	 *
+	 * Socks5 proxy mode will handle the target connection
+	 * later after the client has sent the SOCKS5 authentication
+	 * and command.
+	 */
+	if (!t->ctx->cfg.socks5) {
+		assert(tg_fd >= 0);
+		ev.events = sp->target.ep_msk;
+		ev.data.u64 = 0;
+		ev.data.ptr = sp;
+		ev.data.u64 |= EV_BIT_TARGET_DATA;
+		r = epoll_ctl(t->epl_fd, EPOLL_CTL_ADD, tg_fd, &ev);
+		if (r < 0) {
+			r = -errno;
+			goto out_del_pair;
+		}
+		sp->state = SP_STATE_FWD;
+	} else {
+		sp->state = SP_STATE_SOCKS5_AUTH;
 	}
 
 	ev.events = sp->client.ep_msk;
@@ -487,24 +535,21 @@ out_del_pair:
 	return r;
 }
 
-static int create_connect_timer(struct gwp_ctx *ctx)
+static int create_timerfd(time_t itv_sec, time_t itv_nsec, time_t iti_sec,
+			  time_t iti_nsec)
 {
 	static const int flg = TFD_CLOEXEC | TFD_NONBLOCK;
-	struct gwp_cfg *cfg = &ctx->cfg;
 	const struct itimerspec ts = {
 		.it_value = {
-			.tv_sec = cfg->connect_timeout,
-			.tv_nsec = 0
+			.tv_sec = itv_sec,
+			.tv_nsec = itv_nsec
 		},
 		.it_interval = {
-			.tv_sec = 0,
-			.tv_nsec = 0
+			.tv_sec = iti_sec,
+			.tv_nsec = iti_nsec
 		}
 	};
 	int tm_fd, ret;
-
-	if (cfg->connect_timeout <= 0)
-		return -ENOSYS;
 
 	tm_fd = timerfd_create(CLOCK_MONOTONIC, flg);
 	if (tm_fd < 0)
@@ -520,13 +565,24 @@ static int create_connect_timer(struct gwp_ctx *ctx)
 	return tm_fd;
 }
 
+static int create_initial_timer(struct gwp_ctx *ctx)
+{
+	struct gwp_cfg *cfg = &ctx->cfg;
+	int timeout = cfg->socks5 ? cfg->socks5_timeout : cfg->connect_timeout;
+
+	if (timeout <= 0)
+		return -ENOSYS;
+
+	return create_timerfd(timeout, 0, 0, 0);
+}
+
 static int __process_event_accept(struct gwp_thread *t)
 {
 	static const int flg = SOCK_CLOEXEC | SOCK_NONBLOCK;
 	struct gwp_ctx *ctx = t->ctx;
 	socklen_t addr_len = ctx->bind_addr_len;
 	struct sockaddr_storage addr;
-	int cfd, ret, tg_fd, tm_fd;
+	int cfd, ret, tg_fd = -1, tm_fd;
 
 	cfd = accept4(t->tcp_fd, (struct sockaddr *)&addr, &addr_len, flg);
 	if (cfd < 0)
@@ -534,11 +590,14 @@ static int __process_event_accept(struct gwp_thread *t)
 
 	sock_set_options(cfd);
 
-	ret = tg_fd = create_sock_target(ctx);
-	if (tg_fd < 0)
-		goto close_cfd;
+	if (!ctx->cfg.socks5) {
+		ret = tg_fd = create_sock_target(&ctx->target_addr,
+						 ctx->target_addr_len);
+		if (tg_fd < 0)
+			goto close_cfd;
+	}
 
-	ret = tm_fd = create_connect_timer(ctx);
+	ret = tm_fd = create_initial_timer(ctx);
 	if (tm_fd < 0 && tm_fd != -ENOSYS)
 		goto close_tg_fd;
 
@@ -637,6 +696,9 @@ static int do_forward(struct gwp_sock *src, struct gwp_sock *dst,
 static void adjust_epoll_out(struct gwp_sock *a, struct gwp_sock *b,
 			     int *changed)
 {
+	if (b->fd < 0)
+		return;
+
 	if (a->len > 0) {
 		if (!(b->ep_msk & EPOLLOUT)) {
 			b->ep_msk |= EPOLLOUT;
@@ -652,6 +714,9 @@ static void adjust_epoll_out(struct gwp_sock *a, struct gwp_sock *b,
 
 static void adjust_epoll_in(struct gwp_sock *s, int *changed)
 {
+	if (s->fd < 0)
+		return;
+
 	if (s->cap != s->len) {
 		if (!(s->ep_msk & EPOLLIN)) {
 			s->ep_msk |= EPOLLIN;
@@ -674,9 +739,16 @@ static int adjust_epoll_events(struct gwp_thread *t,
 	int r;
 
 	adjust_epoll_out(&sp->target, &sp->client, &client_need_ctl);
-	adjust_epoll_out(&sp->client, &sp->target, &target_need_ctl);
 	adjust_epoll_in(&sp->client, &client_need_ctl);
-	adjust_epoll_in(&sp->target, &target_need_ctl);
+	if (sp->is_target_alive) {
+		/*
+		 * Only adjust the target epoll events if the target
+		 * connection is alive, otherwise the target socket
+		 * will not be used for forwarding data.
+		 */
+		adjust_epoll_in(&sp->target, &target_need_ctl);
+		adjust_epoll_out(&sp->client, &sp->target, &target_need_ctl);
+	}
 
 	if (client_need_ctl) {
 		ev.events = sp->client.ep_msk;
@@ -701,6 +773,8 @@ static int adjust_epoll_events(struct gwp_thread *t,
 	return 0;
 }
 
+static int handle_socks5_connect_reply(struct gwp_sock_pair *sp, int err);
+
 static int process_event_target_conn(struct gwp_thread *t,
 				     struct gwp_sock_pair *sp)
 {
@@ -714,6 +788,12 @@ static int process_event_target_conn(struct gwp_thread *t,
 	if (r < 0) {
 		r = -errno;
 		goto out_del_pair;
+	}
+
+	if (sp->state == SP_STATE_SOCKS5_CMD_CONNECT) {
+		r = handle_socks5_connect_reply(sp, err);
+		if (r < 0)
+			goto out_del_pair;
 	}
 
 	if (err) {
@@ -755,7 +835,7 @@ static int process_event_target_data(struct gwp_thread *t,
 	}
 
 	if (events & EPOLLOUT) {
-		r = do_forward(&sp->client, &sp->target, true, sp->is_target_alive);
+		r = do_forward(&sp->client, &sp->target, true, true);
 		if (r)
 			return r;
 	}
@@ -765,6 +845,9 @@ static int process_event_target_data(struct gwp_thread *t,
 
 	return adjust_epoll_events(t, sp);
 }
+
+static int handle_socks5_state(struct gwp_thread *t,
+			       struct gwp_sock_pair *sp);
 
 static int process_event_client_data(struct gwp_thread *t,
 				     struct gwp_sock_pair *sp, uint32_t events)
@@ -778,7 +861,7 @@ static int process_event_client_data(struct gwp_thread *t,
 	}
 
 	if (events & EPOLLOUT) {
-		r = do_forward(&sp->target, &sp->client, true, true);
+		r = do_forward(&sp->target, &sp->client, sp->is_target_alive, true);
 		if (r)
 			return r;
 	}
@@ -786,7 +869,455 @@ static int process_event_client_data(struct gwp_thread *t,
 	if (events & (EPOLLHUP | EPOLLRDHUP | EPOLLERR))
 		return -ECONNRESET;
 
+	if (sp->state != SP_STATE_FWD) {
+		assert(t->ctx->cfg.socks5);
+		r = handle_socks5_state(t, sp);
+		if (r < 0)
+			return r;
+	}
+
 	return adjust_epoll_events(t, sp);
+}
+
+/*
+ * RFC 1928, section 3:
+ *
+ *    The client connects to the server, and sends a version
+ *    identifier/method selection message:
+ *
+ *                    +----+----------+----------+
+ *                    |VER | NMETHODS | METHODS  |
+ *                    +----+----------+----------+
+ *                    | 1  |    1     | 1 to 255 |
+ *                    +----+----------+----------+
+ *
+ *    The VER field is set to X'05' for this version of the protocol.  The
+ *    NMETHODS field contains the number of method identifier octets that
+ *    appear in the METHODS field.
+ *
+ *    The server selects from one of the methods given in METHODS, and
+ *    sends a METHOD selection message:
+ *
+ *                          +----+--------+
+ *                          |VER | METHOD |
+ *                          +----+--------+
+ *                          | 1  |   1    |
+ *                          +----+--------+
+ *
+ *    If the selected METHOD is X'FF', none of the methods listed by the
+ *    client are acceptable, and the client MUST close the connection.
+ *
+ *    The values currently defined for METHOD are:
+ *
+ *           o  X'00' NO AUTHENTICATION REQUIRED
+ *           o  X'01' GSSAPI
+ *           o  X'02' USERNAME/PASSWORD
+ *           o  X'03' to X'7F' IANA ASSIGNED
+ *           o  X'80' to X'FE' RESERVED FOR PRIVATE METHODS
+ *           o  X'FF' NO ACCEPTABLE METHODS
+ *
+ *    The client and server then enter a method-specific sub-negotiation.
+ */
+static int handle_socks5_state_auth(struct gwp_thread *t,
+				    struct gwp_sock_pair *sp)
+{
+	struct gwp_cfg *cfg = &t->ctx->cfg;
+	struct gwp_sock *s = &sp->client;
+	uint8_t i, nr_methods, *buf = (uint8_t *)s->buf;
+	uint32_t len = s->len;
+
+	/*
+	 * Must have at least 2 bytes for the version and number of methods.
+	 */
+	if (len < 2)
+		return -EAGAIN;
+
+	if (buf[0] != 0x05)
+		return -EINVAL;
+
+	/*
+	 * Must have at least 2 + nr_methods bytes for the version, number of
+	 * methods, and the methods themselves.
+	 */
+	nr_methods = buf[1];
+	if (len < (2u + nr_methods))
+		return -EAGAIN;
+
+	if (*cfg->auth_file) {
+		/*
+		 * TODO: Handle authentication using the provided
+		 * authentication file.
+		 */
+		return -ENOSYS;
+	} else {
+		/*
+		 * No authentication required, verify that the client
+		 * supports it.
+		 */
+		uint8_t *methods = &buf[2];
+		bool found = false;
+
+		for (i = 0; i < nr_methods; i++) {
+			if (methods[i] == 0x00) {
+				found = true;
+				break;
+			}
+		}
+
+		assert(sp->target.cap >= 2);
+		sp->target.len = 2;
+		buf = (uint8_t *)sp->target.buf;
+		buf[0] = 0x05;
+		buf[1] = found ? 0x00 : 0xFF;
+		sp->state = found ? SP_STATE_SOCKS5_CMD : SP_STATE_SOCKS5_ERR;
+	}
+
+	sp->client.len -= (2u + nr_methods);
+	return 0;
+}
+
+/*
+ * RFC 1928, section 6:
+ *
+ *    The SOCKS request information is sent by the client as soon as it has
+ *    established a connection to the SOCKS server, and completed the
+ *    authentication negotiations.  The server evaluates the request, and
+ *    returns a reply formed as follows:
+ *
+ *         +----+-----+-------+------+----------+----------+
+ *         |VER | REP |  RSV  | ATYP | BND.ADDR | BND.PORT |
+ *         +----+-----+-------+------+----------+----------+
+ *         | 1  |  1  | X'00' |  1   | Variable |    2     |
+ *         +----+-----+-------+------+----------+----------+
+ *
+ *      Where:
+ *
+ *           o  VER    protocol version: X'05'
+ *           o  REP    Reply field:
+ *              o  X'00' succeeded
+ *              o  X'01' general SOCKS server failure
+ *              o  X'02' connection not allowed by ruleset
+ *              o  X'03' Network unreachable
+ *              o  X'04' Host unreachable
+ *              o  X'05' Connection refused
+ *              o  X'06' TTL expired
+ *              o  X'07' Command not supported
+ *              o  X'08' Address type not supported
+ *              o  X'09' to X'FF' unassigned
+ *           o  RSV    RESERVED
+ *           o  ATYP   address type of following address
+ *         o  IP V4 address: X'01'
+ *              o  DOMAINNAME: X'03'
+ *              o  IP V6 address: X'04'
+ *           o  BND.ADDR       server bound address
+ *           o  BND.PORT       server bound port in network octet order
+ *              o  IP V4 address: X'01'
+ *              o  DOMAINNAME: X'03'
+ *              o  IP V6 address: X'04'
+ *           o  BND.ADDR       server bound address
+ *           o  BND.PORT       server bound port in network octet order
+ *
+ *    Fields marked RESERVED (RSV) must be set to X'00'.
+ *
+ *    If the chosen method includes encapsulation for purposes of
+ *    authentication, integrity and/or confidentiality, the replies are
+ *    encapsulated in the method-dependent encapsulation.
+ */
+static int handle_socks5_connect_reply(struct gwp_sock_pair *sp, int err)
+{
+	struct sockaddr_storage addr;
+	struct sockaddr_in *in = (struct sockaddr_in *)&addr;
+	struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)&addr;
+	socklen_t addr_len = sizeof(addr);
+	uint8_t *buf;
+	int r;
+
+	if (sp->state != SP_STATE_SOCKS5_CMD_CONNECT)
+		return -EINVAL;
+	if (sp->target.len != 0)
+		return -EINVAL;
+
+	r = getsockname(sp->target.fd, (struct sockaddr *)&addr, &addr_len);
+	if (r < 0)
+		return -errno;
+
+	assert(sp->target.cap >= (4 + 16 + 2));
+	buf = (uint8_t *)sp->target.buf;
+
+	sp->target.len = 4; /* VER, REP, RSV, ATYP */
+
+	buf[0] = 0x05; /* VER */
+	switch (err) {
+	case 0:
+		buf[1] = 0x00; /* Succeeded */
+		break;
+	case ECONNREFUSED:
+		buf[1] = 0x05; /* Connection refused */
+		break;
+	case ENETUNREACH:
+		buf[1] = 0x03; /* Network unreachable */
+		break;
+	case EHOSTUNREACH:
+		buf[1] = 0x04; /* Host unreachable */
+		break;
+	case EPERM:
+	case EACCES:
+		buf[1] = 0x02; /* Connection not allowed by ruleset */
+		break;
+	default:
+		buf[1] = 0x01; /* General SOCKS server failure */
+		break;
+	}
+	buf[2] = 0x00; /* RSV */
+
+	if (addr.ss_family == AF_INET) {
+		buf[3] = 0x01; /* ATYP: IPv4 */
+		memcpy(&buf[4], &in->sin_addr, 4); /* BND.ADDR */
+		memcpy(&buf[8], &in->sin_port, 2); /* BND.PORT */
+		sp->target.len += 4 + 2;
+	} else if (addr.ss_family == AF_INET6) {
+		buf[3] = 0x04; /* ATYP: IPv6 */
+		memcpy(&buf[4], &in6->sin6_addr, 16); /* BND.ADDR */
+		memcpy(&buf[20], &in6->sin6_port, 2); /* BND.PORT */
+		sp->target.len += 16 + 2;
+	} else {
+		return -EINVAL;
+	}
+
+	if (sp->tmfd >= 0) {
+		close(sp->tmfd);
+		sp->tmfd = -1;
+	}
+
+	sp->state = SP_STATE_FWD;
+	return do_forward(&sp->target, &sp->client, false, true);
+}
+
+static int do_connect_socks5_cmd(struct gwp_thread *t,
+				 struct gwp_sock_pair *sp,
+				 const struct sockaddr_storage *addr_ss)
+{
+	struct gwp_cfg *cfg = &t->ctx->cfg;
+	socklen_t addr_len = 0;
+	struct epoll_event ev;
+	int r;
+
+	if (sp->tmfd >= 0) {
+		close(sp->tmfd);
+		sp->tmfd = -1;
+	}
+
+	if (addr_ss->ss_family == AF_INET)
+		addr_len = sizeof(struct sockaddr_in);
+	else if (addr_ss->ss_family == AF_INET6)
+		addr_len = sizeof(struct sockaddr_in6);
+	else
+		return -EINVAL;
+
+	sp->target.fd = r = create_sock_target(addr_ss, addr_len);
+	if (r < 0) {
+		close(sp->tmfd);
+		sp->tmfd = -1;
+		return r;
+	}
+
+	sp->tmfd = r = create_timerfd(cfg->connect_timeout, 0, 0, 0);
+	if (r < 0 && r != -ENOSYS)
+		goto out_close_target;
+
+	ev.events = EPOLLOUT | EPOLLRDHUP;
+	ev.data.u64 = 0;
+	ev.data.ptr = sp;
+	ev.data.u64 |= EV_BIT_TARGET_DATA;
+	r = epoll_ctl(t->epl_fd, EPOLL_CTL_ADD, sp->target.fd, &ev);
+	if (r < 0) {
+		r = -errno;
+		goto out_close_tmfd;
+	}
+
+	if (sp->tmfd >= 0) {
+		ev.events = EPOLLIN;
+		ev.data.u64 = 0;
+		ev.data.ptr = sp;
+		ev.data.u64 |= EV_BIT_TIMER;
+		r = epoll_ctl(t->epl_fd, EPOLL_CTL_ADD, sp->tmfd, &ev);
+		if (r < 0) {
+			r = -errno;
+			goto out_close_tmfd;
+		}
+	}
+
+	sp->state = SP_STATE_SOCKS5_CMD_CONNECT;
+	return 0;
+
+out_close_tmfd:
+	if (sp->tmfd >= 0) {
+		close(sp->tmfd);
+		sp->tmfd = -1;
+	}
+out_close_target:
+	close(sp->target.fd);
+	sp->target.fd = -1;
+	return r;
+}
+
+/*
+ * RFC 1928, section 4:
+ *
+ *    Once the method-dependent subnegotiation has completed, the client
+ *    sends the request details.  If the negotiated method includes
+ *    encapsulation for purposes of integrity checking and/or
+ *    confidentiality, these requests MUST be encapsulated in the method-
+ *    dependent encapsulation.
+ *
+ *    The SOCKS request is formed as follows:
+ *
+ *         +----+-----+-------+------+----------+----------+
+ *         |VER | CMD |  RSV  | ATYP | DST.ADDR | DST.PORT |
+ *         +----+-----+-------+------+----------+----------+
+ *         | 1  |  1  | X'00' |  1   | Variable |    2     |
+ *         +----+-----+-------+------+----------+----------+
+ *
+ *      Where:
+ *
+ *           o  VER    protocol version: X'05'
+ *           o  CMD
+ *              o  CONNECT X'01'
+ *              o  BIND X'02'
+ *              o  UDP ASSOCIATE X'03'
+ *           o  RSV    RESERVED
+ *           o  ATYP   address type of following address
+ *              o  IP V4 address: X'01'
+ *              o  DOMAINNAME: X'03'
+ *              o  IP V6 address: X'04'
+ *           o  DST.ADDR       desired destination address
+ *           o  DST.PORT desired destination port in network octet
+ *              order
+ *
+ *    The SOCKS server will typically evaluate the request based on source
+ *    and destination addresses, and return one or more reply messages, as
+ *    appropriate for the request type.
+ */
+static int handle_socks5_state_cmd(struct gwp_thread *t,
+				   struct gwp_sock_pair *sp)
+{
+	struct sockaddr_storage addr_ss;
+	struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)&addr_ss;
+	struct sockaddr_in *in = (struct sockaddr_in *)&addr_ss;
+	uint32_t needed_len = 4; /* VER, CMD, RSV, ATYP */
+	struct gwp_sock *s = &sp->client;
+	uint8_t *buf = (uint8_t *)s->buf;
+	uint32_t len = s->len;
+
+	if (len < needed_len)
+		return -EAGAIN;
+
+	if (buf[0] != 0x05)
+		return -EINVAL;
+
+	/*
+	 * Currently, only CONNECT command is supported.
+	 */
+	if (buf[1] != 0x01)
+		return -ENOSYS;
+
+	/*
+	 * RSV must be 0x00.
+	 */
+	if (buf[2] != 0x00)
+		return -EINVAL;
+
+	/*
+	 * Only IPv4, domain name, and IPv6 are supported
+	 */
+	if (buf[3] != 0x01 && buf[3] != 0x03 && buf[3] != 0x04)
+		return -ENOSYS;
+
+	switch (buf[3]) {
+	case 0x01:
+		/*
+		 * IPv4 address needs 6 bytes (4 bytes for address
+		 * and 2 bytes for port).
+		 */
+		needed_len += 4 + 2;
+		break;
+	case 0x03:
+		/*
+		 * Domain name address.
+		 * 1 byte for length, followed by the domain name.
+		 * The length must be at least 1 and at most 255
+		 * bytes. And then 2 bytes for port.
+		 */
+		if (len < 5)
+			return -EAGAIN;
+
+		needed_len += 1 + buf[4] + 2;
+		break;
+	case 0x04:
+		/*
+		 * IPv6 address needs 18 bytes (16 bytes for address
+		 * and 2 bytes for port).
+		 */
+		needed_len += 16 + 2;
+		break;
+	default:
+		__builtin_unreachable();
+	}
+
+	if (len < needed_len)
+		return -EAGAIN;
+
+	memset(&addr_ss, 0, sizeof(addr_ss));
+	switch (buf[3]) {
+	case 0x01:
+		in->sin_family = AF_INET;
+		memcpy(&in->sin_addr.s_addr, &buf[4], 4);
+		memcpy(&in->sin_port, &buf[8], 2);
+		break;
+	case 0x03:
+		/*
+		 * TODO: Handle domain name address.
+		 */
+		return -ENOSYS;
+	case 0x04:
+		in6->sin6_family = AF_INET6;
+		memcpy(&in6->sin6_addr, &buf[4], 16);
+		memcpy(&in6->sin6_port, &buf[20], 2);
+		break;
+	}
+
+	sp->client.len -= needed_len;
+	return do_connect_socks5_cmd(t, sp, &addr_ss);
+}
+
+static int handle_socks5_state(struct gwp_thread *t,
+			       struct gwp_sock_pair *sp)
+{
+	int r;
+
+	switch (sp->state) {
+	case SP_STATE_SOCKS5_AUTH:
+		r = handle_socks5_state_auth(t, sp);
+		break;
+	case SP_STATE_SOCKS5_CMD:
+		r = handle_socks5_state_cmd(t, sp);
+		break;
+	default:
+		assert(0 && "Invalid SOCKS5 state");
+		return -EINVAL;
+	}
+
+	if (r == -EAGAIN)
+		return 0;
+
+	r = do_forward(&sp->target, &sp->client, false, true);
+	if (r < 0)
+		return r;
+
+	if (sp->state == SP_STATE_SOCKS5_ERR)
+		return -ECONNRESET;
+
+	return 0;
 }
 
 static int process_event(struct gwp_thread *t, struct epoll_event *ev)
@@ -940,10 +1471,12 @@ static int gwp_init_thread_sock(struct gwp_thread *t)
 	socklen_t addr_len;
 	int fd, err, v;
 
-	err = parse_str_addr(&ctx->target_addr, &ctx->target_addr_len,
-			     ctx->cfg.target_addr);
-	if (err)
-		return err;
+	if (!ctx->cfg.socks5) {
+		err = parse_str_addr(&ctx->target_addr, &ctx->target_addr_len,
+				ctx->cfg.target_addr);
+		if (err)
+			return err;
+	}
 	err = parse_str_addr(&addr, &addr_len, ctx->cfg.bind_addr);
 	if (err)
 		return err;
