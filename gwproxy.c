@@ -3,10 +3,24 @@
  * Author: Alviro Iskandar Setiawan <alviro.iskandar@gnuweeb.org>
  * Link: https://t.me/GNUWeeb/1174779
  *
- * Simple TCP proxy.
+ * Simple TCP proxy with predefined target address:
+ *   ./gwproxy --target 127.0.0.1:1111 --bind [::]:8080 -m 16
  *
- * ./gwproxy --target 127.0.0.1:1111 --bind [::]:8080 -m 16
+ * Socks5 proxy mode without authentication:
+ *   ./gwproxy --socks5 --bind [::]:8080
  *
+ * Socks5 proxy mode with authentication:
+ *   ./gwproxy --socks5 --bind [::]:8080 --auth-file /tmp/auth.txt
+ *
+ * Authentication file format:
+ * For each line, there is a username and password separated by a colon.
+ *
+ * user1:pass1
+ * user2:pass2
+ * user3:pass3
+ * user4:pass4
+ *
+ * The maximum number of characters for a line is 255 + 255 + 1 (LF excluded).
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
