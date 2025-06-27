@@ -61,25 +61,24 @@ enum {
 	EV_BIT_CLIENT_DATA	= (0x0004ULL << 48ULL),
 	EV_BIT_TIMER		= (0x0005ULL << 48ULL),
 	EV_BIT_INOTIFY		= (0x0006ULL << 48ULL),
+	EV_BIT_RESOLVE_DOMAIN	= (0x0007ULL << 48ULL),
 };
 
 enum {
 	SP_STATE_INIT			= 0x00,
-
 	SP_STATE_FWD			= 0x10,
-
 	SP_STATE_SOCKS5_AUTH		= 0x20,
 	SP_STATE_SOCKS5_AUTH_USER_PASS	= 0x21,
-
 	SP_STATE_SOCKS5_CMD		= 0x30,
 	SP_STATE_SOCKS5_CMD_CONNECT	= 0x31,
-
+	SP_STATE_SOCKS5_RESOLVE_DOMAIN	= 0x40,
 	SP_STATE_SOCKS5_ERR		= 0xff,
 };
 
 #define ALL_EV_BITS	(EV_BIT_ACCEPT | EV_BIT_EVFD | \
-			 EV_BIT_TARGET_DATA | EV_BIT_CLIENT_DATA | \
-			 EV_BIT_TIMER | EV_BIT_INOTIFY)
+				EV_BIT_TARGET_DATA | EV_BIT_CLIENT_DATA | \
+				EV_BIT_TIMER | EV_BIT_INOTIFY | \
+				EV_BIT_RESOLVE_DOMAIN)
 #define GET_EV_BIT(X)	((X) & ALL_EV_BITS)
 #define CLEAR_EV_BIT(X)	((X) & ~ALL_EV_BITS)
 #define NR_EPL_EVENTS	512
@@ -90,6 +89,7 @@ enum {
 #define CFG_DEF_RECV_BUF_SIZE	4096
 #define CFG_DEF_NR_ACCEPT_SPIN	32
 #define CFG_DEF_SOCKS5_TIMEOUT	10
+#define CFG_DEF_NR_DNS_THREADS	8
 
 struct gwp_sock {
 	int		fd;
@@ -110,6 +110,7 @@ struct gwp_sock_pair {
 	uint32_t	tfb_len;
 	uint32_t	cfb_len;
 	struct sockaddr_storage addr;
+	struct dns_query *dq;
 };
 
 struct gwp_sock_bucket {
@@ -143,6 +144,7 @@ struct gwp_cfg {
 	bool		socks5;			/* Enable SOCKS5 proxy mode. */
 	char		auth_file[256];	/* Authentication file for SOCKS5. */
 	int		socks5_timeout;	/* SOCKS5 auth and command timeout in seconds. */
+	uint16_t	nr_dns_threads;
 };
 
 struct gwp_socks5_auth_user {
@@ -158,6 +160,30 @@ struct gwp_socks5_auth {
 	size_t				nr_users;
 };
 
+struct dns_query {
+	char				hostname[256];
+	uint16_t			port;
+	int				err;
+	int				ev_fd;
+	struct sockaddr_storage		result;
+	_Atomic(int_fast32_t)		ref_count;
+	struct dns_query		*next;
+};
+
+/*
+ * Dedicated DNS worker thread for resolving
+ * DNS queries from the SOCKS5 proxy.
+ */
+struct gwp_socks5_dnsw {
+	struct gwp_ctx		*ctx;
+	int			nr_sleeping;
+	pthread_t		*threads;
+	pthread_mutex_t		lock;
+	pthread_cond_t		cond;
+	struct dns_query	*head;
+	struct dns_query	*tail;
+};
+
 struct gwp_ctx {
 	volatile bool			stop;
 	uint32_t			rr_counter;
@@ -167,6 +193,7 @@ struct gwp_ctx {
 	struct gwp_thread		*threads;
 	struct gwp_cfg			cfg;
 	struct gwp_socks5_auth		*socks5_auth;
+	struct gwp_socks5_dnsw		*socks5_dnsw;
 };
 
 static const struct option long_opts[] = {
@@ -174,16 +201,17 @@ static const struct option long_opts[] = {
 	{ "target",		required_argument,	NULL, 't' },
 	{ "target-buf-size",	required_argument,	NULL, 'w' },
 	{ "client-buf-size",	required_argument,	NULL, 'x' },
-	{ "threads",		required_argument,	NULL, 'm' },
+	{ "nr-threads",		required_argument,	NULL, 'm' },
 	{ "nr-accept-spin",	required_argument,	NULL, 'A' },
 	{ "connect-timeout",	required_argument,	NULL, 'T' },
 	{ "socks5",		no_argument,		NULL, 'S' },
 	{ "auth-file",		required_argument,	NULL, 'a' },
 	{ "socks5-timeout",	required_argument,	NULL, 'P' },
+	{ "nr-dns-threads",	required_argument,	NULL, 'D' },
 	{ "help",		no_argument,		NULL, 'h' },
 	{ NULL, 0, NULL, 0 }
 };
-static const char short_opts[] = "b:t:w:x:m:A:T:Sa:P:h";
+static const char short_opts[] = "b:t:w:x:m:A:T:Sa:P:D:h";
 
 static int prepare_rlimit(void)
 {
@@ -222,6 +250,7 @@ static void show_usage(const char *progname)
 	fprintf(stderr, "  -S, --socks5               Enable SOCKS5 proxy mode\n");
 	fprintf(stderr, "  -a, --auth-file=FILE       Specify authentication file for SOCKS5 proxy\n");
 	fprintf(stderr, "  -P, --socks5-timeout=SEC   SOCKS5 auth and command timeout in seconds (default: %d)\n", CFG_DEF_SOCKS5_TIMEOUT);
+	fprintf(stderr, "  -D, --nr-dns-threads=NUM   Number of DNS worker threads (default: %d)\n", CFG_DEF_NR_DNS_THREADS);
 	fprintf(stderr, "  -h, --help                 Show this help message\n");
 	exit(EXIT_FAILURE);
 }
@@ -301,6 +330,14 @@ static int process_option(const char *progname, int c, struct gwp_cfg *cfg)
 		}
 		cfg->socks5_timeout = c;
 		break;
+	case 'D':
+		c = atoi(optarg);
+		if (c < 0) {
+			fprintf(stderr, "Invalid number of DNS threads: %s\n", optarg);
+			return -EINVAL;
+		}
+		cfg->nr_dns_threads = (uint16_t)c;
+		break;
 	default:
 	case 'h':
 		show_usage(progname);
@@ -322,6 +359,7 @@ static int prepare_gwp_ctx_from_argv(int argc, char *argv[],
 	cfg->target_buf = CFG_DEF_SEND_BUF_SIZE;
 	cfg->nr_accept_spin = CFG_DEF_NR_ACCEPT_SPIN;
 	cfg->socks5_timeout = CFG_DEF_SOCKS5_TIMEOUT;
+	cfg->nr_dns_threads = CFG_DEF_NR_DNS_THREADS;
 	ctx->stop = false;
 	while (1) {
 		ret = getopt_long(argc, argv, short_opts, long_opts, NULL);
@@ -397,6 +435,8 @@ static void close_sock(struct gwp_sock *s)
 	s->len = 0;
 }
 
+static void gwp_put_dns_query(struct dns_query *dq);
+
 static void gwp_free_thread_sock_pair(struct gwp_sock_pair *sp)
 {
 	if (!sp)
@@ -409,6 +449,7 @@ static void gwp_free_thread_sock_pair(struct gwp_sock_pair *sp)
 	free(sp->target.buf);
 	close_sock(&sp->client);
 	close_sock(&sp->target);
+	gwp_put_dns_query(sp->dq);
 	free(sp);
 }
 
@@ -427,6 +468,8 @@ static int del_sock_pair(struct gwp_thread *t, struct gwp_sock_pair *sp)
 	gsb->pairs[i]->idx = i;
 	gsb->pairs[gsb->nr_pairs - 1] = NULL;
 	gsb->nr_pairs--;
+	if (sp->dq && sp->dq->ev_fd >= 0)
+		epoll_ctl(t->epl_fd, EPOLL_CTL_DEL, sp->dq->ev_fd, NULL);
 	gwp_free_thread_sock_pair(sp);
 
 	if ((gsb->cap_pairs - gsb->nr_pairs) >= 64) {
@@ -444,6 +487,7 @@ static int del_sock_pair(struct gwp_thread *t, struct gwp_sock_pair *sp)
 		gsb->cap_pairs = new_cap;
 	}
 
+	t->need_reload = true;
 	return 0;
 }
 
@@ -468,15 +512,44 @@ static int add_sock_pair(struct gwp_thread *t, struct gwp_sock_pair *sp)
 	return 0;
 }
 
-static int gwp_send_signal_thread(struct gwp_thread *t)
-{
-	uint64_t val = 1;
 
-	assert(t->evp_fd >= 0);
-	if (write(t->evp_fd, &val, sizeof(val)) != (ssize_t)sizeof(val))
+static int gwp_eventfd_read(int fd)
+{
+	uint64_t val;
+	ssize_t ret;
+
+	ret = read(fd, &val, sizeof(val));
+	if (ret < 0) {
+		ret = -errno;
+		return (ret == -EAGAIN || ret == -EINTR) ? 0 : ret;
+	}
+
+	if (ret != (ssize_t)sizeof(val))
 		return -EIO;
 
 	return 0;
+}
+
+static int gwp_eventfd_write(int fd, uint64_t val)
+{
+	ssize_t ret;
+
+	ret = write(fd, &val, sizeof(val));
+	if (ret < 0) {
+		ret = -errno;
+		return (ret == -EAGAIN || ret == -EINTR) ? 0 : ret;
+	}
+
+	if (ret != (ssize_t)sizeof(val))
+		return -EIO;
+
+	return 0;
+}
+
+static int gwp_send_signal_thread(struct gwp_thread *t)
+{
+	assert(t->evp_fd >= 0);
+	return gwp_eventfd_write(t->evp_fd, 1);
 }
 
 static int alloc_sock_pair(struct gwp_thread *t, int cfd, int tg_fd,
@@ -574,8 +647,7 @@ static int alloc_sock_pair(struct gwp_thread *t, int cfd, int tg_fd,
 
 out_del_pair:
 	sp->client.fd = sp->target.fd = sp->tmfd = -1;
-	del_sock_pair(t, sp);
-	return r;
+	return del_sock_pair(t, sp);
 }
 
 static int create_timerfd(time_t itv_sec, time_t itv_nsec, time_t iti_sec,
@@ -674,19 +746,7 @@ static int process_event_accept(struct gwp_thread *t)
 
 static int gwp_recv_signal_thread(struct gwp_thread *t)
 {
-	uint64_t val;
-	ssize_t ret;
-
-	ret = read(t->evp_fd, &val, sizeof(val));
-	if (ret < 0) {
-		ret = -errno;
-		return (ret == -EAGAIN || ret == -EINTR) ? 0 : ret;
-	}
-
-	if (ret != (ssize_t)sizeof(val))
-		return -EIO;
-
-	return 0;
+	return gwp_eventfd_read(t->evp_fd);
 }
 
 static int do_forward(struct gwp_sock *src, struct gwp_sock *dst,
@@ -874,19 +934,20 @@ static int process_event_target_data(struct gwp_thread *t,
 	if (events & EPOLLIN) {
 		r = do_forward(&sp->target, &sp->client, true, true);
 		if (r)
-			return r;
+			goto out;
 	}
 
 	if (events & EPOLLOUT) {
 		r = do_forward(&sp->client, &sp->target, true, true);
 		if (r)
-			return r;
+			goto out;
 	}
 
 	if (events & (EPOLLHUP | EPOLLRDHUP | EPOLLERR))
-		return -ECONNRESET;
+		r = -ECONNRESET;
 
-	return adjust_epoll_events(t, sp);
+out:
+	return r ? del_sock_pair(t, sp) : adjust_epoll_events(t, sp);
 }
 
 static int handle_socks5_state(struct gwp_thread *t,
@@ -900,17 +961,19 @@ static int process_event_client_data(struct gwp_thread *t,
 	if (events & EPOLLIN) {
 		r = do_forward(&sp->client, &sp->target, true, sp->is_target_alive);
 		if (r)
-			return r;
+			goto out;
 	}
 
 	if (events & EPOLLOUT) {
 		r = do_forward(&sp->target, &sp->client, sp->is_target_alive, true);
 		if (r)
-			return r;
+			goto out;
 	}
 
-	if (events & (EPOLLHUP | EPOLLRDHUP | EPOLLERR))
-		return -ECONNRESET;
+	if (events & (EPOLLHUP | EPOLLRDHUP | EPOLLERR)) {
+		r = -ECONNRESET;
+		goto out;
+	}
 
 	if (sp->state != SP_STATE_FWD) {
 		assert(t->ctx->cfg.socks5);
@@ -919,7 +982,8 @@ static int process_event_client_data(struct gwp_thread *t,
 			return r;
 	}
 
-	return adjust_epoll_events(t, sp);
+out:
+	return r ? del_sock_pair(t, sp) : adjust_epoll_events(t, sp);
 }
 
 /*
@@ -1341,6 +1405,162 @@ static int resolve_domain_name(const char *name, uint16_t port,
 	return found ? 0 : -EAFNOSUPPORT;
 }
 
+static void free_dns_query(struct dns_query *dq)
+{
+	if (dq) {
+		close(dq->ev_fd);
+		free(dq);
+	}
+}
+
+static void gwp_put_dns_query(struct dns_query *dq)
+{
+	if (!dq)
+		return;
+
+	if (atomic_fetch_sub(&dq->ref_count, 1) == 1)
+		free_dns_query(dq);
+}
+
+static void gwp_dns_resolve(struct dns_query *dq)
+{
+	/*
+	 * Check the reference count first to see whether the
+	 * client is still interested in the result. If the
+	 * reference count is 1, it means that the client has
+	 * already closed the connection. We are responsible
+	 * for freeing the dns_query structure. No need to
+	 * resolve the domain name in this case.
+	 */
+	if (atomic_load(&dq->ref_count) == 1) {
+		free_dns_query(dq);
+		return;
+	}
+
+	memset(&dq->result, 0, sizeof(dq->result));
+	dq->err = resolve_domain_name(dq->hostname, dq->port, &dq->result);
+	gwp_eventfd_write(dq->ev_fd, 1);
+	gwp_put_dns_query(dq);
+}
+
+static struct dns_query *gwp_dns_pop_queue(struct gwp_socks5_dnsw *dnsw)
+{
+	struct dns_query *dq;
+
+	if (!dnsw->head)
+		return NULL;
+
+	dq = dnsw->head;
+	dnsw->head = dq->next;
+	if (!dnsw->head)
+		dnsw->tail = NULL;
+
+	dq->next = NULL;
+	return dq;
+}
+
+static struct dns_query *alloc_dns_query(const char *hostname, uint16_t port)
+{
+	struct dns_query *dq;
+	size_t l;
+	int fd;
+
+	dq = malloc(sizeof(*dq));
+	if (!dq)
+		return NULL;
+
+	fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+	if (fd < 0) {
+		free(dq);
+		return NULL;
+	}
+
+	l = sizeof(dq->hostname) - 1;
+	strncpy(dq->hostname, hostname, l);
+	dq->hostname[l] = '\0';
+	dq->port = port;
+	dq->err = 0;
+	dq->next = NULL;
+	dq->ev_fd = fd;
+	atomic_init(&dq->ref_count, 2);
+	return dq;
+}
+
+static struct dns_query *gwp_dns_push_queue(struct gwp_socks5_dnsw *dnsw,
+					    const char *hostname, uint16_t port)
+{
+	struct dns_query *dq = alloc_dns_query(hostname, port);
+	if (!dq)
+		return NULL;
+
+	pthread_mutex_lock(&dnsw->lock);
+
+	if (dnsw->tail)
+		dnsw->tail->next = dq;
+	else
+		dnsw->head = dq;
+
+	dnsw->tail = dq;
+	if (dnsw->nr_sleeping)
+		pthread_cond_signal(&dnsw->cond);
+	pthread_mutex_unlock(&dnsw->lock);
+	return dq;
+}
+
+static int async_resolve_domain_name(struct gwp_thread *t,
+				     struct gwp_sock_pair *sp,
+				     const char *hostname, uint16_t port)
+{
+	struct gwp_socks5_dnsw *dnsw = t->ctx->socks5_dnsw;
+	struct epoll_event ev;
+	struct dns_query *dq;
+	int r;
+
+	dq = gwp_dns_push_queue(dnsw, hostname, port);
+	if (!dq)
+		return -ENOMEM;
+
+	sp->state = SP_STATE_SOCKS5_RESOLVE_DOMAIN;
+	sp->dq = dq;
+	ev.events = EPOLLIN;
+	ev.data.u64 = 0;
+	ev.data.ptr = sp;
+	ev.data.u64 |= EV_BIT_RESOLVE_DOMAIN;
+	r = epoll_ctl(t->epl_fd, EPOLL_CTL_ADD, dq->ev_fd, &ev);
+	if (r < 0) {
+		r = -errno;
+		gwp_put_dns_query(dq);
+		return r;
+	}
+
+	return 0;
+}
+
+static int process_event_resolve_domain(struct gwp_thread *t,
+					struct gwp_sock_pair *sp)
+{
+	struct dns_query *dq = sp->dq;
+	int r, err = -dq->err;
+
+	if (err)
+		r = handle_socks5_connect_reply(sp, -err);
+	else
+		r = do_connect_socks5_cmd(t, sp, &dq->result);
+
+	r = epoll_ctl(t->epl_fd, EPOLL_CTL_DEL, dq->ev_fd, NULL);
+	if (r)
+		r = -errno;
+
+	gwp_put_dns_query(dq);
+	sp->dq = NULL;
+	if (r || (sp->state == SP_STATE_SOCKS5_ERR)) {
+		r = del_sock_pair(t, sp);
+		return r ? r : -ECONNRESET;
+	}
+
+	return 0;
+}
+
 /*
  * RFC 1928, section 4:
  *
@@ -1463,9 +1683,13 @@ static int handle_socks5_state_cmd(struct gwp_thread *t,
 		domain_name[buf[4]] = '\0';
 		memcpy(&port, &buf[5 + buf[4]], 2);
 		port = ntohs(port);
+		if (t->ctx->socks5_dnsw)
+			return async_resolve_domain_name(t, sp, domain_name, port);
+
 		r = resolve_domain_name(domain_name, port, &addr_ss);
 		if (r < 0)
 			return handle_socks5_connect_reply(sp, -r);
+
 		break;
 	case 0x04:
 		in6->sin6_family = AF_INET6;
@@ -1542,6 +1766,12 @@ static int process_event_inotify(struct gwp_thread *t)
 	return gwp_load_auth_file(sa);
 }
 
+static int process_event_timer(struct gwp_thread *t, struct gwp_sock_pair *sp)
+{
+	int r = del_sock_pair(t, sp);
+	return r ? r : -ETIMEDOUT;
+}
+
 static int process_event(struct gwp_thread *t, struct epoll_event *ev)
 {
 	uint64_t ev_bit = GET_EV_BIT(ev->data.u64);
@@ -1565,10 +1795,13 @@ static int process_event(struct gwp_thread *t, struct epoll_event *ev)
 		ret = process_event_client_data(t, data, ev->events);
 		break;
 	case EV_BIT_TIMER:
-		ret = -ETIMEDOUT;
+		ret = process_event_timer(t, data);
 		break;
 	case EV_BIT_INOTIFY:
 		ret = process_event_inotify(t);
+		break;
+	case EV_BIT_RESOLVE_DOMAIN:
+		ret = process_event_resolve_domain(t, data);
 		break;
 	default:
 		ret = -EINVAL;
@@ -1579,8 +1812,7 @@ static int process_event(struct gwp_thread *t, struct epoll_event *ev)
 		case EV_BIT_TARGET_DATA:
 		case EV_BIT_CLIENT_DATA:
 		case EV_BIT_TIMER:
-			del_sock_pair(t, data);
-			t->need_reload = true;
+		case EV_BIT_RESOLVE_DOMAIN:
 			ret = 0;
 			break;
 		}
@@ -1877,6 +2109,21 @@ static void gwp_free_thread(struct gwp_thread *t)
 	gwp_free_thread_sock(t);
 }
 
+static void gwp_free_threads(struct gwp_ctx *ctx)
+{
+	struct gwp_thread *threads = ctx->threads;
+	uint32_t i;
+
+	if (!threads)
+		return;
+
+	for (i = 0; i < ctx->cfg.nr_threads; i++)
+		gwp_free_thread(&threads[i]);
+
+	free(threads);
+	ctx->threads = NULL;
+}
+
 static int gwp_init_threads(struct gwp_ctx *ctx)
 {
 	struct gwp_thread *threads;
@@ -2153,6 +2400,126 @@ static void gwp_free_auth_file(struct gwp_ctx *ctx)
 	ctx->socks5_auth = NULL;
 }
 
+static void *gwp_dns_thread_entry(void *arg)
+{
+	struct gwp_socks5_dnsw *dnsw = arg;
+	struct gwp_ctx *ctx = dnsw->ctx;
+	struct dns_query *dq;
+
+	pthread_mutex_lock(&dnsw->lock);
+	while (!ctx->stop) {
+		dq = gwp_dns_pop_queue(dnsw);
+		if (dq) {
+			pthread_mutex_unlock(&dnsw->lock);
+			gwp_dns_resolve(dq);
+			pthread_mutex_lock(&dnsw->lock);
+		} else {
+			dnsw->nr_sleeping++;
+			pthread_cond_wait(&dnsw->cond, &dnsw->lock);
+			dnsw->nr_sleeping--;
+		}
+	}
+	pthread_mutex_unlock(&dnsw->lock);
+
+	return NULL;
+}
+
+static int gwp_init_dns_threads(struct gwp_ctx *ctx)
+{
+	struct gwp_socks5_dnsw *dnsw;
+	pthread_t *threads;
+	char tmp[128];
+	uint16_t i;
+	int r;
+
+	if (!ctx->cfg.nr_dns_threads)
+		return 0;
+
+	dnsw = calloc(1, sizeof(*dnsw));
+	if (!dnsw)
+		return -ENOMEM;
+
+	dnsw->ctx = ctx;
+	r = pthread_mutex_init(&dnsw->lock, NULL);
+	if (r) {
+		r = -r;
+		goto out_free_dnsw;
+	}
+
+	r = pthread_cond_init(&dnsw->cond, NULL);
+	if (r) {
+		r = -r;
+		goto out_destroy_lock;
+	}
+
+	threads = calloc(ctx->cfg.nr_dns_threads, sizeof(*threads));
+	if (!threads) {
+		r = -ENOMEM;
+		goto out_destroy_cond;
+	}
+
+	for (i = 0; i < ctx->cfg.nr_dns_threads; i++) {
+		r = pthread_create(&threads[i], NULL, &gwp_dns_thread_entry, dnsw);
+		if (r) {
+			r = -r;
+			goto out_join_threads;
+		}
+		snprintf(tmp, sizeof(tmp), "dns-thread-%u", i);
+		pthread_setname_np(threads[i], tmp);
+	}
+
+	dnsw->threads = threads;
+	ctx->socks5_dnsw = dnsw;
+	return 0;
+
+out_join_threads:
+	ctx->stop = true;
+	while (i--) {
+		pthread_mutex_lock(&dnsw->lock);
+		pthread_cond_broadcast(&dnsw->cond);
+		pthread_mutex_unlock(&dnsw->lock);
+		pthread_join(threads[i], NULL);
+	}
+	free(threads);
+out_destroy_cond:
+	pthread_cond_destroy(&dnsw->cond);
+out_destroy_lock:
+	pthread_mutex_destroy(&dnsw->lock);
+out_free_dnsw:
+	free(dnsw);
+	return r;
+}
+
+static void gwp_free_dns_threads(struct gwp_ctx *ctx)
+{
+	struct gwp_socks5_dnsw *dnsw = ctx->socks5_dnsw;
+	struct dns_query *dq, *next;
+	uint16_t i;
+
+	if (!dnsw)
+		return;
+
+	ctx->stop = true;
+	for (i = 0; i < ctx->cfg.nr_dns_threads; i++) {
+		pthread_mutex_lock(&dnsw->lock);
+		pthread_cond_broadcast(&dnsw->cond);
+		pthread_mutex_unlock(&dnsw->lock);
+		pthread_join(dnsw->threads[i], NULL);
+	}
+
+	free(dnsw->threads);
+	pthread_cond_destroy(&dnsw->cond);
+	pthread_mutex_destroy(&dnsw->lock);
+	dq = dnsw->head;
+	while (dq) {
+		next = dq->next;
+		free(dq);
+		dq = next;
+	}
+	free(dnsw);
+	ctx->socks5_dnsw = NULL;
+}
+
 static int gwp_init(struct gwp_ctx *ctx)
 {
 	int r;
@@ -2160,14 +2527,20 @@ static int gwp_init(struct gwp_ctx *ctx)
 	r = gwp_init_auth_file(ctx);
 	if (r)
 		return r;
-
+	r = gwp_init_dns_threads(ctx);
+	if (r)
+		goto out_free_auth_file;
 	r = gwp_init_threads(ctx);
-	if (r) {
-		gwp_free_auth_file(ctx);
-		return r;
-	}
+	if (r)
+		goto out_free_dns_threads;
 
 	return 0;
+
+out_free_dns_threads:
+	gwp_free_dns_threads(ctx);
+out_free_auth_file:
+	gwp_free_auth_file(ctx);
+	return r;
 }
 
 static void gwp_free(struct gwp_ctx *ctx)
@@ -2176,15 +2549,9 @@ static void gwp_free(struct gwp_ctx *ctx)
 		return;
 
 	ctx->stop = true;
-
-	if (ctx->threads) {
-		uint32_t i;
-
-		for (i = 0; i < ctx->cfg.nr_threads; i++)
-			gwp_free_thread(&ctx->threads[i]);
-		free(ctx->threads);
-		ctx->threads = NULL;
-	}
+	gwp_free_threads(ctx);
+	gwp_free_auth_file(ctx);
+	gwp_free_dns_threads(ctx);
 }
 
 static int gwp_run(struct gwp_ctx *ctx)
