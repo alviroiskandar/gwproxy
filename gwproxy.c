@@ -461,18 +461,30 @@ static void gwp_free_thread_sock_pair(struct gwp_sock_pair *sp)
 static int del_sock_pair(struct gwp_thread *t, struct gwp_sock_pair *sp)
 {
 	struct gwp_sock_bucket *gsb = &t->gsb;
+	struct dns_query *dq = sp->dq;
 	struct gwp_sock_pair *sq;
 	uint32_t i = sp->idx;
 
 	sq = gsb->pairs[i];
 	assert(sq == sp);
-	if (sq != sp)
+	if (sq != sp) {
+		t->ctx->stop = true;
 		return -EINVAL;
+	}
 
 	gsb->pairs[i] = gsb->pairs[gsb->nr_pairs - 1];
 	gsb->pairs[i]->idx = i;
 	gsb->pairs[gsb->nr_pairs - 1] = NULL;
 	gsb->nr_pairs--;
+	if (dq && dq->ev_fd >= 0) {
+		/*
+		 * Delete early to avoid EPOLLIN being fired again.
+		 */
+		if (epoll_ctl(t->epl_fd, EPOLL_CTL_DEL, dq->ev_fd, NULL)) {
+			t->ctx->stop = true;
+			return -errno;
+		}
+	}
 	gwp_free_thread_sock_pair(sp);
 
 	t->epl_need_reload = true;
@@ -485,7 +497,7 @@ static int del_sock_pair(struct gwp_thread *t, struct gwp_sock_pair *sp)
 
 		new_pairs = realloc(gsb->pairs, new_cap * sizeof(*new_pairs));
 		if (!new_pairs)
-			return -ENOMEM;
+			return 0;
 
 		gsb->pairs = new_pairs;
 		gsb->cap_pairs = new_cap;
@@ -1571,6 +1583,8 @@ static int process_event_resolve_domain(struct gwp_thread *t,
 		t->ctx->stop = true;
 		return -errno;
 	}
+	close(dq->ev_fd);
+	dq->ev_fd = -1;
 	gwp_put_dns_query(dq);
 
 	if (sp) {
