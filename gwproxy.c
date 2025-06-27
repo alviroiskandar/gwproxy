@@ -53,6 +53,7 @@
 #include <sys/file.h>
 #include <sys/inotify.h>
 #include <linux/limits.h>
+#include <signal.h>
 
 enum {
 	EV_BIT_ACCEPT		= (0x0001ULL << 48ULL),
@@ -127,7 +128,7 @@ struct gwp_thread {
 	int			evp_fd;
 	struct gwp_sock_bucket	gsb;
 	struct gwp_ctx		*ctx;
-	bool			need_reload;
+	bool			epl_need_reload;
 	uint16_t		idx;
 	pthread_t		thread;
 	struct epoll_event	events[NR_EPL_EVENTS];
@@ -167,6 +168,7 @@ struct dns_query {
 	int				ev_fd;
 	struct sockaddr_storage		result;
 	_Atomic(int_fast32_t)		ref_count;
+	struct gwp_sock_pair		*sp;
 	struct dns_query		*next;
 };
 
@@ -449,7 +451,10 @@ static void gwp_free_thread_sock_pair(struct gwp_sock_pair *sp)
 	free(sp->target.buf);
 	close_sock(&sp->client);
 	close_sock(&sp->target);
-	gwp_put_dns_query(sp->dq);
+	if (sp->dq) {
+		sp->dq->sp = NULL;
+		gwp_put_dns_query(sp->dq);
+	}
 	free(sp);
 }
 
@@ -468,10 +473,9 @@ static int del_sock_pair(struct gwp_thread *t, struct gwp_sock_pair *sp)
 	gsb->pairs[i]->idx = i;
 	gsb->pairs[gsb->nr_pairs - 1] = NULL;
 	gsb->nr_pairs--;
-	if (sp->dq && sp->dq->ev_fd >= 0)
-		epoll_ctl(t->epl_fd, EPOLL_CTL_DEL, sp->dq->ev_fd, NULL);
 	gwp_free_thread_sock_pair(sp);
 
+	t->epl_need_reload = true;
 	if ((gsb->cap_pairs - gsb->nr_pairs) >= 64) {
 		/*
 		 * Shirk the capacity if many sock pairs have been freed.
@@ -487,7 +491,6 @@ static int del_sock_pair(struct gwp_thread *t, struct gwp_sock_pair *sp)
 		gsb->cap_pairs = new_cap;
 	}
 
-	t->need_reload = true;
 	return 0;
 }
 
@@ -498,6 +501,7 @@ static int add_sock_pair(struct gwp_thread *t, struct gwp_sock_pair *sp)
 	if (gsb->nr_pairs >= gsb->cap_pairs) {
 		uint32_t new_cap = (gsb->cap_pairs + 1) * 2;
 		struct gwp_sock_pair **new_pairs;
+		size_t new_area_sz;
 
 		new_pairs = realloc(gsb->pairs, new_cap * sizeof(*new_pairs));
 		if (!new_pairs)
@@ -505,6 +509,8 @@ static int add_sock_pair(struct gwp_thread *t, struct gwp_sock_pair *sp)
 
 		gsb->pairs = new_pairs;
 		gsb->cap_pairs = new_cap;
+		new_area_sz = (new_cap - gsb->nr_pairs) * sizeof(*new_pairs);
+		memset(&gsb->pairs[gsb->nr_pairs], 0, new_area_sz);
 	}
 
 	sp->idx = gsb->nr_pairs;
@@ -723,7 +729,8 @@ static int __process_event_accept(struct gwp_thread *t)
 	if (tm_fd >= 0)
 		close(tm_fd);
 close_tg_fd:
-	close(tg_fd);
+	if (tg_fd >= 0)
+		close(tg_fd);
 close_cfd:
 	close(cfd);
 	return ret;
@@ -919,7 +926,7 @@ static int process_event_target_conn(struct gwp_thread *t,
 	return adjust_epoll_events(t, sp);
 
 out_del_pair:
-	t->need_reload = true;
+	t->epl_need_reload = true;
 	return del_sock_pair(t, sp);
 }
 
@@ -1407,18 +1414,24 @@ static int resolve_domain_name(const char *name, uint16_t port,
 
 static void free_dns_query(struct dns_query *dq)
 {
-	if (dq) {
+
+	if (dq->ev_fd >= 0) {
 		close(dq->ev_fd);
-		free(dq);
+		dq->ev_fd = -1;
 	}
+	free(dq);
 }
 
 static void gwp_put_dns_query(struct dns_query *dq)
 {
+	int x;
+
 	if (!dq)
 		return;
 
-	if (atomic_fetch_sub(&dq->ref_count, 1) == 1)
+	x = atomic_fetch_sub(&dq->ref_count, 1);
+	assert(x > 0);
+	if (x == 1)
 		free_dns_query(dq);
 }
 
@@ -1475,24 +1488,26 @@ static struct dns_query *alloc_dns_query(const char *hostname, uint16_t port)
 		return NULL;
 	}
 
-	l = sizeof(dq->hostname) - 1;
-	strncpy(dq->hostname, hostname, l);
-	dq->hostname[l] = '\0';
 	dq->port = port;
 	dq->err = 0;
 	dq->next = NULL;
 	dq->ev_fd = fd;
+	l = sizeof(dq->hostname) - 1;
 	atomic_init(&dq->ref_count, 2);
+	strncpy(dq->hostname, hostname, l);
+	dq->hostname[l] = '\0';
 	return dq;
 }
 
 static struct dns_query *gwp_dns_push_queue(struct gwp_socks5_dnsw *dnsw,
-					    const char *hostname, uint16_t port)
+					    const char *hostname, uint16_t port,
+					    struct gwp_sock_pair *sp)
 {
 	struct dns_query *dq = alloc_dns_query(hostname, port);
 	if (!dq)
 		return NULL;
 
+	dq->sp = sp;
 	pthread_mutex_lock(&dnsw->lock);
 
 	if (dnsw->tail)
@@ -1516,7 +1531,7 @@ static int async_resolve_domain_name(struct gwp_thread *t,
 	struct dns_query *dq;
 	int r;
 
-	dq = gwp_dns_push_queue(dnsw, hostname, port);
+	dq = gwp_dns_push_queue(dnsw, hostname, port, sp);
 	if (!dq)
 		return -ENOMEM;
 
@@ -1524,7 +1539,7 @@ static int async_resolve_domain_name(struct gwp_thread *t,
 	sp->dq = dq;
 	ev.events = EPOLLIN;
 	ev.data.u64 = 0;
-	ev.data.ptr = sp;
+	ev.data.ptr = dq;
 	ev.data.u64 |= EV_BIT_RESOLVE_DOMAIN;
 	r = epoll_ctl(t->epl_fd, EPOLL_CTL_ADD, dq->ev_fd, &ev);
 	if (r < 0) {
@@ -1537,25 +1552,32 @@ static int async_resolve_domain_name(struct gwp_thread *t,
 }
 
 static int process_event_resolve_domain(struct gwp_thread *t,
-					struct gwp_sock_pair *sp)
+					struct dns_query *dq)
 {
-	struct dns_query *dq = sp->dq;
-	int r, err = -dq->err;
+	struct gwp_sock_pair *sp = dq->sp;
+	int r = 0, err = dq->err;
 
-	if (err)
-		r = handle_socks5_connect_reply(sp, -err);
-	else
-		r = do_connect_socks5_cmd(t, sp, &dq->result);
+	if (sp) {
+		sp->dq = NULL;
+		if (err)
+			r = handle_socks5_connect_reply(sp, -err);
+		else
+			r = do_connect_socks5_cmd(t, sp, &dq->result);
+	}
 
+	assert(dq->ev_fd >= 0);
 	r = epoll_ctl(t->epl_fd, EPOLL_CTL_DEL, dq->ev_fd, NULL);
-	if (r)
-		r = -errno;
-
+	if (r) {
+		t->ctx->stop = true;
+		return -errno;
+	}
 	gwp_put_dns_query(dq);
-	sp->dq = NULL;
-	if (r || (sp->state == SP_STATE_SOCKS5_ERR)) {
-		r = del_sock_pair(t, sp);
-		return r ? r : -ECONNRESET;
+
+	if (sp) {
+		if (r || (sp->state == SP_STATE_SOCKS5_ERR)) {
+			r = del_sock_pair(t, sp);
+			return r ? r : -ECONNRESET;
+		}
 	}
 
 	return 0;
@@ -1831,7 +1853,7 @@ static int process_events(struct gwp_thread *t, int nr_events)
 		if (ret < 0)
 			return ret;
 
-		if (t->need_reload || ctx->stop)
+		if (t->epl_need_reload || ctx->stop)
 			break;
 	}
 
@@ -1930,13 +1952,16 @@ static int gwp_init_thread_sock(struct gwp_thread *t)
 
 	if (!ctx->cfg.socks5) {
 		err = parse_str_addr(&ctx->target_addr, &ctx->target_addr_len,
-				ctx->cfg.target_addr);
+				     ctx->cfg.target_addr);
 		if (err)
 			return err;
 	}
+
+	memset(&addr, 0, sizeof(addr));
 	err = parse_str_addr(&addr, &addr_len, ctx->cfg.bind_addr);
 	if (err)
 		return err;
+
 	ctx->bind_addr_len = addr_len;
 	fd = socket(addr.ss_family, flg, 0);
 	if (fd < 0)
@@ -2041,7 +2066,7 @@ static void gwp_free_thread_sock_bucket(struct gwp_thread *t)
 	struct gwp_sock_bucket *gsb = &t->gsb;
 	uint32_t i;
 
-	if (!gsb || !gsb->pairs)
+	if (!gsb->pairs)
 		return;
 
 	for (i = 0; i < gsb->nr_pairs; i++)
@@ -2103,7 +2128,9 @@ static void gwp_free_thread(struct gwp_thread *t)
 
 	t->ctx->stop = true;
 	gwp_send_signal_thread(t);
-	pthread_join(t->thread, NULL);
+	if (t->idx > 0)
+		pthread_join(t->thread, NULL);
+
 	gwp_free_thread_epoll(t);
 	gwp_free_thread_sock_bucket(t);
 	gwp_free_thread_sock(t);
@@ -2494,7 +2521,7 @@ static void gwp_free_dns_threads(struct gwp_ctx *ctx)
 {
 	struct gwp_socks5_dnsw *dnsw = ctx->socks5_dnsw;
 	struct dns_query *dq, *next;
-	uint16_t i;
+	uint64_t i;
 
 	if (!dnsw)
 		return;
@@ -2513,6 +2540,8 @@ static void gwp_free_dns_threads(struct gwp_ctx *ctx)
 	dq = dnsw->head;
 	while (dq) {
 		next = dq->next;
+		if (dq->ev_fd >= 0)
+			close(dq->ev_fd);
 		free(dq);
 		dq = next;
 	}
@@ -2559,8 +2588,24 @@ static int gwp_run(struct gwp_ctx *ctx)
 	return (intptr_t)gwp_thread_entry(ctx->threads);
 }
 
+struct gwp_ctx *g_ctx = NULL;
+
+static void do_graful_exit(int sig)
+{
+	if (g_ctx) {
+		g_ctx->stop = true;
+		putchar('\n');
+	}
+
+	(void)sig;
+}
+
 int main(int argc, char *argv[])
 {
+	static const struct sigaction sa = {
+		.sa_handler = do_graful_exit,
+		.sa_flags = 0,
+	};
 	struct gwp_ctx ctx;
 	int ret;
 
@@ -2580,6 +2625,16 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "Failed to initialize gwp ctx: %s\n",
 			strerror(-ret));
 		return -ret;
+	}
+
+	g_ctx = &ctx;
+	ret |= sigaction(SIGINT, &sa, NULL);
+	ret |= sigaction(SIGTERM, &sa, NULL);
+	if (ret) {
+		fprintf(stderr, "Failed to set signal handlers: %s\n",
+			strerror(errno));
+		gwp_free(&ctx);
+		return -errno;
 	}
 
 	ret = gwp_run(&ctx);
