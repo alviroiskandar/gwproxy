@@ -184,6 +184,7 @@ struct gwp_socks5_dnsw {
 	pthread_cond_t		cond;
 	struct dns_query	*head;
 	struct dns_query	*tail;
+	uint32_t		nr_queries;
 };
 
 struct gwp_ctx {
@@ -1434,6 +1435,20 @@ static void free_dns_query(struct dns_query *dq)
 	free(dq);
 }
 
+struct gai_entry {
+	struct gaicb		req;
+	char			port[6];
+	struct dns_query	*dq;
+};
+
+struct dns_query_batch {
+	struct addrinfo		hints;
+	struct gai_entry	*entries;
+	struct gaicb		**reqs;
+	size_t			nr;
+	size_t			cap;
+};
+
 static void gwp_put_dns_query(struct dns_query *dq)
 {
 	int x;
@@ -1445,6 +1460,169 @@ static void gwp_put_dns_query(struct dns_query *dq)
 	assert(x > 0);
 	if (x == 1)
 		free_dns_query(dq);
+}
+
+static struct dns_query *gwp_dns_pop_queue(struct gwp_socks5_dnsw *dnsw)
+{
+	struct dns_query *dq;
+
+	if (!dnsw->head)
+		return NULL;
+
+	dq = dnsw->head;
+	dnsw->head = dq->next;
+	if (!dnsw->head)
+		dnsw->tail = NULL;
+
+	dq->next = NULL;
+	dnsw->nr_queries--;
+	return dq;
+}
+
+static void dqb_init(struct dns_query_batch *dqb)
+{
+	memset(dqb, 0, sizeof(*dqb));
+	dqb->hints = (struct addrinfo){
+		.ai_flags = AI_CANONNAME | AI_ADDRCONFIG,
+		.ai_family = AF_UNSPEC,
+		.ai_socktype = SOCK_STREAM
+	};
+}
+
+static void dqb_free(struct dns_query_batch *dqb)
+{
+	if (dqb->entries) {
+		free(dqb->entries);
+		dqb->entries = NULL;
+	}
+	if (dqb->reqs) {
+		free(dqb->reqs);
+		dqb->reqs = NULL;
+	}
+	dqb->nr = 0;
+	dqb->cap = 0;
+}
+
+static int dqb_add_query(struct dns_query_batch *dqb, struct dns_query *dq)
+{
+	struct gai_entry *e;
+
+	/*
+	 * Check the reference count first to see whether the
+	 * client is still interested in the result. If the
+	 * reference count is 1, it means that the client has
+	 * already closed the connection. We are responsible
+	 * for freeing the dns_query structure. No need to
+	 * resolve the domain name in this case.
+	 */
+	if (atomic_load(&dq->ref_count) == 1) {
+		gwp_put_dns_query(dq);
+		return 0;
+	}
+
+	if (dqb->nr >= dqb->cap) {
+		size_t new_cap = dqb->cap ? dqb->cap * 2 : 16;
+		struct gai_entry *new_entries;
+		struct gaicb **new_reqs;
+
+		new_entries = realloc(dqb->entries, new_cap * sizeof(*new_entries));
+		if (!new_entries)
+			return -ENOMEM;
+		dqb->entries = new_entries;
+
+		new_reqs = realloc(dqb->reqs, new_cap * sizeof(*new_reqs));
+		if (!new_reqs)
+			return -ENOMEM;
+		dqb->reqs = new_reqs;
+		dqb->cap = new_cap;
+	}
+
+	e = &dqb->entries[dqb->nr++];
+	e->dq = dq;
+	snprintf(e->port, sizeof(e->port), "%hu", dq->port);
+	memset(&e->req, 0, sizeof(e->req));
+	e->req.ar_name = dq->hostname;
+	e->req.ar_service = e->port;
+	e->req.ar_request = &dqb->hints;
+	e->req.ar_result = NULL;
+	return 0;
+}
+
+static void dqb_collect_queries(struct dns_query_batch *dqb,
+				struct gwp_socks5_dnsw *dnsw)
+{
+	struct dns_query *dq;
+	int r;
+
+	while (1) {
+		dq = gwp_dns_pop_queue(dnsw);
+		if (!dq)
+			break;
+
+		r = dqb_add_query(dqb, dq);
+		if (r < 0) {
+			dq->err = -ENOMEM;
+			gwp_eventfd_write(dq->ev_fd, 1);
+			gwp_put_dns_query(dq);
+			break;
+		}
+	}
+}
+
+static int dqb_process_result(int err, struct gai_entry *e, struct gaicb *req)
+{
+	struct dns_query *dq = e->dq;
+	struct addrinfo *res = e->req.ar_result;
+	struct sockaddr_in *r4;
+	struct sockaddr_in6 *r6;
+
+	if (err) {
+		dq->err = -err;
+		goto out;
+	}
+
+	err = gai_error(req);
+	if (err) {
+		dq->err = -err;
+		goto out;
+	}
+
+	if (!res) {
+		dq->err = -EHOSTUNREACH;
+		goto out;
+	}
+
+	memset(&dq->result, 0, sizeof(dq->result));
+	r4 = (struct sockaddr_in *)&dq->result;
+	r6 = (struct sockaddr_in6 *)&dq->result;
+	if (res->ai_family == AF_INET)
+		*r4 = *(struct sockaddr_in *)res->ai_addr;
+	else if (res->ai_family == AF_INET6)
+		*r6 = *(struct sockaddr_in6 *)res->ai_addr;
+	else
+		dq->err = -EAFNOSUPPORT;
+
+out:
+	e->dq = NULL;
+	gwp_eventfd_write(dq->ev_fd, 1);
+	gwp_put_dns_query(dq);
+	return 0;
+}
+
+static void dqb_resolve(struct dns_query_batch *dqb)
+{
+	struct sigevent sev;
+	size_t i;
+	int r;
+
+	for (i = 0; i < dqb->nr; i++)
+		dqb->reqs[i] = &dqb->entries[i].req;
+
+	memset(&sev, 0, sizeof(sev));
+	sev.sigev_notify = SIGEV_NONE;
+	r = getaddrinfo_a(GAI_WAIT, dqb->reqs, dqb->nr, &sev);
+	for (i = 0; i < dqb->nr; i++)
+		dqb_process_result(r, &dqb->entries[i], dqb->reqs[i]);
 }
 
 static void gwp_dns_resolve(struct dns_query *dq)
@@ -1468,20 +1646,38 @@ static void gwp_dns_resolve(struct dns_query *dq)
 	gwp_put_dns_query(dq);
 }
 
-static struct dns_query *gwp_dns_pop_queue(struct gwp_socks5_dnsw *dnsw)
+static void *gwp_dns_thread_entry(void *arg)
 {
-	struct dns_query *dq;
+	struct gwp_socks5_dnsw *dnsw = arg;
+	struct gwp_ctx *ctx = dnsw->ctx;
 
-	if (!dnsw->head)
-		return NULL;
+	pthread_mutex_lock(&dnsw->lock);
+	while (!ctx->stop) {
+		if (!dnsw->head) {
+			dnsw->nr_sleeping++;
+			pthread_cond_wait(&dnsw->cond, &dnsw->lock);
+			dnsw->nr_sleeping--;
+			continue;
+		}
 
-	dq = dnsw->head;
-	dnsw->head = dq->next;
-	if (!dnsw->head)
-		dnsw->tail = NULL;
+		if (dnsw->nr_queries > (uint32_t)dnsw->nr_sleeping) {
+			struct dns_query_batch dqb;
+			dqb_init(&dqb);
+			dqb_collect_queries(&dqb, dnsw);
+			pthread_mutex_unlock(&dnsw->lock);
+			dqb_resolve(&dqb);
+			dqb_free(&dqb);
+			pthread_mutex_lock(&dnsw->lock);
+		} else {
+			struct dns_query *dq = gwp_dns_pop_queue(dnsw);
+			pthread_mutex_unlock(&dnsw->lock);
+			gwp_dns_resolve(dq);
+			pthread_mutex_lock(&dnsw->lock);
+		}
+	}
+	pthread_mutex_unlock(&dnsw->lock);
 
-	dq->next = NULL;
-	return dq;
+	return NULL;
 }
 
 static struct dns_query *alloc_dns_query(const char *hostname, uint16_t port)
@@ -1528,6 +1724,7 @@ static struct dns_query *gwp_dns_push_queue(struct gwp_socks5_dnsw *dnsw,
 		dnsw->head = dq;
 
 	dnsw->tail = dq;
+	dnsw->nr_queries++;
 	if (dnsw->nr_sleeping)
 		pthread_cond_signal(&dnsw->cond);
 	pthread_mutex_unlock(&dnsw->lock);
@@ -2439,30 +2636,6 @@ static void gwp_free_auth_file(struct gwp_ctx *ctx)
 	pthread_mutex_destroy(&gsa->lock);
 	free(gsa);
 	ctx->socks5_auth = NULL;
-}
-
-static void *gwp_dns_thread_entry(void *arg)
-{
-	struct gwp_socks5_dnsw *dnsw = arg;
-	struct gwp_ctx *ctx = dnsw->ctx;
-	struct dns_query *dq;
-
-	pthread_mutex_lock(&dnsw->lock);
-	while (!ctx->stop) {
-		dq = gwp_dns_pop_queue(dnsw);
-		if (dq) {
-			pthread_mutex_unlock(&dnsw->lock);
-			gwp_dns_resolve(dq);
-			pthread_mutex_lock(&dnsw->lock);
-		} else {
-			dnsw->nr_sleeping++;
-			pthread_cond_wait(&dnsw->cond, &dnsw->lock);
-			dnsw->nr_sleeping--;
-		}
-	}
-	pthread_mutex_unlock(&dnsw->lock);
-
-	return NULL;
 }
 
 static int gwp_init_dns_threads(struct gwp_ctx *ctx)
