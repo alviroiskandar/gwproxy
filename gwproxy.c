@@ -184,6 +184,7 @@ struct gwp_socks5_dnsw {
 	pthread_cond_t		cond;
 	struct dns_query	*head;
 	struct dns_query	*tail;
+	uint32_t		nr_queries;
 };
 
 struct gwp_ctx {
@@ -1474,6 +1475,7 @@ static struct dns_query *gwp_dns_pop_queue(struct gwp_socks5_dnsw *dnsw)
 		dnsw->tail = NULL;
 
 	dq->next = NULL;
+	dnsw->nr_queries--;
 	return dq;
 }
 
@@ -1623,11 +1625,31 @@ static void dqb_resolve(struct dns_query_batch *dqb)
 		dqb_process_result(r, &dqb->entries[i], dqb->reqs[i]);
 }
 
+static void gwp_dns_resolve(struct dns_query *dq)
+{
+	/*
+	 * Check the reference count first to see whether the
+	 * client is still interested in the result. If the
+	 * reference count is 1, it means that the client has
+	 * already closed the connection. We are responsible
+	 * for freeing the dns_query structure. No need to
+	 * resolve the domain name in this case.
+	 */
+	if (atomic_load(&dq->ref_count) == 1) {
+		free_dns_query(dq);
+		return;
+	}
+
+	memset(&dq->result, 0, sizeof(dq->result));
+	dq->err = resolve_domain_name(dq->hostname, dq->port, &dq->result);
+	gwp_eventfd_write(dq->ev_fd, 1);
+	gwp_put_dns_query(dq);
+}
+
 static void *gwp_dns_thread_entry(void *arg)
 {
 	struct gwp_socks5_dnsw *dnsw = arg;
 	struct gwp_ctx *ctx = dnsw->ctx;
-	struct dns_query_batch dqb;
 
 	pthread_mutex_lock(&dnsw->lock);
 	while (!ctx->stop) {
@@ -1638,12 +1660,20 @@ static void *gwp_dns_thread_entry(void *arg)
 			continue;
 		}
 
-		dqb_init(&dqb);
-		dqb_collect_queries(&dqb, dnsw);
-		pthread_mutex_unlock(&dnsw->lock);
-		dqb_resolve(&dqb);
-		dqb_free(&dqb);
-		pthread_mutex_lock(&dnsw->lock);
+		if (dnsw->nr_queries > (uint32_t)dnsw->nr_sleeping) {
+			struct dns_query_batch dqb;
+			dqb_init(&dqb);
+			dqb_collect_queries(&dqb, dnsw);
+			pthread_mutex_unlock(&dnsw->lock);
+			dqb_resolve(&dqb);
+			dqb_free(&dqb);
+			pthread_mutex_lock(&dnsw->lock);
+		} else {
+			struct dns_query *dq = gwp_dns_pop_queue(dnsw);
+			pthread_mutex_unlock(&dnsw->lock);
+			gwp_dns_resolve(dq);
+			pthread_mutex_lock(&dnsw->lock);
+		}
 	}
 	pthread_mutex_unlock(&dnsw->lock);
 
@@ -1694,6 +1724,7 @@ static struct dns_query *gwp_dns_push_queue(struct gwp_socks5_dnsw *dnsw,
 		dnsw->head = dq;
 
 	dnsw->tail = dq;
+	dnsw->nr_queries++;
 	if (dnsw->nr_sleeping)
 		pthread_cond_signal(&dnsw->cond);
 	pthread_mutex_unlock(&dnsw->lock);
