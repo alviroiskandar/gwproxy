@@ -283,6 +283,10 @@ static inline int __sys_eventfd(unsigned int c, int flags)
 	return (int) __do_syscall2(__NR_eventfd2, c, flags);
 }
 
+static inline pid_t __sys_gettid(void)
+{
+	return (pid_t)__do_syscall0(__NR_gettid);
+}
 #else /* #ifdef __x86_64__ */
 
 #include <errno.h>
@@ -429,6 +433,11 @@ static inline int __sys_shutdown(int sockfd, int how)
 {
 	int r = shutdown(sockfd, how);
 	return (r < 0) ? -errno : r;
+}
+
+static inline pid_t __sys_gettid(void)
+{
+	return syscall(__NR_gettid);
 }
 #endif /* #endif __x86_64__ */
 

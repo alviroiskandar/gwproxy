@@ -1,5 +1,6 @@
 #include <gwproxy/common.h>
 #include <gwproxy/log.h>
+#include <gwproxy/syscall.h>
 #include <time.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -48,7 +49,7 @@ void __pr_log(FILE *handle, int level, const char *fmt, ...)
 	else
 		time_buf[0] = '\0';
 
-	fprintf(handle, "[%s][%s][%08d]: %s\n", time_buf, ls, gettid(), pb);
+	fprintf(handle, "[%s][%s][%08d]: %s\n", time_buf, ls, __sys_gettid(), pb);
 	if (unlikely(pb != loc_buf))
 		free(pb);
 out:
