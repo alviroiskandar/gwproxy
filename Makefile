@@ -3,7 +3,6 @@ ifndef OPTIMIZE
 	OPTIMIZE = -O2
 endif
 INCLUDE_FLAGS = -I./src/
-LIBS = -lpthread
 DEPFLAGS = -MMD -MP -MF $@.d
 LDFLAGS_SHARED = $(LDFLAGS) -shared
 GWPROXY_DIR = ./src/gwproxy
@@ -80,6 +79,7 @@ config.make: configure
 endif
 endif
 -include config.make
+LIBS=$(LIB_LDFLAGS)
 
 ifeq ($(CONFIG_IO_URING),y)
 	GWPROXY_CC_SOURCES += $(GWPROXY_DIR)/ev/io_uring.c

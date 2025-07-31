@@ -356,20 +356,20 @@ fi;
 
 # ------ Check for getaddrinfo_a() ------
 cat > $tmp_c << EOF
-#define _GNU_SOURCE
 #include <netdb.h>
 int main(void)
 {
 	struct sigevent ev;
-	struct gaicb gc;
+	struct gaicb *gc = (void *)0;
 	getaddrinfo_a(GAI_NOWAIT, &gc, 1, &ev);
 	return 0;
 }
 EOF
 l="Do we have getaddrinfo_a()?";
-if compile_cc "" "" "getaddrinfo_a()"; then
+if compile_cc "" "-lanl" "getaddrinfo_a()"; then
 	add_config "CONFIG_HAVE_GETADDRINFO_A";
 	print_supp "yes" "${l}";
+	LIB_LDFLAGS="${LIB_LDFLAGS} -lanl";
 else
 	print_supp "no" "${l}";
 fi;
