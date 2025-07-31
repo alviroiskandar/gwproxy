@@ -230,25 +230,30 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 
 	if (!cfg->as_socks5 && !cfg->target) {
 		fprintf(stderr, "Error: --target is required unless --as-socks5 is specified.\n");
-		return -EINVAL;
+		goto einval;
 	}
 
 	if (cfg->nr_workers <= 0) {
 		fprintf(stderr, "Error: --nr-workers must be at least 1.\n");
-		return -EINVAL;
+		goto einval;
 	}
 
 	if (cfg->target_buf_size <= 1) {
 		fprintf(stderr, "Error: --target-buf-size must be greater than 1.\n");
-		return -EINVAL;
+		goto einval;
 	}
 
 	if (cfg->client_buf_size <= 1) {
 		fprintf(stderr, "Error: --client-buf-size must be greater than 1.\n");
-		return -EINVAL;
+		goto einval;
 	}
 
 	return 0;
+
+einval:
+	fprintf(stderr, "\n");
+	show_help(argv[0]);
+	return -EINVAL;
 }
 
 #define FULL_ADDRSTRLEN (INET6_ADDRSTRLEN + sizeof(":65535[]") - 1)
