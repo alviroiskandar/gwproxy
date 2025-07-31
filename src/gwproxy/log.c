@@ -1,11 +1,17 @@
 #include <gwproxy/common.h>
 #include <gwproxy/log.h>
+#include <gwproxy/syscall.h>
 #include <time.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 #include <stdarg.h>
+
+static inline pid_t __sys_gettid(void)
+{
+	return (pid_t)__do_syscall0(__NR_gettid);
+}
 
 __attribute__((__format__(printf, 3, 4)))
 void __pr_log(FILE *handle, int level, const char *fmt, ...)
@@ -48,7 +54,7 @@ void __pr_log(FILE *handle, int level, const char *fmt, ...)
 	else
 		time_buf[0] = '\0';
 
-	fprintf(handle, "[%s][%s][%08d]: %s\n", time_buf, ls, gettid(), pb);
+	fprintf(handle, "[%s][%s][%08d]: %s\n", time_buf, ls, __sys_gettid(), pb);
 	if (unlikely(pb != loc_buf))
 		free(pb);
 out:
