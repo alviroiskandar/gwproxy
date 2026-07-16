@@ -1722,12 +1722,12 @@ static int get_local_addr_for_socks5(struct gwp_ctx *ctx, int fd,
 	case AF_INET:
 		ba->ver = GWP_SOCKS5_ATYP_IPV4;
 		memcpy(&ba->ip4, &t.i4.sin_addr, 4);
-		ba->port = ntohs(t.i4.sin_port);
+		ba->port = t.i4.sin_port;
 		return 0;
 	case AF_INET6:
 		ba->ver = GWP_SOCKS5_ATYP_IPV6;
 		memcpy(&ba->ip6, &t.i6.sin6_addr, 16);
-		ba->port = ntohs(t.i6.sin6_port);
+		ba->port = t.i6.sin6_port;
 		return 0;
 	default:
 		pr_err(&ctx->lh, "Unsupported address family %d for local socket",
