@@ -5,8 +5,9 @@
 # issues UDP ASSOCIATE, and the proxy returns a bound UDP relay endpoint. The
 # client then sends SOCKS5-wrapped datagrams to that relay, which forwards them
 # to a UDP echo server and relays the replies back. Verify datagrams of several
-# sizes round-trip byte-exact, that the relay is torn down with its TCP control
-# connection, and that plain SOCKS5 CONNECT still works on the same port. The
+# sizes round-trip byte-exact, IPv4/IPv6 and cross-address-family targets all
+# relay (the relay socket is dual-stack), the relay is torn down with its TCP
+# control connection, and plain SOCKS5 CONNECT still works on the same port. The
 # relay is exercised on both event loops (epoll and, when built, io_uring).
 
 . "$(dirname "$0")/lib.sh"
@@ -14,79 +15,99 @@ require curl
 require python3
 require ss
 
-# Start the dual-purpose UDP echo server and wait until its socket is bound.
+udp_client() { python3 "$SERVERS_DIR/socks5_udp_client.py" "$@"; }
+
+wait_udp_bound() {			# $1=port
+	local i
+	for i in $(seq 1 50); do
+		ss -uanH "sport = :$1" 2>/dev/null | grep -q . && return 0
+		sleep 0.1
+	done
+	fail "UDP echo server did not bind on $1"
+}
+
+# IPv4 UDP echo server.
 ep="$(pick_port)"
 python3 "$SERVERS_DIR/udp_echo.py" 127.0.0.1 "$ep" \
 	>"$WORK/udp_echo.$ep.log" 2>&1 &
 _PIDS+=("$!")
-for i in $(seq 1 50); do
-	ss -uanH "sport = :$ep" 2>/dev/null | grep -q . && break
-	sleep 0.1
-	[ "$i" = 50 ] && fail "UDP echo server did not bind on $ep"
-done
+wait_udp_bound "$ep"
+
+# IPv6 UDP echo server (best-effort: skip the IPv6 cases where ::1 is absent).
+have_v6=0
+ep6="$(pick_port)"
+if python3 -c 'import socket,sys; socket.socket(socket.AF_INET6,socket.SOCK_DGRAM).bind(("::1",0))' 2>/dev/null; then
+	have_v6=1
+	python3 "$SERVERS_DIR/udp_echo.py" ::1 "$ep6" \
+		>"$WORK/udp_echo.$ep6.log" 2>&1 &
+	_PIDS+=("$!")
+	wait_udp_bound "$ep6"
+fi
 
 # A TCP HTTP origin for the coexisting CONNECT check.
 hp="$(pick_port)"
 make_payload "$WORK/payload.bin" 100000
 start_httpd "$hp" "$WORK" "1.1"
 
-pp="$(pick_port)"
-gwp_start "127.0.0.1:$pp" --as-socks5=1 --event-loop=epoll --nr-workers=2
+# Run the full relay matrix on one event loop.
+run_loop() {
+	local loop="$1" pp tp
 
-# (1) UDP ASSOCIATE relay: datagrams of assorted sizes echo back intact.
-python3 "$SERVERS_DIR/socks5_udp_client.py" "$pp" "$ep" 1 60 1400 9000 60000 \
-	|| fail "SOCKS5 UDP ASSOCIATE relay failed"
-
-# (2) A fresh association works after the first is gone (each run opens and
-#     closes its own control connection, exercising relay teardown).
-python3 "$SERVERS_DIR/socks5_udp_client.py" "$pp" "$ep" 200 \
-	|| fail "second SOCKS5 UDP association failed"
-
-# (2b) The association outlives the protocol-handshake timeout (the handshake
-#      timer must be disarmed once the relay is up). Use a short timeout and a
-#      client that sends a datagram after it would have fired.
-tp="$(pick_port)"
-gwp_start "127.0.0.1:$tp" --as-socks5=1 --event-loop=epoll --protocol-timeout=1
-GWP_TP="$GWP_PID"
-python3 "$SERVERS_DIR/socks5_udp_client.py" "$tp" "$ep" --delay 2.0 64 \
-	|| fail "UDP association did not survive the protocol timeout"
-kill "$GWP_TP" 2>/dev/null
-
-# (3) Coexistence: plain SOCKS5 CONNECT still works on the same port.
-curl -s --max-time 20 -x "socks5h://127.0.0.1:$pp" \
-	"http://127.0.0.1:$hp/payload.bin" -o "$WORK/out.bin" \
-	|| fail "SOCKS5 CONNECT on the UDP-capable port failed"
-assert_files_equal "$WORK/payload.bin" "$WORK/out.bin" \
-	"SOCKS5 CONNECT corrupted the payload"
-
-kill "$GWP_PID" 2>/dev/null
-
-# (4) The io_uring loop relays too (when built): repeat the round-trip, a fresh
-#     association, and the protocol-timeout survival check on that loop.
-if grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null; then
+	# (1) IPv4 client -> IPv4 target: datagrams of assorted sizes echo back.
 	pp="$(pick_port)"
-	gwp_start "127.0.0.1:$pp" --as-socks5=1 --event-loop=io_uring --nr-workers=2
+	gwp_start "127.0.0.1:$pp" --as-socks5=1 --event-loop="$loop" --nr-workers=2
+	udp_client "$pp" "$ep" 1 60 1400 9000 60000 \
+		|| fail "$loop SOCKS5 UDP ASSOCIATE relay failed"
 
-	python3 "$SERVERS_DIR/socks5_udp_client.py" "$pp" "$ep" 1 60 1400 9000 60000 \
-		|| fail "io_uring SOCKS5 UDP ASSOCIATE relay failed"
-	python3 "$SERVERS_DIR/socks5_udp_client.py" "$pp" "$ep" 200 \
-		|| fail "second io_uring SOCKS5 UDP association failed"
+	# (2) A fresh association works after the first is gone (exercises the
+	#     relay teardown that each closed control connection triggers).
+	udp_client "$pp" "$ep" 200 \
+		|| fail "$loop second SOCKS5 UDP association failed"
 
-	# Coexistence: plain SOCKS5 CONNECT still works on the io_uring loop.
+	# (3) Cross-address family: an IPv4-connected client reaches an IPv6
+	#     target through the dual-stack relay socket.
+	if [ "$have_v6" = 1 ]; then
+		udp_client --target-host ::1 "$pp" "$ep6" 1 1400 60000 \
+			|| fail "$loop IPv4-client -> IPv6-target relay failed"
+	fi
+
+	# (4) Coexistence: plain SOCKS5 CONNECT still works on the same port.
 	curl -s --max-time 20 -x "socks5h://127.0.0.1:$pp" \
-		"http://127.0.0.1:$hp/payload.bin" -o "$WORK/out.iou.bin" \
-		|| fail "io_uring SOCKS5 CONNECT on the UDP-capable port failed"
-	assert_files_equal "$WORK/payload.bin" "$WORK/out.iou.bin" \
-		"io_uring SOCKS5 CONNECT corrupted the payload"
+		"http://127.0.0.1:$hp/payload.bin" -o "$WORK/out.$loop.bin" \
+		|| fail "$loop SOCKS5 CONNECT on the UDP-capable port failed"
+	assert_files_equal "$WORK/payload.bin" "$WORK/out.$loop.bin" \
+		"$loop SOCKS5 CONNECT corrupted the payload"
 	kill "$GWP_PID" 2>/dev/null
 
+	# (5) IPv6 client, to both IPv6 and (cross-family) IPv4 targets.
+	if [ "$have_v6" = 1 ]; then
+		pp="$(pick_port)"
+		gwp_start "[::1]:$pp" --as-socks5=1 --event-loop="$loop" \
+			--nr-workers=2
+		udp_client --proxy-host ::1 --target-host ::1 \
+			"$pp" "$ep6" 1 1400 60000 \
+			|| fail "$loop IPv6-client -> IPv6-target relay failed"
+		udp_client --proxy-host ::1 --target-host 127.0.0.1 \
+			"$pp" "$ep" 1 1400 60000 \
+			|| fail "$loop IPv6-client -> IPv4-target relay failed"
+		kill "$GWP_PID" 2>/dev/null
+	fi
+
+	# (6) The association outlives the protocol-handshake timeout (the
+	#     handshake timer must be disarmed once the relay is up).
 	tp="$(pick_port)"
-	gwp_start "127.0.0.1:$tp" --as-socks5=1 --event-loop=io_uring \
+	gwp_start "127.0.0.1:$tp" --as-socks5=1 --event-loop="$loop" \
 		--protocol-timeout=1
 	GWP_TP="$GWP_PID"
-	python3 "$SERVERS_DIR/socks5_udp_client.py" "$tp" "$ep" --delay 2.0 64 \
-		|| fail "io_uring UDP association did not survive the timeout"
+	udp_client "$tp" "$ep" --delay 2.0 64 \
+		|| fail "$loop UDP association did not survive the timeout"
 	kill "$GWP_TP" 2>/dev/null
+}
+
+run_loop epoll
+
+if grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null; then
+	run_loop io_uring
 fi
 
 pass

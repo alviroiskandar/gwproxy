@@ -2063,16 +2063,66 @@ static int handle_socks5_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	return 0;
 }
 
+/* Write the IPv4-mapped IPv6 form (::ffff:a.b.c.d) of a 4-byte address. */
+static void set_v4mapped(struct in6_addr *a6, const void *v4)
+{
+	memset(a6, 0, sizeof(*a6));
+	a6->s6_addr[10] = 0xff;
+	a6->s6_addr[11] = 0xff;
+	memcpy(&a6->s6_addr[12], v4, 4);
+}
+
+/* Canonicalise an address to (is_v4, pointer to its 4- or 16-byte IP). */
+static void sockaddr_canon_ip(const struct gwp_sockaddr *a, bool *is_v4,
+			      const uint8_t **ip)
+{
+	if (a->sa.sa_family == AF_INET) {
+		*is_v4 = true;
+		*ip = (const uint8_t *)&a->i4.sin_addr;
+		return;
+	}
+	if (IN6_IS_ADDR_V4MAPPED(&a->i6.sin6_addr)) {
+		*is_v4 = true;
+		*ip = &a->i6.sin6_addr.s6_addr[12];
+		return;
+	}
+	*is_v4 = false;
+	*ip = a->i6.sin6_addr.s6_addr;
+}
+
+/*
+ * Compare two addresses by IP only (not port), treating an IPv4 address and its
+ * IPv4-mapped IPv6 form as equal. The UDP relay socket is dual-stack, so a
+ * datagram's source is always AF_INET6 (v4-mapped for an IPv4 peer) while the
+ * pinned client address may be either family; this bridges them.
+ */
+bool gwp_sockaddr_ip_eq(const struct gwp_sockaddr *a, const struct gwp_sockaddr *b)
+{
+	const uint8_t *ai, *bi;
+	bool av4, bv4;
+
+	sockaddr_canon_ip(a, &av4, &ai);
+	sockaddr_canon_ip(b, &bv4, &bi);
+	if (av4 != bv4)
+		return false;
+	return !memcmp(ai, bi, av4 ? 4 : 16);
+}
+
 int gwp_socks5_addr_to_sockaddr(const struct gwp_socks5_addr *a,
 				struct gwp_sockaddr *sa, socklen_t *slen)
 {
+	/*
+	 * The relay socket is dual-stack AF_INET6, so every target is expressed
+	 * as an IPv6 sockaddr: an IPv4 target becomes its IPv4-mapped form so
+	 * one socket can reach both families.
+	 */
 	memset(sa, 0, sizeof(*sa));
 	switch (a->ver) {
 	case GWP_SOCKS5_ATYP_IPV4:
-		sa->i4.sin_family = AF_INET;
-		memcpy(&sa->i4.sin_addr, a->ip4, 4);
-		sa->i4.sin_port = a->port;
-		*slen = sizeof(sa->i4);
+		sa->i6.sin6_family = AF_INET6;
+		set_v4mapped(&sa->i6.sin6_addr, a->ip4);
+		sa->i6.sin6_port = a->port;
+		*slen = sizeof(sa->i6);
 		return 0;
 	case GWP_SOCKS5_ATYP_IPV6:
 		sa->i6.sin6_family = AF_INET6;
@@ -2086,21 +2136,50 @@ int gwp_socks5_addr_to_sockaddr(const struct gwp_socks5_addr *a,
 	}
 }
 
+/*
+ * Fill a SOCKS5 header address from a UDP reply's source. The relay is
+ * dual-stack so the source is AF_INET6; a v4-mapped source is unmapped back to
+ * an IPv4 ATYP so the client sees the target it actually addressed.
+ */
+void gwp_socks5_reply_addr_from_sockaddr(const struct gwp_sockaddr *src,
+					 struct gwp_socks5_addr *a)
+{
+	if (src->sa.sa_family == AF_INET) {
+		a->ver = GWP_SOCKS5_ATYP_IPV4;
+		memcpy(a->ip4, &src->i4.sin_addr, 4);
+		a->port = src->i4.sin_port;
+		return;
+	}
+	if (IN6_IS_ADDR_V4MAPPED(&src->i6.sin6_addr)) {
+		a->ver = GWP_SOCKS5_ATYP_IPV4;
+		memcpy(a->ip4, &src->i6.sin6_addr.s6_addr[12], 4);
+		a->port = src->i6.sin6_port;
+		return;
+	}
+	a->ver = GWP_SOCKS5_ATYP_IPV6;
+	memcpy(a->ip6, &src->i6.sin6_addr, 16);
+	a->port = src->i6.sin6_port;
+}
+
 int gwp_socks5_udp_associate_setup(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	static const int type = SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC;
 	struct gwp_ctx *ctx = w->ctx;
 	struct gwp_socks5_addr bnd;
-	struct gwp_sockaddr local;
+	struct gwp_sockaddr local, relay;
 	socklen_t slen = sizeof(local);
 	int fd = -1, r, rep = GWP_SOCKS5_REP_SUCCESS;
 	size_t out_len;
 
 	/*
-	 * Bind the relay on the proxy address the client connected to, so the
-	 * BND.ADDR we return is reachable by the client. getsockname() on the
-	 * accepted TCP fd yields that concrete local address even for a
-	 * wildcard listener.
+	 * The relay is a dual-stack IPv6 socket bound to the wildcard address so
+	 * one socket can both receive from the client and reach IPv4 and IPv6
+	 * targets (a socket bound to a single-family local address cannot egress
+	 * the other family). BND.ADDR must still be an address the client can
+	 * reach, so it is taken from the proxy address the client connected to
+	 * (getsockname() on the control fd), paired with the relay's ephemeral
+	 * port. Widening the bind to the wildcard does not change the threat
+	 * model: the port is ephemeral and the client is IP-pinned.
 	 */
 	r = __sys_getsockname(gcp->client.fd, &local.sa, &slen);
 	if (r < 0) {
@@ -2110,26 +2189,22 @@ int gwp_socks5_udp_associate_setup(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		goto reply;
 	}
 
-	fd = __sys_socket(local.sa.sa_family, type, 0);
+	fd = __sys_socket(AF_INET6, type, 0);
 	if (fd < 0) {
 		pr_err(&ctx->lh, "UDP associate: socket() failed: %s", strerror(-fd));
 		rep = GWP_SOCKS5_REP_FAILURE;
 		goto reply;
 	}
 
+	setskopt_int(fd, IPPROTO_IPV6, IPV6_V6ONLY, 0);
 	if (ctx->cfg.mark)
 		setskopt_int(fd, SOL_SOCKET, SO_MARK, ctx->cfg.mark);
 
-	/* Ephemeral UDP port on that IP. */
-	if (local.sa.sa_family == AF_INET) {
-		local.i4.sin_port = 0;
-		slen = sizeof(local.i4);
-	} else {
-		local.i6.sin6_port = 0;
-		slen = sizeof(local.i6);
-	}
-
-	r = __sys_bind(fd, &local.sa, slen);
+	memset(&relay, 0, sizeof(relay));
+	relay.i6.sin6_family = AF_INET6;
+	relay.i6.sin6_addr = in6addr_any;
+	relay.i6.sin6_port = 0;
+	r = __sys_bind(fd, &relay.sa, sizeof(relay.i6));
 	if (r < 0) {
 		pr_err(&ctx->lh, "UDP associate: bind() failed: %s", strerror(-r));
 		__sys_close(fd);
@@ -2138,13 +2213,25 @@ int gwp_socks5_udp_associate_setup(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		goto reply;
 	}
 
-	r = get_local_addr_for_socks5(ctx, fd, &bnd);
+	/* BND.ADDR from the control connection, BND.PORT from the relay socket. */
+	slen = sizeof(relay);
+	r = __sys_getsockname(fd, &relay.sa, &slen);
 	if (r < 0) {
+		pr_err(&ctx->lh, "UDP associate: getsockname(relay) failed: %s",
+			strerror(-r));
 		__sys_close(fd);
 		fd = -1;
 		rep = GWP_SOCKS5_REP_FAILURE;
 		goto reply;
 	}
+	if (local.sa.sa_family == AF_INET) {
+		bnd.ver = GWP_SOCKS5_ATYP_IPV4;
+		memcpy(bnd.ip4, &local.i4.sin_addr, 4);
+	} else {
+		bnd.ver = GWP_SOCKS5_ATYP_IPV6;
+		memcpy(bnd.ip6, &local.i6.sin6_addr, 16);
+	}
+	bnd.port = relay.i6.sin6_port;
 
 	gcp->udp_fd = fd;
 	pr_info(&ctx->lh,

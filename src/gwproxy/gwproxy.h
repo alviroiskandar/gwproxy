@@ -451,9 +451,20 @@ void gwp_setup_cli_sock_options(struct gwp_wrk *w, int fd);
  */
 int gwp_socks5_udp_associate_setup(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 
-/* Convert a SOCKS5 IPv4/IPv6 address to a sockaddr (domain -> -EAFNOSUPPORT). */
+/*
+ * Convert a SOCKS5 IPv4/IPv6 target to a sockaddr for the dual-stack UDP relay
+ * (always AF_INET6; IPv4 is returned v4-mapped). Domain -> -EAFNOSUPPORT.
+ */
 int gwp_socks5_addr_to_sockaddr(const struct gwp_socks5_addr *a,
 				struct gwp_sockaddr *sa, socklen_t *slen);
+
+/* Fill a SOCKS5 UDP reply-header address from a datagram source (unmaps v4). */
+void gwp_socks5_reply_addr_from_sockaddr(const struct gwp_sockaddr *src,
+					 struct gwp_socks5_addr *a);
+
+/* Compare two addresses by IP only, matching IPv4 with its v4-mapped form. */
+bool gwp_sockaddr_ip_eq(const struct gwp_sockaddr *a,
+			const struct gwp_sockaddr *b);
 int gwp_get_orig_dst(int fd, const struct gwp_sockaddr *client,
 		     struct gwp_sockaddr *dst);
 const char *ip_to_str(const struct gwp_sockaddr *gs);

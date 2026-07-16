@@ -1644,19 +1644,6 @@ static bool sockaddr_eq(const struct gwp_sockaddr *a,
 	return false;
 }
 
-/* Compare only the IP (not the port) of two addresses. */
-static bool sockaddr_ip_eq(const struct gwp_sockaddr *a,
-			   const struct gwp_sockaddr *b)
-{
-	if (a->sa.sa_family != b->sa.sa_family)
-		return false;
-	if (a->sa.sa_family == AF_INET)
-		return a->i4.sin_addr.s_addr == b->i4.sin_addr.s_addr;
-	if (a->sa.sa_family == AF_INET6)
-		return !memcmp(&a->i6.sin6_addr, &b->i6.sin6_addr, 16);
-	return false;
-}
-
 /* Arm the next relay recvmsg into the front-padded scratch buffer. */
 static void prep_udp_recv(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
@@ -1737,7 +1724,7 @@ static int handle_ev_udp_relay(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		 * connection's IP so an off-path source cannot hijack the
 		 * association (RFC 1928).
 		 */
-		if (!sockaddr_ip_eq(&u->src, &gcp->client_addr)) {
+		if (!gwp_sockaddr_ip_eq(&u->src, &gcp->client_addr)) {
 			prep_udp_recv(w, gcp);
 			return 0;
 		}
@@ -1763,32 +1750,18 @@ static int handle_ev_udp_relay(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	} else {
 		/* Target -> client: prepend a header in the front slack. */
 		struct gwp_socks5_addr sa;
-		socklen_t clen;
 		size_t h, hlen;
 
-		if (u->src.sa.sa_family == AF_INET) {
-			sa.ver = GWP_SOCKS5_ATYP_IPV4;
-			memcpy(sa.ip4, &u->src.i4.sin_addr, 4);
-			sa.port = u->src.i4.sin_port;
-			h = 3 + 1 + 4 + 2;
-			clen = sizeof(gcp->udp_peer.i4);
-		} else if (u->src.sa.sa_family == AF_INET6) {
-			sa.ver = GWP_SOCKS5_ATYP_IPV6;
-			memcpy(sa.ip6, &u->src.i6.sin6_addr, 16);
-			sa.port = u->src.i6.sin6_port;
-			h = 3 + 1 + 16 + 2;
-			clen = sizeof(gcp->udp_peer.i6);
-		} else {
-			prep_udp_recv(w, gcp);
-			return 0;
-		}
-
+		gwp_socks5_reply_addr_from_sockaddr(&u->src, &sa);
+		h = (sa.ver == GWP_SOCKS5_ATYP_IPV4) ? 3 + 1 + 4 + 2
+						     : 3 + 1 + 16 + 2;
 		if (gwp_socks5_udp_build_hdr(&sa, base - h, h, &hlen)) {
 			prep_udp_recv(w, gcp);
 			return 0;
 		}
+		/* The relay is dual-stack, so udp_peer is always AF_INET6. */
 		prep_udp_send(w, gcp, base - h, h + (size_t)n, &gcp->udp_peer,
-			      clen);
+			      sizeof(gcp->udp_peer.i6));
 	}
 
 	return 0;
