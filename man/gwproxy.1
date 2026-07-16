@@ -15,7 +15,8 @@ a plain TCP\-to\-TCP forwarder to a fixed
 .IP \(bu 3
 a
 .B SOCKS5
-proxy (RFC 1928) with IPv4, IPv6 and domain\-name targets and optional
+proxy (RFC 1928) with CONNECT to IPv4, IPv6 and domain\-name targets, UDP
+ASSOCIATE relaying to IPv4/IPv6 targets (on the epoll loop), and optional
 username/password authentication (RFC 1929);
 .IP \(bu 3
 an

@@ -111,6 +111,12 @@ enum {
 	EV_BIT_RAW_DNS_QUERY		= (19ull << 48ull),
 
 	/*
+	 * Per-connection UDP relay socket for a SOCKS5 UDP ASSOCIATE. Values
+	 * 9-21 are reserved by the io_uring aliases below, so use 22.
+	 */
+	EV_BIT_UDP_RELAY		= (22ull << 48ull),
+
+	/*
 	 * This ev_bit is used for user_data masking during protocol
 	 * initalization.
 	 *
@@ -162,6 +168,7 @@ enum {
 	CONN_STATE_SOCKS5_MIN		= 100,
 	CONN_STATE_SOCKS5_DATA		= 101,
 	CONN_STATE_SOCKS5_CONNECT	= 102,
+	CONN_STATE_SOCKS5_UDP_ASSOCIATE	= 103,	/* relay active; TCP conn idle */
 	CONN_STATE_SOCKS5_DNS_QUERY	= 104,
 	CONN_STATE_SOCKS5_MAX		= 199,
 
@@ -277,6 +284,19 @@ struct gwp_conn_pair {
 	uint64_t		flags;
 	int			conn_state;
 	int			timer_fd;
+
+	/*
+	 * SOCKS5 UDP ASSOCIATE relay. @udp_fd is the per-connection bound UDP
+	 * socket the client sends datagrams to (-1 when not a UDP association);
+	 * its lifetime is tied to this (TCP control) connection. @udp_peer is
+	 * the client's UDP source address, pinned from its first datagram
+	 * (@udp_pinned); datagrams from other sources are treated as replies
+	 * from targets.
+	 */
+	int			udp_fd;
+	bool			udp_pinned;
+	struct gwp_sockaddr	udp_peer;
+
 	uint32_t		idx;
 	union {
 		struct gwp_socks5_conn	*s5_conn;
@@ -359,6 +379,14 @@ struct gwp_wrk {
 	uint32_t		idx;
 	pthread_t		thread;
 
+	/*
+	 * Per-worker scratch for the SOCKS5 UDP relay, allocated at worker
+	 * start when SOCKS5 is enabled. A datagram is received at offset
+	 * GWP_SOCKS5_UDP_HDR_MAX so a reply header can be prepended in-place
+	 * (no copy); the tail holds up to one max-size UDP payload.
+	 */
+	unsigned char		*udp_buf;
+
 #ifdef CONFIG_NEW_DNS_RESOLVER
 	struct gwp_wrk_dns	*dns;
 #endif
@@ -393,6 +421,26 @@ int gwp_create_sock_target(struct gwp_wrk *w, struct gwp_sockaddr *addr,
 			   bool *is_target_alive, bool non_block);
 int gwp_create_timer(int fd, int sec, int nsec);
 void gwp_setup_cli_sock_options(struct gwp_wrk *w, int fd);
+
+/*
+ * Per-worker SOCKS5 UDP relay scratch: room to prepend a max relay header plus
+ * one max-size UDP payload (65535 bytes). Datagrams are received at offset
+ * GWP_SOCKS5_UDP_HDR_MAX within it.
+ */
+#define GWP_UDP_RELAY_BUFSZ	(GWP_SOCKS5_UDP_HDR_MAX + 65535)
+
+/*
+ * Create and bind the per-connection UDP relay socket for a SOCKS5 UDP
+ * ASSOCIATE, derive its BND.ADDR:PORT and write the SOCKS5 reply into
+ * gcp->target.buf (for the caller to flush to the client), and stash the fd in
+ * gcp->udp_fd. On failure a SOCKS5 failure reply is queued instead and a
+ * negative error is returned. The caller registers the fd with its event loop.
+ */
+int gwp_socks5_udp_associate_setup(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
+
+/* Convert a SOCKS5 IPv4/IPv6 address to a sockaddr (domain -> -EAFNOSUPPORT). */
+int gwp_socks5_addr_to_sockaddr(const struct gwp_socks5_addr *a,
+				struct gwp_sockaddr *sa, socklen_t *slen);
 int gwp_get_orig_dst(int fd, const struct gwp_sockaddr *client,
 		     struct gwp_sockaddr *dst);
 const char *ip_to_str(const struct gwp_sockaddr *gs);

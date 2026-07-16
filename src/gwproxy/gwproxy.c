@@ -743,6 +743,8 @@ static void gwp_ctx_free_thread_sock_pairs(struct gwp_wrk *w)
 		free_conn(&gcp->client);
 		if (gcp->timer_fd >= 0)
 			__sys_close(gcp->timer_fd);
+		if (gcp->udp_fd >= 0)
+			__sys_close(gcp->udp_fd);
 
 		/*
 		 * s5_conn and http_conn share a union, so the protocol object
@@ -1425,6 +1427,7 @@ struct gwp_conn_pair *gwp_alloc_conn_pair(struct gwp_wrk *w)
 		goto out_free_target_conn;
 
 	gcp->timer_fd = -1;
+	gcp->udp_fd = -1;
 	gcp->idx = gcs->nr;
 	gcp->conn_state = CONN_STATE_INIT;
 	gcs->pairs[gcs->nr++] = gcp;
@@ -1488,7 +1491,7 @@ int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	log_conn_pair_close(w, gcp);
 
 	if (gcp->flags & GWP_CONN_FLAG_NO_CLOSE_FD)
-		gcp->target.fd = gcp->client.fd = gcp->timer_fd = -1;
+		gcp->target.fd = gcp->client.fd = gcp->timer_fd = gcp->udp_fd = -1;
 
 	tmp = gcs->pairs[--gcs->nr];
 	gcs->pairs[gcs->nr] = NULL;
@@ -1500,6 +1503,8 @@ int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 	if (gcp->timer_fd >= 0)
 		__sys_close(gcp->timer_fd);
+	if (gcp->udp_fd >= 0)
+		__sys_close(gcp->udp_fd);
 
 #ifdef CONFIG_NEW_DNS_RESOLVER
 	if (w->ctx->cfg.use_raw_dns && gcp->gdp) {
@@ -2057,6 +2062,106 @@ static int handle_socks5_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	return 0;
 }
 
+int gwp_socks5_addr_to_sockaddr(const struct gwp_socks5_addr *a,
+				struct gwp_sockaddr *sa, socklen_t *slen)
+{
+	memset(sa, 0, sizeof(*sa));
+	switch (a->ver) {
+	case GWP_SOCKS5_ATYP_IPV4:
+		sa->i4.sin_family = AF_INET;
+		memcpy(&sa->i4.sin_addr, a->ip4, 4);
+		sa->i4.sin_port = a->port;
+		*slen = sizeof(sa->i4);
+		return 0;
+	case GWP_SOCKS5_ATYP_IPV6:
+		sa->i6.sin6_family = AF_INET6;
+		memcpy(&sa->i6.sin6_addr, a->ip6, 16);
+		sa->i6.sin6_port = a->port;
+		*slen = sizeof(sa->i6);
+		return 0;
+	default:
+		/* Domain targets in relayed datagrams need DNS; not yet. */
+		return -EAFNOSUPPORT;
+	}
+}
+
+int gwp_socks5_udp_associate_setup(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	static const int type = SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC;
+	struct gwp_ctx *ctx = w->ctx;
+	struct gwp_socks5_addr bnd;
+	struct gwp_sockaddr local;
+	socklen_t slen = sizeof(local);
+	int fd = -1, r, rep = GWP_SOCKS5_REP_SUCCESS;
+	size_t out_len;
+
+	/*
+	 * Bind the relay on the proxy address the client connected to, so the
+	 * BND.ADDR we return is reachable by the client. getsockname() on the
+	 * accepted TCP fd yields that concrete local address even for a
+	 * wildcard listener.
+	 */
+	r = __sys_getsockname(gcp->client.fd, &local.sa, &slen);
+	if (r < 0) {
+		pr_err(&ctx->lh, "UDP associate: getsockname(client) failed: %s",
+			strerror(-r));
+		rep = GWP_SOCKS5_REP_FAILURE;
+		goto reply;
+	}
+
+	fd = __sys_socket(local.sa.sa_family, type, 0);
+	if (fd < 0) {
+		pr_err(&ctx->lh, "UDP associate: socket() failed: %s", strerror(-fd));
+		rep = GWP_SOCKS5_REP_FAILURE;
+		goto reply;
+	}
+
+	if (ctx->cfg.mark)
+		setskopt_int(fd, SOL_SOCKET, SO_MARK, ctx->cfg.mark);
+
+	/* Ephemeral UDP port on that IP. */
+	if (local.sa.sa_family == AF_INET) {
+		local.i4.sin_port = 0;
+		slen = sizeof(local.i4);
+	} else {
+		local.i6.sin6_port = 0;
+		slen = sizeof(local.i6);
+	}
+
+	r = __sys_bind(fd, &local.sa, slen);
+	if (r < 0) {
+		pr_err(&ctx->lh, "UDP associate: bind() failed: %s", strerror(-r));
+		__sys_close(fd);
+		fd = -1;
+		rep = GWP_SOCKS5_REP_FAILURE;
+		goto reply;
+	}
+
+	r = get_local_addr_for_socks5(ctx, fd, &bnd);
+	if (r < 0) {
+		__sys_close(fd);
+		fd = -1;
+		rep = GWP_SOCKS5_REP_FAILURE;
+		goto reply;
+	}
+
+	gcp->udp_fd = fd;
+	pr_info(&ctx->lh,
+		"SOCKS5 UDP ASSOCIATE relay bound (idx=%u, cfd=%d, ufd=%d)",
+		gcp->idx, gcp->client.fd, fd);
+
+reply:
+	out_len = gcp->target.cap - gcp->target.len;
+	r = gwp_socks5_conn_cmd_udp_associate_res(gcp->s5_conn,
+			(rep == GWP_SOCKS5_REP_SUCCESS) ? &bnd : NULL, rep,
+			gcp->target.buf + gcp->target.len, &out_len);
+	if (r < 0)
+		return r;
+	gcp->target.len += (uint32_t)out_len;
+
+	return (rep == GWP_SOCKS5_REP_SUCCESS) ? 0 : -ECONNREFUSED;
+}
+
 int gwp_handle_conn_state_socks5(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	int r, ct;
@@ -2082,6 +2187,21 @@ int gwp_handle_conn_state_socks5(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 		if (!r)
 			gcp->conn_state = CONN_STATE_SOCKS5_CONNECT;
+	} else if (gcp->s5_conn->state == GWP_SOCKS5_ST_CMD_UDP_ASSOCIATE) {
+		if (w->ctx->ev_used == GWP_EV_EPOLL) {
+			r = gwp_socks5_udp_associate_setup(w, gcp);
+			if (!r)
+				gcp->conn_state = CONN_STATE_SOCKS5_UDP_ASSOCIATE;
+		} else {
+			/* The io_uring relay is not implemented yet. */
+			size_t out_len = gcp->target.cap - gcp->target.len;
+
+			gwp_socks5_conn_cmd_udp_associate_res(gcp->s5_conn, NULL,
+				GWP_SOCKS5_REP_COMMAND_NOT_SUPPORTED,
+				gcp->target.buf + gcp->target.len, &out_len);
+			gcp->target.len += (uint32_t)out_len;
+			r = -ENOTSUP;
+		}
 	}
 
 	return r;
