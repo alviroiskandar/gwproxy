@@ -10,8 +10,8 @@ Features
   - Plain TCP-to-TCP forwarding to a fixed --target.
   - SOCKS5 proxy (RFC 1928):
       - CONNECT to IPv4, IPv6 and domain-name (ATYP) targets.
-      - UDP ASSOCIATE: relay UDP datagrams to IPv4/IPv6 targets (epoll
-        loop only for now).
+      - UDP ASSOCIATE: relay UDP datagrams to IPv4/IPv6 targets (on both
+        the epoll and io_uring loops).
       - Username/password authentication (RFC 1929), or no authentication.
   - HTTP proxy:
       - CONNECT tunneling.

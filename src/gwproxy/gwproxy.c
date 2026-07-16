@@ -745,6 +745,7 @@ static void gwp_ctx_free_thread_sock_pairs(struct gwp_wrk *w)
 			__sys_close(gcp->timer_fd);
 		if (gcp->udp_fd >= 0)
 			__sys_close(gcp->udp_fd);
+		free(gcp->udp_iou);	/* io_uring relay scratch, else NULL */
 
 		/*
 		 * s5_conn and http_conn share a union, so the protocol object
@@ -2188,20 +2189,14 @@ int gwp_handle_conn_state_socks5(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		if (!r)
 			gcp->conn_state = CONN_STATE_SOCKS5_CONNECT;
 	} else if (gcp->s5_conn->state == GWP_SOCKS5_ST_CMD_UDP_ASSOCIATE) {
-		if (w->ctx->ev_used == GWP_EV_EPOLL) {
-			r = gwp_socks5_udp_associate_setup(w, gcp);
-			if (!r)
-				gcp->conn_state = CONN_STATE_SOCKS5_UDP_ASSOCIATE;
-		} else {
-			/* The io_uring relay is not implemented yet. */
-			size_t out_len = gcp->target.cap - gcp->target.len;
-
-			gwp_socks5_conn_cmd_udp_associate_res(gcp->s5_conn, NULL,
-				GWP_SOCKS5_REP_COMMAND_NOT_SUPPORTED,
-				gcp->target.buf + gcp->target.len, &out_len);
-			gcp->target.len += (uint32_t)out_len;
-			r = -ENOTSUP;
-		}
+		/*
+		 * Bind the relay socket and queue the reply; both event loops
+		 * then arm their own relay (handle_udp_associate on epoll,
+		 * arm_udp_relay on io_uring).
+		 */
+		r = gwp_socks5_udp_associate_setup(w, gcp);
+		if (!r)
+			gcp->conn_state = CONN_STATE_SOCKS5_UDP_ASSOCIATE;
 	}
 
 	return r;

@@ -34,6 +34,7 @@
 struct gwp_ssl_ctx;
 struct gwp_ssl;
 struct gwp_iou_tls;
+struct gwp_iou_udp;
 
 struct gwp_cfg {
 	const char	*event_loop;
@@ -153,6 +154,15 @@ enum {
 	EV_BIT_IOU_TLS_HS_SEND		= (19ull << 48ull),
 	EV_BIT_IOU_UPSTREAM_S5		= (20ull << 48ull),
 	EV_BIT_IOU_ACCEPT_RETRY		= (21ull << 48ull),
+
+	/*
+	 * SOCKS5 UDP relay on io_uring. The recvmsg reuses the shared
+	 * EV_BIT_UDP_RELAY (22); the sendmsg and the fd-cancel need their own
+	 * selectors so the completion dispatch can tell them apart.
+	 */
+	EV_BIT_IOU_UDP_RX		= EV_BIT_UDP_RELAY,
+	EV_BIT_IOU_UDP_TX		= (23ull << 48ull),
+	EV_BIT_IOU_UDP_CANCEL		= (24ull << 48ull),
 #endif
 };
 
@@ -291,11 +301,14 @@ struct gwp_conn_pair {
 	 * its lifetime is tied to this (TCP control) connection. @udp_peer is
 	 * the client's UDP source address, pinned from its first datagram
 	 * (@udp_pinned); datagrams from other sources are treated as replies
-	 * from targets.
+	 * from targets. @udp_iou is the io_uring relay's per-connection async
+	 * scratch (msghdr + buffer), NULL on the epoll loop which relays
+	 * synchronously into the per-worker udp_buf.
 	 */
 	int			udp_fd;
 	bool			udp_pinned;
 	struct gwp_sockaddr	udp_peer;
+	struct gwp_iou_udp	*udp_iou;
 
 	uint32_t		idx;
 	union {
