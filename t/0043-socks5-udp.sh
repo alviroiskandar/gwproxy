@@ -49,6 +49,11 @@ hp="$(pick_port)"
 make_payload "$WORK/payload.bin" 100000
 start_httpd "$hp" "$WORK" "1.1"
 
+# A standalone SOCKS5 proxy used only as an upstream for the chaining-refusal
+# check below (kept alive for the whole test via _PIDS).
+up="$(pick_port)"
+gwp_start "127.0.0.1:$up" --as-socks5=1 --event-loop=epoll --nr-workers=2
+
 # Run the full relay matrix on one event loop.
 run_loop() {
 	local loop="$1" pp tp
@@ -102,6 +107,19 @@ run_loop() {
 	udp_client "$tp" "$ep" --delay 2.0 64 \
 		|| fail "$loop UDP association did not survive the timeout"
 	kill "$GWP_TP" 2>/dev/null
+
+	# (7) UDP ASSOCIATE is refused when an upstream proxy is configured:
+	#     chaining UDP is unsupported and a local relay would bypass the
+	#     upstream, so the proxy must reply with a non-zero REP.
+	fp="$(pick_port)"
+	gwp_start "127.0.0.1:$fp" --as-socks5=1 --event-loop="$loop" \
+		--upstream-proxy="socks5://127.0.0.1:$up"
+	if udp_client "$fp" "$ep" 64 >"$WORK/upstream.$loop.log" 2>&1; then
+		fail "$loop UDP ASSOCIATE accepted with an upstream configured"
+	fi
+	grep -qi refused "$WORK/upstream.$loop.log" \
+		|| fail "$loop UDP ASSOCIATE upstream rejection lacked its error"
+	kill "$GWP_PID" 2>/dev/null
 }
 
 run_loop epoll

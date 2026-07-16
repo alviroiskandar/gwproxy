@@ -2172,6 +2172,17 @@ int gwp_socks5_udp_associate_setup(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	size_t out_len;
 
 	/*
+	 * UDP ASSOCIATE is not chained through an upstream proxy: an HTTP
+	 * upstream cannot carry UDP at all, and SOCKS5 upstream UDP is not
+	 * implemented. Binding a local relay here would silently bypass the
+	 * configured chain, so refuse the command instead.
+	 */
+	if (ctx->upstream.enabled) {
+		rep = GWP_SOCKS5_REP_COMMAND_NOT_SUPPORTED;
+		goto reply;
+	}
+
+	/*
 	 * The relay is a dual-stack IPv6 socket bound to the wildcard address so
 	 * one socket can both receive from the client and reach IPv4 and IPv6
 	 * targets (a socket bound to a single-family local address cannot egress
