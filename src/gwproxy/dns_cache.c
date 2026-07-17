@@ -36,6 +36,7 @@ struct dns_hash_map {
 	struct dns_cache_entry	**table;
 	size_t			nr_buckets;
 	size_t			nr_entries;
+	size_t			max_entries;	/* 0 = unlimited */
 };
 
 struct gwp_dns_cache {
@@ -57,7 +58,8 @@ static uint64_t hash_key(const unsigned char *key)
 	return hash;
 }
 
-static int dns_map_init(struct dns_hash_map *map, size_t nr_buckets)
+static int dns_map_init(struct dns_hash_map *map, size_t nr_buckets,
+			size_t max_entries)
 {
 	map->table = calloc(nr_buckets, sizeof(*map->table));
 	if (!map->table)
@@ -65,6 +67,7 @@ static int dns_map_init(struct dns_hash_map *map, size_t nr_buckets)
 
 	map->nr_buckets = nr_buckets;
 	map->nr_entries = 0;
+	map->max_entries = max_entries;
 	return 0;
 }
 
@@ -215,6 +218,10 @@ static int dns_map_insert(struct dns_hash_map *map, const char *key,
 		/*
 		 * Case 1. Best case, no collision!
 		 */
+		if (map->max_entries && map->nr_entries >= map->max_entries) {
+			free(de);	/* fresh, unshared alloc (ref_cnt == 1) */
+			return -ENOSPC;
+		}
 		map->table[idx] = de;
 		de->next = NULL;
 		map->nr_entries++;
@@ -304,7 +311,16 @@ static int dns_map_insert(struct dns_hash_map *map, const char *key,
 	/*
 	 * Case 3. The worst case.
 	 * Collision with a different key or an expired entry.
+	 *
+	 * The collision walk above already reclaimed any expired entries in this
+	 * bucket, so the count reflects live + not-yet-swept entries. Bound the
+	 * cache: once at capacity, refuse new keys (resolution still works, it is
+	 * just not cached) rather than growing without limit.
 	 */
+	if (map->max_entries && map->nr_entries >= map->max_entries) {
+		free(de);	/* fresh, unshared alloc (ref_cnt == 1) */
+		return -ENOSPC;
+	}
 	map->nr_entries++;
 	de->next = NULL;
 	if (prev)
@@ -346,7 +362,8 @@ static int dns_map_lookup_and_get(struct dns_hash_map *map, const char *key,
 	return -ENOENT;
 }
 
-int gwp_dns_cache_init(struct gwp_dns_cache **cache_p, uint32_t nr_buckets)
+int gwp_dns_cache_init(struct gwp_dns_cache **cache_p, uint32_t nr_buckets,
+		       uint32_t max_entries)
 {
 	struct gwp_dns_cache *cache;
 	int r;
@@ -365,7 +382,7 @@ int gwp_dns_cache_init(struct gwp_dns_cache **cache_p, uint32_t nr_buckets)
 		goto out_free_cache;
 	}
 
-	r = dns_map_init(&cache->map, nr_buckets);
+	r = dns_map_init(&cache->map, nr_buckets, max_entries);
 	if (r)
 		goto out_destroy_lock;
 

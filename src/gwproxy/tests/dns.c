@@ -8,9 +8,14 @@
 #include <stdio.h>
 #include <assert.h>
 #include <gwproxy/dns.h>
+#include <gwproxy/dns_cache.h>
 #include <poll.h>
 #include <errno.h>
 #include <string.h>
+#include <time.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 #ifndef ARRAY_SIZE
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
@@ -136,10 +141,58 @@ static void test_dns_cache(void)
 	gwp_dns_ctx_free(ctx);
 }
 
+/*
+ * Exercise the cache layer directly (no network): the max-entries cap must
+ * refuse new keys once full while still allowing same-key replacement.
+ */
+static void test_dns_cache_cap(void)
+{
+	struct gwp_dns_cache *cache = NULL;
+	struct gwp_dns_cache_entry *e;
+	struct sockaddr_in sa;
+	struct addrinfo ai;
+	char key[32];
+	int r, i;
+
+	memset(&sa, 0, sizeof(sa));
+	sa.sin_family = AF_INET;
+	sa.sin_addr.s_addr = htonl(0x7f000001);	/* 127.0.0.1 */
+	memset(&ai, 0, sizeof(ai));
+	ai.ai_family = AF_INET;
+	ai.ai_addr = (struct sockaddr *)&sa;
+	ai.ai_addrlen = sizeof(sa);
+
+	r = gwp_dns_cache_init(&cache, 16, 4);	/* cap = 4 entries */
+	assert(!r && cache);
+
+	/* Fill to capacity: four distinct keys are accepted. */
+	for (i = 0; i < 4; i++) {
+		snprintf(key, sizeof(key), "host%d.example", i);
+		r = gwp_dns_cache_insert(cache, key, &ai, time(NULL) + 100);
+		assert(!r);
+	}
+
+	/* A fifth distinct key is refused and not cached. */
+	r = gwp_dns_cache_insert(cache, "host4.example", &ai, time(NULL) + 100);
+	assert(r == -ENOSPC);
+	r = gwp_dns_cache_getent(cache, "host4.example", &e);
+	assert(r == -ENOENT);
+
+	/* Existing keys remain; replacing one (same key) is allowed when full. */
+	r = gwp_dns_cache_getent(cache, "host0.example", &e);
+	assert(!r);
+	gwp_dns_cache_putent(e);
+	r = gwp_dns_cache_insert(cache, "host0.example", &ai, time(NULL) + 100);
+	assert(!r);
+
+	gwp_dns_cache_free(cache);
+}
+
 int main(void)
 {
 	test_basic_dns_multiple_requests();
 	test_dns_cache();
+	test_dns_cache_cap();
 	printf("All tests passed.\n");
 	return 0;
 }
