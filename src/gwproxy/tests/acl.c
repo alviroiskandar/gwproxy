@@ -13,6 +13,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <unistd.h>
+#include <fcntl.h>
 
 static struct gwp_sockaddr sa4(const char *ip, uint16_t port)
 {
@@ -316,11 +318,31 @@ static void test_parse_errors(void)
 		"garbage line\n",			    /* not -P/-A */
 	};
 	size_t i;
+	int saved, devnull;
+
+	/*
+	 * These cases are meant to fail parsing, and the parser logs each bad
+	 * line to stderr. Silence stderr for the loop so the expected
+	 * diagnostics do not look like test failures in "make test" output.
+	 */
+	fflush(stderr);
+	saved = dup(STDERR_FILENO);
+	devnull = open("/dev/null", O_WRONLY);
+	if (saved >= 0 && devnull >= 0)
+		dup2(devnull, STDERR_FILENO);
 
 	for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
 		a = (void *)0x1;
 		assert(gwp_acl_parse_str(&a, bad[i]) < 0);
 	}
+
+	fflush(stderr);
+	if (saved >= 0)
+		dup2(saved, STDERR_FILENO);
+	if (devnull >= 0)
+		close(devnull);
+	if (saved >= 0)
+		close(saved);
 }
 
 static void run_tests(void)
