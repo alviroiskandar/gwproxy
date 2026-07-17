@@ -194,6 +194,43 @@ print(s.recv(64).decode().strip())' "$bpp" 2>/dev/null)"
 		"$loop plain DNAT redirected to the wrong target"
 	kill "$GWP_PID" 2>/dev/null
 
+	# Upstream DNAT: the front rewrites the destination before handing it to
+	# the upstream proxy. A plain upstream SOCKS5 hop (no ACL) is the chain
+	# endpoint; the front carries the DNAT rule.
+	uup="$(pick_port)"
+	gwp_start "127.0.0.1:$uup" --as-socks5=1 --event-loop="$loop"
+	usp="$GWP_PID"		# gwp_start overwrites GWP_PID with the front below
+
+	# socks5:// front (front-resolved IP): a literal-IP request to a dead
+	# port is DNAT-redirected, and the rewritten IP reaches the upstream.
+	ufp="$(pick_port)"
+	gwp_start "127.0.0.1:$ufp" --as-socks5=1 --event-loop="$loop" \
+		--upstream-proxy="socks5://127.0.0.1:$uup" \
+		--acl-file="$WORK/dnat.acl"
+	curl -s --max-time 20 -x "socks5://127.0.0.1:$ufp" \
+		"http://127.0.0.1:8080/payload.bin" -o "$WORK/updnat.out" \
+		|| fail "$loop socks5:// upstream DNAT failed"
+	assert_files_equal "$WORK/payload.bin" "$WORK/updnat.out" \
+		"$loop socks5:// upstream DNAT redirected to the wrong target"
+	kill "$GWP_PID" 2>/dev/null
+
+	# socks5h:// front (upstream resolves): a hostname request is rewritten
+	# to the origin IP, so the (unresolvable) name never reaches DNS.
+	printf -- '%s\n' \
+		"-A OUTPUT -m domain --domain blocked.invalid -j DNAT --to 127.0.0.1:$hp" \
+		'-P OUTPUT ACCEPT' >"$WORK/updnath.acl"
+	ufp="$(pick_port)"
+	gwp_start "127.0.0.1:$ufp" --as-socks5=1 --event-loop="$loop" \
+		--upstream-proxy="socks5h://127.0.0.1:$uup" \
+		--acl-file="$WORK/updnath.acl"
+	curl -s --max-time 20 -x "socks5h://127.0.0.1:$ufp" \
+		"http://blocked.invalid:9999/payload.bin" -o "$WORK/updnath.out" \
+		|| fail "$loop socks5h:// upstream DNAT failed"
+	assert_files_equal "$WORK/payload.bin" "$WORK/updnath.out" \
+		"$loop socks5h:// upstream DNAT redirected to the wrong target"
+	kill "$GWP_PID" 2>/dev/null
+	kill "$usp" 2>/dev/null
+
 	# Hot reload survives an atomic replace (write-temp + rename-over, as
 	# editors and install(1) do): the watch is on the directory, so a
 	# renamed-in acl file is still picked up. A file/inode watch would go

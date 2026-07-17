@@ -189,8 +189,10 @@ is
 .RB ( OUTPUT "-only) with " \-\-to\-destination " " \fIaddr\fR [ :\fIport\fR ],
 which rewrites the destination (address and/or port, either optional) and, like
 iptables, is terminal \(em it accepts the connection and stops matching (DNAT
-applies to SOCKS5, HTTP, plain and transparent forwarding, but not the UDP relay
-or upstream\-proxied connections), or
+applies to SOCKS5, HTTP, plain and transparent forwarding and, when chaining, to
+the destination handed to an upstream proxy \(em including replacing a
+.B socks5h://
+hostname with the rewritten IP \(em but not the UDP relay), or
 .B MARK
 .RB ( OUTPUT "-only) with " \-\-set\-mark " " \fInum\fR "."
 .IP

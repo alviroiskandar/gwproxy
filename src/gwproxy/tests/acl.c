@@ -448,6 +448,28 @@ static void test_dnat(void)
 	assert(req.dnat_applied);
 	assert(inet_ntop(AF_INET, &req.dnat.i4.sin_addr, ip, sizeof(ip)));
 	assert(!strcmp(ip, "5.6.7.8"));
+
+	/*
+	 * A domain-only request (no resolved IP, as with a socks5h upstream) can
+	 * still be DNAT'd to an explicit address; the rewrite yields that IP even
+	 * with no base target. The caller then redirects the upstream to it.
+	 */
+	{
+		struct gwp_acl *a = NULL;
+		struct gwp_acl_req q;
+
+		assert(!gwp_acl_parse_str(&a,
+			"-A OUTPUT -m domain --domain blocked.invalid -j DNAT --to 10.1.2.3:8443\n"
+			"-P OUTPUT ACCEPT\n"));
+		memset(&q, 0, sizeof(q));
+		q.domain = "blocked.invalid";
+		q.proto = GWP_ACL_PROTO_TCP;
+		assert(gwp_acl_eval_output(a, &q) == GWP_ACL_ACCEPT);
+		assert(q.dnat_applied && q.dnat.i4.sin_family == AF_INET);
+		assert(inet_ntop(AF_INET, &q.dnat.i4.sin_addr, ip, sizeof(ip)));
+		assert(!strcmp(ip, "10.1.2.3") && ntohs(q.dnat.i4.sin_port) == 8443);
+		gwp_acl_destroy(a);
+	}
 }
 
 static void test_comments_and_default_policy(void)

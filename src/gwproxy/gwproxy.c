@@ -1118,19 +1118,24 @@ static uint16_t sa_port_h(const struct gwp_sockaddr *s)
 						: s->i6.sin6_port);
 }
 
+static int upstream_dst_from_sockaddr(const struct gwp_sockaddr *sa,
+				      struct gwp_socks5_addr *out);
+
 /*
  * Evaluate the ACL OUTPUT chain for a connection to @target from @client (with
- * an optional requested @domain). Returns the verdict; allows (with no eval)
- * when there is no ACL, or nothing to match on. When @do_dnat is set and a
- * matching -j DNAT rule fired, the rewritten destination is written back to
- * *@target -- but only for a direct connection (not an upstream one, where the
- * target is handed to the upstream rather than connected here).
+ * an optional requested @domain / @user). Returns the verdict; allows (with no
+ * eval) when there is no ACL, or nothing to match on. When @do_dnat is set and a
+ * matching -j DNAT rule produced a concrete address, the rewritten destination
+ * is written back to *@target (for the direct connection and, via the caller,
+ * the upstream) and *@dnat_out (when non-NULL) is set true. Composable -j MARK /
+ * -j BIND modifiers are surfaced in *@so_out.
  */
 static enum gwp_acl_verdict acl_out(struct gwp_ctx *ctx,
 				    const struct gwp_sockaddr *client,
 				    struct gwp_sockaddr *target,
 				    const char *domain, const char *user,
 				    struct gwp_conn_sockopt *so_out,
+				    bool *dnat_out,
 				    enum gwp_acl_proto proto, bool do_dnat)
 {
 	int fam = target ? target->sa.sa_family : 0;
@@ -1140,6 +1145,8 @@ static enum gwp_acl_verdict acl_out(struct gwp_ctx *ctx,
 
 	if (so_out)
 		memset(so_out, 0, sizeof(*so_out));
+	if (dnat_out)
+		*dnat_out = false;
 
 	if (!ctx->acl)
 		return GWP_ACL_ACCEPT;
@@ -1160,10 +1167,22 @@ static enum gwp_acl_verdict acl_out(struct gwp_ctx *ctx,
 	if (v != GWP_ACL_ACCEPT)
 		return v;
 
-	if (do_dnat && req.dnat_applied && have_ip && !ctx->upstream.enabled) {
-		pr_info(&ctx->lh, "ACL DNAT %s -> %s",
-			ip_to_str(target), ip_to_str(&req.dnat));
+	/*
+	 * Apply a matched DNAT when it produced a concrete address, rewriting
+	 * the destination for both the direct path (*target) and, via the
+	 * caller, the upstream destination. A port-only DNAT with no base IP
+	 * (e.g. a socks5h domain request) yields no address and is skipped.
+	 */
+	if (do_dnat && req.dnat_applied && req.dnat.sa.sa_family) {
+		if (have_ip)
+			pr_info(&ctx->lh, "ACL DNAT %s -> %s",
+				ip_to_str(target), ip_to_str(&req.dnat));
+		else
+			pr_info(&ctx->lh, "ACL DNAT %s -> %s",
+				domain ? domain : "?", ip_to_str(&req.dnat));
 		*target = req.dnat;
+		if (dnat_out)
+			*dnat_out = true;
 	}
 	/* Surface composable -j MARK / -j BIND to the socket-creation path. */
 	if (so_out && req.mark_set) {
@@ -1183,8 +1202,8 @@ bool gwp_ctx_acl_output_allowed(struct gwp_ctx *ctx,
 {
 	struct gwp_sockaddr tmp = *target;
 
-	return acl_out(ctx, client, &tmp, NULL, NULL, NULL, proto, false) ==
-	       GWP_ACL_ACCEPT;
+	return acl_out(ctx, client, &tmp, NULL, NULL, NULL, NULL, proto,
+		       false) == GWP_ACL_ACCEPT;
 }
 
 /* Verdict + DNAT rewrite of *@target, for the accept-time plain/transparent
@@ -1195,8 +1214,8 @@ bool gwp_ctx_acl_output_dnat(struct gwp_ctx *ctx,
 			     struct gwp_conn_sockopt *so,
 			     enum gwp_acl_proto proto)
 {
-	return acl_out(ctx, client, target, NULL, NULL, so, proto, true) ==
-	       GWP_ACL_ACCEPT;
+	return acl_out(ctx, client, target, NULL, NULL, so, NULL, proto,
+		       true) == GWP_ACL_ACCEPT;
 }
 
 /* The authenticated username for an ACL "-m user" match, or NULL when the
@@ -1212,9 +1231,27 @@ static const char *gcp_req_user(const struct gwp_conn_pair *gcp)
 
 bool gwp_ctx_acl_target_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp)
 {
-	return acl_out(ctx, &gcp->client_addr, &gcp->target_addr, gcp->req_domain,
-		       gcp_req_user(gcp), &gcp->acl_sockopt, GWP_ACL_PROTO_TCP,
-		       true) == GWP_ACL_ACCEPT;
+	bool dnat = false;
+	enum gwp_acl_verdict v;
+
+	v = acl_out(ctx, &gcp->client_addr, &gcp->target_addr, gcp->req_domain,
+		    gcp_req_user(gcp), &gcp->acl_sockopt, &dnat,
+		    GWP_ACL_PROTO_TCP, true);
+	if (v != GWP_ACL_ACCEPT)
+		return false;
+
+	/*
+	 * When chaining to an upstream by remote DNS (socks5h), up_dst carries
+	 * the requested hostname. A DNAT has rewritten target_addr to a concrete
+	 * IP, so push that into up_dst too, making the upstream connect to the
+	 * DNAT target instead of resolving the original name. For socks5:// the
+	 * up_dst is still unset here (ver == 0) and is finalised from the
+	 * (already rewritten) target_addr after the upstream connects.
+	 */
+	if (dnat && ctx->upstream.enabled && gcp->up_dst.ver != 0)
+		upstream_dst_from_sockaddr(&gcp->target_addr, &gcp->up_dst);
+
+	return true;
 }
 
 /*
