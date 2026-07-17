@@ -73,6 +73,9 @@ void gwp_acl_destroy(struct gwp_acl *acl);
  *
  * Outputs (set by gwp_acl_eval_output()):
  *   @dnat_applied  true if a -j DNAT rule matched; @dnat then holds the rewrite.
+ *   @mark_set/@mark  true and the fwmark from the last matched -j MARK rule.
+ *                    MARK is a composable modifier: it records state and eval
+ *                    keeps matching (only ACCEPT/REJECT/DNAT terminate).
  */
 struct gwp_acl_req {
 	const struct gwp_sockaddr	*client;
@@ -85,6 +88,8 @@ struct gwp_acl_req {
 
 	bool				dnat_applied;
 	struct gwp_sockaddr		dnat;
+	bool				mark_set;
+	uint32_t			mark;
 };
 
 /*

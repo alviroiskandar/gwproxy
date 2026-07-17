@@ -1130,12 +1130,16 @@ static enum gwp_acl_verdict acl_out(struct gwp_ctx *ctx,
 				    const struct gwp_sockaddr *client,
 				    struct gwp_sockaddr *target,
 				    const char *domain, const char *user,
+				    struct gwp_conn_sockopt *so_out,
 				    enum gwp_acl_proto proto, bool do_dnat)
 {
 	int fam = target ? target->sa.sa_family : 0;
 	bool have_ip = (fam == AF_INET || fam == AF_INET6);
 	enum gwp_acl_verdict v;
 	struct gwp_acl_req req;
+
+	if (so_out)
+		memset(so_out, 0, sizeof(*so_out));
 
 	if (!ctx->acl)
 		return GWP_ACL_ACCEPT;
@@ -1153,11 +1157,18 @@ static enum gwp_acl_verdict acl_out(struct gwp_ctx *ctx,
 	req.sport = client ? sa_port_h(client) : 0;
 
 	v = gwp_acl_eval_output(ctx->acl, &req);
-	if (v == GWP_ACL_ACCEPT && do_dnat && req.dnat_applied && have_ip &&
-	    !ctx->upstream.enabled) {
+	if (v != GWP_ACL_ACCEPT)
+		return v;
+
+	if (do_dnat && req.dnat_applied && have_ip && !ctx->upstream.enabled) {
 		pr_info(&ctx->lh, "ACL DNAT %s -> %s",
 			ip_to_str(target), ip_to_str(&req.dnat));
 		*target = req.dnat;
+	}
+	/* Surface composable -j MARK to the socket-creation path. */
+	if (so_out && req.mark_set) {
+		so_out->mark_set = true;
+		so_out->mark = req.mark;
 	}
 	return v;
 }
@@ -1170,7 +1181,7 @@ bool gwp_ctx_acl_output_allowed(struct gwp_ctx *ctx,
 {
 	struct gwp_sockaddr tmp = *target;
 
-	return acl_out(ctx, client, &tmp, NULL, NULL, proto, false) ==
+	return acl_out(ctx, client, &tmp, NULL, NULL, NULL, proto, false) ==
 	       GWP_ACL_ACCEPT;
 }
 
@@ -1179,9 +1190,10 @@ bool gwp_ctx_acl_output_allowed(struct gwp_ctx *ctx,
 bool gwp_ctx_acl_output_dnat(struct gwp_ctx *ctx,
 			     const struct gwp_sockaddr *client,
 			     struct gwp_sockaddr *target,
+			     struct gwp_conn_sockopt *so,
 			     enum gwp_acl_proto proto)
 {
-	return acl_out(ctx, client, target, NULL, NULL, proto, true) ==
+	return acl_out(ctx, client, target, NULL, NULL, so, proto, true) ==
 	       GWP_ACL_ACCEPT;
 }
 
@@ -1199,8 +1211,8 @@ static const char *gcp_req_user(const struct gwp_conn_pair *gcp)
 bool gwp_ctx_acl_target_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp)
 {
 	return acl_out(ctx, &gcp->client_addr, &gcp->target_addr, gcp->req_domain,
-		       gcp_req_user(gcp), GWP_ACL_PROTO_TCP, true) ==
-	       GWP_ACL_ACCEPT;
+		       gcp_req_user(gcp), &gcp->acl_sockopt, GWP_ACL_PROTO_TCP,
+		       true) == GWP_ACL_ACCEPT;
 }
 
 /*
@@ -1890,6 +1902,7 @@ void gwp_setup_cli_sock_options(struct gwp_wrk *w, int fd)
 
 __hot
 int gwp_create_sock_target(struct gwp_wrk *w, struct gwp_sockaddr *addr,
+			   const struct gwp_conn_sockopt *so,
 			   bool *is_target_alive, bool non_block)
 {
 	int t = SOCK_STREAM | SOCK_CLOEXEC | (non_block ? SOCK_NONBLOCK : 0);
@@ -1902,8 +1915,13 @@ int gwp_create_sock_target(struct gwp_wrk *w, struct gwp_sockaddr *addr,
 
 	gwp_setup_cli_sock_options(w, fd);
 
-	/* Mark the outgoing connection for policy routing / iptables matching. */
-	if (w->ctx->cfg.mark)
+	/*
+	 * Mark the outgoing connection for policy routing / iptables matching.
+	 * A per-connection -j MARK from the ACL overrides the global --mark.
+	 */
+	if (so && so->mark_set)
+		setskopt_int(fd, SOL_SOCKET, SO_MARK, (int)so->mark);
+	else if (w->ctx->cfg.mark)
 		setskopt_int(fd, SOL_SOCKET, SO_MARK, w->ctx->cfg.mark);
 
 	/*

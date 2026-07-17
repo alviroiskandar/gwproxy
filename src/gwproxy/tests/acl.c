@@ -279,6 +279,48 @@ static void test_user(void)
 #endif
 }
 
+static void test_mark(void)
+{
+	struct gwp_sockaddr t = sa4("1.2.3.4", 80);
+	struct gwp_acl *a = NULL;
+	struct gwp_acl_req req;
+
+	/* MARK is a composable modifier: it records the fwmark (hex accepted)
+	 * and eval keeps matching to reach a terminal rule / the policy. */
+	assert(!gwp_acl_parse_str(&a,
+		"-A OUTPUT -d 1.2.3.4 -j MARK --set-mark 0x64\n"
+		"-P OUTPUT ACCEPT\n"));
+	memset(&req, 0, sizeof(req));
+	req.target = &t; req.dport = 80; req.proto = GWP_ACL_PROTO_TCP;
+	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_ACCEPT);
+	assert(req.mark_set && req.mark == 100);
+	gwp_acl_destroy(a);
+
+	/* A non-matching MARK rule leaves the request unmarked. */
+	a = NULL;
+	assert(!gwp_acl_parse_str(&a,
+		"-A OUTPUT -d 9.9.9.9 -j MARK --set-mark 7\n"
+		"-P OUTPUT ACCEPT\n"));
+	memset(&req, 0, sizeof(req));
+	req.target = &t; req.dport = 80; req.proto = GWP_ACL_PROTO_TCP;
+	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_ACCEPT);
+	assert(!req.mark_set);
+	gwp_acl_destroy(a);
+
+	/* Last MARK wins; a later terminal REJECT still decides the verdict. */
+	a = NULL;
+	assert(!gwp_acl_parse_str(&a,
+		"-A OUTPUT -d 1.2.3.4 -j MARK --set-mark 1\n"
+		"-A OUTPUT -d 1.2.3.4 -j MARK --set-mark 2\n"
+		"-A OUTPUT -d 1.2.3.4 -j REJECT\n"
+		"-P OUTPUT ACCEPT\n"));
+	memset(&req, 0, sizeof(req));
+	req.target = &t; req.dport = 80; req.proto = GWP_ACL_PROTO_TCP;
+	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_REJECT);
+	assert(req.mark_set && req.mark == 2);
+	gwp_acl_destroy(a);
+}
+
 /* Evaluate one OUTPUT DNAT rule against target @ip:@port; return the req. */
 static struct gwp_acl_req dnat_eval(const char *rule, const char *ip,
 				    uint16_t port, bool v6)
@@ -390,6 +432,11 @@ static void test_parse_errors(void)
 		"-A OUTPUT -j DNAT\n",			    /* DNAT w/o --to */
 		"-A OUTPUT -d 1.2.3.4 -j DNAT --to :\n",	    /* empty port */
 		"-A OUTPUT -d 1.2.3.4 -j ACCEPT --to :80\n",	    /* --to w/o DNAT */
+		"-A OUTPUT -j MARK\n",				    /* MARK w/o --set-mark */
+		"-A OUTPUT -j ACCEPT --set-mark 5\n",		    /* --set-mark w/o MARK */
+		"-A INPUT -j MARK --set-mark 5\n",		    /* MARK in INPUT */
+		"-A OUTPUT -j MARK --set-mark nope\n",		    /* bad mark value */
+		"-A OUTPUT -j MARK --set-mark 5 --set-mark 6\n",    /* dup --set-mark */
 		"-A INPUT -s 1.2.3.4 -j DNAT --to-destination 5.6.7.8\n", /* DNAT in INPUT */
 		"-A OUTPUT -d 999.0.0.1 -j REJECT\n",	    /* bad CIDR */
 		"-A OUTPUT -d 1.2.3.4/33 -j REJECT\n",	    /* bad prefix */
@@ -474,6 +521,7 @@ static void run_tests(void)
 		test_domain();
 		test_domain_regexp();
 		test_user();
+		test_mark();
 		test_dnat();
 		test_comments_and_default_policy();
 	}

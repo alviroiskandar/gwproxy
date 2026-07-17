@@ -185,12 +185,31 @@ for a PCRE match),
 range, or a comma list;
 .B \-\-dports
 is
-.BR OUTPUT "-only). The target is " ACCEPT ", " REJECT ", or " DNAT
+.BR OUTPUT "-only). The target is " ACCEPT ", " REJECT ", " DNAT
 .RB ( OUTPUT "-only) with " \-\-to\-destination " " \fIaddr\fR [ :\fIport\fR ],
 which rewrites the destination (address and/or port, either optional) and, like
-iptables, is terminal \(em it accepts the connection and stops matching. DNAT
-applies to SOCKS5, HTTP, plain and transparent forwarding, but not to the
-UDP relay or upstream\-proxied connections.
+iptables, is terminal \(em it accepts the connection and stops matching (DNAT
+applies to SOCKS5, HTTP, plain and transparent forwarding, but not the UDP relay
+or upstream\-proxied connections), or
+.B MARK
+.RB ( OUTPUT "-only) with " \-\-set\-mark " " \fInum\fR "."
+.IP
+.B \-j MARK
+sets the fwmark
+.RB ( SO_MARK )
+on the outgoing target socket, overriding the global
+.BR \-\-mark ,
+for policy routing / iptables matching. Unlike iptables it is a
+.I composable modifier
+here, not a terminal action: it records the mark and eval keeps matching, so a
+connection can accumulate a mark and still fall through to a terminal
+.BR ACCEPT / REJECT / DNAT
+or the chain policy. The last matching
+.B \-j MARK
+wins. It needs
+.BR CAP_NET_ADMIN ,
+and applies to TCP target connections (SOCKS5, HTTP, plain and transparent), not
+the UDP relay.
 .RE
 .IP
 Addresses match IPv4 and its IPv4\-mapped IPv6 form equally. A rejected target

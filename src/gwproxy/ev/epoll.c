@@ -402,7 +402,8 @@ static int handle_new_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		if (ctx->upstream.enabled)
 			ca = &ctx->upstream.addr;
 
-		target_fd = gwp_create_sock_target(w, ca, p, true);
+		target_fd = gwp_create_sock_target(w, ca, &gcp->acl_sockopt, p,
+						   true);
 		if (target_fd < 0) {
 			pr_err(&ctx->lh, "Failed to create target socket: %s",
 				strerror(-target_fd));
@@ -1567,9 +1568,11 @@ static int handle_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	p = &gcp->is_target_alive;
 	if (w->ctx->upstream.enabled) {
 		/* Connect to the upstream proxy, not the real destination. */
-		tfd = gwp_create_sock_target(w, &w->ctx->upstream.addr, p, true);
+		tfd = gwp_create_sock_target(w, &w->ctx->upstream.addr,
+					     &gcp->acl_sockopt, p, true);
 	} else {
-		tfd = gwp_create_sock_target(w, &gcp->target_addr, p, true);
+		tfd = gwp_create_sock_target(w, &gcp->target_addr,
+					     &gcp->acl_sockopt, p, true);
 	}
 	if (unlikely(tfd < 0)) {
 		pr_err(&w->ctx->lh, "Failed to create target socket: %s", strerror(-tfd));

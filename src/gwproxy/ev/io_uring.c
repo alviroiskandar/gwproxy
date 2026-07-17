@@ -878,6 +878,9 @@ static int __handle_ev_accept(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 	/* The plain/transparent forwarding target, possibly DNAT-rewritten. For
 	 * SOCKS5/HTTP it stays the --target placeholder set during the handshake. */
 	struct gwp_sockaddr fwd_target = ctx->target_addr;
+	/* Per-conn ACL socket options (-j MARK/BIND) for the plain/transparent
+	 * path; copied onto the gcp once it exists. */
+	struct gwp_conn_sockopt fwd_so;
 
 	if (unlikely(fd < 0)) {
 		if (fd == -EAGAIN || fd == -EINTR)
@@ -918,7 +921,8 @@ static int __handle_ev_accept(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 		 */
 		fwd_target = transparent ? tdst : ctx->target_addr;
 		if (!gwp_ctx_acl_output_dnat(ctx, &w->iou->accept_addr,
-					     &fwd_target, GWP_ACL_PROTO_TCP)) {
+					     &fwd_target, &fwd_so,
+					     GWP_ACL_PROTO_TCP)) {
 			pr_info(&ctx->lh, "ACL denied target %s for client %s",
 				ip_to_str(&fwd_target),
 				ip_to_str(&w->iou->accept_addr));
@@ -929,7 +933,7 @@ static int __handle_ev_accept(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 		/* Connect to the upstream proxy or the (rewritten) target. */
 		ca = ctx->upstream.enabled ? &ctx->upstream.addr : &fwd_target;
 
-		tg_fd = gwp_create_sock_target(w, ca, NULL, false);
+		tg_fd = gwp_create_sock_target(w, ca, &fwd_so, NULL, false);
 		if (unlikely(tg_fd < 0)) {
 			pr_err(&ctx->lh, "Create target socket: %s", strerror(-tg_fd));
 			goto out_close;
@@ -1656,7 +1660,7 @@ static int handle_prot_connect_target(struct gwp_wrk *w,
 	if (ctx->upstream.enabled)
 		ca = &ctx->upstream.addr;
 
-	r = gwp_create_sock_target(w, ca, NULL, false);
+	r = gwp_create_sock_target(w, ca, &gcp->acl_sockopt, NULL, false);
 	if (r < 0) {
 		pr_err(&w->ctx->lh, "Create target socket: %s", strerror(-r));
 		return r;

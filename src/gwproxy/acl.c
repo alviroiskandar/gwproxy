@@ -23,6 +23,11 @@ enum gwp_acl_action {
 	GWP_ACL_ACT_ACCEPT	= 0,
 	GWP_ACL_ACT_REJECT	= 1,
 	GWP_ACL_ACT_DNAT	= 2,
+	/*
+	 * Composable modifiers: they record connection state (fwmark) and eval
+	 * keeps matching. Only ACCEPT/REJECT/DNAT terminate.
+	 */
+	GWP_ACL_ACT_MARK	= 3,
 };
 
 enum gwp_acl_chain {
@@ -79,6 +84,7 @@ struct gwp_acl_rule {
 	struct gwp_acl_ports	sports, dports;
 	struct gwp_acl_cidr	src, dst;
 	struct gwp_acl_dnat	dnat;		/* -j DNAT --to-destination */
+	uint32_t		setmark;	/* -j MARK --set-mark */
 
 	bool			has_src : 1, has_dst : 1, has_domain : 1,
 				has_proto : 1, has_sports : 1, has_dports : 1;
@@ -87,6 +93,7 @@ struct gwp_acl_rule {
 	bool			has_user : 1, neg_user : 1;
 	bool			domain_is_re : 1;	/* --domain-regexp */
 	bool			user_is_re : 1;		/* --user-regexp */
+	bool			has_setmark : 1;	/* -j MARK --set-mark seen */
 	uint8_t			proto : 1;	/* enum gwp_acl_proto */
 	uint8_t			action : 2;	/* enum gwp_acl_action */
 };
@@ -474,6 +481,22 @@ static bool eq(const char *a, const char *b1, const char *b2)
 	return !strcmp(a, b1) || (b2 && !strcmp(a, b2));
 }
 
+/* Parse a 32-bit unsigned value (decimal, or 0x hex) into @out; -1 on error. */
+static int parse_u32(const char *s, uint32_t *out)
+{
+	unsigned long v;
+	char *end;
+
+	if (!*s)
+		return -1;
+	errno = 0;
+	v = strtoul(s, &end, 0);
+	if (errno || *end || v > 0xffffffffUL)
+		return -1;
+	*out = (uint32_t)v;
+	return 0;
+}
+
 /* Tokenise @line in place on whitespace into @tok; returns token count or -1. */
 static int tokenise(char *line, char **tok)
 {
@@ -674,6 +697,10 @@ static int parse_rule(struct gwp_acl_ruleset *rs, char **tok, int n)
 				r->action = GWP_ACL_ACT_REJECT;
 			} else if (!strcmp(v, "DNAT")) {
 				r->action = GWP_ACL_ACT_DNAT;
+			} else if (!strcmp(v, "MARK")) {
+				if (chain != GWP_ACL_OUTPUT)  /* egress sockets */
+					goto out;
+				r->action = GWP_ACL_ACT_MARK;
 			} else {
 				goto out;
 			}
@@ -682,6 +709,11 @@ static int parse_rule(struct gwp_acl_ruleset *rs, char **tok, int n)
 			v = next_val(tok, n, &i);
 			if (neg || !v || parse_dnat(v, &r->dnat))
 				goto out;
+		} else if (!strcmp(o, "--set-mark")) {
+			v = next_val(tok, n, &i);
+			if (neg || !v || r->has_setmark || parse_u32(v, &r->setmark))
+				goto out;
+			r->has_setmark = true;
 		} else {
 			goto out;		/* unknown option */
 		}
@@ -700,6 +732,13 @@ static int parse_rule(struct gwp_acl_ruleset *rs, char **tok, int n)
 			if (!have_to)			/* DNAT needs --to */
 				goto out;
 		} else if (have_to) {			/* --to only with DNAT */
+			goto out;
+		}
+
+		if (r->action == GWP_ACL_ACT_MARK) {
+			if (!r->has_setmark)		/* MARK needs --set-mark */
+				goto out;
+		} else if (r->has_setmark) {		/* --set-mark only with MARK */
 			goto out;
 		}
 	}
@@ -1022,7 +1061,10 @@ static void apply_dnat(struct gwp_acl_req *req, const struct gwp_acl_dnat *d)
 	req->dnat_applied = true;
 }
 
-/* Walk @head, returning the first terminal verdict; DNAT rewrites @req->dnat. */
+/*
+ * Walk @head, returning the first terminal verdict. DNAT rewrites @req->dnat;
+ * MARK is a composable modifier that records @req->mark and keeps matching.
+ */
 static enum gwp_acl_verdict eval_chain(const struct gwp_acl_rule *head,
 				       enum gwp_acl_verdict policy,
 				       struct gwp_acl_req *req)
@@ -1033,7 +1075,17 @@ static enum gwp_acl_verdict eval_chain(const struct gwp_acl_rule *head,
 		if (!rule_matches(r, req))
 			continue;
 
-		if (r->action == GWP_ACL_ACT_DNAT) {
+		switch (r->action) {
+		case GWP_ACL_ACT_MARK:
+			/*
+			 * Modifier: record the fwmark and keep matching. A later
+			 * MARK overrides it; a terminal rule (or the policy) then
+			 * decides the verdict.
+			 */
+			req->mark = r->setmark;
+			req->mark_set = true;
+			continue;
+		case GWP_ACL_ACT_DNAT:
 			/*
 			 * DNAT is terminal (like iptables' nat table): record
 			 * the rewrite and accept, so later rules cannot re-match
@@ -1041,9 +1093,11 @@ static enum gwp_acl_verdict eval_chain(const struct gwp_acl_rule *head,
 			 */
 			apply_dnat(req, &r->dnat);
 			return GWP_ACL_ACCEPT;
+		case GWP_ACL_ACT_REJECT:
+			return GWP_ACL_REJECT;
+		default: /* GWP_ACL_ACT_ACCEPT */
+			return GWP_ACL_ACCEPT;
 		}
-		return (r->action == GWP_ACL_ACT_ACCEPT) ?
-		       GWP_ACL_ACCEPT : GWP_ACL_REJECT;
 	}
 	return policy;
 }
@@ -1054,6 +1108,7 @@ enum gwp_acl_verdict gwp_acl_eval_output(struct gwp_acl *acl,
 	enum gwp_acl_verdict verdict;
 
 	req->dnat_applied = false;
+	req->mark_set = false;
 	if (!acl)
 		return GWP_ACL_ACCEPT;
 

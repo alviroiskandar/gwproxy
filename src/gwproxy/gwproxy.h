@@ -281,6 +281,17 @@ enum {
 
 struct gwp_dns_packet;
 
+/*
+ * Per-connection socket options that the ACL OUTPUT chain can impose on the
+ * outgoing target socket (composable -j MARK / -j BIND modifiers). Built from
+ * the ACL result and applied in gwp_create_sock_target() before connect(). A
+ * NULL pointer (or all-unset fields) means "use the global defaults".
+ */
+struct gwp_conn_sockopt {
+	bool			mark_set;	/* -j MARK: use @mark, not cfg.mark */
+	uint32_t		mark;		/* SO_MARK value */
+};
+
 struct gwp_conn_pair {
 	struct gwp_conn		target;
 	struct gwp_conn		client;
@@ -339,6 +350,13 @@ struct gwp_conn_pair {
 	 * life; NULL for literal-IP requests.
 	 */
 	const char		*req_domain;
+
+	/*
+	 * Per-connection socket options from the ACL OUTPUT chain (-j MARK /
+	 * -j BIND), filled by gwp_ctx_acl_target_allowed() and applied when the
+	 * target socket is created.
+	 */
+	struct gwp_conn_sockopt	acl_sockopt;
 
 	/*
 	 * Destination requested from the upstream SOCKS5 proxy. Only used
@@ -454,6 +472,7 @@ struct gwp_ctx {
 struct gwp_conn_pair *gwp_alloc_conn_pair(struct gwp_wrk *w);
 int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 int gwp_create_sock_target(struct gwp_wrk *w, struct gwp_sockaddr *addr,
+			   const struct gwp_conn_sockopt *so,
 			   bool *is_target_alive, bool non_block);
 int gwp_create_timer(int fd, int sec, int nsec);
 void gwp_setup_cli_sock_options(struct gwp_wrk *w, int fd);
@@ -496,10 +515,13 @@ bool gwp_ctx_acl_output_allowed(struct gwp_ctx *ctx,
 				const struct gwp_sockaddr *target,
 				enum gwp_acl_proto proto);
 
-/* As gwp_ctx_acl_output_allowed(), but a matching -j DNAT rewrites *@target. */
+/* As gwp_ctx_acl_output_allowed(), but a matching -j DNAT rewrites *@target and
+ * any -j MARK/-j BIND modifiers are written to *@so (ignored when @so is NULL).
+ * For the accept-time plain/transparent path, which has no gwp_conn_pair. */
 bool gwp_ctx_acl_output_dnat(struct gwp_ctx *ctx,
 			     const struct gwp_sockaddr *client,
 			     struct gwp_sockaddr *target,
+			     struct gwp_conn_sockopt *so,
 			     enum gwp_acl_proto proto);
 
 /* Convenience wrapper: ACL OUTPUT check for a TCP target (gcp->target_addr). */
