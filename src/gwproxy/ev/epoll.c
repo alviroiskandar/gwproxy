@@ -526,6 +526,13 @@ static int __handle_ev_accept(struct gwp_wrk *w)
 	pr_dbg(&ctx->lh, "New connection from %s (fd=%d)",
 		ip_to_str(&gcp->client_addr), fd);
 
+	if (!gwp_ctx_acl_client_allowed(ctx, &gcp->client_addr)) {
+		pr_info(&ctx->lh, "ACL denied client %s",
+			ip_to_str(&gcp->client_addr));
+		free_conn_pair(w, gcp);
+		return 0;
+	}
+
 	if (cfg->as_transparent) {
 		r = gwp_get_orig_dst(fd, &gcp->client_addr, &gcp->target_addr);
 		if (r) {

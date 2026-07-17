@@ -1071,6 +1071,27 @@ bool gwp_ctx_acl_target_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp)
 	return gwp_acl_eval_output(ctx->acl, &req) == GWP_ACL_ACCEPT;
 }
 
+/*
+ * Evaluate the ACL INPUT chain for an incoming client. Returns true when the
+ * client is allowed (always so when no ACL is loaded). Evaluated at accept
+ * time, where the connection is the client's TCP control/proxy connection.
+ */
+bool gwp_ctx_acl_client_allowed(struct gwp_ctx *ctx,
+				const struct gwp_sockaddr *client)
+{
+	struct gwp_acl_req req;
+
+	if (!ctx->acl)
+		return true;
+
+	memset(&req, 0, sizeof(req));
+	req.client = client;
+	req.proto = GWP_ACL_PROTO_TCP;
+	req.sport = ntohs(client->sa.sa_family == AF_INET ? client->i4.sin_port
+							  : client->i6.sin6_port);
+	return gwp_acl_eval_input(ctx->acl, &req) == GWP_ACL_ACCEPT;
+}
+
 static int gwp_ctx_init_socks5(struct gwp_ctx *ctx)
 {
 	struct gwp_socks5_cfg s5cfg;

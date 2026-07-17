@@ -30,6 +30,11 @@ printf -- '%s\n' \
 	'-A OUTPUT --dports 9 -j REJECT' \
 	'-P OUTPUT ACCEPT' >"$WORK/ok.acl"
 
+# INPUT chain that rejects loopback clients (the test client is 127.0.0.1).
+printf -- '%s\n' \
+	'-A INPUT -s 127.0.0.1/32 -j REJECT' \
+	'-P INPUT ACCEPT' >"$WORK/deny-client.acl"
+
 # Read the SOCKS5 CONNECT reply code for a TCP target, via the given proxy.
 socks5_connect_rep() {			# $1=proxy_port $2=dst_ip $3=dst_port
 	python3 - "$@" <<-'PY'
@@ -69,6 +74,17 @@ for loop in epoll io_uring; do
 	[ "$code" = 403 ] \
 		|| fail "$loop HTTP forward to a denied target got $code (want 403)"
 
+	kill "$GWP_PID" 2>/dev/null
+
+	# INPUT chain: a denied client source is dropped at accept, before any
+	# handshake, so the connection fails outright.
+	ip="$(pick_port)"
+	gwp_start "127.0.0.1:$ip" --as-socks5=1 --event-loop="$loop" \
+		--acl-file="$WORK/deny-client.acl"
+	if curl -s --max-time 10 -x "socks5h://127.0.0.1:$ip" \
+		"http://127.0.0.1:$hp/payload.bin" -o /dev/null 2>/dev/null; then
+		fail "$loop INPUT-denied client was served"
+	fi
 	kill "$GWP_PID" 2>/dev/null
 done
 

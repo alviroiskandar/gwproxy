@@ -483,6 +483,11 @@ bool gwp_sockaddr_ip_eq(const struct gwp_sockaddr *a,
 /* True if the ACL permits a TCP connection to gcp->target_addr (allow-all when
  * no ACL is loaded or the target has no resolved IP). */
 bool gwp_ctx_acl_target_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp);
+
+/* True if the ACL INPUT chain permits an incoming client (allow-all with no
+ * ACL). Evaluated at accept time. */
+bool gwp_ctx_acl_client_allowed(struct gwp_ctx *ctx,
+				const struct gwp_sockaddr *client);
 int gwp_get_orig_dst(int fd, const struct gwp_sockaddr *client,
 		     struct gwp_sockaddr *dst);
 const char *ip_to_str(const struct gwp_sockaddr *gs);
