@@ -226,12 +226,52 @@ static void test_dns_cache_case(void)
 	gwp_dns_cache_free(cache);
 }
 
+/*
+ * An already-expired entry is not returned, and a reference obtained before a
+ * same-key replace stays valid until released (the documented guarantee; run
+ * under ASan this also checks there is no use-after-free).
+ */
+static void test_dns_cache_expiry_refcount(void)
+{
+	struct gwp_dns_cache_entry *e, *e2;
+	struct gwp_dns_cache *cache = NULL;
+	struct sockaddr_in sa;
+	struct addrinfo ai;
+	int r;
+
+	fill_ai_v4(&ai, &sa);
+	r = gwp_dns_cache_init(&cache, 16, 0);
+	assert(!r && cache);
+
+	/* Expired-on-insert: lookup reports a miss, not the stale entry. */
+	r = gwp_dns_cache_insert(cache, "old.example", &ai, time(NULL) - 1);
+	assert(!r);
+	r = gwp_dns_cache_getent(cache, "old.example", &e);
+	assert(r == -ETIMEDOUT || r == -ENOENT);
+
+	/* A held reference survives a same-key replace. */
+	r = gwp_dns_cache_insert(cache, "live.example", &ai, time(NULL) + 100);
+	assert(!r);
+	r = gwp_dns_cache_getent(cache, "live.example", &e);	/* ref held */
+	assert(!r);
+	r = gwp_dns_cache_insert(cache, "live.example", &ai, time(NULL) + 100);
+	assert(!r);						/* replaced */
+	assert(e->name_len > 0);				/* stale ref still readable */
+	r = gwp_dns_cache_getent(cache, "live.example", &e2);	/* fresh entry */
+	assert(!r);
+	gwp_dns_cache_putent(e2);
+	gwp_dns_cache_putent(e);				/* frees the old entry */
+
+	gwp_dns_cache_free(cache);
+}
+
 int main(void)
 {
 	test_basic_dns_multiple_requests();
 	test_dns_cache();
 	test_dns_cache_cap();
 	test_dns_cache_case();
+	test_dns_cache_expiry_refcount();
 	printf("All tests passed.\n");
 	return 0;
 }
