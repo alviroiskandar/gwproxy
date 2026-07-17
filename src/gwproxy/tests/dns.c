@@ -141,6 +141,18 @@ static void test_dns_cache(void)
 	gwp_dns_ctx_free(ctx);
 }
 
+/* A throwaway one-address (IPv4) addrinfo for direct cache-layer tests. */
+static void fill_ai_v4(struct addrinfo *ai, struct sockaddr_in *sa)
+{
+	memset(sa, 0, sizeof(*sa));
+	sa->sin_family = AF_INET;
+	sa->sin_addr.s_addr = htonl(0x7f000001);	/* 127.0.0.1 */
+	memset(ai, 0, sizeof(*ai));
+	ai->ai_family = AF_INET;
+	ai->ai_addr = (struct sockaddr *)sa;
+	ai->ai_addrlen = sizeof(*sa);
+}
+
 /*
  * Exercise the cache layer directly (no network): the max-entries cap must
  * refuse new keys once full while still allowing same-key replacement.
@@ -154,13 +166,7 @@ static void test_dns_cache_cap(void)
 	char key[32];
 	int r, i;
 
-	memset(&sa, 0, sizeof(sa));
-	sa.sin_family = AF_INET;
-	sa.sin_addr.s_addr = htonl(0x7f000001);	/* 127.0.0.1 */
-	memset(&ai, 0, sizeof(ai));
-	ai.ai_family = AF_INET;
-	ai.ai_addr = (struct sockaddr *)&sa;
-	ai.ai_addrlen = sizeof(sa);
+	fill_ai_v4(&ai, &sa);
 
 	r = gwp_dns_cache_init(&cache, 16, 4);	/* cap = 4 entries */
 	assert(!r && cache);
@@ -188,11 +194,44 @@ static void test_dns_cache_cap(void)
 	gwp_dns_cache_free(cache);
 }
 
+/* Keys are case-insensitive: a mixed-case insert is found by any case. */
+static void test_dns_cache_case(void)
+{
+	struct gwp_dns_cache *cache = NULL;
+	struct gwp_dns_cache_entry *e;
+	struct sockaddr_in sa;
+	struct addrinfo ai;
+	int r;
+
+	fill_ai_v4(&ai, &sa);
+	r = gwp_dns_cache_init(&cache, 16, 0);
+	assert(!r && cache);
+
+	r = gwp_dns_cache_insert(cache, "MixedCase.Example", &ai, time(NULL) + 100);
+	assert(!r);
+	r = gwp_dns_cache_getent(cache, "mixedcase.example", &e);
+	assert(!r);
+	gwp_dns_cache_putent(e);
+	r = gwp_dns_cache_getent(cache, "MIXEDCASE.EXAMPLE", &e);
+	assert(!r);
+	gwp_dns_cache_putent(e);
+
+	/* A differently-cased insert replaces, not duplicates, the same key. */
+	r = gwp_dns_cache_insert(cache, "MIXEDCASE.example", &ai, time(NULL) + 100);
+	assert(!r);
+	r = gwp_dns_cache_getent(cache, "mixedcase.example", &e);
+	assert(!r);
+	gwp_dns_cache_putent(e);
+
+	gwp_dns_cache_free(cache);
+}
+
 int main(void)
 {
 	test_basic_dns_multiple_requests();
 	test_dns_cache();
 	test_dns_cache_cap();
+	test_dns_cache_case();
 	printf("All tests passed.\n");
 	return 0;
 }

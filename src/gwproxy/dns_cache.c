@@ -90,6 +90,27 @@ static uint64_t hash_key(uint64_t seed, const unsigned char *key)
 	return hash;
 }
 
+/*
+ * ASCII-lowercase @key into @buf (capacity @cap) and return the length incl. the
+ * NUL terminator, or 0 if it does not fit. DNS is case-insensitive, so keying on
+ * the folded name avoids duplicate entries (and lookup misses) for case-varied
+ * requests. Only A-Z is folded (hostnames are ASCII; avoids locale tolower()).
+ */
+static size_t normalize_key(const char *key, char *buf, size_t cap)
+{
+	size_t i;
+
+	for (i = 0; key[i]; i++) {
+		unsigned char c = (unsigned char)key[i];
+
+		if (i + 1 >= cap)
+			return 0;
+		buf[i] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : (char)c;
+	}
+	buf[i] = '\0';
+	return i + 1;
+}
+
 static int dns_map_init(struct dns_hash_map *map, size_t nr_buckets,
 			size_t max_entries)
 {
@@ -231,10 +252,15 @@ static int dns_map_insert(struct dns_hash_map *map, const char *key,
 			  const struct addrinfo *ai, time_t expired_at)
 {
 	struct dns_cache_entry *de, *cur, *prev = NULL, *next;
+	time_t now = time(NULL);
 	uint64_t hash, idx;
+	char lkey[256];
 	int r;
 
-	r = alloc_dns_entry(&de, key, ai, expired_at);
+	if (!normalize_key(key, lkey, sizeof(lkey)))
+		return -EINVAL;
+
+	r = alloc_dns_entry(&de, lkey, ai, expired_at);
 	if (r)
 		return r;
 
@@ -244,7 +270,7 @@ static int dns_map_insert(struct dns_hash_map *map, const char *key,
 	 *   2) Collision with the same key, replace the entry.
 	 *   3) Collision with a different key, chain the entry.
 	 */
-	hash = hash_key(map->seed, (const unsigned char *)key);
+	hash = hash_key(map->seed, (const unsigned char *)lkey);
 	idx = hash % map->nr_buckets;
 	cur = map->table[idx];
 	if (!cur) {
@@ -303,7 +329,7 @@ static int dns_map_insert(struct dns_hash_map *map, const char *key,
 		 *		- If @cur is expired and prev is not NULL, set
 		 *		@prev->next to @cur->next. Then free @cur.
 		 */
-		while (cur && cur->expired_at <= time(NULL)) {
+		while (cur && cur->expired_at <= now) {
 			/*
 			 * Remove expired entries.
 			 */
@@ -368,21 +394,23 @@ static int dns_map_lookup_and_get(struct dns_hash_map *map, const char *key,
 				  struct dns_cache_entry **ep)
 {
 	struct dns_cache_entry *cur;
+	time_t now = time(NULL);
 	uint64_t hash, idx;
+	char lkey[256];
 	size_t nl;
 
-	nl = strlen(key) + 1;
+	nl = normalize_key(key, lkey, sizeof(lkey));
 	if (nl <= 1 || nl > 255)
 		return -EINVAL;
 
-	hash = hash_key(map->seed, (const unsigned char *)key);
+	hash = hash_key(map->seed, (const unsigned char *)lkey);
 	idx = hash % map->nr_buckets;
 	cur = map->table[idx];
 
 	while (cur) {
-		if (cur->e.name_len == nl && !memcmp(cur->e.block, key, nl)) {
+		if (cur->e.name_len == nl && !memcmp(cur->e.block, lkey, nl)) {
 
-			if (cur->expired_at <= time(NULL))
+			if (cur->expired_at <= now)
 				return -ETIMEDOUT;
 
 			get_dns_entry(cur);
@@ -498,6 +526,7 @@ void gwp_dns_cache_putent(struct gwp_dns_cache_entry *e)
 static void dns_map_scan_and_remove_expired(struct dns_hash_map *map)
 {
 	struct dns_cache_entry *next, *cur;
+	time_t now = time(NULL);
 	size_t i;
 
 	for (i = 0; i < map->nr_buckets; i++) {
@@ -505,7 +534,7 @@ static void dns_map_scan_and_remove_expired(struct dns_hash_map *map)
 		map->table[i] = NULL;
 		while (cur) {
 			next = cur->next;
-			if (cur->expired_at <= time(NULL)) {
+			if (cur->expired_at <= now) {
 				map->nr_entries--;
 				put_dns_entry(cur);
 			} else {
