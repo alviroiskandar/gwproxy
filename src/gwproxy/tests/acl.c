@@ -8,6 +8,7 @@
 #undef NDEBUG
 #endif
 #include <gwproxy/acl.h>
+#include <gwproxy/common.h>
 #include <arpa/inet.h>
 #include <assert.h>
 #include <stdio.h>
@@ -97,7 +98,7 @@ static const char DEFAULT_RULES[] =
 	"-A OUTPUT -d fc00::/7 -j REJECT\n"
 	"-P OUTPUT ACCEPT\n";
 
-static void test_default_ruleset(void)
+static noinline void test_default_ruleset(void)
 {
 	struct gwp_acl *a = NULL;
 	struct gwp_sockaddr s;
@@ -149,7 +150,7 @@ static void test_default_ruleset(void)
 	gwp_acl_destroy(a);
 }
 
-static void test_ports_and_negation(void)
+static noinline void test_ports_and_negation(void)
 {
 	struct gwp_acl *a = NULL;
 	struct gwp_sockaddr s;
@@ -176,7 +177,7 @@ static void test_ports_and_negation(void)
 	gwp_acl_destroy(a);
 }
 
-static void test_input_and_proto(void)
+static noinline void test_input_and_proto(void)
 {
 	struct gwp_acl *a = NULL;
 	struct gwp_sockaddr s;
@@ -193,7 +194,7 @@ static void test_input_and_proto(void)
 	gwp_acl_destroy(a);
 }
 
-static void test_domain(void)
+static noinline void test_domain(void)
 {
 	struct gwp_acl *a = NULL;
 	struct gwp_sockaddr s;
@@ -221,7 +222,7 @@ static void test_domain(void)
 	gwp_acl_destroy(a);
 }
 
-static void test_domain_regexp(void)
+static noinline void test_domain_regexp(void)
 {
 #ifdef CONFIG_PCRE
 	struct gwp_acl *a = NULL;
@@ -241,7 +242,7 @@ static void test_domain_regexp(void)
 #endif
 }
 
-static void test_user(void)
+static noinline void test_user(void)
 {
 	struct gwp_acl *a = NULL;
 	struct gwp_sockaddr s = sa4("1.2.3.4", 80);
@@ -279,7 +280,7 @@ static void test_user(void)
 #endif
 }
 
-static void test_mark(void)
+static noinline void test_mark(void)
 {
 	struct gwp_sockaddr t = sa4("1.2.3.4", 80);
 	struct gwp_acl *a = NULL;
@@ -321,7 +322,7 @@ static void test_mark(void)
 	gwp_acl_destroy(a);
 }
 
-static void test_bind(void)
+static noinline void test_bind(void)
 {
 	struct gwp_sockaddr t = sa4("1.2.3.4", 80);
 	struct gwp_acl *a = NULL;
@@ -379,7 +380,7 @@ static void test_bind(void)
 }
 
 /* Evaluate one OUTPUT DNAT rule against target @ip:@port; return the req. */
-static struct gwp_acl_req dnat_eval(const char *rule, const char *ip,
+static noinline struct gwp_acl_req dnat_eval(const char *rule, const char *ip,
 				    uint16_t port, bool v6)
 {
 	struct gwp_acl *a = NULL;
@@ -393,7 +394,7 @@ static struct gwp_acl_req dnat_eval(const char *rule, const char *ip,
 	return req;
 }
 
-static void test_dnat(void)
+static noinline void test_dnat(void)
 {
 	struct gwp_acl_req req;
 	char ip[64];
@@ -472,7 +473,7 @@ static void test_dnat(void)
 	}
 }
 
-static void test_comments_and_default_policy(void)
+static noinline void test_comments_and_default_policy(void)
 {
 	struct gwp_acl *a = NULL;
 	struct gwp_sockaddr s;
@@ -495,7 +496,7 @@ static void test_comments_and_default_policy(void)
 	assert(in(NULL, &s, 1, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
 }
 
-static void test_parse_errors(void)
+static noinline void test_parse_errors(void)
 {
 	struct gwp_acl *a;
 	static const char *bad[] = {
