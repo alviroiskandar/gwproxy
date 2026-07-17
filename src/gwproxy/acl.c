@@ -867,9 +867,13 @@ static enum gwp_acl_verdict eval_chain(const struct gwp_acl_rule *head,
 			continue;
 
 		if (r->action == GWP_ACL_ACT_DNAT) {
-			/* Non-terminal: record the rewrite and keep matching. */
+			/*
+			 * DNAT is terminal (like iptables' nat table): record
+			 * the rewrite and accept, so later rules cannot re-match
+			 * or override it.
+			 */
 			apply_dnat(req, &r->dnat);
-			continue;
+			return GWP_ACL_ACCEPT;
 		}
 		return (r->action == GWP_ACL_ACT_ACCEPT) ?
 		       GWP_ACL_ACCEPT : GWP_ACL_REJECT;

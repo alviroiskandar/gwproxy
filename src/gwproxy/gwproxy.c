@@ -1057,57 +1057,73 @@ static uint16_t sa_port_h(const struct gwp_sockaddr *s)
 }
 
 /*
- * Evaluate the ACL OUTPUT chain for a connection to @target from @client.
- * Returns true when allowed: always so with no ACL, or when @target has no
- * usable IP family (e.g. an unresolved socks5h remote-DNS upstream, checked
- * separately once domain matching lands).
+ * Evaluate the ACL OUTPUT chain for a connection to @target from @client (with
+ * an optional requested @domain). Returns the verdict; allows (with no eval)
+ * when there is no ACL, or nothing to match on. When @do_dnat is set and a
+ * matching -j DNAT rule fired, the rewritten destination is written back to
+ * *@target -- but only for a direct connection (not an upstream one, where the
+ * target is handed to the upstream rather than connected here).
  */
+static enum gwp_acl_verdict acl_out(struct gwp_ctx *ctx,
+				    const struct gwp_sockaddr *client,
+				    struct gwp_sockaddr *target,
+				    const char *domain,
+				    enum gwp_acl_proto proto, bool do_dnat)
+{
+	int fam = target ? target->sa.sa_family : 0;
+	bool have_ip = (fam == AF_INET || fam == AF_INET6);
+	enum gwp_acl_verdict v;
+	struct gwp_acl_req req;
+
+	if (!ctx->acl)
+		return GWP_ACL_ACCEPT;
+	/* A domain-only request (remote-DNS upstream) still matches -m domain. */
+	if (!have_ip && !domain)
+		return GWP_ACL_ACCEPT;
+
+	memset(&req, 0, sizeof(req));
+	req.client = client;
+	req.target = have_ip ? target : NULL;
+	req.domain = domain;
+	req.proto = proto;
+	req.dport = have_ip ? sa_port_h(target) : 0;
+	req.sport = client ? sa_port_h(client) : 0;
+
+	v = gwp_acl_eval_output(ctx->acl, &req);
+	if (v == GWP_ACL_ACCEPT && do_dnat && req.dnat_applied && have_ip &&
+	    !ctx->upstream.enabled) {
+		pr_info(&ctx->lh, "ACL DNAT %s -> %s",
+			ip_to_str(target), ip_to_str(&req.dnat));
+		*target = req.dnat;
+	}
+	return v;
+}
+
+/* Verdict only (no DNAT), for the UDP relay's per-datagram target. */
 bool gwp_ctx_acl_output_allowed(struct gwp_ctx *ctx,
 				const struct gwp_sockaddr *client,
 				const struct gwp_sockaddr *target,
 				enum gwp_acl_proto proto)
 {
-	int fam = target->sa.sa_family;
-	struct gwp_acl_req req;
+	struct gwp_sockaddr tmp = *target;
 
-	if (!ctx->acl)
-		return true;
-	if (fam != AF_INET && fam != AF_INET6)
-		return true;
+	return acl_out(ctx, client, &tmp, NULL, proto, false) == GWP_ACL_ACCEPT;
+}
 
-	memset(&req, 0, sizeof(req));
-	req.client = client;
-	req.target = target;
-	req.proto = proto;
-	req.dport = sa_port_h(target);
-	req.sport = client ? sa_port_h(client) : 0;
-	return gwp_acl_eval_output(ctx->acl, &req) == GWP_ACL_ACCEPT;
+/* Verdict + DNAT rewrite of *@target, for the accept-time plain/transparent
+ * forwarding path (which has no gwp_conn_pair yet). */
+bool gwp_ctx_acl_output_dnat(struct gwp_ctx *ctx,
+			     const struct gwp_sockaddr *client,
+			     struct gwp_sockaddr *target,
+			     enum gwp_acl_proto proto)
+{
+	return acl_out(ctx, client, target, NULL, proto, true) == GWP_ACL_ACCEPT;
 }
 
 bool gwp_ctx_acl_target_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp)
 {
-	struct gwp_sockaddr *t = &gcp->target_addr;
-	int fam = t->sa.sa_family;
-	bool have_ip = (fam == AF_INET || fam == AF_INET6);
-	struct gwp_acl_req req;
-
-	if (!ctx->acl)
-		return true;
-	/*
-	 * Nothing to match on: a literal-IP request that did not resolve to a
-	 * usable address (should not happen) and no requested hostname.
-	 */
-	if (!have_ip && !gcp->req_domain)
-		return true;
-
-	memset(&req, 0, sizeof(req));
-	req.client = &gcp->client_addr;
-	req.target = have_ip ? t : NULL;	/* NULL for remote-DNS upstream */
-	req.domain = gcp->req_domain;		/* NULL for a literal-IP target */
-	req.proto = GWP_ACL_PROTO_TCP;
-	req.dport = have_ip ? sa_port_h(t) : 0;
-	req.sport = sa_port_h(&gcp->client_addr);
-	return gwp_acl_eval_output(ctx->acl, &req) == GWP_ACL_ACCEPT;
+	return acl_out(ctx, &gcp->client_addr, &gcp->target_addr, gcp->req_domain,
+		       GWP_ACL_PROTO_TCP, true) == GWP_ACL_ACCEPT;
 }
 
 /*

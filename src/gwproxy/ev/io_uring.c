@@ -875,6 +875,9 @@ static int __handle_ev_accept(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 	int fd = cqe->res, tg_fd, r;
 	struct gwp_conn_pair *gcp;
 	struct gwp_sockaddr tdst;
+	/* The plain/transparent forwarding target, possibly DNAT-rewritten. For
+	 * SOCKS5/HTTP it stays the --target placeholder set during the handshake. */
+	struct gwp_sockaddr fwd_target = ctx->target_addr;
 
 	if (unlikely(fd < 0)) {
 		if (fd == -EAGAIN || fd == -EINTR)
@@ -904,30 +907,27 @@ static int __handle_ev_accept(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 	}
 
 	if (!ctx->cfg.as_socks5 && !ctx->cfg.as_http) {
-		const struct gwp_sockaddr *ult = transparent ? &tdst
-							     : &ctx->target_addr;
 		struct gwp_sockaddr *ca;
 
 		/*
 		 * Plain and transparent forwarding connect at accept time (no
 		 * handshake, no reply): enforce the OUTPUT chain on the ultimate
-		 * target and drop the connection if it is denied.
+		 * target and drop the connection if it is denied. A -j DNAT rule
+		 * rewrites fwd_target in place, which is then used for both the
+		 * socket and gcp->target_addr below.
 		 */
-		if (!gwp_ctx_acl_output_allowed(ctx, &w->iou->accept_addr, ult,
-						GWP_ACL_PROTO_TCP)) {
+		fwd_target = transparent ? tdst : ctx->target_addr;
+		if (!gwp_ctx_acl_output_dnat(ctx, &w->iou->accept_addr,
+					     &fwd_target, GWP_ACL_PROTO_TCP)) {
 			pr_info(&ctx->lh, "ACL denied target %s for client %s",
-				ip_to_str(ult), ip_to_str(&w->iou->accept_addr));
+				ip_to_str(&fwd_target),
+				ip_to_str(&w->iou->accept_addr));
 			prep_close(w, fd);
 			return 0;
 		}
 
-		/* Connect to the upstream proxy, the original dst, or --target. */
-		if (ctx->upstream.enabled)
-			ca = &ctx->upstream.addr;
-		else if (transparent)
-			ca = &tdst;
-		else
-			ca = &ctx->target_addr;
+		/* Connect to the upstream proxy or the (rewritten) target. */
+		ca = ctx->upstream.enabled ? &ctx->upstream.addr : &fwd_target;
 
 		tg_fd = gwp_create_sock_target(w, ca, NULL, false);
 		if (unlikely(tg_fd < 0)) {
@@ -950,7 +950,7 @@ static int __handle_ev_accept(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 	gcp->client.fd = fd;
 	gcp->target.fd = tg_fd;
 	gcp->client_addr = w->iou->accept_addr;
-	gcp->target_addr = transparent ? tdst : ctx->target_addr;
+	gcp->target_addr = fwd_target;
 	gcp->is_target_alive = false;
 	r = arm_gcp(w, gcp);
 	if (unlikely(r))

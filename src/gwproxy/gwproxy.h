@@ -496,6 +496,12 @@ bool gwp_ctx_acl_output_allowed(struct gwp_ctx *ctx,
 				const struct gwp_sockaddr *target,
 				enum gwp_acl_proto proto);
 
+/* As gwp_ctx_acl_output_allowed(), but a matching -j DNAT rewrites *@target. */
+bool gwp_ctx_acl_output_dnat(struct gwp_ctx *ctx,
+			     const struct gwp_sockaddr *client,
+			     struct gwp_sockaddr *target,
+			     enum gwp_acl_proto proto);
+
 /* Convenience wrapper: ACL OUTPUT check for a TCP target (gcp->target_addr). */
 bool gwp_ctx_acl_target_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp);
 

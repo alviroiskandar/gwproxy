@@ -182,7 +182,10 @@ range, or a comma list;
 is
 .BR OUTPUT "-only). The target is " ACCEPT ", " REJECT ", or " DNAT
 .RB ( OUTPUT "-only) with " \-\-to\-destination " " \fIaddr\fR [ :\fIport\fR ],
-which rewrites the destination (address and/or port) and continues matching.
+which rewrites the destination (address and/or port, either optional) and, like
+iptables, is terminal \(em it accepts the connection and stops matching. DNAT
+applies to SOCKS5, HTTP, plain and transparent forwarding, but not to the
+UDP relay or upstream\-proxied connections.
 .RE
 .IP
 Addresses match IPv4 and its IPv4\-mapped IPv6 form equally. A rejected target

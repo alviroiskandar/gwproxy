@@ -269,6 +269,17 @@ static void test_dnat(void)
 	req = dnat_eval("-A OUTPUT -d 1.2.3.4 -j DNAT --to :4444\n"
 			"-P OUTPUT ACCEPT\n", "9.9.9.9", 80, false);
 	assert(!req.dnat_applied);
+
+	/*
+	 * DNAT is terminal: a later matching REJECT must not be reached, so the
+	 * verdict is ACCEPT and the rewrite still applies.
+	 */
+	req = dnat_eval("-A OUTPUT -d 1.2.3.4 -j DNAT --to 5.6.7.8\n"
+			"-A OUTPUT -d 1.2.3.4 -j REJECT\n"
+			"-P OUTPUT REJECT\n", "1.2.3.4", 80, false);
+	assert(req.dnat_applied);
+	assert(inet_ntop(AF_INET, &req.dnat.i4.sin_addr, ip, sizeof(ip)));
+	assert(!strcmp(ip, "5.6.7.8"));
 }
 
 static void test_comments_and_default_policy(void)

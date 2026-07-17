@@ -101,6 +101,33 @@ for loop in epoll io_uring; do
 		"$loop -m domain corrupted the literal-IP payload"
 	kill "$GWP_PID" 2>/dev/null
 
+	# -j DNAT rewrites the destination: a CONNECT to a dead port is
+	# redirected to the real origin and succeeds.
+	printf -- '%s\n' \
+		"-A OUTPUT -d 127.0.0.1 --dports 8080 -j DNAT --to :$hp" \
+		'-P OUTPUT ACCEPT' >"$WORK/dnat.acl"
+	np="$(pick_port)"
+	gwp_start "127.0.0.1:$np" --as-socks5=1 --event-loop="$loop" \
+		--acl-file="$WORK/dnat.acl"
+	curl -s --max-time 20 -x "socks5://127.0.0.1:$np" \
+		"http://127.0.0.1:8080/payload.bin" -o "$WORK/dnat.out" \
+		|| fail "$loop DNAT-redirected CONNECT failed"
+	assert_files_equal "$WORK/payload.bin" "$WORK/dnat.out" \
+		"$loop DNAT redirected to the wrong target"
+	kill "$GWP_PID" 2>/dev/null
+
+	# DNAT also applies to plain --target forwarding: the fixed dead target
+	# is redirected to the real origin.
+	fp="$(pick_port)"
+	gwp_start "127.0.0.1:$fp" --target="127.0.0.1:8080" --event-loop="$loop" \
+		--acl-file="$WORK/dnat.acl"
+	curl -s --max-time 20 "http://127.0.0.1:$fp/payload.bin" \
+		-o "$WORK/dnat.plain.out" \
+		|| fail "$loop plain DNAT-redirected forward failed"
+	assert_files_equal "$WORK/payload.bin" "$WORK/dnat.plain.out" \
+		"$loop plain DNAT redirected to the wrong target"
+	kill "$GWP_PID" 2>/dev/null
+
 	# INPUT chain: a denied client source is dropped at accept, before any
 	# handshake, so the connection fails outright.
 	ip="$(pick_port)"
