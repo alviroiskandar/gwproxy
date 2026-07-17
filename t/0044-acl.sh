@@ -86,6 +86,29 @@ for loop in epoll io_uring; do
 		fail "$loop INPUT-denied client was served"
 	fi
 	kill "$GWP_PID" 2>/dev/null
+
+	# Plain --target forwarding connects at accept time and enforces the
+	# OUTPUT chain too: denied target -> dropped, allowed target -> served.
+	printf -- '%s\n' "-A OUTPUT --dports $hp -j REJECT" '-P OUTPUT ACCEPT' \
+		>"$WORK/plain-deny.acl"
+	fp="$(pick_port)"
+	gwp_start "127.0.0.1:$fp" --target="127.0.0.1:$hp" --event-loop="$loop" \
+		--acl-file="$WORK/plain-deny.acl"
+	if curl -s --max-time 10 "http://127.0.0.1:$fp/payload.bin" \
+		-o /dev/null 2>/dev/null; then
+		fail "$loop plain forward to a denied target was served"
+	fi
+	kill "$GWP_PID" 2>/dev/null
+
+	fp="$(pick_port)"
+	gwp_start "127.0.0.1:$fp" --target="127.0.0.1:$hp" --event-loop="$loop" \
+		--acl-file="$WORK/ok.acl"
+	curl -s --max-time 20 "http://127.0.0.1:$fp/payload.bin" \
+		-o "$WORK/plain.out" \
+		|| fail "$loop plain forward to an allowed target failed"
+	assert_files_equal "$WORK/payload.bin" "$WORK/plain.out" \
+		"$loop plain forward corrupted the payload"
+	kill "$GWP_PID" 2>/dev/null
 done
 
 pass

@@ -1049,11 +1049,25 @@ static void gwp_ctx_free_acl(struct gwp_ctx *ctx)
  * domain is known), it is allowed here; domain-based rules are applied
  * separately once wired in.
  */
-bool gwp_ctx_acl_target_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp)
+/* Host-order port of a sockaddr, regardless of family. */
+static uint16_t sa_port_h(const struct gwp_sockaddr *s)
 {
-	struct gwp_sockaddr *t = &gcp->target_addr;
-	struct gwp_sockaddr *c = &gcp->client_addr;
-	int fam = t->sa.sa_family;
+	return ntohs(s->sa.sa_family == AF_INET ? s->i4.sin_port
+						: s->i6.sin6_port);
+}
+
+/*
+ * Evaluate the ACL OUTPUT chain for a connection to @target from @client.
+ * Returns true when allowed: always so with no ACL, or when @target has no
+ * usable IP family (e.g. an unresolved socks5h remote-DNS upstream, checked
+ * separately once domain matching lands).
+ */
+bool gwp_ctx_acl_output_allowed(struct gwp_ctx *ctx,
+				const struct gwp_sockaddr *client,
+				const struct gwp_sockaddr *target,
+				enum gwp_acl_proto proto)
+{
+	int fam = target->sa.sa_family;
 	struct gwp_acl_req req;
 
 	if (!ctx->acl)
@@ -1062,22 +1076,29 @@ bool gwp_ctx_acl_target_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp)
 		return true;
 
 	memset(&req, 0, sizeof(req));
-	req.client = c;
-	req.target = t;
-	req.proto = GWP_ACL_PROTO_TCP;
-	req.dport = ntohs(fam == AF_INET ? t->i4.sin_port : t->i6.sin6_port);
-	req.sport = ntohs(c->sa.sa_family == AF_INET ? c->i4.sin_port
-						     : c->i6.sin6_port);
+	req.client = client;
+	req.target = target;
+	req.proto = proto;
+	req.dport = sa_port_h(target);
+	req.sport = client ? sa_port_h(client) : 0;
 	return gwp_acl_eval_output(ctx->acl, &req) == GWP_ACL_ACCEPT;
+}
+
+bool gwp_ctx_acl_target_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp)
+{
+	return gwp_ctx_acl_output_allowed(ctx, &gcp->client_addr,
+					  &gcp->target_addr, GWP_ACL_PROTO_TCP);
 }
 
 /*
  * Evaluate the ACL INPUT chain for an incoming client. Returns true when the
- * client is allowed (always so when no ACL is loaded). Evaluated at accept
- * time, where the connection is the client's TCP control/proxy connection.
+ * client is allowed (always so when no ACL is loaded). @proto distinguishes the
+ * client's TCP control connection (accept time) from a UDP association it later
+ * requests.
  */
 bool gwp_ctx_acl_client_allowed(struct gwp_ctx *ctx,
-				const struct gwp_sockaddr *client)
+				const struct gwp_sockaddr *client,
+				enum gwp_acl_proto proto)
 {
 	struct gwp_acl_req req;
 
@@ -1086,9 +1107,8 @@ bool gwp_ctx_acl_client_allowed(struct gwp_ctx *ctx,
 
 	memset(&req, 0, sizeof(req));
 	req.client = client;
-	req.proto = GWP_ACL_PROTO_TCP;
-	req.sport = ntohs(client->sa.sa_family == AF_INET ? client->i4.sin_port
-							  : client->i6.sin6_port);
+	req.proto = proto;
+	req.sport = sa_port_h(client);
 	return gwp_acl_eval_input(ctx->acl, &req) == GWP_ACL_ACCEPT;
 }
 

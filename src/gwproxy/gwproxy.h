@@ -14,6 +14,7 @@
 #include <gwproxy/auth.h>
 #include <gwproxy/http.h>
 #include <gwproxy/dns.h>
+#include <gwproxy/acl.h>
 #include <gwproxy/log.h>
 #include <assert.h>
 #ifdef CONFIG_IO_URING
@@ -480,14 +481,21 @@ void gwp_socks5_reply_addr_from_sockaddr(const struct gwp_sockaddr *src,
 bool gwp_sockaddr_ip_eq(const struct gwp_sockaddr *a,
 			const struct gwp_sockaddr *b);
 
-/* True if the ACL permits a TCP connection to gcp->target_addr (allow-all when
- * no ACL is loaded or the target has no resolved IP). */
+/* True if the ACL OUTPUT chain permits a @proto connection from @client to
+ * @target (allow-all when no ACL is loaded or @target has no resolved IP). */
+bool gwp_ctx_acl_output_allowed(struct gwp_ctx *ctx,
+				const struct gwp_sockaddr *client,
+				const struct gwp_sockaddr *target,
+				enum gwp_acl_proto proto);
+
+/* Convenience wrapper: ACL OUTPUT check for a TCP target (gcp->target_addr). */
 bool gwp_ctx_acl_target_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp);
 
-/* True if the ACL INPUT chain permits an incoming client (allow-all with no
- * ACL). Evaluated at accept time. */
+/* True if the ACL INPUT chain permits an incoming client for @proto (allow-all
+ * with no ACL). */
 bool gwp_ctx_acl_client_allowed(struct gwp_ctx *ctx,
-				const struct gwp_sockaddr *client);
+				const struct gwp_sockaddr *client,
+				enum gwp_acl_proto proto);
 int gwp_get_orig_dst(int fd, const struct gwp_sockaddr *client,
 		     struct gwp_sockaddr *dst);
 const char *ip_to_str(const struct gwp_sockaddr *gs);

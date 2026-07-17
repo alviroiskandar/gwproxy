@@ -884,7 +884,8 @@ static int __handle_ev_accept(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 		return fd;
 	}
 
-	if (!gwp_ctx_acl_client_allowed(ctx, &w->iou->accept_addr)) {
+	if (!gwp_ctx_acl_client_allowed(ctx, &w->iou->accept_addr,
+					GWP_ACL_PROTO_TCP)) {
 		pr_info(&ctx->lh, "ACL denied client %s",
 			ip_to_str(&w->iou->accept_addr));
 		prep_close(w, fd);
@@ -903,7 +904,22 @@ static int __handle_ev_accept(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 	}
 
 	if (!ctx->cfg.as_socks5 && !ctx->cfg.as_http) {
+		const struct gwp_sockaddr *ult = transparent ? &tdst
+							     : &ctx->target_addr;
 		struct gwp_sockaddr *ca;
+
+		/*
+		 * Plain and transparent forwarding connect at accept time (no
+		 * handshake, no reply): enforce the OUTPUT chain on the ultimate
+		 * target and drop the connection if it is denied.
+		 */
+		if (!gwp_ctx_acl_output_allowed(ctx, &w->iou->accept_addr, ult,
+						GWP_ACL_PROTO_TCP)) {
+			pr_info(&ctx->lh, "ACL denied target %s for client %s",
+				ip_to_str(ult), ip_to_str(&w->iou->accept_addr));
+			prep_close(w, fd);
+			return 0;
+		}
 
 		/* Connect to the upstream proxy, the original dst, or --target. */
 		if (ctx->upstream.enabled)

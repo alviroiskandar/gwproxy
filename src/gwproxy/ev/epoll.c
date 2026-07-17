@@ -386,6 +386,18 @@ static int handle_new_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		bool *p = &gcp->is_target_alive;
 		struct gwp_sockaddr *ca = &gcp->target_addr;
 
+		/*
+		 * Plain and transparent forwarding connect at accept time (no
+		 * SOCKS5/HTTP handshake, hence no reply): enforce the OUTPUT
+		 * chain here and drop the connection if the target is denied.
+		 */
+		if (!gwp_ctx_acl_target_allowed(ctx, gcp)) {
+			pr_info(&ctx->lh, "ACL denied target %s for client %s",
+				ip_to_str(&gcp->target_addr),
+				ip_to_str(&gcp->client_addr));
+			return -EACCES;
+		}
+
 		/* With an upstream proxy, connect to the proxy instead. */
 		if (ctx->upstream.enabled)
 			ca = &ctx->upstream.addr;
@@ -526,7 +538,8 @@ static int __handle_ev_accept(struct gwp_wrk *w)
 	pr_dbg(&ctx->lh, "New connection from %s (fd=%d)",
 		ip_to_str(&gcp->client_addr), fd);
 
-	if (!gwp_ctx_acl_client_allowed(ctx, &gcp->client_addr)) {
+	if (!gwp_ctx_acl_client_allowed(ctx, &gcp->client_addr,
+					GWP_ACL_PROTO_TCP)) {
 		pr_info(&ctx->lh, "ACL denied client %s",
 			ip_to_str(&gcp->client_addr));
 		free_conn_pair(w, gcp);
