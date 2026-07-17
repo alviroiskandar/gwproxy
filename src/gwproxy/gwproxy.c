@@ -1165,11 +1165,13 @@ static enum gwp_acl_verdict acl_out(struct gwp_ctx *ctx,
 			ip_to_str(target), ip_to_str(&req.dnat));
 		*target = req.dnat;
 	}
-	/* Surface composable -j MARK to the socket-creation path. */
+	/* Surface composable -j MARK / -j BIND to the socket-creation path. */
 	if (so_out && req.mark_set) {
 		so_out->mark_set = true;
 		so_out->mark = req.mark;
 	}
+	if (so_out && req.bind.set)
+		so_out->bind = req.bind;
 	return v;
 }
 
@@ -1880,6 +1882,55 @@ static int setskopt_int(int fd, int level, int optname, int value)
 	return __sys_setsockopt(fd, level, optname, &value, sizeof(value));
 }
 
+/*
+ * Apply a -j BIND to socket @fd before connect: pin the outgoing interface
+ * (SO_BINDTODEVICE) and/or source address (bind()). Strict -- any failure is
+ * returned so the caller drops the connection rather than proceeding on the
+ * default route/source (which would leak traffic via the wrong path). @dst is
+ * the address about to be connected, used to require a matching source family.
+ * Both operations generally need CAP_NET_ADMIN.
+ */
+static int apply_conn_bind(struct gwp_wrk *w, int fd,
+			   const struct gwp_sockaddr *dst,
+			   const struct gwp_acl_bind *b)
+{
+	int r;
+
+	if (b->iface[0]) {
+		r = __sys_setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE,
+				     b->iface, (socklen_t)strlen(b->iface));
+		if (unlikely(r < 0)) {
+			pr_err(&w->ctx->lh,
+			       "ACL BIND: SO_BINDTODEVICE(%s) failed: %s (CAP_NET_ADMIN required)",
+			       b->iface, strerror(-r));
+			return r;
+		}
+	}
+
+	if (b->have_src) {
+		const struct gwp_sockaddr *s = &b->src;
+		socklen_t len;
+
+		/* The source family must match the socket/target family. */
+		if (s->sa.sa_family != dst->sa.sa_family) {
+			pr_err(&w->ctx->lh,
+			       "ACL BIND: --to-source family does not match target %s",
+			       ip_to_str(dst));
+			return -EAFNOSUPPORT;
+		}
+
+		len = (s->sa.sa_family == AF_INET) ? sizeof(struct sockaddr_in)
+						   : sizeof(struct sockaddr_in6);
+		r = __sys_bind(fd, &s->sa, len);
+		if (unlikely(r < 0)) {
+			pr_err(&w->ctx->lh, "ACL BIND: bind(%s) failed: %s",
+			       ip_to_str(s), strerror(-r));
+			return r;
+		}
+	}
+	return 0;
+}
+
 void gwp_setup_cli_sock_options(struct gwp_wrk *w, int fd)
 {
 	struct gwp_cfg *cfg = &w->ctx->cfg;
@@ -1923,6 +1974,19 @@ int gwp_create_sock_target(struct gwp_wrk *w, struct gwp_sockaddr *addr,
 		setskopt_int(fd, SOL_SOCKET, SO_MARK, (int)so->mark);
 	else if (w->ctx->cfg.mark)
 		setskopt_int(fd, SOL_SOCKET, SO_MARK, w->ctx->cfg.mark);
+
+	/*
+	 * -j BIND: pin the source interface/address before connect. Strict --
+	 * a failure drops the connection rather than falling back to the wrong
+	 * source (see apply_conn_bind).
+	 */
+	if (so && so->bind.set) {
+		r = apply_conn_bind(w, fd, addr, &so->bind);
+		if (unlikely(r)) {
+			__sys_close(fd);
+			return r;
+		}
+	}
 
 	/*
 	 * Do not connect if non_block is false, as we

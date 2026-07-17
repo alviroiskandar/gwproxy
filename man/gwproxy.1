@@ -210,6 +210,35 @@ wins. It needs
 .BR CAP_NET_ADMIN ,
 and applies to TCP target connections (SOCKS5, HTTP, plain and transparent), not
 the UDP relay.
+.IP
+.B \-j BIND
+.RB ( OUTPUT "-only) with " \-\-to\-source " " \fIaddr\fR [ :\fIport\fR ] " and/or"
+.B \-\-to\-iface
+.IR ifname ,
+pins the outgoing connection to a source address (and/or port) and/or a network
+interface \(em e.g. to route a given user's egress out of a specific WireGuard
+tunnel. At least one of
+.B \-\-to\-source
+/
+.B \-\-to\-iface
+is required. Like
+.BR MARK ,
+it is a composable modifier (the last match wins) and applies to the same TCP
+target connections. It is
+.I strict:
+if binding the interface
+.RB ( SO_BINDTODEVICE )
+or the source address
+.RB ( bind (2))
+fails \(em including a
+.B \-\-to\-source
+whose address family does not match the target \(em the connection is dropped
+rather than continued on the wrong source. It generally needs
+.BR CAP_NET_ADMIN .
+Binding a fixed source
+.I port
+limits concurrency to one connection per identical destination (a 4\-tuple
+clash); omit the port (the default) for an ephemeral source port.
 .RE
 .IP
 Addresses match IPv4 and its IPv4\-mapped IPv6 form equally. A rejected target

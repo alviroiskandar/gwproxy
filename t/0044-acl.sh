@@ -147,6 +147,26 @@ for loop in epoll io_uring; do
 		|| fail "$loop -m user over HTTP got $code for user001 (want 403)"
 	kill "$GWP_PID" 2>/dev/null
 
+	# -j BIND --to-source pins the outgoing source address. All of
+	# 127.0.0.0/8 is local, so binding 127.0.0.2 needs no privilege; a
+	# peer-reporting server confirms the proxy connected from that source.
+	pa="$(pick_port)"
+	python3 "$SERVERS_DIR/peer_addr.py" 127.0.0.1 "$pa" \
+		>"$WORK/peer.log" 2>&1 &
+	_PIDS+=("$!")
+	sleep 0.3
+	printf -- '%s\n' '-A OUTPUT -j BIND --to-source 127.0.0.2' \
+		'-P OUTPUT ACCEPT' >"$WORK/bind.acl"
+	bpp="$(pick_port)"
+	gwp_start "127.0.0.1:$bpp" --target="127.0.0.1:$pa" \
+		--event-loop="$loop" --acl-file="$WORK/bind.acl"
+	src="$(python3 -c 'import socket,sys
+s=socket.create_connection(("127.0.0.1", int(sys.argv[1]))); s.settimeout(10)
+print(s.recv(64).decode().strip())' "$bpp" 2>/dev/null)"
+	[ "$src" = 127.0.0.2 ] \
+		|| fail "$loop BIND --to-source: server saw '$src' (want 127.0.0.2)"
+	kill "$GWP_PID" 2>/dev/null
+
 	# -j DNAT rewrites the destination: a CONNECT to a dead port is
 	# redirected to the real origin and succeeds.
 	printf -- '%s\n' \

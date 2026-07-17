@@ -321,6 +321,63 @@ static void test_mark(void)
 	gwp_acl_destroy(a);
 }
 
+static void test_bind(void)
+{
+	struct gwp_sockaddr t = sa4("1.2.3.4", 80);
+	struct gwp_acl *a = NULL;
+	struct gwp_acl_req req;
+	char ip[64];
+
+	/* BIND records a source address (with port) and interface, and keeps
+	 * matching (composable modifier). */
+	assert(!gwp_acl_parse_str(&a,
+		"-A OUTPUT -d 1.2.3.4 -j BIND --to-source 10.0.0.2:5000 --to-iface wg0\n"
+		"-P OUTPUT ACCEPT\n"));
+	memset(&req, 0, sizeof(req));
+	req.target = &t; req.dport = 80; req.proto = GWP_ACL_PROTO_TCP;
+	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_ACCEPT);
+	assert(req.bind.set && req.bind.have_src);
+	assert(!strcmp(req.bind.iface, "wg0"));
+	assert(req.bind.src.i4.sin_family == AF_INET);
+	assert(inet_ntop(AF_INET, &req.bind.src.i4.sin_addr, ip, sizeof(ip)));
+	assert(!strcmp(ip, "10.0.0.2") && ntohs(req.bind.src.i4.sin_port) == 5000);
+	gwp_acl_destroy(a);
+
+	/* Interface-only bind. */
+	a = NULL;
+	assert(!gwp_acl_parse_str(&a,
+		"-A OUTPUT -j BIND --to-iface eth1\n-P OUTPUT ACCEPT\n"));
+	memset(&req, 0, sizeof(req));
+	req.target = &t; req.dport = 80; req.proto = GWP_ACL_PROTO_TCP;
+	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_ACCEPT);
+	assert(req.bind.set && !req.bind.have_src && !strcmp(req.bind.iface, "eth1"));
+	gwp_acl_destroy(a);
+
+	/* Bracketed IPv6 source with a port; source-only bind. */
+	a = NULL;
+	assert(!gwp_acl_parse_str(&a,
+		"-A OUTPUT -j BIND --to-source [2001:db8::1]:443\n"
+		"-P OUTPUT ACCEPT\n"));
+	memset(&req, 0, sizeof(req));
+	req.target = &t; req.dport = 80; req.proto = GWP_ACL_PROTO_TCP;
+	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_ACCEPT);
+	assert(req.bind.set && req.bind.have_src && req.bind.iface[0] == '\0');
+	assert(req.bind.src.i6.sin6_family == AF_INET6);
+	assert(ntohs(req.bind.src.i6.sin6_port) == 443);
+	gwp_acl_destroy(a);
+
+	/* Composable: BIND then a terminal REJECT still records the bind. */
+	a = NULL;
+	assert(!gwp_acl_parse_str(&a,
+		"-A OUTPUT -d 1.2.3.4 -j BIND --to-iface eth0\n"
+		"-A OUTPUT -d 1.2.3.4 -j REJECT\n-P OUTPUT ACCEPT\n"));
+	memset(&req, 0, sizeof(req));
+	req.target = &t; req.dport = 80; req.proto = GWP_ACL_PROTO_TCP;
+	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_REJECT);
+	assert(req.bind.set && !strcmp(req.bind.iface, "eth0"));
+	gwp_acl_destroy(a);
+}
+
 /* Evaluate one OUTPUT DNAT rule against target @ip:@port; return the req. */
 static struct gwp_acl_req dnat_eval(const char *rule, const char *ip,
 				    uint16_t port, bool v6)
@@ -437,6 +494,13 @@ static void test_parse_errors(void)
 		"-A INPUT -j MARK --set-mark 5\n",		    /* MARK in INPUT */
 		"-A OUTPUT -j MARK --set-mark nope\n",		    /* bad mark value */
 		"-A OUTPUT -j MARK --set-mark 5 --set-mark 6\n",    /* dup --set-mark */
+		"-A OUTPUT -j BIND\n",				    /* BIND w/o src|iface */
+		"-A OUTPUT -j ACCEPT --to-source 10.0.0.1\n",	    /* --to-source w/o BIND */
+		"-A OUTPUT -j ACCEPT --to-iface eth0\n",	    /* --to-iface w/o BIND */
+		"-A INPUT -j BIND --to-iface eth0\n",		    /* BIND in INPUT */
+		"-A OUTPUT -j BIND --to-source notanip\n",	    /* bad source */
+		"-A OUTPUT -j BIND --to-source 1.1.1.1 --to-source 2.2.2.2\n", /* dup src */
+		"-A OUTPUT -j BIND --to-iface toolonginterfacename0\n", /* iface >= 16 */
 		"-A INPUT -s 1.2.3.4 -j DNAT --to-destination 5.6.7.8\n", /* DNAT in INPUT */
 		"-A OUTPUT -d 999.0.0.1 -j REJECT\n",	    /* bad CIDR */
 		"-A OUTPUT -d 1.2.3.4/33 -j REJECT\n",	    /* bad prefix */
@@ -522,6 +586,7 @@ static void run_tests(void)
 		test_domain_regexp();
 		test_user();
 		test_mark();
+		test_bind();
 		test_dnat();
 		test_comments_and_default_policy();
 	}

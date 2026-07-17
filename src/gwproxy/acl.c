@@ -24,10 +24,11 @@ enum gwp_acl_action {
 	GWP_ACL_ACT_REJECT	= 1,
 	GWP_ACL_ACT_DNAT	= 2,
 	/*
-	 * Composable modifiers: they record connection state (fwmark) and eval
-	 * keeps matching. Only ACCEPT/REJECT/DNAT terminate.
+	 * Composable modifiers: they record connection state (fwmark, source
+	 * bind) and eval keeps matching. Only ACCEPT/REJECT/DNAT terminate.
 	 */
 	GWP_ACL_ACT_MARK	= 3,
+	GWP_ACL_ACT_BIND	= 4,
 };
 
 enum gwp_acl_chain {
@@ -85,6 +86,7 @@ struct gwp_acl_rule {
 	struct gwp_acl_cidr	src, dst;
 	struct gwp_acl_dnat	dnat;		/* -j DNAT --to-destination */
 	uint32_t		setmark;	/* -j MARK --set-mark */
+	struct gwp_acl_bind	bind_spec;	/* -j BIND --to-source/--to-iface */
 
 	bool			has_src : 1, has_dst : 1, has_domain : 1,
 				has_proto : 1, has_sports : 1, has_dports : 1;
@@ -95,7 +97,7 @@ struct gwp_acl_rule {
 	bool			user_is_re : 1;		/* --user-regexp */
 	bool			has_setmark : 1;	/* -j MARK --set-mark seen */
 	uint8_t			proto : 1;	/* enum gwp_acl_proto */
-	uint8_t			action : 2;	/* enum gwp_acl_action */
+	uint8_t			action : 3;	/* enum gwp_acl_action */
 };
 
 struct gwp_acl_ruleset {
@@ -497,6 +499,92 @@ static int parse_u32(const char *s, uint32_t *out)
 	return 0;
 }
 
+/* Parse a decimal port (1..65535, or 0 for "ephemeral") into @out; -1 bad. */
+static int parse_port_num(const char *s, uint16_t *out)
+{
+	unsigned long v;
+	char *end;
+
+	if (!*s)
+		return -1;
+	errno = 0;
+	v = strtoul(s, &end, 10);
+	if (errno || *end || v > 65535)
+		return -1;
+	*out = (uint16_t)v;
+	return 0;
+}
+
+/*
+ * Parse a -j BIND --to-source argument (a literal source address, optionally
+ * with a port) into @out: "ip", "ip:port", "[v6]:port", or a bare IPv6 literal.
+ * No DNS -- acl.c is self-contained. Returns 0 on success, -1 on error.
+ */
+static int parse_source(const char *s, struct gwp_sockaddr *out)
+{
+	char host[64];
+	const char *colon;
+	uint16_t port = 0;
+	struct in6_addr a6;
+	struct in_addr a4;
+
+	memset(out, 0, sizeof(*out));
+
+	if (*s == '[') {			/* [v6] or [v6]:port */
+		const char *end = strchr(s, ']');
+		size_t n;
+
+		if (!end)
+			return -1;
+		n = (size_t)(end - s - 1);
+		if (n >= sizeof(host))
+			return -1;
+		memcpy(host, s + 1, n);
+		host[n] = '\0';
+		if (inet_pton(AF_INET6, host, &a6) != 1)
+			return -1;
+		s = end + 1;
+		if (*s == ':') {
+			if (parse_port_num(s + 1, &port))
+				return -1;
+		} else if (*s) {
+			return -1;
+		}
+		out->i6.sin6_family = AF_INET6;
+		out->i6.sin6_addr = a6;
+		out->i6.sin6_port = htons(port);
+		return 0;
+	}
+
+	if (inet_pton(AF_INET6, s, &a6) == 1) {	/* bare IPv6 literal, no port */
+		out->i6.sin6_family = AF_INET6;
+		out->i6.sin6_addr = a6;
+		return 0;
+	}
+
+	colon = strchr(s, ':');			/* IPv4, optional :port */
+	if (colon) {
+		size_t n = (size_t)(colon - s);
+
+		if (n >= sizeof(host))
+			return -1;
+		memcpy(host, s, n);
+		host[n] = '\0';
+		if (parse_port_num(colon + 1, &port))
+			return -1;
+	} else {
+		if (strlen(s) >= sizeof(host))
+			return -1;
+		strcpy(host, s);
+	}
+	if (inet_pton(AF_INET, host, &a4) != 1)
+		return -1;
+	out->i4.sin_family = AF_INET;
+	out->i4.sin_addr = a4;
+	out->i4.sin_port = htons(port);
+	return 0;
+}
+
 /* Tokenise @line in place on whitespace into @tok; returns token count or -1. */
 static int tokenise(char *line, char **tok)
 {
@@ -701,6 +789,10 @@ static int parse_rule(struct gwp_acl_ruleset *rs, char **tok, int n)
 				if (chain != GWP_ACL_OUTPUT)  /* egress sockets */
 					goto out;
 				r->action = GWP_ACL_ACT_MARK;
+			} else if (!strcmp(v, "BIND")) {
+				if (chain != GWP_ACL_OUTPUT)  /* egress sockets */
+					goto out;
+				r->action = GWP_ACL_ACT_BIND;
 			} else {
 				goto out;
 			}
@@ -714,6 +806,18 @@ static int parse_rule(struct gwp_acl_ruleset *rs, char **tok, int n)
 			if (neg || !v || r->has_setmark || parse_u32(v, &r->setmark))
 				goto out;
 			r->has_setmark = true;
+		} else if (!strcmp(o, "--to-source")) {
+			v = next_val(tok, n, &i);
+			if (neg || !v || r->bind_spec.have_src ||
+			    parse_source(v, &r->bind_spec.src))
+				goto out;
+			r->bind_spec.have_src = true;
+		} else if (!strcmp(o, "--to-iface")) {
+			v = next_val(tok, n, &i);
+			if (neg || !v || r->bind_spec.iface[0] ||
+			    strlen(v) >= sizeof(r->bind_spec.iface))
+				goto out;
+			memcpy(r->bind_spec.iface, v, strlen(v) + 1);
 		} else {
 			goto out;		/* unknown option */
 		}
@@ -725,6 +829,7 @@ static int parse_rule(struct gwp_acl_ruleset *rs, char **tok, int n)
 		goto out;
 	{
 		bool have_to = r->dnat.set_addr || r->dnat.set_port;
+		bool have_bind = r->bind_spec.have_src || r->bind_spec.iface[0];
 
 		if (r->action == GWP_ACL_ACT_DNAT) {
 			if (chain != GWP_ACL_OUTPUT)	/* DNAT rewrites targets */
@@ -739,6 +844,14 @@ static int parse_rule(struct gwp_acl_ruleset *rs, char **tok, int n)
 			if (!r->has_setmark)		/* MARK needs --set-mark */
 				goto out;
 		} else if (r->has_setmark) {		/* --set-mark only with MARK */
+			goto out;
+		}
+
+		if (r->action == GWP_ACL_ACT_BIND) {
+			r->bind_spec.set = true;
+			if (!have_bind)		/* BIND needs a source or iface */
+				goto out;
+		} else if (have_bind) {		/* --to-source/iface only with BIND */
 			goto out;
 		}
 	}
@@ -1085,6 +1198,10 @@ static enum gwp_acl_verdict eval_chain(const struct gwp_acl_rule *head,
 			req->mark = r->setmark;
 			req->mark_set = true;
 			continue;
+		case GWP_ACL_ACT_BIND:
+			/* Modifier: record the source/iface bind, keep matching. */
+			req->bind = r->bind_spec;
+			continue;
 		case GWP_ACL_ACT_DNAT:
 			/*
 			 * DNAT is terminal (like iptables' nat table): record
@@ -1109,6 +1226,7 @@ enum gwp_acl_verdict gwp_acl_eval_output(struct gwp_acl *acl,
 
 	req->dnat_applied = false;
 	req->mark_set = false;
+	req->bind.set = false;
 	if (!acl)
 		return GWP_ACL_ACCEPT;
 

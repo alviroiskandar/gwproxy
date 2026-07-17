@@ -33,6 +33,19 @@ enum gwp_acl_proto {
 struct gwp_acl;
 
 /*
+ * A -j BIND request: pin the outgoing connection to a source address (and/or
+ * port) and/or a network interface. At least one of @have_src / a non-empty
+ * @iface is present. @set marks that a BIND rule matched. The 16-byte @iface is
+ * IFNAMSIZ (SO_BINDTODEVICE); "" means "no interface".
+ */
+struct gwp_acl_bind {
+	bool			set;
+	bool			have_src;
+	struct gwp_sockaddr	src;
+	char			iface[16];
+};
+
+/*
  * Parse an ACL rule file at @path into a new ACL. Returns 0 and stores the ACL
  * in *@out on success; a negative errno on failure (a bad rule is reported to
  * stderr with its line number). An empty/NULL @path yields *@out == NULL,
@@ -76,6 +89,8 @@ void gwp_acl_destroy(struct gwp_acl *acl);
  *   @mark_set/@mark  true and the fwmark from the last matched -j MARK rule.
  *                    MARK is a composable modifier: it records state and eval
  *                    keeps matching (only ACCEPT/REJECT/DNAT terminate).
+ *   @bind    the source/interface from the last matched -j BIND rule (also a
+ *            composable modifier); @bind.set is false when none matched.
  */
 struct gwp_acl_req {
 	const struct gwp_sockaddr	*client;
@@ -90,6 +105,7 @@ struct gwp_acl_req {
 	struct gwp_sockaddr		dnat;
 	bool				mark_set;
 	uint32_t			mark;
+	struct gwp_acl_bind		bind;
 };
 
 /*

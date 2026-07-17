@@ -290,6 +290,7 @@ struct gwp_dns_packet;
 struct gwp_conn_sockopt {
 	bool			mark_set;	/* -j MARK: use @mark, not cfg.mark */
 	uint32_t		mark;		/* SO_MARK value */
+	struct gwp_acl_bind	bind;		/* -j BIND: bind.set when present */
 };
 
 struct gwp_conn_pair {
