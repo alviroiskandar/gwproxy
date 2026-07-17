@@ -1800,6 +1800,11 @@ static int handle_ev_udp_relay(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			prep_udp_recv(w, gcp);	/* bad header or domain target */
 			return 0;
 		}
+		if (!gwp_ctx_acl_output_allowed(w->ctx, &gcp->udp_peer, &tsa,
+						GWP_ACL_PROTO_UDP)) {
+			prep_udp_recv(w, gcp);	/* ACL denied this datagram */
+			return 0;
+		}
 		prep_udp_send(w, gcp, base + hdr_len, (size_t)n - hdr_len,
 			      &tsa, tslen);
 	} else {

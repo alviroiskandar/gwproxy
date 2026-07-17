@@ -1865,6 +1865,9 @@ static int handle_ev_udp_relay(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 				continue;
 			if (gwp_socks5_addr_to_sockaddr(&dst, &tsa, &tslen))
 				continue;	/* domain target: unsupported */
+			if (!gwp_ctx_acl_output_allowed(w->ctx, &gcp->udp_peer,
+							&tsa, GWP_ACL_PROTO_UDP))
+				continue;	/* ACL denied this datagram */
 			__sys_sendto(fd, buf + off + hdr_len,
 				     (size_t)n - hdr_len, MSG_NOSIGNAL,
 				     &tsa.sa, tslen);

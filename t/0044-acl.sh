@@ -14,6 +14,12 @@ hp="$(pick_port)"
 make_payload "$WORK/payload.bin" 20000
 start_httpd "$hp" "$WORK" "1.1"
 
+# A UDP echo server for the UDP-relay ACL checks (binds synchronously).
+ep="$(pick_port)"
+python3 "$SERVERS_DIR/udp_echo.py" 127.0.0.1 "$ep" >"$WORK/udp_echo.log" 2>&1 &
+_PIDS+=("$!")
+sleep 0.3
+
 # A malformed ACL is rejected at startup (gwproxy exits non-zero, no listener).
 printf -- '-A OUTPUT -j BOGUS\n' >"$WORK/bad.acl"
 bp="$(pick_port)"
@@ -108,6 +114,41 @@ for loop in epoll io_uring; do
 		|| fail "$loop plain forward to an allowed target failed"
 	assert_files_equal "$WORK/payload.bin" "$WORK/plain.out" \
 		"$loop plain forward corrupted the payload"
+	kill "$GWP_PID" 2>/dev/null
+
+	# UDP relay OUTPUT: a datagram to a denied target is dropped, while an
+	# allowed target (ok.acl only denies TCP port 9) round-trips.
+	printf -- '%s\n' "-A OUTPUT -p udp --dports $ep -j REJECT" \
+		'-P OUTPUT ACCEPT' >"$WORK/udp-deny.acl"
+	up="$(pick_port)"
+	gwp_start "127.0.0.1:$up" --as-socks5=1 --event-loop="$loop" \
+		--acl-file="$WORK/udp-deny.acl"
+	if python3 "$SERVERS_DIR/socks5_udp_client.py" "$up" "$ep" 64 \
+		>/dev/null 2>&1; then
+		fail "$loop UDP datagram to a denied target was relayed"
+	fi
+	kill "$GWP_PID" 2>/dev/null
+
+	up="$(pick_port)"
+	gwp_start "127.0.0.1:$up" --as-socks5=1 --event-loop="$loop" \
+		--acl-file="$WORK/ok.acl"
+	python3 "$SERVERS_DIR/socks5_udp_client.py" "$up" "$ep" 64 \
+		|| fail "$loop UDP datagram to an allowed target failed"
+
+	# INPUT with -p udp: the UDP ASSOCIATE is refused, but TCP still works
+	# (the rule is protocol-specific).
+	printf -- '%s\n' '-A INPUT -s 127.0.0.1/32 -p udp -j REJECT' \
+		'-P INPUT ACCEPT' >"$WORK/udp-in-deny.acl"
+	up="$(pick_port)"
+	gwp_start "127.0.0.1:$up" --as-socks5=1 --event-loop="$loop" \
+		--acl-file="$WORK/udp-in-deny.acl"
+	if python3 "$SERVERS_DIR/socks5_udp_client.py" "$up" "$ep" 64 \
+		>/dev/null 2>&1; then
+		fail "$loop UDP ASSOCIATE from a udp-denied client succeeded"
+	fi
+	curl -s --max-time 20 -x "socks5h://127.0.0.1:$up" \
+		"http://127.0.0.1:$hp/payload.bin" -o /dev/null \
+		|| fail "$loop TCP wrongly blocked by a -p udp INPUT rule"
 	kill "$GWP_PID" 2>/dev/null
 done
 

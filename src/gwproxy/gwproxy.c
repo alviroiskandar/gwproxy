@@ -2344,6 +2344,18 @@ int gwp_socks5_udp_associate_setup(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	}
 
 	/*
+	 * Re-check the INPUT chain for this client as a UDP request: a "-p udp"
+	 * rule cannot match at accept time, where the control connection is TCP.
+	 */
+	if (!gwp_ctx_acl_client_allowed(ctx, &gcp->client_addr,
+					GWP_ACL_PROTO_UDP)) {
+		pr_info(&ctx->lh, "ACL denied UDP ASSOCIATE for client %s",
+			ip_to_str(&gcp->client_addr));
+		rep = GWP_SOCKS5_REP_NOT_ALLOWED;
+		goto reply;
+	}
+
+	/*
 	 * The relay is a dual-stack IPv6 socket bound to the wildcard address so
 	 * one socket can both receive from the client and reach IPv4 and IPv6
 	 * targets (a socket bound to a single-family local address cannot egress
