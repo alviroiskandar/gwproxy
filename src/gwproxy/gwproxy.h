@@ -35,6 +35,7 @@ struct gwp_ssl_ctx;
 struct gwp_ssl;
 struct gwp_iou_tls;
 struct gwp_iou_udp;
+struct gwp_acl;
 
 struct gwp_cfg {
 	const char	*event_loop;
@@ -46,6 +47,7 @@ struct gwp_cfg {
 	bool		use_raw_dns;
 	int		protocol_timeout;
 	const char	*auth_file;
+	const char	*acl_file;
 	int		dns_cache_secs;
 	int		nr_workers;
 	int		nr_dns_workers;
@@ -118,6 +120,12 @@ enum {
 	EV_BIT_UDP_RELAY		= (22ull << 48ull),
 
 	/*
+	 * inotify watch for the ACL rule file (--acl-file); 23-24 are the
+	 * io_uring UDP relay aliases below, so use 25.
+	 */
+	EV_BIT_ACL_FILE			= (25ull << 48ull),
+
+	/*
 	 * This ev_bit is used for user_data masking during protocol
 	 * initalization.
 	 *
@@ -163,6 +171,7 @@ enum {
 	EV_BIT_IOU_UDP_RX		= EV_BIT_UDP_RELAY,
 	EV_BIT_IOU_UDP_TX		= (23ull << 48ull),
 	EV_BIT_IOU_UDP_CANCEL		= (24ull << 48ull),
+	EV_BIT_IOU_ACL_FILE		= EV_BIT_ACL_FILE,
 #endif
 };
 
@@ -424,6 +433,11 @@ struct gwp_ctx {
 	struct gwp_cfg			cfg;
 	int				ino_fd;
 	char				*ino_buf;
+	/* ACL rule store (--acl-file) and its own inotify watch. Global to all
+	 * proxy modes, unlike @auth which is prot-only. */
+	struct gwp_acl			*acl;
+	int				acl_ino_fd;
+	char				*acl_ino_buf;
 	_Atomic(int32_t)		nr_fd_closed;
 	_Atomic(int32_t)		nr_accept_stopped;
 };

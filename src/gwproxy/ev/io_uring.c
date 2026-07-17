@@ -11,6 +11,7 @@
 #include <gwproxy/ev/io_uring.h>
 #include <gwproxy/gwproxy.h>
 #include <gwproxy/common.h>
+#include <gwproxy/acl.h>
 #include <stdlib.h>
 #include <inttypes.h>
 #include <sys/eventfd.h>
@@ -1947,6 +1948,30 @@ static int handle_ev_auth_file(struct gwp_wrk *w)
 	return 0;
 }
 
+static void prep_acl_reload(struct gwp_wrk *w)
+{
+	static const size_t l = sizeof(struct inotify_event) + NAME_MAX + 1;
+	struct gwp_ctx *ctx = w->ctx;
+	struct io_uring_sqe *s;
+
+	assert(ctx->acl);
+	s = get_sqe_nofail(w);
+	io_uring_prep_read(s, ctx->acl_ino_fd, ctx->acl_ino_buf, l, 0);
+	s->user_data = EV_BIT_IOU_ACL_FILE;
+}
+
+static int handle_ev_acl_file(struct gwp_wrk *w)
+{
+	struct gwp_ctx *ctx = w->ctx;
+
+	prep_acl_reload(w);
+	if (gwp_acl_reload(ctx->acl))
+		pr_warn(&ctx->lh, "Failed to reload ACL file; keeping current rules");
+	else
+		pr_info(&ctx->lh, "Reloaded ACL file");
+	return 0;
+}
+
 static int handle_event(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 {
 	void *udata = U64_TO_PTR(CLEAR_EV_BIT(cqe->user_data));
@@ -2031,6 +2056,9 @@ static int handle_event(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 	case EV_BIT_IOU_SOCKS5_AUTH_FILE:
 		pr_dbg(&ctx->lh, "Handling SOCKS5 auth file reload event: %d", cqe->res);
 		return handle_ev_auth_file(w);
+	case EV_BIT_IOU_ACL_FILE:
+		pr_dbg(&ctx->lh, "Handling ACL file reload event: %d", cqe->res);
+		return handle_ev_acl_file(w);
 	case EV_BIT_IOU_TARGET_CANCEL:
 		gcp = udata;
 		pr_dbg(&ctx->lh, "Handling target cancel event: %d", cqe->res);
@@ -2128,6 +2156,9 @@ int gwp_ctx_thread_entry_io_uring(struct gwp_wrk *w)
 
 	if (w->idx == 0 && ctx->ino_fd >= 0)
 		prep_auth_reload(w);
+
+	if (w->idx == 0 && ctx->acl_ino_fd >= 0)
+		prep_acl_reload(w);
 
 	io_uring_set_iowait(&w->iou->ring, false);
 	arm_accept(w);

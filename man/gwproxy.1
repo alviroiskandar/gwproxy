@@ -149,6 +149,48 @@ credentials, one per line, shared by SOCKS5 (RFC 1929) and HTTP "Basic" (RFC
 credentials. The file is watched and hot\-reloaded on change. Without it, no
 authentication is required (see
 .BR "AUTHENTICATION" ).
+.SS Access control
+.TP
+.BR \-a ", " \-\-acl\-file=\fIfile\fR
+Load an iptables\-style access\-control list that filters incoming clients
+.RB ( INPUT " chain)"
+and outgoing targets
+.RB ( OUTPUT " chain)."
+The file is watched and hot\-reloaded on change, and a malformed file is
+rejected (at startup, or by keeping the previous rules on reload). Without it,
+no filtering is applied. Each line is one directive, evaluated top\-to\-bottom
+with first\-match\-wins; a chain's policy applies when nothing matches:
+.RS
+.IP \(bu 3
+.BI "\-P " "chain target"
+\(em set a chain's default policy
+.RB ( ACCEPT " or " REJECT ).
+.IP \(bu 3
+.BI "\-A " "chain [matches] " "\fB\-j\fR " target
+\(em append a rule. Matches, each negatable with a leading
+.BR ! :
+.BR \-s / \-\-source " and " \-d / \-\-destination " (" IP/CIDR ", "
+.B \-d
+is
+.BR OUTPUT "-only), " "\-m domain \-\-domain" " (" OUTPUT "-only, target"
+hostname),
+.BR \-p / \-\-protocol " (" tcp / udp "), " \-\-sports " and " \-\-dports
+(a port, a
+.IR lo \- hi
+range, or a comma list;
+.B \-\-dports
+is
+.BR OUTPUT "-only). The target is " ACCEPT ", " REJECT ", or " DNAT
+.RB ( OUTPUT "-only) with " \-\-to\-destination " " \fIaddr\fR [ :\fIport\fR ],
+which rewrites the destination (address and/or port) and continues matching.
+.RE
+.IP
+Addresses match IPv4 and its IPv4\-mapped IPv6 form equally. A rejected target
+is refused (SOCKS5 reply
+.BR 0x02 ,
+HTTP
+.BR 403 );
+a rejected client connection is closed.
 .SS TLS termination (HTTPS proxy)
 These options require a build with OpenSSL support (see
 .BR "AVAILABILITY" ).

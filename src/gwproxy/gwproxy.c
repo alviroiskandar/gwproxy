@@ -7,6 +7,7 @@
 #include <gwproxy/gwproxy.h>
 #include <gwproxy/common.h>
 #include <gwproxy/log.h>
+#include <gwproxy/acl.h>
 #include <gwproxy/ev/epoll.h>
 #ifdef CONFIG_IO_URING
 #include <gwproxy/ev/io_uring.h>
@@ -55,6 +56,7 @@ static const struct option long_opts[] = {
 	{ "prefer-ipv6",	required_argument,	NULL,	'Q' },
 	{ "protocol-timeout",	required_argument,	NULL,	'o' },
 	{ "auth-file",		required_argument,	NULL,	'A' },
+	{ "acl-file",		required_argument,	NULL,	'a' },
 	{ "dns-cache-secs",	required_argument,	NULL,	'L' },
 	{ "nr-workers",		required_argument,	NULL,	'w' },
 	{ "nr-dns-workers",	required_argument,	NULL,	'W' },
@@ -94,6 +96,7 @@ static const struct gwp_cfg default_opts = {
 	.use_raw_dns		= false,
 	.protocol_timeout	= 10,
 	.auth_file		= NULL,
+	.acl_file		= NULL,
 	.dns_cache_secs		= 0,
 	.nr_workers		= 4,
 	.nr_dns_workers		= 4,
@@ -130,6 +133,7 @@ static void show_help(const char *app)
 	printf("  -Q, --prefer-ipv6=0|1           Prefer IPv6 for proxy DNS queries (default: %d)\n", default_opts.prefer_ipv6);
 	printf("  -o, --protocol-timeout=sec      Timeout for protocol handshake process (default: %d)\n", default_opts.protocol_timeout);
 	printf("  -A, --auth-file=file            File with username:password credentials for SOCKS5 and HTTP auth (default: no auth)\n");
+	printf("  -a, --acl-file=file             iptables-style ACL rule file for target/client filtering (default: no ACL)\n");
 	printf("  -L, --dns-cache-secs=sec        Proxy DNS cache duration in seconds (default: %d)\n", default_opts.dns_cache_secs);
 	printf("                                  Set to 0 or a negative number to disable DNS caching.\n");
 	printf("  -w, --nr-workers=nr             Number of worker threads (default: %d)\n", default_opts.nr_workers);
@@ -227,6 +231,9 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 			break;
 		case 'A':
 			cfg->auth_file = optarg;
+			break;
+		case 'a':
+			cfg->acl_file = optarg;
 			break;
 		case 'L':
 			cfg->dns_cache_secs = atoi(optarg);
@@ -958,6 +965,83 @@ static void gwp_ctx_free_auth(struct gwp_ctx *ctx)
 	ctx->auth = NULL;
 }
 
+/*
+ * Load the ACL rule file (--acl-file) and watch it for changes so it is
+ * hot-reloaded, mirroring the auth store. Unlike auth (prot-only), the ACL is
+ * global to every proxy mode, so this is initialised from gwp_ctx_init()
+ * regardless of SOCKS5/HTTP/transparent/plain forwarding. Leaves the ACL
+ * disabled (NULL, watch fd -1) when no file is configured.
+ */
+static int gwp_ctx_init_acl(struct gwp_ctx *ctx)
+{
+	struct gwp_cfg *cfg = &ctx->cfg;
+	int r;
+
+	ctx->acl = NULL;
+	ctx->acl_ino_fd = -1;
+	ctx->acl_ino_buf = NULL;
+
+	if (!cfg->acl_file || !*cfg->acl_file) {
+		pr_dbg(&ctx->lh, "ACL disabled (no acl file)");
+		return 0;
+	}
+
+	r = gwp_acl_create(&ctx->acl, cfg->acl_file);
+	if (r < 0) {
+		pr_err(&ctx->lh, "Failed to load ACL file '%s': %s",
+			cfg->acl_file, strerror(-r));
+		return r;
+	}
+
+	r = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+	if (r < 0) {
+		pr_err(&ctx->lh, "Failed to initialize ACL inotify: %s",
+			strerror(-r));
+		goto out_err;
+	}
+	ctx->acl_ino_fd = r;
+
+	r = inotify_add_watch(ctx->acl_ino_fd, cfg->acl_file,
+			      IN_DELETE | IN_CLOSE_WRITE);
+	if (r < 0) {
+		pr_err(&ctx->lh, "Failed to add ACL inotify watch: %s",
+			strerror(-r));
+		goto out_err;
+	}
+
+	ctx->acl_ino_buf = malloc(sizeof(struct inotify_event) + NAME_MAX + 1);
+	if (!ctx->acl_ino_buf) {
+		r = -ENOMEM;
+		goto out_err;
+	}
+
+	pr_info(&ctx->lh, "Loaded ACL file '%s'", cfg->acl_file);
+	return 0;
+
+out_err:
+	if (ctx->acl_ino_fd >= 0) {
+		__sys_close(ctx->acl_ino_fd);
+		ctx->acl_ino_fd = -1;
+	}
+	gwp_acl_destroy(ctx->acl);
+	ctx->acl = NULL;
+	return r;
+}
+
+static void gwp_ctx_free_acl(struct gwp_ctx *ctx)
+{
+	if (ctx->acl_ino_buf) {
+		free(ctx->acl_ino_buf);
+		ctx->acl_ino_buf = NULL;
+	}
+	if (ctx->acl_ino_fd >= 0) {
+		__sys_close(ctx->acl_ino_fd);
+		ctx->acl_ino_fd = -1;
+	}
+	gwp_acl_destroy(ctx->acl);
+	ctx->acl = NULL;
+}
+
 static int gwp_ctx_init_socks5(struct gwp_ctx *ctx)
 {
 	struct gwp_socks5_cfg s5cfg;
@@ -1312,9 +1396,13 @@ static int gwp_ctx_init(struct gwp_ctx *ctx)
 	if (r < 0)
 		goto out_free_tls;
 
-	r = gwp_ctx_init_dns(ctx);
+	r = gwp_ctx_init_acl(ctx);
 	if (r < 0)
 		goto out_free_prot;
+
+	r = gwp_ctx_init_dns(ctx);
+	if (r < 0)
+		goto out_free_acl;
 
 	r = gwp_ctx_init_threads(ctx);
 	if (r < 0) {
@@ -1326,6 +1414,8 @@ static int gwp_ctx_init(struct gwp_ctx *ctx)
 
 out_free_dns:
 	gwp_ctx_free_dns(ctx);
+out_free_acl:
+	gwp_ctx_free_acl(ctx);
 out_free_prot:
 	gwp_ctx_free_prot(ctx);
 out_free_tls:
@@ -1348,6 +1438,7 @@ static void gwp_ctx_free(struct gwp_ctx *ctx)
 	gwp_ctx_stop(ctx);
 	gwp_ctx_free_threads(ctx);
 	gwp_ctx_free_dns(ctx);
+	gwp_ctx_free_acl(ctx);
 	gwp_ctx_free_prot(ctx);
 	gwp_ctx_free_tls(ctx);
 	gwp_ctx_free_log(ctx);

@@ -7,6 +7,7 @@
 #endif
 #include <gwproxy/ev/epoll.h>
 #include <gwproxy/common.h>
+#include <gwproxy/acl.h>
 #include <stdlib.h>
 #include <inttypes.h>
 #include <sys/epoll.h>
@@ -202,6 +203,14 @@ int gwp_ctx_init_thread_epoll(struct gwp_wrk *w)
 		ev.events = EPOLLIN;
 		ev.data.u64 = EV_BIT_SOCKS5_AUTH_FILE;
 		r = __sys_epoll_ctl(ep_fd, EPOLL_CTL_ADD, ctx->ino_fd, &ev);
+		if (unlikely(r))
+			goto out_free_events;
+	}
+
+	if (w->idx == 0 && (ctx->acl_ino_fd >= 0)) {
+		ev.events = EPOLLIN;
+		ev.data.u64 = EV_BIT_ACL_FILE;
+		r = __sys_epoll_ctl(ep_fd, EPOLL_CTL_ADD, ctx->acl_ino_fd, &ev);
 		if (unlikely(r))
 			goto out_free_events;
 	}
@@ -1661,6 +1670,31 @@ static int handle_ev_auth_file(struct gwp_wrk *w)
 	return 0;
 }
 
+static int handle_ev_acl_file(struct gwp_wrk *w)
+{
+	static const size_t l = sizeof(struct inotify_event) + NAME_MAX + 1;
+	struct gwp_ctx *ctx = w->ctx;
+	ssize_t r;
+
+	assert(ctx->acl);
+
+	r = __sys_read(ctx->acl_ino_fd, ctx->acl_ino_buf, l);
+	if (unlikely(r < 0)) {
+		if (r == -EINTR || r == -EAGAIN)
+			return 0;
+
+		pr_err(&ctx->lh, "Failed to read ACL inotify event: %s",
+			strerror((int)-r));
+		return (int)r;
+	}
+
+	if (gwp_acl_reload(ctx->acl))
+		pr_warn(&ctx->lh, "Failed to reload ACL file; keeping current rules");
+	else
+		pr_info(&ctx->lh, "Reloaded ACL file");
+	return 0;
+}
+
 static bool is_ev_bit_conn_pair(uint64_t ev_bit)
 {
 	switch (ev_bit) {
@@ -2169,6 +2203,9 @@ static int handle_event(struct gwp_wrk *w, struct epoll_event *ev)
 		break;
 	case EV_BIT_SOCKS5_AUTH_FILE:
 		r = handle_ev_auth_file(w);
+		break;
+	case EV_BIT_ACL_FILE:
+		r = handle_ev_acl_file(w);
 		break;
 	case EV_BIT_RAW_DNS_QUERY:
 		r = handle_ev_raw_dns_query(w);
