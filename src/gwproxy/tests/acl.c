@@ -518,6 +518,9 @@ static noinline void test_parse_errors(void)
 		"-A OUTPUT -j MARK --set-mark nope\n",		    /* bad mark value */
 		"-A OUTPUT -j MARK --set-mark 5 --set-mark 6\n",    /* dup --set-mark */
 		"-A OUTPUT -j BIND\n",				    /* BIND w/o src|iface */
+		"-A OUTPUT -j DNAT --to 1.2.3.4 --set-mark 5\n",    /* DNAT+MARK payloads */
+		"-A OUTPUT -j BIND --to-iface eth0 --to 1.2.3.4\n", /* BIND+DNAT payloads */
+		"-A OUTPUT -j MARK --set-mark 5 --to-source 10.0.0.1\n", /* MARK+BIND */
 		"-A OUTPUT -j ACCEPT --to-source 10.0.0.1\n",	    /* --to-source w/o BIND */
 		"-A OUTPUT -j ACCEPT --to-iface eth0\n",	    /* --to-iface w/o BIND */
 		"-A INPUT -j BIND --to-iface eth0\n",		    /* BIND in INPUT */

@@ -68,25 +68,41 @@ struct gwp_acl_dnat {
 
 /*
  * Ordered to minimise padding: the pointer-aligned members lead, then the
- * address prefixes and the DNAT rewrite, then a single bit-field block. The
- * per-criterion present/negated flags and the small proto/action selectors all
- * live in that block (as bit fields) so the struct stays compact as criteria
- * grow. proto/action use uint8_t so 0/1/2 round-trip safely (a signed 1-bit
- * field would turn value 1 into -1).
+ * address prefixes, then the action payload, then a single bit-field block.
+ * Three sets of mutually exclusive fields share unions to keep the struct
+ * compact as criteria grow:
+ *   - the -m domain value is either an exact string or (on a PCRE build) a
+ *     compiled regex, selected by @domain_is_re; likewise -m user / @user_is_re;
+ *   - a rule carries exactly one -j action payload -- a DNAT rewrite, a MARK
+ *     value, or a BIND spec -- selected by @action (ACCEPT/REJECT carry none).
+ * The per-criterion present/negated flags and the small proto/action selectors
+ * live in one bit-field block. proto/action use uint8_t so their values
+ * round-trip safely (a signed 1-bit field would turn value 1 into -1).
  */
 struct gwp_acl_rule {
 	struct gwp_acl_rule	*next;
-	char			*domain;	/* -m domain --domain (exact) */
-	char			*user;		/* -m user --user (exact) */
+	/* -m domain: exact .str, or compiled .re when @domain_is_re (PCRE). */
+	union {
+		char		*str;
 #ifdef CONFIG_PCRE
-	pcre2_code		*domain_re;	/* --domain-regexp (PCRE) */
-	pcre2_code		*user_re;	/* --user-regexp (PCRE) */
+		pcre2_code	*re;
 #endif
+	} domain;
+	/* -m user: exact .str, or compiled .re when @user_is_re (PCRE). */
+	union {
+		char		*str;
+#ifdef CONFIG_PCRE
+		pcre2_code	*re;
+#endif
+	} user;
 	struct gwp_acl_ports	sports, dports;
 	struct gwp_acl_cidr	src, dst;
-	struct gwp_acl_dnat	dnat;		/* -j DNAT --to-destination */
-	uint32_t		setmark;	/* -j MARK --set-mark */
-	struct gwp_acl_bind	bind_spec;	/* -j BIND --to-source/--to-iface */
+	/* -j action payload; the live member is selected by @action. */
+	union {
+		struct gwp_acl_dnat	dnat;	 /* GWP_ACL_ACT_DNAT (--to) */
+		uint32_t		setmark; /* GWP_ACL_ACT_MARK (--set-mark) */
+		struct gwp_acl_bind	bind;	 /* GWP_ACL_ACT_BIND (--to-*) */
+	} act;
 
 	bool			has_src : 1, has_dst : 1, has_domain : 1,
 				has_proto : 1, has_sports : 1, has_dports : 1;
@@ -95,7 +111,6 @@ struct gwp_acl_rule {
 	bool			has_user : 1, neg_user : 1;
 	bool			domain_is_re : 1;	/* --domain-regexp */
 	bool			user_is_re : 1;		/* --user-regexp */
-	bool			has_setmark : 1;	/* -j MARK --set-mark seen */
 	uint8_t			proto : 1;	/* enum gwp_acl_proto */
 	uint8_t			action : 3;	/* enum gwp_acl_action */
 };
@@ -438,13 +453,18 @@ static int parse_dnat(const char *s, struct gwp_acl_dnat *d)
 
 static void free_rule(struct gwp_acl_rule *r)
 {
-	free(r->domain);
-	free(r->user);
 #ifdef CONFIG_PCRE
-	if (r->domain_re)
-		pcre2_code_free(r->domain_re);
-	if (r->user_re)
-		pcre2_code_free(r->user_re);
+	if (r->domain_is_re)
+		pcre2_code_free(r->domain.re);
+	else
+		free(r->domain.str);
+	if (r->user_is_re)
+		pcre2_code_free(r->user.re);
+	else
+		free(r->user.str);
+#else
+	free(r->domain.str);
+	free(r->user.str);
 #endif
 	free(r->sports.v);
 	free(r->dports.v);
@@ -636,6 +656,9 @@ static int parse_rule(struct gwp_acl_ruleset *rs, char **tok, int n)
 	struct gwp_acl_rule *r;
 	enum gwp_acl_chain chain;
 	bool neg = false, m_domain = false, m_user = false, have_jump = false;
+	/* At most one -j action payload group may be present (they share a union). */
+	bool have_to = false, have_setmark = false;
+	bool have_src = false, have_iface = false;
 	const char *v;
 	int i, ret = -EINVAL;
 
@@ -694,8 +717,8 @@ static int parse_rule(struct gwp_acl_ruleset *rs, char **tok, int n)
 			if (chain != GWP_ACL_OUTPUT || !m_domain || !v ||
 			    r->has_domain || r->has_dst)
 				goto out;
-			r->domain = strdup(v);
-			if (!r->domain) {
+			r->domain.str = strdup(v);
+			if (!r->domain.str) {
 				ret = -ENOMEM;
 				goto out;
 			}
@@ -707,8 +730,8 @@ static int parse_rule(struct gwp_acl_ruleset *rs, char **tok, int n)
 			    r->has_domain || r->has_dst)
 				goto out;
 #ifdef CONFIG_PCRE
-			r->domain_re = regex_compile(v, /*caseless=*/true);
-			if (!r->domain_re)
+			r->domain.re = regex_compile(v, /*caseless=*/true);
+			if (!r->domain.re)
 				goto out;
 			r->domain_is_re = true;
 			r->has_domain = true;
@@ -723,8 +746,8 @@ static int parse_rule(struct gwp_acl_ruleset *rs, char **tok, int n)
 			if (chain != GWP_ACL_OUTPUT || !m_user || !v ||
 			    r->has_user)
 				goto out;
-			r->user = strdup(v);
-			if (!r->user) {
+			r->user.str = strdup(v);
+			if (!r->user.str) {
 				ret = -ENOMEM;
 				goto out;
 			}
@@ -737,8 +760,8 @@ static int parse_rule(struct gwp_acl_ruleset *rs, char **tok, int n)
 				goto out;
 #ifdef CONFIG_PCRE
 			/* Usernames are case-sensitive, unlike hostnames. */
-			r->user_re = regex_compile(v, /*caseless=*/false);
-			if (!r->user_re)
+			r->user.re = regex_compile(v, /*caseless=*/false);
+			if (!r->user.re)
 				goto out;
 			r->user_is_re = true;
 			r->has_user = true;
@@ -798,26 +821,34 @@ static int parse_rule(struct gwp_acl_ruleset *rs, char **tok, int n)
 			}
 			have_jump = true;
 		} else if (eq(o, "--to-destination", "--to")) {
+			/* DNAT payload: no other action group may share the union. */
 			v = next_val(tok, n, &i);
-			if (neg || !v || parse_dnat(v, &r->dnat))
+			if (neg || !v || have_to || have_setmark || have_src ||
+			    have_iface || parse_dnat(v, &r->act.dnat))
 				goto out;
+			have_to = true;
 		} else if (!strcmp(o, "--set-mark")) {
+			/* MARK payload: mutually exclusive with DNAT/BIND. */
 			v = next_val(tok, n, &i);
-			if (neg || !v || r->has_setmark || parse_u32(v, &r->setmark))
+			if (neg || !v || have_to || have_setmark || have_src ||
+			    have_iface || parse_u32(v, &r->act.setmark))
 				goto out;
-			r->has_setmark = true;
+			have_setmark = true;
 		} else if (!strcmp(o, "--to-source")) {
+			/* BIND payload: may pair with --to-iface, not DNAT/MARK. */
 			v = next_val(tok, n, &i);
-			if (neg || !v || r->bind_spec.have_src ||
-			    parse_source(v, &r->bind_spec.src))
+			if (neg || !v || have_to || have_setmark || have_src ||
+			    parse_source(v, &r->act.bind.src))
 				goto out;
-			r->bind_spec.have_src = true;
+			r->act.bind.have_src = true;
+			have_src = true;
 		} else if (!strcmp(o, "--to-iface")) {
 			v = next_val(tok, n, &i);
-			if (neg || !v || r->bind_spec.iface[0] ||
-			    strlen(v) >= sizeof(r->bind_spec.iface))
+			if (neg || !v || have_to || have_setmark || have_iface ||
+			    strlen(v) >= sizeof(r->act.bind.iface))
 				goto out;
-			memcpy(r->bind_spec.iface, v, strlen(v) + 1);
+			memcpy(r->act.bind.iface, v, strlen(v) + 1);
+			have_iface = true;
 		} else {
 			goto out;		/* unknown option */
 		}
@@ -827,33 +858,33 @@ static int parse_rule(struct gwp_acl_ruleset *rs, char **tok, int n)
 
 	if (neg || !have_jump)
 		goto out;
-	{
-		bool have_to = r->dnat.set_addr || r->dnat.set_port;
-		bool have_bind = r->bind_spec.have_src || r->bind_spec.iface[0];
 
-		if (r->action == GWP_ACL_ACT_DNAT) {
-			if (chain != GWP_ACL_OUTPUT)	/* DNAT rewrites targets */
-				goto out;
-			if (!have_to)			/* DNAT needs --to */
-				goto out;
-		} else if (have_to) {			/* --to only with DNAT */
+	/*
+	 * Exactly the action's own payload group may be present. The cross-group
+	 * guards above already reject mixing DNAT/MARK/BIND options, so here we
+	 * only require the matching group and forbid a stray one on an action
+	 * that takes no payload (ACCEPT/REJECT).
+	 */
+	switch (r->action) {
+	case GWP_ACL_ACT_DNAT:
+		if (chain != GWP_ACL_OUTPUT)	/* DNAT rewrites targets */
 			goto out;
-		}
-
-		if (r->action == GWP_ACL_ACT_MARK) {
-			if (!r->has_setmark)		/* MARK needs --set-mark */
-				goto out;
-		} else if (r->has_setmark) {		/* --set-mark only with MARK */
+		if (!have_to)			/* DNAT needs --to */
 			goto out;
-		}
-
-		if (r->action == GWP_ACL_ACT_BIND) {
-			r->bind_spec.set = true;
-			if (!have_bind)		/* BIND needs a source or iface */
-				goto out;
-		} else if (have_bind) {		/* --to-source/iface only with BIND */
+		break;
+	case GWP_ACL_ACT_MARK:
+		if (!have_setmark)		/* MARK needs --set-mark */
 			goto out;
-		}
+		break;
+	case GWP_ACL_ACT_BIND:
+		if (!have_src && !have_iface)	/* BIND needs a source or iface */
+			goto out;
+		r->act.bind.set = true;
+		break;
+	default:				/* ACCEPT / REJECT: no payload */
+		if (have_to || have_setmark || have_src || have_iface)
+			goto out;
+		break;
 	}
 
 	if (chain == GWP_ACL_INPUT) {
@@ -1087,9 +1118,9 @@ static bool domain_match(const struct gwp_acl_rule *r, const char *dom)
 		return false;
 #ifdef CONFIG_PCRE
 	if (r->domain_is_re)
-		return r->domain_re && regex_match(r->domain_re, dom);
+		return r->domain.re && regex_match(r->domain.re, dom);
 #endif
-	return r->domain && !strcasecmp(dom, r->domain);
+	return r->domain.str && !strcasecmp(dom, r->domain.str);
 }
 
 /*
@@ -1103,9 +1134,9 @@ static bool user_match(const struct gwp_acl_rule *r, const char *user)
 		return false;
 #ifdef CONFIG_PCRE
 	if (r->user_is_re)
-		return r->user_re && regex_match(r->user_re, user);
+		return r->user.re && regex_match(r->user.re, user);
 #endif
-	return r->user && !strcmp(user, r->user);
+	return r->user.str && !strcmp(user, r->user.str);
 }
 
 static bool rule_matches(const struct gwp_acl_rule *r,
@@ -1195,12 +1226,12 @@ static enum gwp_acl_verdict eval_chain(const struct gwp_acl_rule *head,
 			 * MARK overrides it; a terminal rule (or the policy) then
 			 * decides the verdict.
 			 */
-			req->mark = r->setmark;
+			req->mark = r->act.setmark;
 			req->mark_set = true;
 			continue;
 		case GWP_ACL_ACT_BIND:
 			/* Modifier: record the source/iface bind, keep matching. */
-			req->bind = r->bind_spec;
+			req->bind = r->act.bind;
 			continue;
 		case GWP_ACL_ACT_DNAT:
 			/*
@@ -1208,7 +1239,7 @@ static enum gwp_acl_verdict eval_chain(const struct gwp_acl_rule *head,
 			 * the rewrite and accept, so later rules cannot re-match
 			 * or override it.
 			 */
-			apply_dnat(req, &r->dnat);
+			apply_dnat(req, &r->act.dnat);
 			return GWP_ACL_ACCEPT;
 		case GWP_ACL_ACT_REJECT:
 			return GWP_ACL_REJECT;
