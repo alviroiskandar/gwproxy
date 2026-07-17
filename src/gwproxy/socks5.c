@@ -69,6 +69,11 @@ void gwp_socks5_conn_free(struct gwp_socks5_conn *conn)
 	free(conn);
 }
 
+const char *gwp_socks5_conn_username(const struct gwp_socks5_conn *conn)
+{
+	return (conn && conn->user_len) ? conn->user : NULL;
+}
+
 struct data_arg {
 	struct gwp_socks5_ctx	*ctx;
 	struct gwp_socks5_conn	*conn;
@@ -311,6 +316,10 @@ static int handle_state_auth_userpass(struct data_arg *d)
 		/* STATUS = 0x00 (success) */
 		resp[1] = 0x00;
 		d->conn->state = GWP_SOCKS5_ST_CMD;
+		/* Remember the username for ACL "-m user" matching (ulen <= 255). */
+		memcpy(d->conn->user, u, ulen);
+		d->conn->user[ulen] = '\0';
+		d->conn->user_len = (uint8_t)ulen;
 	} else {
 		/* STATUS = 0x01 (failure) */
 		resp[1] = 0x01;

@@ -39,6 +39,12 @@ void gwp_http_conn_free(struct gwp_http_conn *hc);
 /* Whether the (already classified) request is a forwarding request. */
 bool gwp_http_conn_is_forward(const struct gwp_http_conn *hc);
 
+/*
+ * The authenticated username (Basic proxy auth), or NULL if the request was not
+ * authenticated. Valid until gwp_http_conn_free(); used for ACL "-m user".
+ */
+const char *gwp_http_conn_username(const struct gwp_http_conn *hc);
+
 /**
  * Consume client request bytes and, once the header is complete, classify the
  * request.

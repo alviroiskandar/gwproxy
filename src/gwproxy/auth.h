@@ -69,4 +69,13 @@ bool gwp_auth_check(struct gwp_auth *auth, const char *u, size_t ulen,
  */
 bool gwp_auth_check_basic(struct gwp_auth *auth, const char *hdr_val);
 
+/**
+ * Like gwp_auth_check_basic(), but on success also copies the authenticated
+ * username into @user_out (NUL-terminated, at most @user_cap bytes including the
+ * terminator). @user_out is left untouched on failure. Pass user_out=NULL /
+ * user_cap=0 to ignore the username (gwp_auth_check_basic is this variant).
+ */
+bool gwp_auth_check_basic_ex(struct gwp_auth *auth, const char *hdr_val,
+			     char *user_out, size_t user_cap);
+
 #endif /* #ifndef GWPROXY__AUTH_H */

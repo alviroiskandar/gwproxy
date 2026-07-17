@@ -1129,7 +1129,7 @@ static uint16_t sa_port_h(const struct gwp_sockaddr *s)
 static enum gwp_acl_verdict acl_out(struct gwp_ctx *ctx,
 				    const struct gwp_sockaddr *client,
 				    struct gwp_sockaddr *target,
-				    const char *domain,
+				    const char *domain, const char *user,
 				    enum gwp_acl_proto proto, bool do_dnat)
 {
 	int fam = target ? target->sa.sa_family : 0;
@@ -1147,6 +1147,7 @@ static enum gwp_acl_verdict acl_out(struct gwp_ctx *ctx,
 	req.client = client;
 	req.target = have_ip ? target : NULL;
 	req.domain = domain;
+	req.user = user;
 	req.proto = proto;
 	req.dport = have_ip ? sa_port_h(target) : 0;
 	req.sport = client ? sa_port_h(client) : 0;
@@ -1169,23 +1170,37 @@ bool gwp_ctx_acl_output_allowed(struct gwp_ctx *ctx,
 {
 	struct gwp_sockaddr tmp = *target;
 
-	return acl_out(ctx, client, &tmp, NULL, proto, false) == GWP_ACL_ACCEPT;
+	return acl_out(ctx, client, &tmp, NULL, NULL, proto, false) ==
+	       GWP_ACL_ACCEPT;
 }
 
 /* Verdict + DNAT rewrite of *@target, for the accept-time plain/transparent
- * forwarding path (which has no gwp_conn_pair yet). */
+ * forwarding path (which has no gwp_conn_pair yet, hence no username). */
 bool gwp_ctx_acl_output_dnat(struct gwp_ctx *ctx,
 			     const struct gwp_sockaddr *client,
 			     struct gwp_sockaddr *target,
 			     enum gwp_acl_proto proto)
 {
-	return acl_out(ctx, client, target, NULL, proto, true) == GWP_ACL_ACCEPT;
+	return acl_out(ctx, client, target, NULL, NULL, proto, true) ==
+	       GWP_ACL_ACCEPT;
+}
+
+/* The authenticated username for an ACL "-m user" match, or NULL when the
+ * connection carried no proxy authentication. */
+static const char *gcp_req_user(const struct gwp_conn_pair *gcp)
+{
+	if (gcp->prot_type == GWP_PROT_TYPE_SOCKS5 && gcp->s5_conn)
+		return gwp_socks5_conn_username(gcp->s5_conn);
+	if (gcp->prot_type == GWP_PROT_TYPE_HTTP && gcp->http_conn)
+		return gwp_http_conn_username(gcp->http_conn);
+	return NULL;
 }
 
 bool gwp_ctx_acl_target_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp)
 {
 	return acl_out(ctx, &gcp->client_addr, &gcp->target_addr, gcp->req_domain,
-		       GWP_ACL_PROTO_TCP, true) == GWP_ACL_ACCEPT;
+		       gcp_req_user(gcp), GWP_ACL_PROTO_TCP, true) ==
+	       GWP_ACL_ACCEPT;
 }
 
 /*

@@ -31,6 +31,10 @@ struct gwp_http_conn {
 	/* Rewritten origin-form request header for a forwarding request. */
 	char				*fwd_req;
 	size_t				fwd_req_len;
+
+	/* Authenticated username (Basic auth), for ACL "-m user" matching. */
+	bool				have_user;
+	char				user[256];
 };
 
 struct gwp_http_conn *gwp_http_conn_alloc(void)
@@ -62,6 +66,11 @@ void gwp_http_conn_free(struct gwp_http_conn *hc)
 bool gwp_http_conn_is_forward(const struct gwp_http_conn *hc)
 {
 	return hc->is_forward;
+}
+
+const char *gwp_http_conn_username(const struct gwp_http_conn *hc)
+{
+	return hc->have_user ? hc->user : NULL;
 }
 
 /*
@@ -320,8 +329,10 @@ int gwp_http_conn_process(struct gwp_http_conn *hc, struct gwp_auth *auth,
 	if (auth) {
 		const char *cred = gwnet_http_hdr_fields_get(&req->fields,
 							     "Proxy-Authorization");
-		if (!gwp_auth_check_basic(auth, cred))
+		if (!gwp_auth_check_basic_ex(auth, cred, hc->user,
+					     sizeof(hc->user)))
 			return GWP_HTTP_NEED_AUTH;
+		hc->have_user = true;
 	}
 
 	/* A non-CONNECT method is a forwarding request (absolute-form target). */

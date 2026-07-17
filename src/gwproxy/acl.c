@@ -71,8 +71,10 @@ struct gwp_acl_dnat {
 struct gwp_acl_rule {
 	struct gwp_acl_rule	*next;
 	char			*domain;	/* -m domain --domain (exact) */
+	char			*user;		/* -m user --user (exact) */
 #ifdef CONFIG_PCRE
 	pcre2_code		*domain_re;	/* --domain-regexp (PCRE) */
+	pcre2_code		*user_re;	/* --user-regexp (PCRE) */
 #endif
 	struct gwp_acl_ports	sports, dports;
 	struct gwp_acl_cidr	src, dst;
@@ -82,7 +84,9 @@ struct gwp_acl_rule {
 				has_proto : 1, has_sports : 1, has_dports : 1;
 	bool			neg_src : 1, neg_dst : 1, neg_domain : 1,
 				neg_proto : 1, neg_sports : 1, neg_dports : 1;
+	bool			has_user : 1, neg_user : 1;
 	bool			domain_is_re : 1;	/* --domain-regexp */
+	bool			user_is_re : 1;		/* --user-regexp */
 	uint8_t			proto : 1;	/* enum gwp_acl_proto */
 	uint8_t			action : 2;	/* enum gwp_acl_action */
 };
@@ -426,9 +430,12 @@ static int parse_dnat(const char *s, struct gwp_acl_dnat *d)
 static void free_rule(struct gwp_acl_rule *r)
 {
 	free(r->domain);
+	free(r->user);
 #ifdef CONFIG_PCRE
 	if (r->domain_re)
 		pcre2_code_free(r->domain_re);
+	if (r->user_re)
+		pcre2_code_free(r->user_re);
 #endif
 	free(r->sports.v);
 	free(r->dports.v);
@@ -517,7 +524,7 @@ static int parse_rule(struct gwp_acl_ruleset *rs, char **tok, int n)
 {
 	struct gwp_acl_rule *r;
 	enum gwp_acl_chain chain;
-	bool neg = false, m_domain = false, have_jump = false;
+	bool neg = false, m_domain = false, m_user = false, have_jump = false;
 	const char *v;
 	int i, ret = -EINVAL;
 
@@ -559,9 +566,17 @@ static int parse_rule(struct gwp_acl_ruleset *rs, char **tok, int n)
 			r->neg_dst = neg;
 		} else if (!strcmp(o, "-m")) {
 			v = next_val(tok, n, &i);
-			if (!v || strcmp(v, "domain") || neg)
+			if (!v || neg)
 				goto out;
-			m_domain = true;
+			if (!strcmp(v, "domain")) {
+				m_domain = true;
+			} else if (!strcmp(v, "user")) {
+				if (chain != GWP_ACL_OUTPUT)
+					goto out;	/* -m user is OUTPUT-only */
+				m_user = true;
+			} else {
+				goto out;
+			}
 			continue;	/* -m is not itself negatable */
 		} else if (!strcmp(o, "--domain")) {
 			v = next_val(tok, n, &i);
@@ -589,6 +604,36 @@ static int parse_rule(struct gwp_acl_ruleset *rs, char **tok, int n)
 			r->neg_domain = neg;
 #else
 			/* --domain-regexp requires a --use-pcre build. */
+			ret = -ENOSYS;
+			goto out;
+#endif
+		} else if (!strcmp(o, "--user")) {
+			v = next_val(tok, n, &i);
+			if (chain != GWP_ACL_OUTPUT || !m_user || !v ||
+			    r->has_user)
+				goto out;
+			r->user = strdup(v);
+			if (!r->user) {
+				ret = -ENOMEM;
+				goto out;
+			}
+			r->has_user = true;
+			r->neg_user = neg;
+		} else if (!strcmp(o, "--user-regexp")) {
+			v = next_val(tok, n, &i);
+			if (chain != GWP_ACL_OUTPUT || !m_user || !v ||
+			    r->has_user)
+				goto out;
+#ifdef CONFIG_PCRE
+			/* Usernames are case-sensitive, unlike hostnames. */
+			r->user_re = regex_compile(v, /*caseless=*/false);
+			if (!r->user_re)
+				goto out;
+			r->user_is_re = true;
+			r->has_user = true;
+			r->neg_user = neg;
+#else
+			/* --user-regexp requires a --use-pcre build. */
 			ret = -ENOSYS;
 			goto out;
 #endif
@@ -895,6 +940,22 @@ static bool domain_match(const struct gwp_acl_rule *r, const char *dom)
 	return r->domain && !strcasecmp(dom, r->domain);
 }
 
+/*
+ * True if rule @r's -m user criterion matches the authenticated username @user
+ * (exact, case-sensitive; or PCRE when --user-regexp was used). Returns false
+ * for a NULL @user so an unauthenticated connection never matches a user rule.
+ */
+static bool user_match(const struct gwp_acl_rule *r, const char *user)
+{
+	if (!user)
+		return false;
+#ifdef CONFIG_PCRE
+	if (r->user_is_re)
+		return r->user_re && regex_match(r->user_re, user);
+#endif
+	return r->user && !strcmp(user, r->user);
+}
+
 static bool rule_matches(const struct gwp_acl_rule *r,
 			 const struct gwp_acl_req *q)
 {
@@ -904,6 +965,7 @@ static bool rule_matches(const struct gwp_acl_rule *r,
 		       q->target && cidr_match(&r->dst, q->target), r->neg_dst) &&
 	       crit_ok(r->has_domain, domain_match(r, q->domain),
 		       r->neg_domain) &&
+	       crit_ok(r->has_user, user_match(r, q->user), r->neg_user) &&
 	       crit_ok(r->has_proto, q->proto == r->proto, r->neg_proto) &&
 	       crit_ok(r->has_sports, ports_match(&r->sports, q->sport),
 		       r->neg_sports) &&

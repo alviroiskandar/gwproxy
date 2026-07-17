@@ -176,6 +176,9 @@ is
 hostname; or
 .B \-\-domain\-regexp
 for a PCRE match, see below),
+.BR "\-m user \-\-user" " (" OUTPUT "-only, the authenticated username; or"
+.B \-\-user\-regexp
+for a PCRE match),
 .BR \-p / \-\-protocol " (" tcp / udp "), " \-\-sports " and " \-\-dports
 (a port, a
 .IR lo \- hi
@@ -212,6 +215,23 @@ and unanchored (case\-insensitively): it can match anywhere in the hostname
 unless you anchor it yourself with
 .BR ^ " and " $ .
 A pattern must contain no whitespace (rules are whitespace\-tokenised).
+.IP
+.BR "\-m user \-\-user" " " \fIname\fR
+matches the username the client authenticated as (via
+.BR \-\-auth\-file );
+.B \-\-user\-regexp
+takes a PCRE instead (case\-sensitive, raw/unanchored, needs
+.BR \-\-use\-pcre ).
+It is
+.B OUTPUT
+\-only and matches nothing when the connection is unauthenticated, so it only
+has effect together with
+.BR \-\-auth\-file .
+The
+.BR \-\-user\-regexp
+option, like
+.BR \-\-domain\-regexp ,
+requires a PCRE2 build.
 .SS TLS termination (HTTPS proxy)
 These options require a build with OpenSSL support (see
 .BR "AVAILABILITY" ).
@@ -562,8 +582,10 @@ and
 .IP \(bu 3
 .B \-\-use\-pcre
 builds PCRE2 regexp matches for the ACL, enabling
-.BR \-\-domain\-regexp ;
-without it that rule option is rejected.
+.B \-\-domain\-regexp
+and
+.BR \-\-user\-regexp ;
+without it those rule options are rejected.
 .PP
 Options for features not compiled in are rejected. Run
 .B ./configure \-\-help

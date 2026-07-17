@@ -83,6 +83,8 @@ struct gwp_socks5_conn {
 	int			state;
 	struct gwp_socks5_addr	dst_addr;
 	struct gwp_socks5_ctx	*ctx;
+	uint8_t			user_len;	/* authenticated username len, 0=none */
+	char			user[256];	/* NUL-terminated when user_len > 0 */
 };
 
 /**
@@ -123,6 +125,13 @@ struct gwp_socks5_conn *gwp_socks5_conn_alloc(struct gwp_socks5_ctx *ctx);
  * @param conn	The SOCKS5 connection to free.
  */
 void gwp_socks5_conn_free(struct gwp_socks5_conn *conn);
+
+/**
+ * Return the authenticated username for @conn, or NULL if the connection was
+ * not authenticated (no auth store, or no username/password handshake). The
+ * pointer stays valid for the connection's life.
+ */
+const char *gwp_socks5_conn_username(const struct gwp_socks5_conn *conn);
 
 /**
  * Handle incoming data and prepare outgoing data for a SOCKS5 connection.

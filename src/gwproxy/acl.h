@@ -65,6 +65,8 @@ void gwp_acl_destroy(struct gwp_acl *acl);
  *   @target  resolved destination address, for -d; NULL when only @domain is
  *            known (e.g. socks5h remote-DNS upstream).
  *   @domain  client-requested destination hostname for -m domain, or NULL.
+ *   @user    authenticated username for -m user (OUTPUT), or NULL when the
+ *            connection is unauthenticated (no -m user rule then matches).
  *   @sport   client source port, host byte order (both chains).
  *   @dport   destination port, host byte order (OUTPUT).
  *   @proto   GWP_ACL_PROTO_TCP / _UDP.
@@ -76,6 +78,7 @@ struct gwp_acl_req {
 	const struct gwp_sockaddr	*client;
 	const struct gwp_sockaddr	*target;
 	const char			*domain;
+	const char			*user;
 	uint16_t			sport;
 	uint16_t			dport;
 	enum gwp_acl_proto		proto;

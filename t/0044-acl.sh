@@ -122,6 +122,31 @@ for loop in epoll io_uring; do
 		kill "$GWP_PID" 2>/dev/null
 	fi
 
+	# -m user (OUTPUT-only): with an auth file, a rule keyed on the
+	# authenticated username blocks that user while another is served. The
+	# username is known only after the auth handshake.
+	printf -- '%s\n' 'user001:pw1' 'user002:pw2' >"$WORK/user.auth"
+	printf -- '%s\n' '-A OUTPUT -m user --user user001 -j REJECT' \
+		'-P OUTPUT ACCEPT' >"$WORK/user.acl"
+	uxp="$(pick_port)"
+	gwp_start "127.0.0.1:$uxp" --as-socks5=1 --as-http=1 \
+		--event-loop="$loop" --auth-file="$WORK/user.auth" \
+		--acl-file="$WORK/user.acl"
+	if curl -s --max-time 10 -x "socks5h://user001:pw1@127.0.0.1:$uxp" \
+		"http://127.0.0.1:$hp/payload.bin" -o /dev/null 2>/dev/null; then
+		fail "$loop -m user did not block user001 (socks5)"
+	fi
+	curl -s --max-time 20 -x "socks5h://user002:pw2@127.0.0.1:$uxp" \
+		"http://127.0.0.1:$hp/payload.bin" -o "$WORK/user.out" \
+		|| fail "$loop -m user wrongly blocked user002 (socks5)"
+	assert_files_equal "$WORK/payload.bin" "$WORK/user.out" \
+		"$loop -m user corrupted user002's payload"
+	code="$(curl -s --max-time 20 -x "http://user001:pw1@127.0.0.1:$uxp" \
+		"http://127.0.0.1:$hp/payload.bin" -o /dev/null -w '%{http_code}')"
+	[ "$code" = 403 ] \
+		|| fail "$loop -m user over HTTP got $code for user001 (want 403)"
+	kill "$GWP_PID" 2>/dev/null
+
 	# -j DNAT rewrites the destination: a CONNECT to a dead port is
 	# redirected to the real origin and succeeds.
 	printf -- '%s\n' \

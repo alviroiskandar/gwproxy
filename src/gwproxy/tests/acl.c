@@ -65,6 +65,17 @@ static enum gwp_acl_verdict out(struct gwp_acl *a, struct gwp_sockaddr *t,
 	return gwp_acl_eval_output(a, &req);
 }
 
+static enum gwp_acl_verdict out_user(struct gwp_acl *a, struct gwp_sockaddr *t,
+				     const char *user, uint16_t dport)
+{
+	struct gwp_acl_req req = {
+		.target = t, .user = user, .dport = dport,
+		.proto = GWP_ACL_PROTO_TCP,
+	};
+
+	return gwp_acl_eval_output(a, &req);
+}
+
 static enum gwp_acl_verdict in(struct gwp_acl *a, struct gwp_sockaddr *c,
 			       uint16_t sport, enum gwp_acl_proto p)
 {
@@ -230,6 +241,44 @@ static void test_domain_regexp(void)
 #endif
 }
 
+static void test_user(void)
+{
+	struct gwp_acl *a = NULL;
+	struct gwp_sockaddr s = sa4("1.2.3.4", 80);
+
+	/* Exact, case-sensitive username; unauthenticated never matches. */
+	assert(!gwp_acl_parse_str(&a,
+		"-A OUTPUT -m user --user alice -j REJECT\n"
+		"-P OUTPUT ACCEPT\n"));
+	assert(out_user(a, &s, "alice", 80) == GWP_ACL_REJECT);
+	assert(out_user(a, &s, "ALICE", 80) == GWP_ACL_ACCEPT);
+	assert(out_user(a, &s, "bob", 80) == GWP_ACL_ACCEPT);
+	assert(out_user(a, &s, NULL, 80) == GWP_ACL_ACCEPT);
+	gwp_acl_destroy(a);
+
+	/* Negated: everyone but alice, including an absent (NULL) username. */
+	a = NULL;
+	assert(!gwp_acl_parse_str(&a,
+		"-A OUTPUT -m user ! --user alice -j REJECT\n"
+		"-P OUTPUT ACCEPT\n"));
+	assert(out_user(a, &s, "bob", 80) == GWP_ACL_REJECT);
+	assert(out_user(a, &s, "alice", 80) == GWP_ACL_ACCEPT);
+	assert(out_user(a, &s, NULL, 80) == GWP_ACL_REJECT);
+	gwp_acl_destroy(a);
+
+#ifdef CONFIG_PCRE
+	/* --user-regexp is case-sensitive (no PCRE2_CASELESS for usernames). */
+	a = NULL;
+	assert(!gwp_acl_parse_str(&a,
+		"-A OUTPUT -m user --user-regexp ^team- -j REJECT\n"
+		"-P OUTPUT ACCEPT\n"));
+	assert(out_user(a, &s, "team-a", 80) == GWP_ACL_REJECT);
+	assert(out_user(a, &s, "user001", 80) == GWP_ACL_ACCEPT);
+	assert(out_user(a, &s, "TEAM-a", 80) == GWP_ACL_ACCEPT);
+	gwp_acl_destroy(a);
+#endif
+}
+
 /* Evaluate one OUTPUT DNAT rule against target @ip:@port; return the req. */
 static struct gwp_acl_req dnat_eval(const char *rule, const char *ip,
 				    uint16_t port, bool v6)
@@ -371,6 +420,22 @@ static void test_parse_errors(void)
 	a = (void *)0x1;
 	assert(gwp_acl_parse_str(&a,
 		"-A OUTPUT --domain-regexp x -j REJECT\n") < 0);
+
+	/* -m user is OUTPUT-only; --user needs the module and rejects dupes. */
+	a = (void *)0x1;
+	assert(gwp_acl_parse_str(&a,
+		"-A OUTPUT --user alice -j REJECT\n") < 0);		/* no -m user */
+	a = (void *)0x1;
+	assert(gwp_acl_parse_str(&a,
+		"-A INPUT -m user --user alice -j REJECT\n") < 0);	/* INPUT */
+	a = (void *)0x1;
+	assert(gwp_acl_parse_str(&a,
+		"-A OUTPUT -m user --user a --user b -j REJECT\n") < 0);	/* dup */
+#ifndef CONFIG_PCRE
+	a = (void *)0x1;
+	assert(gwp_acl_parse_str(&a,
+		"-A OUTPUT -m user --user-regexp x -j REJECT\n") < 0);	/* no pcre */
+#endif
 #ifdef CONFIG_PCRE
 	/* A malformed pattern, and mixing exact + regexp for one field, fail. */
 	a = (void *)0x1;
@@ -408,6 +473,7 @@ static void run_tests(void)
 		test_input_and_proto();
 		test_domain();
 		test_domain_regexp();
+		test_user();
 		test_dnat();
 		test_comments_and_default_policy();
 	}
