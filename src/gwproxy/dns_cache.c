@@ -17,6 +17,8 @@
 #include <netdb.h>
 #include <assert.h>
 #include <stdatomic.h>
+#include <unistd.h>
+#include <sys/random.h>
 #include <gwproxy/dns_cache.h>
 #include <arpa/inet.h>
 
@@ -37,6 +39,7 @@ struct dns_hash_map {
 	size_t			nr_buckets;
 	size_t			nr_entries;
 	size_t			max_entries;	/* 0 = unlimited */
+	uint64_t		seed;		/* per-cache random hash seed */
 };
 
 struct gwp_dns_cache {
@@ -54,12 +57,31 @@ struct gwp_dns_cache {
 /* Minimum seconds between two lookup-triggered full sweeps. */
 #define GWP_DNS_HOUSEKEEP_MIN_INTERVAL 1
 
-/**
- * DJB2 Hash function.
+/*
+ * A per-process random hash seed so an attacker cannot precompute hostnames
+ * that collide into one bucket (offline hash-flooding). getrandom() is
+ * preferred; the fallback mixes time/pid/address, which is not cryptographic
+ * but still unpredictable to a remote attacker.
  */
-static uint64_t hash_key(const unsigned char *key)
+static uint64_t gen_hash_seed(void)
 {
-	uint64_t hash = 5381;
+	uint64_t s;
+
+	if (getrandom(&s, sizeof(s), 0) == (ssize_t)sizeof(s))
+		return s;
+
+	s = (uint64_t)time(NULL);
+	s ^= (uint64_t)getpid() * 0x9e3779b97f4a7c15ULL;
+	s ^= (uint64_t)(uintptr_t)&s;
+	return s ? s : 0x9e3779b97f4a7c15ULL;
+}
+
+/**
+ * DJB2 Hash function, seeded to defeat offline collision precomputation.
+ */
+static uint64_t hash_key(uint64_t seed, const unsigned char *key)
+{
+	uint64_t hash = seed;
 	int c;
 
 	while ((c = *key++))
@@ -78,6 +100,7 @@ static int dns_map_init(struct dns_hash_map *map, size_t nr_buckets,
 	map->nr_buckets = nr_buckets;
 	map->nr_entries = 0;
 	map->max_entries = max_entries;
+	map->seed = gen_hash_seed();
 	return 0;
 }
 
@@ -221,7 +244,7 @@ static int dns_map_insert(struct dns_hash_map *map, const char *key,
 	 *   2) Collision with the same key, replace the entry.
 	 *   3) Collision with a different key, chain the entry.
 	 */
-	hash = hash_key((const unsigned char *)key);
+	hash = hash_key(map->seed, (const unsigned char *)key);
 	idx = hash % map->nr_buckets;
 	cur = map->table[idx];
 	if (!cur) {
@@ -352,7 +375,7 @@ static int dns_map_lookup_and_get(struct dns_hash_map *map, const char *key,
 	if (nl <= 1 || nl > 255)
 		return -EINVAL;
 
-	hash = hash_key((const unsigned char *)key);
+	hash = hash_key(map->seed, (const unsigned char *)key);
 	idx = hash % map->nr_buckets;
 	cur = map->table[idx];
 
