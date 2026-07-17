@@ -1042,6 +1042,35 @@ static void gwp_ctx_free_acl(struct gwp_ctx *ctx)
 	ctx->acl = NULL;
 }
 
+/*
+ * Evaluate the ACL OUTPUT chain for a connection's resolved TCP target. Returns
+ * true when the connection is allowed. With no ACL loaded, or when the target
+ * has no locally-resolved IP (e.g. a socks5h remote-DNS upstream, where only a
+ * domain is known), it is allowed here; domain-based rules are applied
+ * separately once wired in.
+ */
+bool gwp_ctx_acl_target_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp)
+{
+	struct gwp_sockaddr *t = &gcp->target_addr;
+	struct gwp_sockaddr *c = &gcp->client_addr;
+	int fam = t->sa.sa_family;
+	struct gwp_acl_req req;
+
+	if (!ctx->acl)
+		return true;
+	if (fam != AF_INET && fam != AF_INET6)
+		return true;
+
+	memset(&req, 0, sizeof(req));
+	req.client = c;
+	req.target = t;
+	req.proto = GWP_ACL_PROTO_TCP;
+	req.dport = ntohs(fam == AF_INET ? t->i4.sin_port : t->i6.sin6_port);
+	req.sport = ntohs(c->sa.sa_family == AF_INET ? c->i4.sin_port
+						     : c->i6.sin6_port);
+	return gwp_acl_eval_output(ctx->acl, &req) == GWP_ACL_ACCEPT;
+}
+
 static int gwp_ctx_init_socks5(struct gwp_ctx *ctx)
 {
 	struct gwp_socks5_cfg s5cfg;

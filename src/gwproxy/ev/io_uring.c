@@ -1591,12 +1591,43 @@ static int handle_ev_target_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	return 0;
 }
 
+/*
+ * The ACL rejected this target: queue a client reply (SOCKS5 REP 0x02, or HTTP
+ * 403) and return an error so the connection is torn down. The reply send is
+ * best-effort (it may be cancelled by the teardown), matching the other
+ * io_uring rejection paths.
+ */
+static int acl_reject_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	pr_info(&w->ctx->lh, "ACL denied target %s for client %s (idx=%u)",
+		ip_to_str(&gcp->target_addr), ip_to_str(&gcp->client_addr),
+		gcp->idx);
+
+	if (gcp->prot_type == GWP_PROT_TYPE_SOCKS5) {
+		if (!gwp_socks5_prep_connect_reply(w, gcp, -EACCES))
+			prep_send_client(w, gcp);
+	} else if (gcp->prot_type == GWP_PROT_TYPE_HTTP) {
+		int r = gwp_http_build_forbidden_reply(
+				gcp->target.buf + gcp->target.len,
+				gcp->target.cap - gcp->target.len);
+
+		if (r >= 0) {
+			gcp->target.len += (uint32_t)r;
+			prep_send_client(w, gcp);
+		}
+	}
+	return -EACCES;
+}
+
 static int handle_prot_connect_target(struct gwp_wrk *w,
 				      struct gwp_conn_pair *gcp)
 {
 	struct gwp_ctx *ctx = w->ctx;
 	struct gwp_sockaddr *ca = &gcp->target_addr;
 	int r;
+
+	if (!gwp_ctx_acl_target_allowed(ctx, gcp))
+		return acl_reject_target(w, gcp);
 
 	/* The socket connects to the upstream proxy when enabled. */
 	if (ctx->upstream.enabled)

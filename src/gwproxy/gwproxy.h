@@ -479,6 +479,10 @@ void gwp_socks5_reply_addr_from_sockaddr(const struct gwp_sockaddr *src,
 /* Compare two addresses by IP only, matching IPv4 with its v4-mapped form. */
 bool gwp_sockaddr_ip_eq(const struct gwp_sockaddr *a,
 			const struct gwp_sockaddr *b);
+
+/* True if the ACL permits a TCP connection to gcp->target_addr (allow-all when
+ * no ACL is loaded or the target has no resolved IP). */
+bool gwp_ctx_acl_target_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp);
 int gwp_get_orig_dst(int fd, const struct gwp_sockaddr *client,
 		     struct gwp_sockaddr *dst);
 const char *ip_to_str(const struct gwp_sockaddr *gs);
