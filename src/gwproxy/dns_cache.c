@@ -42,7 +42,17 @@ struct dns_hash_map {
 struct gwp_dns_cache {
 	pthread_rwlock_t	lock;
 	struct dns_hash_map	map;
+	/*
+	 * Rate-limits the lookup-triggered expiry sweep (see throttled_housekeep).
+	 * A 32-bit seconds counter, not time_t: an 8-byte atomic is not lock-free
+	 * on 32-bit targets and would pull in libatomic. Unsigned wrap of the
+	 * delta is fine for a 1-second throttle.
+	 */
+	_Atomic(uint32_t)	last_housekeep;
 };
+
+/* Minimum seconds between two lookup-triggered full sweeps. */
+#define GWP_DNS_HOUSEKEEP_MIN_INTERVAL 1
 
 /**
  * DJB2 Hash function.
@@ -386,6 +396,7 @@ int gwp_dns_cache_init(struct gwp_dns_cache **cache_p, uint32_t nr_buckets,
 	if (r)
 		goto out_destroy_lock;
 
+	atomic_init(&cache->last_housekeep, (uint32_t)0);
 	*cache_p = cache;
 	return 0;
 
@@ -416,6 +427,28 @@ int gwp_dns_cache_insert(struct gwp_dns_cache *cache, const char *key,
 	return r;
 }
 
+/*
+ * Sweep expired entries, but at most once per GWP_DNS_HOUSEKEEP_MIN_INTERVAL and
+ * with only one sweeper at a time. Without this, a hot name expiring makes every
+ * concurrent lookup that hits it (-ETIMEDOUT) launch its own O(total) full-table
+ * sweep under the write lock -- a thundering-herd stall recurring at each TTL
+ * boundary. The winner of the timestamp CAS performs the sweep; the rest skip.
+ */
+static void throttled_housekeep(struct gwp_dns_cache *cache)
+{
+	uint32_t now = (uint32_t)time(NULL);
+	uint32_t last = atomic_load_explicit(&cache->last_housekeep,
+					     memory_order_relaxed);
+
+	if (now - last < GWP_DNS_HOUSEKEEP_MIN_INTERVAL)
+		return;
+	if (!atomic_compare_exchange_strong_explicit(&cache->last_housekeep,
+			&last, now, memory_order_relaxed, memory_order_relaxed))
+		return;
+
+	gwp_dns_cache_housekeep(cache);
+}
+
 int gwp_dns_cache_getent(struct gwp_dns_cache *cache, const char *key,
 			 struct gwp_dns_cache_entry **ep)
 {
@@ -428,7 +461,7 @@ int gwp_dns_cache_getent(struct gwp_dns_cache *cache, const char *key,
 	if (de)
 		*ep = &de->e;
 	else if (r == -ETIMEDOUT)
-		gwp_dns_cache_housekeep(cache);
+		throttled_housekeep(cache);
 
 	return r;
 }
