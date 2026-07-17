@@ -73,6 +73,14 @@ sudo apt install -y libssl-dev;
 ./configure --use-openssl;
 make -j$(nproc);
 
+To enable PCRE2 regular-expression matches in the access-control list (the
+--domain-regexp and --user-regexp rule options), install PCRE2's development
+package and configure with --use-pcre:
+
+sudo apt install -y libpcre2-dev;
+./configure --use-pcre;
+make -j$(nproc);
+
 Other configure options include --debug, --sanitize (ASan/UBSan) and
 --use-new-dns-resolver (which enables the -r/--raw-dns and -j/--dns-server
 options). Run './configure --help' for the full list. Run 'make test' to

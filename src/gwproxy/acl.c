@@ -15,6 +15,10 @@
 #include <strings.h>
 #include <errno.h>
 
+#ifdef CONFIG_PCRE
+#include <pcre2.h>
+#endif
+
 enum gwp_acl_action {
 	GWP_ACL_ACT_ACCEPT	= 0,
 	GWP_ACL_ACT_REJECT	= 1,
@@ -66,7 +70,10 @@ struct gwp_acl_dnat {
  */
 struct gwp_acl_rule {
 	struct gwp_acl_rule	*next;
-	char			*domain;
+	char			*domain;	/* -m domain --domain (exact) */
+#ifdef CONFIG_PCRE
+	pcre2_code		*domain_re;	/* --domain-regexp (PCRE) */
+#endif
 	struct gwp_acl_ports	sports, dports;
 	struct gwp_acl_cidr	src, dst;
 	struct gwp_acl_dnat	dnat;		/* -j DNAT --to-destination */
@@ -75,6 +82,7 @@ struct gwp_acl_rule {
 				has_proto : 1, has_sports : 1, has_dports : 1;
 	bool			neg_src : 1, neg_dst : 1, neg_domain : 1,
 				neg_proto : 1, neg_sports : 1, neg_dports : 1;
+	bool			domain_is_re : 1;	/* --domain-regexp */
 	uint8_t			proto : 1;	/* enum gwp_acl_proto */
 	uint8_t			action : 2;	/* enum gwp_acl_action */
 };
@@ -92,6 +100,68 @@ struct gwp_acl {
 };
 
 #define ACL_MAX_TOKENS	32
+
+#ifdef CONFIG_PCRE
+/*
+ * ------------------------------------------------------------------------
+ * PCRE2 regexp helpers (--domain-regexp / --user-regexp)
+ * ------------------------------------------------------------------------
+ *
+ * Patterns are matched raw/unanchored -- the user writes ^...$ if they want a
+ * full-string match. Matching runs against attacker-influenced hostnames and
+ * usernames, so a shared match context caps the work (match + backtracking
+ * depth limits) to keep a pathological pattern from becoming a ReDoS.
+ */
+static pthread_once_t g_regex_once = PTHREAD_ONCE_INIT;
+static pcre2_match_context *g_regex_mctx;
+
+static void regex_ctx_init(void)
+{
+	g_regex_mctx = pcre2_match_context_create(NULL);
+	if (g_regex_mctx) {
+		pcre2_set_match_limit(g_regex_mctx, 100000);
+		pcre2_set_depth_limit(g_regex_mctx, 1000);
+	}
+}
+
+/* Compile @pat, JIT-compiling it when supported. Returns NULL on error. */
+static pcre2_code *regex_compile(const char *pat, bool caseless)
+{
+	uint32_t opts = caseless ? PCRE2_CASELESS : 0;
+	PCRE2_SIZE erroff;
+	pcre2_code *re;
+	int errcode;
+
+	pthread_once(&g_regex_once, regex_ctx_init);
+	re = pcre2_compile((PCRE2_SPTR)pat, PCRE2_ZERO_TERMINATED, opts,
+			   &errcode, &erroff, NULL);
+	if (!re)
+		return NULL;
+	pcre2_jit_compile(re, PCRE2_JIT_COMPLETE);	/* best effort */
+	return re;
+}
+
+/*
+ * True if @re matches @subj. Fails closed (no match) on OOM or if the match hits
+ * the configured limits (a would-be ReDoS is treated as a non-match, not an
+ * accept).
+ */
+static bool regex_match(const pcre2_code *re, const char *subj)
+{
+	pcre2_match_data *md;
+	int rc;
+
+	if (!subj)
+		return false;
+	md = pcre2_match_data_create(1, NULL);
+	if (!md)
+		return false;
+	rc = pcre2_match(re, (PCRE2_SPTR)subj, PCRE2_ZERO_TERMINATED, 0, 0,
+			 md, g_regex_mctx);
+	pcre2_match_data_free(md);
+	return rc >= 0;
+}
+#endif /* CONFIG_PCRE */
 
 /*
  * ------------------------------------------------------------------------
@@ -356,6 +426,10 @@ static int parse_dnat(const char *s, struct gwp_acl_dnat *d)
 static void free_rule(struct gwp_acl_rule *r)
 {
 	free(r->domain);
+#ifdef CONFIG_PCRE
+	if (r->domain_re)
+		pcre2_code_free(r->domain_re);
+#endif
 	free(r->sports.v);
 	free(r->dports.v);
 	free(r);
@@ -501,6 +575,23 @@ static int parse_rule(struct gwp_acl_ruleset *rs, char **tok, int n)
 			}
 			r->has_domain = true;
 			r->neg_domain = neg;
+		} else if (!strcmp(o, "--domain-regexp")) {
+			v = next_val(tok, n, &i);
+			if (chain != GWP_ACL_OUTPUT || !m_domain || !v ||
+			    r->has_domain || r->has_dst)
+				goto out;
+#ifdef CONFIG_PCRE
+			r->domain_re = regex_compile(v, /*caseless=*/true);
+			if (!r->domain_re)
+				goto out;
+			r->domain_is_re = true;
+			r->has_domain = true;
+			r->neg_domain = neg;
+#else
+			/* --domain-regexp requires a --use-pcre build. */
+			ret = -ENOSYS;
+			goto out;
+#endif
 		} else if (eq(o, "-p", "--protocol")) {
 			v = next_val(tok, n, &i);
 			if (!v || r->has_proto)
@@ -788,6 +879,22 @@ static bool crit_ok(bool present, bool matched, bool negate)
 	return !present || (matched != negate);
 }
 
+/*
+ * True if rule @r's -m domain criterion matches the requested hostname @dom
+ * (exact, case-insensitive; or PCRE when --domain-regexp was used). Returns
+ * false for a NULL @dom so a literal-IP request never matches a domain rule.
+ */
+static bool domain_match(const struct gwp_acl_rule *r, const char *dom)
+{
+	if (!dom)
+		return false;
+#ifdef CONFIG_PCRE
+	if (r->domain_is_re)
+		return r->domain_re && regex_match(r->domain_re, dom);
+#endif
+	return r->domain && !strcasecmp(dom, r->domain);
+}
+
 static bool rule_matches(const struct gwp_acl_rule *r,
 			 const struct gwp_acl_req *q)
 {
@@ -795,9 +902,7 @@ static bool rule_matches(const struct gwp_acl_rule *r,
 		       q->client && cidr_match(&r->src, q->client), r->neg_src) &&
 	       crit_ok(r->has_dst,
 		       q->target && cidr_match(&r->dst, q->target), r->neg_dst) &&
-	       crit_ok(r->has_domain,
-		       r->domain && q->domain &&
-			       !strcasecmp(q->domain, r->domain),
+	       crit_ok(r->has_domain, domain_match(r, q->domain),
 		       r->neg_domain) &&
 	       crit_ok(r->has_proto, q->proto == r->proto, r->neg_proto) &&
 	       crit_ok(r->has_sports, ports_match(&r->sports, q->sport),

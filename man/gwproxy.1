@@ -173,7 +173,9 @@ with first\-match\-wins; a chain's policy applies when nothing matches:
 .B \-d
 is
 .BR OUTPUT "-only), " "\-m domain \-\-domain" " (" OUTPUT "-only, target"
-hostname),
+hostname; or
+.B \-\-domain\-regexp
+for a PCRE match, see below),
 .BR \-p / \-\-protocol " (" tcp / udp "), " \-\-sports " and " \-\-dports
 (a port, a
 .IR lo \- hi
@@ -194,6 +196,22 @@ is refused (SOCKS5 reply
 HTTP
 .BR 403 );
 a rejected client connection is closed.
+.IP
+.B \-\-domain\-regexp
+.I pattern
+(an alternative to
+.BR \-\-domain ,
+also under
+.BR "\-m domain" )
+matches the requested hostname with a PCRE. It requires a build with PCRE2
+support (see
+.BR "AVAILABILITY" )
+and is rejected otherwise. The pattern is matched
+.I raw
+and unanchored (case\-insensitively): it can match anywhere in the hostname
+unless you anchor it yourself with
+.BR ^ " and " $ .
+A pattern must contain no whitespace (rules are whitespace\-tokenised).
 .SS TLS termination (HTTPS proxy)
 These options require a build with OpenSSL support (see
 .BR "AVAILABILITY" ).
@@ -541,6 +559,11 @@ builds the raw DNS resolver, enabling
 .B \-\-raw\-dns
 and
 .BR \-\-dns\-server .
+.IP \(bu 3
+.B \-\-use\-pcre
+builds PCRE2 regexp matches for the ACL, enabling
+.BR \-\-domain\-regexp ;
+without it that rule option is rejected.
 .PP
 Options for features not compiled in are rejected. Run
 .B ./configure \-\-help

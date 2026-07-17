@@ -210,6 +210,26 @@ static void test_domain(void)
 	gwp_acl_destroy(a);
 }
 
+static void test_domain_regexp(void)
+{
+#ifdef CONFIG_PCRE
+	struct gwp_acl *a = NULL;
+
+	/* Raw/unanchored, case-insensitive PCRE against the requested host. */
+	assert(!gwp_acl_parse_str(&a,
+		"-A OUTPUT -m domain --domain-regexp \\.example\\.com$ -j REJECT\n"
+		"-P OUTPUT ACCEPT\n"));
+	assert(out(a, NULL, "a.example.com", 443, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+	assert(out(a, NULL, "A.EXAMPLE.COM", 443, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+	/* Unanchored on the left, anchored on the right by the pattern. */
+	assert(out(a, NULL, "example.com.evil.net", 443, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
+	assert(out(a, NULL, "other.org", 443, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
+	/* A literal-IP target (no hostname) never matches a domain regexp. */
+	assert(out(a, NULL, NULL, 443, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
+	gwp_acl_destroy(a);
+#endif
+}
+
 /* Evaluate one OUTPUT DNAT rule against target @ip:@port; return the req. */
 static struct gwp_acl_req dnat_eval(const char *rule, const char *ip,
 				    uint16_t port, bool v6)
@@ -347,6 +367,25 @@ static void test_parse_errors(void)
 		assert(gwp_acl_parse_str(&a, bad[i]) < 0);
 	}
 
+	/* --domain-regexp still needs the -m domain module loaded first. */
+	a = (void *)0x1;
+	assert(gwp_acl_parse_str(&a,
+		"-A OUTPUT --domain-regexp x -j REJECT\n") < 0);
+#ifdef CONFIG_PCRE
+	/* A malformed pattern, and mixing exact + regexp for one field, fail. */
+	a = (void *)0x1;
+	assert(gwp_acl_parse_str(&a,
+		"-A OUTPUT -m domain --domain-regexp ( -j REJECT\n") < 0);
+	a = (void *)0x1;
+	assert(gwp_acl_parse_str(&a,
+		"-A OUTPUT -m domain --domain a --domain-regexp b -j REJECT\n") < 0);
+#else
+	/* Without --use-pcre the regexp option is rejected outright. */
+	a = (void *)0x1;
+	assert(gwp_acl_parse_str(&a,
+		"-A OUTPUT -m domain --domain-regexp x -j REJECT\n") < 0);
+#endif
+
 	fflush(stderr);
 	if (saved >= 0)
 		dup2(saved, STDERR_FILENO);
@@ -368,6 +407,7 @@ static void run_tests(void)
 		test_ports_and_negation();
 		test_input_and_proto();
 		test_domain();
+		test_domain_regexp();
 		test_dnat();
 		test_comments_and_default_policy();
 	}

@@ -101,6 +101,27 @@ for loop in epoll io_uring; do
 		"$loop -m domain corrupted the literal-IP payload"
 	kill "$GWP_PID" 2>/dev/null
 
+	# --domain-regexp (PCRE builds only): a raw/unanchored pattern matches
+	# the requested hostname; a non-matching host is served.
+	if grep -q CONFIG_PCRE "$ROOT/config.h" 2>/dev/null; then
+		printf -- '%s\n' \
+			'-A OUTPUT -m domain --domain-regexp ^localhost$ -j REJECT' \
+			'-P OUTPUT ACCEPT' >"$WORK/domre.acl"
+		rp="$(pick_port)"
+		gwp_start "127.0.0.1:$rp" --as-socks5=1 --event-loop="$loop" \
+			--acl-file="$WORK/domre.acl"
+		if curl -s --max-time 10 -x "socks5h://127.0.0.1:$rp" \
+			"http://localhost:$hp/payload.bin" -o /dev/null 2>/dev/null; then
+			fail "$loop --domain-regexp did not block the hostname"
+		fi
+		curl -s --max-time 20 -x "socks5://127.0.0.1:$rp" \
+			"http://127.0.0.1:$hp/payload.bin" -o "$WORK/domre.out" \
+			|| fail "$loop literal-IP wrongly blocked by --domain-regexp"
+		assert_files_equal "$WORK/payload.bin" "$WORK/domre.out" \
+			"$loop --domain-regexp corrupted the literal-IP payload"
+		kill "$GWP_PID" 2>/dev/null
+	fi
+
 	# -j DNAT rewrites the destination: a CONNECT to a dead port is
 	# redirected to the real origin and succeeds.
 	printf -- '%s\n' \

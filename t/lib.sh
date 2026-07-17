@@ -50,6 +50,14 @@ require_io_uring()
 		skip "gwproxy built without io_uring"
 }
 
+# Skip unless gwproxy was built with PCRE2 support (--use-pcre), needed by the
+# ACL --domain-regexp / --user-regexp matches.
+require_pcre()
+{
+	grep -q 'CONFIG_PCRE' "$ROOT/config.h" 2>/dev/null || \
+		skip "gwproxy built without PCRE (--use-pcre)"
+}
+
 # Skip unless gwproxy advertises a given long option in --help.
 require_opt()
 {
