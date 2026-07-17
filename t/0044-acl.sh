@@ -82,6 +82,25 @@ for loop in epoll io_uring; do
 
 	kill "$GWP_PID" 2>/dev/null
 
+	# -m domain: a socks5h request naming a blocked host is refused (the
+	# domain is matched before resolution), while a literal-IP request
+	# (which carries no hostname) is allowed.
+	printf -- '%s\n' '-A OUTPUT -m domain --domain localhost -j REJECT' \
+		'-P OUTPUT ACCEPT' >"$WORK/domain.acl"
+	dp="$(pick_port)"
+	gwp_start "127.0.0.1:$dp" --as-socks5=1 --event-loop="$loop" \
+		--acl-file="$WORK/domain.acl"
+	if curl -s --max-time 10 -x "socks5h://127.0.0.1:$dp" \
+		"http://localhost:$hp/payload.bin" -o /dev/null 2>/dev/null; then
+		fail "$loop -m domain rule did not block the hostname request"
+	fi
+	curl -s --max-time 20 -x "socks5://127.0.0.1:$dp" \
+		"http://127.0.0.1:$hp/payload.bin" -o "$WORK/dom.out" \
+		|| fail "$loop literal-IP request wrongly blocked by -m domain"
+	assert_files_equal "$WORK/payload.bin" "$WORK/dom.out" \
+		"$loop -m domain corrupted the literal-IP payload"
+	kill "$GWP_PID" 2>/dev/null
+
 	# INPUT chain: a denied client source is dropped at accept, before any
 	# handshake, so the connection fails outright.
 	ip="$(pick_port)"

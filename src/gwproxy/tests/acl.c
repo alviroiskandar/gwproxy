@@ -183,6 +183,7 @@ static void test_input_and_proto(void)
 static void test_domain(void)
 {
 	struct gwp_acl *a = NULL;
+	struct gwp_sockaddr s;
 
 	assert(!gwp_acl_parse_str(&a,
 		"-A OUTPUT -m domain --domain example.com -j REJECT\n"));
@@ -191,6 +192,19 @@ static void test_domain(void)
 	assert(out(a, NULL, "other.com", 443, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
 	/* A literal-IP target (no domain) does not match a domain rule. */
 	assert(out(a, NULL, NULL, 443, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
+	gwp_acl_destroy(a);
+
+	/*
+	 * A rule WITHOUT a domain match, evaluated against a query that DOES
+	 * carry a domain, must not deref the rule's NULL domain (regression:
+	 * crit_ok evaluates its matched argument eagerly).
+	 */
+	a = NULL;
+	assert(!gwp_acl_parse_str(&a,
+		"-A OUTPUT --dports 80 -j REJECT\n-P OUTPUT ACCEPT\n"));
+	s = sa4("1.2.3.4", 80);
+	assert(out(a, &s, "example.com", 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+	assert(out(a, &s, "example.com", 81, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
 	gwp_acl_destroy(a);
 }
 

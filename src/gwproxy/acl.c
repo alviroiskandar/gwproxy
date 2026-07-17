@@ -777,6 +777,11 @@ void gwp_acl_destroy(struct gwp_acl *acl)
  * whether the value matched; @negate is the rule's neg_* flag. The criterion is
  * satisfied when it is absent, or present with (matched XOR negated). Adding a
  * new criterion to rule_matches() is then a one-liner.
+ *
+ * @matched is computed by the caller and so is evaluated even when @present is
+ * false: it must be side-effect-free and safe to compute for a rule that does
+ * not set the criterion (e.g. guard a pointer deref on the rule field, not just
+ * the query field).
  */
 static bool crit_ok(bool present, bool matched, bool negate)
 {
@@ -791,7 +796,8 @@ static bool rule_matches(const struct gwp_acl_rule *r,
 	       crit_ok(r->has_dst,
 		       q->target && cidr_match(&r->dst, q->target), r->neg_dst) &&
 	       crit_ok(r->has_domain,
-		       q->domain && !strcasecmp(q->domain, r->domain),
+		       r->domain && q->domain &&
+			       !strcasecmp(q->domain, r->domain),
 		       r->neg_domain) &&
 	       crit_ok(r->has_proto, q->proto == r->proto, r->neg_proto) &&
 	       crit_ok(r->has_sports, ports_match(&r->sports, q->sport),

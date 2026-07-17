@@ -333,6 +333,14 @@ struct gwp_conn_pair {
 	struct gwp_sockaddr	target_addr;
 
 	/*
+	 * The hostname the client asked for, when it used a domain target
+	 * (SOCKS5 ATYP 0x03 or an HTTP host), for ACL "-m domain" matching.
+	 * Points into s5_conn/http_conn and stays valid for the connection's
+	 * life; NULL for literal-IP requests.
+	 */
+	const char		*req_domain;
+
+	/*
 	 * Destination requested from the upstream SOCKS5 proxy. Only used
 	 * when ctx->upstream.enabled. For socks5:// this is filled from
 	 * target_addr (an IP); for socks5h:// it carries the hostname.

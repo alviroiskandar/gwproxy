@@ -1086,8 +1086,28 @@ bool gwp_ctx_acl_output_allowed(struct gwp_ctx *ctx,
 
 bool gwp_ctx_acl_target_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp)
 {
-	return gwp_ctx_acl_output_allowed(ctx, &gcp->client_addr,
-					  &gcp->target_addr, GWP_ACL_PROTO_TCP);
+	struct gwp_sockaddr *t = &gcp->target_addr;
+	int fam = t->sa.sa_family;
+	bool have_ip = (fam == AF_INET || fam == AF_INET6);
+	struct gwp_acl_req req;
+
+	if (!ctx->acl)
+		return true;
+	/*
+	 * Nothing to match on: a literal-IP request that did not resolve to a
+	 * usable address (should not happen) and no requested hostname.
+	 */
+	if (!have_ip && !gcp->req_domain)
+		return true;
+
+	memset(&req, 0, sizeof(req));
+	req.client = &gcp->client_addr;
+	req.target = have_ip ? t : NULL;	/* NULL for remote-DNS upstream */
+	req.domain = gcp->req_domain;		/* NULL for a literal-IP target */
+	req.proto = GWP_ACL_PROTO_TCP;
+	req.dport = have_ip ? sa_port_h(t) : 0;
+	req.sport = sa_port_h(&gcp->client_addr);
+	return gwp_acl_eval_output(ctx->acl, &req) == GWP_ACL_ACCEPT;
 }
 
 /*
@@ -2099,6 +2119,9 @@ static int prepare_target_addr_domain(struct gwp_wrk *w,
 	struct gwp_ctx *ctx = w->ctx;
 	struct gwp_cfg *cfg = &ctx->cfg;
 	int r;
+
+	/* Remember the requested hostname for ACL "-m domain" matching. */
+	gcp->req_domain = host;
 
 	/*
 	 * socks5h://: don't resolve locally; hand the hostname to the upstream
