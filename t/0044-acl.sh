@@ -82,6 +82,26 @@ for loop in epoll io_uring; do
 
 	kill "$GWP_PID" 2>/dev/null
 
+	# End-to-end IPv6: an IPv6-bound listener with an ACL rule on an IPv6
+	# CIDR blocks the IPv6 target (::1) but still serves an IPv4 target
+	# (the dual-stack httpd is reachable both ways). Exercises the v6
+	# address match and a v6 listener on both loops.
+	printf -- '%s\n' '-A OUTPUT -d ::1/128 -j REJECT' \
+		'-P OUTPUT ACCEPT' >"$WORK/v6.acl"
+	v6p="$(pick_port)"
+	gwp_start "[::1]:$v6p" --as-socks5=1 --event-loop="$loop" \
+		--acl-file="$WORK/v6.acl"
+	if curl -s --max-time 10 -x "socks5h://[::1]:$v6p" \
+		"http://[::1]:$hp/payload.bin" -o /dev/null 2>/dev/null; then
+		fail "$loop IPv6 ACL rule did not block the ::1 target"
+	fi
+	curl -s --max-time 20 -x "socks5h://[::1]:$v6p" \
+		"http://127.0.0.1:$hp/payload.bin" -o "$WORK/v6.out" \
+		|| fail "$loop IPv6 listener wrongly blocked the IPv4 target"
+	assert_files_equal "$WORK/payload.bin" "$WORK/v6.out" \
+		"$loop IPv6 path corrupted the IPv4-target payload"
+	kill "$GWP_PID" 2>/dev/null
+
 	# -m domain: a socks5h request naming a blocked host is refused (the
 	# domain is matched before resolution), while a literal-IP request
 	# (which carries no hostname) is allowed.
