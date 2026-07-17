@@ -54,10 +54,13 @@ struct gwp_auth;
 struct gwp_socks5_cfg {
 	/* Borrowed credential store, or NULL to disable authentication. */
 	struct gwp_auth	*auth;
+	/* Allow the UDP ASSOCIATE command (rejected with REP 0x07 when false). */
+	bool		udp_associate;
 };
 
 struct gwp_socks5_ctx {
 	struct gwp_auth		*auth;
+	bool			udp_associate;
 	_Atomic(uint32_t)	nr_clients;
 };
 

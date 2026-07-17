@@ -26,10 +26,14 @@ int gwp_socks5_ctx_init(struct gwp_socks5_ctx **ctx_p,
 
 	/*
 	 * The credential store is owned by the caller (shared with the HTTP
-	 * proxy front-end); we only borrow the pointer.
+	 * proxy front-end); we only borrow the pointer. A NULL cfg means
+	 * "defaults": no auth, and UDP ASSOCIATE enabled (the standard command).
 	 */
-	if (cfg)
+	ctx->udp_associate = true;
+	if (cfg) {
 		ctx->auth = cfg->auth;
+		ctx->udp_associate = cfg->udp_associate;
+	}
 
 	*ctx_p = ctx;
 	return 0;
@@ -548,6 +552,9 @@ static int handle_state_cmd(struct data_arg *d)
 	case 0x01: /* CONNECT */
 		return handle_cmd_connect(d);
 	case 0x03: /* UDP ASSOCIATE */
+		if (!d->ctx->udp_associate)
+			return set_err_reply(d,
+					GWP_SOCKS5_REP_COMMAND_NOT_SUPPORTED);
 		return handle_cmd_udp_associate(d);
 
 	/*

@@ -44,6 +44,7 @@ struct gwp_cfg {
 	const char	*target;
 	bool		as_socks5;
 	bool		as_http;
+	bool		udp_associate;	/* allow SOCKS5 UDP ASSOCIATE (default on) */
 	bool		prefer_ipv6;
 	bool		use_raw_dns;
 	int		protocol_timeout;

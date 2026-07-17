@@ -118,6 +118,20 @@ Run as a SOCKS5 proxy. Default:
 Run as an HTTP proxy (CONNECT and forwarding). Default:
 .BR 0 .
 .TP
+.BR \-U ", " \-\-udp\-associate=\fI0|1\fR
+Allow the SOCKS5
+.B UDP ASSOCIATE
+command. When
+.BR 0 ,
+the proxy rejects it with reply
+.B 0x07
+(command not supported), leaving TCP
+.B CONNECT
+unaffected; only meaningful with
+.BR \-\-as\-socks5 .
+Default:
+.BR 1 .
+.TP
 .BR \-R ", " \-\-as\-transparent=\fI0|1\fR
 Run as a transparent proxy, taking the target from
 .B SO_ORIGINAL_DST

@@ -53,6 +53,7 @@ static const struct option long_opts[] = {
 	{ "target",		required_argument,	NULL,	't' },
 	{ "as-socks5",		required_argument,	NULL,	'S' },
 	{ "as-http",		required_argument,	NULL,	'H' },
+	{ "udp-associate",	required_argument,	NULL,	'U' },
 	{ "prefer-ipv6",	required_argument,	NULL,	'Q' },
 	{ "protocol-timeout",	required_argument,	NULL,	'o' },
 	{ "auth-file",		required_argument,	NULL,	'A' },
@@ -92,6 +93,7 @@ static const struct gwp_cfg default_opts = {
 	.target			= NULL,
 	.as_socks5		= false,
 	.as_http		= false,
+	.udp_associate		= true,
 	.prefer_ipv6		= false,
 	.use_raw_dns		= false,
 	.protocol_timeout	= 10,
@@ -130,6 +132,7 @@ static void show_help(const char *app)
 	printf("  -t, --target=addr_port          Target address to connect to\n");
 	printf("  -S, --as-socks5=0|1             Run as a SOCKS5 proxy (default: %d)\n", default_opts.as_socks5);
 	printf("  -H, --as-http=0|1               Run as an HTTP proxy (default: %d)\n", default_opts.as_http);
+	printf("  -U, --udp-associate=0|1         Allow SOCKS5 UDP ASSOCIATE; 0 rejects it with REP 0x07 (default: %d)\n", default_opts.udp_associate);
 	printf("  -Q, --prefer-ipv6=0|1           Prefer IPv6 for proxy DNS queries (default: %d)\n", default_opts.prefer_ipv6);
 	printf("  -o, --protocol-timeout=sec      Timeout for protocol handshake process (default: %d)\n", default_opts.protocol_timeout);
 	printf("  -A, --auth-file=file            File with username:password credentials for SOCKS5 and HTTP auth (default: no auth)\n");
@@ -222,6 +225,9 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 			break;
 		case 'H':
 			cfg->as_http = !!atoi(optarg);
+			break;
+		case 'U':
+			cfg->udp_associate = !!atoi(optarg);
 			break;
 		case 'Q':
 			cfg->prefer_ipv6 = !!atoi(optarg);
@@ -1284,6 +1290,7 @@ static int gwp_ctx_init_socks5(struct gwp_ctx *ctx)
 	pr_dbg(&ctx->lh, "Initializing SOCKS5 context");
 	memset(&s5cfg, 0, sizeof(s5cfg));
 	s5cfg.auth = ctx->auth;
+	s5cfg.udp_associate = ctx->cfg.udp_associate;
 	r = gwp_socks5_ctx_init(&ctx->socks5, &s5cfg);
 	if (r < 0) {
 		pr_err(&ctx->lh, "Failed to initialize SOCKS5 context: %s",
