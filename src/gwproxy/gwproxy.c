@@ -883,6 +883,70 @@ static void gwp_ctx_free_threads(struct gwp_ctx *ctx)
 	ctx->workers = NULL;
 }
 
+static const char *path_basename(const char *path)
+{
+	const char *slash = strrchr(path, '/');
+
+	return slash ? slash + 1 : path;
+}
+
+/*
+ * Add an inotify watch that survives an atomic replace of `path`. We watch the
+ * *parent directory*, not the file: an inode watch is silently dropped the
+ * moment an editor, `install`, or `mv` swaps the file via rename, and never
+ * fires again. Watching the directory for IN_CLOSE_WRITE (in-place writes) and
+ * IN_MOVED_TO (rename-into-place) catches both update styles; handlers narrow
+ * the reported events down to the file's basename with
+ * gwp_inotify_event_matches(). Returns the watch descriptor or -errno.
+ */
+static int add_reload_watch(int ino_fd, const char *path)
+{
+	const char *slash = strrchr(path, '/');
+	char dir[PATH_MAX];
+	int r;
+
+	if (!slash) {
+		dir[0] = '.';
+		dir[1] = '\0';
+	} else {
+		size_t n = (size_t)(slash - path);
+
+		if (n == 0)		/* "/file": watch the root directory */
+			n = 1;
+		if (n >= sizeof(dir))
+			return -ENAMETOOLONG;
+		memcpy(dir, path, n);
+		dir[n] = '\0';
+	}
+
+	r = inotify_add_watch(ino_fd, dir, IN_CLOSE_WRITE | IN_MOVED_TO);
+	return (r < 0) ? -errno : r;
+}
+
+/*
+ * True when a drained inotify buffer names the basename of `path`. The reload
+ * watches sit on the parent directory (see add_reload_watch), so handlers call
+ * this to reload only for their own file and ignore unrelated directory churn.
+ */
+bool gwp_inotify_event_matches(const void *buf, size_t len, const char *path)
+{
+	const char *base = path_basename(path);
+	size_t off = 0;
+
+	while (off + sizeof(struct inotify_event) <= len) {
+		const struct inotify_event *e =
+			(const struct inotify_event *)((const char *)buf + off);
+		size_t rec = sizeof(*e) + e->len;
+
+		if (off + rec > len)
+			break;
+		if (e->len && !strcmp(e->name, base))
+			return true;
+		off += rec;
+	}
+	return false;
+}
+
 /*
  * Load the shared credential store from the auth file (if configured) and set
  * up an inotify watch so it is hot-reloaded on change. The store is shared by
@@ -919,8 +983,7 @@ static int gwp_ctx_init_auth(struct gwp_ctx *ctx)
 	pr_dbg(&ctx->lh, "Inotify file descriptor initialized (fd=%d)", r);
 
 	ctx->ino_fd = r;
-	r = inotify_add_watch(ctx->ino_fd, cfg->auth_file,
-			      IN_DELETE | IN_CLOSE_WRITE);
+	r = add_reload_watch(ctx->ino_fd, cfg->auth_file);
 	if (r < 0) {
 		pr_err(&ctx->lh, "Failed to add inotify watch: %s", strerror(-r));
 		goto out_err;
@@ -1001,8 +1064,7 @@ static int gwp_ctx_init_acl(struct gwp_ctx *ctx)
 	}
 	ctx->acl_ino_fd = r;
 
-	r = inotify_add_watch(ctx->acl_ino_fd, cfg->acl_file,
-			      IN_DELETE | IN_CLOSE_WRITE);
+	r = add_reload_watch(ctx->acl_ino_fd, cfg->acl_file);
 	if (r < 0) {
 		pr_err(&ctx->lh, "Failed to add ACL inotify watch: %s",
 			strerror(-r));

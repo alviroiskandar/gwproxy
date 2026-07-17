@@ -1997,11 +1997,15 @@ static void prep_auth_reload(struct gwp_wrk *w)
 	s->user_data = EV_BIT_IOU_SOCKS5_AUTH_FILE;
 }
 
-static int handle_ev_auth_file(struct gwp_wrk *w)
+static int handle_ev_auth_file(struct gwp_wrk *w, int res)
 {
 	struct gwp_ctx *ctx = w->ctx;
 
 	prep_auth_reload(w);
+	if (res <= 0 || !gwp_inotify_event_matches(ctx->ino_buf, (size_t)res,
+						   ctx->cfg.auth_file))
+		return 0;
+
 	gwp_auth_reload(ctx->auth);
 	pr_info(&ctx->lh, "Reloaded authentication file");
 	return 0;
@@ -2019,11 +2023,15 @@ static void prep_acl_reload(struct gwp_wrk *w)
 	s->user_data = EV_BIT_IOU_ACL_FILE;
 }
 
-static int handle_ev_acl_file(struct gwp_wrk *w)
+static int handle_ev_acl_file(struct gwp_wrk *w, int res)
 {
 	struct gwp_ctx *ctx = w->ctx;
 
 	prep_acl_reload(w);
+	if (res <= 0 || !gwp_inotify_event_matches(ctx->acl_ino_buf, (size_t)res,
+						   ctx->cfg.acl_file))
+		return 0;
+
 	if (gwp_acl_reload(ctx->acl))
 		pr_warn(&ctx->lh, "Failed to reload ACL file; keeping current rules");
 	else
@@ -2114,10 +2122,10 @@ static int handle_event(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 		break;
 	case EV_BIT_IOU_SOCKS5_AUTH_FILE:
 		pr_dbg(&ctx->lh, "Handling SOCKS5 auth file reload event: %d", cqe->res);
-		return handle_ev_auth_file(w);
+		return handle_ev_auth_file(w, cqe->res);
 	case EV_BIT_IOU_ACL_FILE:
 		pr_dbg(&ctx->lh, "Handling ACL file reload event: %d", cqe->res);
-		return handle_ev_acl_file(w);
+		return handle_ev_acl_file(w, cqe->res);
 	case EV_BIT_IOU_TARGET_CANCEL:
 		gcp = udata;
 		pr_dbg(&ctx->lh, "Handling target cancel event: %d", cqe->res);

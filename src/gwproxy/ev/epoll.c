@@ -1723,6 +1723,10 @@ static int handle_ev_auth_file(struct gwp_wrk *w)
 		return (int)r;
 	}
 
+	if (!gwp_inotify_event_matches(w->ctx->ino_buf, (size_t)r,
+				       w->ctx->cfg.auth_file))
+		return 0;
+
 	gwp_auth_reload(w->ctx->auth);
 	pr_info(&w->ctx->lh, "Reloaded authentication file");
 	return 0;
@@ -1745,6 +1749,10 @@ static int handle_ev_acl_file(struct gwp_wrk *w)
 			strerror((int)-r));
 		return (int)r;
 	}
+
+	if (!gwp_inotify_event_matches(ctx->acl_ino_buf, (size_t)r,
+				       ctx->cfg.acl_file))
+		return 0;
 
 	if (gwp_acl_reload(ctx->acl))
 		pr_warn(&ctx->lh, "Failed to reload ACL file; keeping current rules");

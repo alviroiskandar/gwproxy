@@ -514,6 +514,11 @@ int gwp_get_orig_dst(int fd, const struct gwp_sockaddr *client,
 		     struct gwp_sockaddr *dst);
 const char *ip_to_str(const struct gwp_sockaddr *gs);
 
+/* True when a drained inotify buffer names the basename of @path. The auth/ACL
+ * reload watches sit on the parent directory (so atomic renames still fire), so
+ * the reload handlers use this to reload only for their own file. */
+bool gwp_inotify_event_matches(const void *buf, size_t len, const char *path);
+
 static inline void gwp_conn_buf_advance(struct gwp_conn *conn, size_t len)
 {
 	assert(len <= conn->len);

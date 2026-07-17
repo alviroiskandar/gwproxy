@@ -128,6 +128,32 @@ for loop in epoll io_uring; do
 		"$loop plain DNAT redirected to the wrong target"
 	kill "$GWP_PID" 2>/dev/null
 
+	# Hot reload survives an atomic replace (write-temp + rename-over, as
+	# editors and install(1) do): the watch is on the directory, so a
+	# renamed-in acl file is still picked up. A file/inode watch would go
+	# stale here and never reload.
+	cp "$WORK/ok.acl" "$WORK/reload.acl"
+	rp="$(pick_port)"
+	gwp_start "127.0.0.1:$rp" --as-http=1 --event-loop="$loop" \
+		--acl-file="$WORK/reload.acl"
+	code="$(curl -s --max-time 20 -x "http://127.0.0.1:$rp" \
+		"http://127.0.0.1:$hp/payload.bin" -o /dev/null -w '%{http_code}')"
+	[ "$code" = 200 ] || fail "$loop pre-reload fetch got $code (want 200)"
+	printf -- '%s\n' "-A OUTPUT --dports $hp -j REJECT" '-P OUTPUT ACCEPT' \
+		>"$WORK/reload.new"
+	mv -f "$WORK/reload.new" "$WORK/reload.acl"
+	code=""
+	for _ in $(seq 1 50); do
+		code="$(curl -s --max-time 20 -x "http://127.0.0.1:$rp" \
+			"http://127.0.0.1:$hp/payload.bin" -o /dev/null \
+			-w '%{http_code}')"
+		[ "$code" = 403 ] && break
+		sleep 0.1
+	done
+	[ "$code" = 403 ] \
+		|| fail "$loop acl not reloaded after atomic rename ($code, want 403)"
+	kill "$GWP_PID" 2>/dev/null
+
 	# INPUT chain: a denied client source is dropped at accept, before any
 	# handshake, so the connection fails outright.
 	ip="$(pick_port)"
