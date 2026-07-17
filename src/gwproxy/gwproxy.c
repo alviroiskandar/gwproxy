@@ -153,7 +153,7 @@ static void show_help(const char *app)
 	printf("  -m, --log-level=level           Set log level (0=none, 1=error, 2=warning, 3=info, 4=debug, default: %d)\n", default_opts.log_level);
 	printf("  -f, --log-file=file             Log to the specified file (default: %s)\n", default_opts.log_file);
 	printf("  -p, --pid-file=file             Write PID to the specified file (default is no pid file)\n");
-	printf("  -x, --upstream-proxy=url       Route outgoing connections through an upstream proxy\n");
+	printf("  -x, --upstream-proxy=url        Route outgoing connections through an upstream proxy\n");
 	printf("                                  URL: socks5://[user:pass@]host:port  (local DNS)\n");
 	printf("                                       socks5h://[user:pass@]host:port (proxy resolves the host)\n");
 	printf("                                       http://[user:pass@]host:port    (HTTP CONNECT)\n");
