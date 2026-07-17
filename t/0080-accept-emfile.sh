@@ -73,7 +73,7 @@ run_leg()
 	# Proxy with a low descriptor limit so it can be driven into EMFILE.
 	( ulimit -n "$FDLIMIT"; exec "$GWPROXY" --event-loop="$ev" \
 		--target="127.0.0.1:$op" --bind="127.0.0.1:$tp" \
-		--nr-workers=1 --log-level=4 ) >"$glog" 2>&1 &
+		--acl-allow-all --nr-workers=1 --log-level=4 ) >"$glog" 2>&1 &
 	gwp_pid=$!
 	_PIDS+=("$gwp_pid")
 	wait_listen "$tp" "$gwp_pid" \

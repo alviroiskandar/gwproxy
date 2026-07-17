@@ -50,6 +50,7 @@ struct gwp_cfg {
 	int		protocol_timeout;
 	const char	*auth_file;
 	const char	*acl_file;
+	bool		acl_allow_all;	/* skip the built-in default ACL */
 	int		dns_cache_secs;
 	int		nr_workers;
 	int		nr_dns_workers;

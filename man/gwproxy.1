@@ -171,8 +171,11 @@ Load an iptables\-style access\-control list that filters incoming clients
 and outgoing targets
 .RB ( OUTPUT " chain)."
 The file is watched and hot\-reloaded on change, and a malformed file is
-rejected (at startup, or by keeping the previous rules on reload). Without it,
-no filtering is applied. Each line is one directive, evaluated top\-to\-bottom
+rejected (at startup, or by keeping the previous rules on reload). When
+.B \-\-acl\-file
+is not given, a built\-in default ACL is applied instead (see
+.BR \-\-acl\-allow\-all
+below). Each line is one directive, evaluated top\-to\-bottom
 with first\-match\-wins; a chain's policy applies when nothing matches:
 .RS
 .IP \(bu 3
@@ -296,6 +299,34 @@ The
 option, like
 .BR \-\-domain\-regexp ,
 requires a PCRE2 build.
+.TP
+.B \-\-acl\-allow\-all
+Do not apply the built\-in default ACL; allow all targets (the behaviour before
+a default ACL existed). This is ignored when
+.B \-\-acl\-file
+is given \(em the file's rules always apply as written.
+.PP
+.RS
+When neither
+.B \-\-acl\-file
+nor
+.B \-\-acl\-allow\-all
+is given, gwproxy applies a built\-in default ACL that rejects outgoing
+connections to loopback and private address ranges (SSRF hardening) while
+accepting all clients:
+.RS
+.nf
+\-P INPUT ACCEPT
+\-A OUTPUT \-d 10.0.0.0/8 \-j REJECT
+\-A OUTPUT \-d 127.0.0.0/8 \-j REJECT
+\-A OUTPUT \-d 192.168.0.0/16 \-j REJECT
+\-A OUTPUT \-d 172.16.0.0/12 \-j REJECT
+\-A OUTPUT \-d fe80::/10 \-j REJECT
+\-A OUTPUT \-d fc00::/7 \-j REJECT
+\-P OUTPUT ACCEPT
+.fi
+.RE
+.RE
 .SS TLS termination (HTTPS proxy)
 These options require a build with OpenSSL support (see
 .BR "AVAILABILITY" ).

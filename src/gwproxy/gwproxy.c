@@ -46,6 +46,12 @@
 #include <sys/resource.h>
 #include <sys/inotify.h>
 
+/* Long-only options (no short letter): values >= 128 are skipped by the
+ * short-option string builder below. */
+enum {
+	OPT_ACL_ALLOW_ALL = 0x100,
+};
+
 static const struct option long_opts[] = {
 	{ "help",		no_argument,		NULL,	'h' },
 	{ "event-loop",		required_argument,	NULL,	'e' },
@@ -58,6 +64,7 @@ static const struct option long_opts[] = {
 	{ "protocol-timeout",	required_argument,	NULL,	'o' },
 	{ "auth-file",		required_argument,	NULL,	'A' },
 	{ "acl-file",		required_argument,	NULL,	'a' },
+	{ "acl-allow-all",	no_argument,		NULL,	OPT_ACL_ALLOW_ALL },
 	{ "dns-cache-secs",	required_argument,	NULL,	'L' },
 	{ "nr-workers",		required_argument,	NULL,	'w' },
 	{ "nr-dns-workers",	required_argument,	NULL,	'W' },
@@ -136,7 +143,9 @@ static void show_help(const char *app)
 	printf("  -Q, --prefer-ipv6=0|1           Prefer IPv6 for proxy DNS queries (default: %d)\n", default_opts.prefer_ipv6);
 	printf("  -o, --protocol-timeout=sec      Timeout for protocol handshake process (default: %d)\n", default_opts.protocol_timeout);
 	printf("  -A, --auth-file=file            File with username:password credentials for SOCKS5 and HTTP auth (default: no auth)\n");
-	printf("  -a, --acl-file=file             iptables-style ACL rule file for target/client filtering (default: no ACL)\n");
+	printf("  -a, --acl-file=file             iptables-style ACL rule file for target/client filtering\n");
+	printf("                                  (default: a built-in ACL that rejects private/loopback target ranges)\n");
+	printf("      --acl-allow-all             Do not apply the built-in default ACL (allow all; ignored with --acl-file)\n");
 	printf("  -L, --dns-cache-secs=sec        Proxy DNS cache duration in seconds (default: %d)\n", default_opts.dns_cache_secs);
 	printf("                                  Set to 0 or a negative number to disable DNS caching.\n");
 	printf("  -w, --nr-workers=nr             Number of worker threads (default: %d)\n", default_opts.nr_workers);
@@ -193,6 +202,9 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 
 	p = short_opts;
 	for (i = 0; i < NR_OPTS; i++) {
+		/* Long-only options use a val >= 128 and have no short letter. */
+		if (long_opts[i].val <= 0 || long_opts[i].val >= 128)
+			continue;
 		*p++ = long_opts[i].val;
 		if (long_opts[i].has_arg == required_argument ||
 		    long_opts[i].has_arg == optional_argument)
@@ -240,6 +252,9 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 			break;
 		case 'a':
 			cfg->acl_file = optarg;
+			break;
+		case OPT_ACL_ALLOW_ALL:
+			cfg->acl_allow_all = true;
 			break;
 		case 'L':
 			cfg->dns_cache_secs = atoi(optarg);
@@ -1035,11 +1050,28 @@ static void gwp_ctx_free_auth(struct gwp_ctx *ctx)
 }
 
 /*
+ * Applied when no --acl-file is given (and --acl-allow-all is not set): an
+ * SSRF-hardening default that rejects outgoing connections to loopback and
+ * private address ranges while accepting all clients. --acl-file overrides it
+ * wholesale; --acl-allow-all disables it (allow everything).
+ */
+static const char gwp_acl_default_rules[] =
+	"-P INPUT ACCEPT\n"
+	"-A OUTPUT -d 10.0.0.0/8 -j REJECT\n"
+	"-A OUTPUT -d 127.0.0.0/8 -j REJECT\n"
+	"-A OUTPUT -d 192.168.0.0/16 -j REJECT\n"
+	"-A OUTPUT -d 172.16.0.0/12 -j REJECT\n"
+	"-A OUTPUT -d fe80::/10 -j REJECT\n"
+	"-A OUTPUT -d fc00::/7 -j REJECT\n"
+	"-P OUTPUT ACCEPT\n";
+
+/*
  * Load the ACL rule file (--acl-file) and watch it for changes so it is
  * hot-reloaded, mirroring the auth store. Unlike auth (prot-only), the ACL is
  * global to every proxy mode, so this is initialised from gwp_ctx_init()
- * regardless of SOCKS5/HTTP/transparent/plain forwarding. Leaves the ACL
- * disabled (NULL, watch fd -1) when no file is configured.
+ * regardless of SOCKS5/HTTP/transparent/plain forwarding. With no file it
+ * applies the built-in default ACL, unless --acl-allow-all leaves it disabled
+ * (NULL, watch fd -1).
  */
 static int gwp_ctx_init_acl(struct gwp_ctx *ctx)
 {
@@ -1051,7 +1083,21 @@ static int gwp_ctx_init_acl(struct gwp_ctx *ctx)
 	ctx->acl_ino_buf = NULL;
 
 	if (!cfg->acl_file || !*cfg->acl_file) {
-		pr_dbg(&ctx->lh, "ACL disabled (no acl file)");
+		if (cfg->acl_allow_all) {
+			pr_dbg(&ctx->lh, "ACL disabled (--acl-allow-all)");
+			return 0;
+		}
+
+		/* No file to watch/reload: the default rules are compiled in. */
+		r = gwp_acl_parse_str(&ctx->acl, gwp_acl_default_rules);
+		if (r < 0) {
+			pr_err(&ctx->lh, "Failed to build default ACL: %s",
+				strerror(-r));
+			ctx->acl = NULL;
+			return r;
+		}
+		pr_info(&ctx->lh,
+			"Applied built-in default ACL (loopback/private targets blocked; --acl-allow-all to disable)");
 		return 0;
 	}
 

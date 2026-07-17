@@ -53,6 +53,31 @@ socks5_connect_rep() {			# $1=proxy_port $2=dst_ip $3=dst_port
 	PY
 }
 
+# Built-in default ACL: with no --acl-file (and no --acl-allow-all) gwproxy
+# rejects loopback/private targets. Launch directly to bypass gwp_start's
+# automatic --acl-allow-all injection.
+ddp="$(pick_port)"
+"$GWPROXY" --bind="127.0.0.1:$ddp" --as-http=1 --nr-workers=1 --log-level=3 \
+	>"$WORK/defacl.log" 2>&1 &
+dpid=$!
+_PIDS+=("$dpid")
+wait_listen "$ddp" "$dpid" || fail "default-ACL proxy did not listen"
+code="$(curl -s --max-time 10 -x "http://127.0.0.1:$ddp" \
+	"http://127.0.0.1:$hp/payload.bin" -o /dev/null -w '%{http_code}')"
+[ "$code" = 403 ] \
+	|| fail "default ACL did not block the loopback target ($code, want 403)"
+kill "$dpid" 2>/dev/null
+
+# --acl-allow-all disables the default so the same fetch succeeds (gwp_start
+# injects --acl-allow-all when no ACL argument is present).
+ap="$(pick_port)"
+gwp_start "127.0.0.1:$ap" --as-http=1
+code="$(curl -s --max-time 20 -x "http://127.0.0.1:$ap" \
+	"http://127.0.0.1:$hp/payload.bin" -o /dev/null -w '%{http_code}')"
+[ "$code" = 200 ] \
+	|| fail "--acl-allow-all did not permit the loopback target ($code, want 200)"
+kill "$GWP_PID" 2>/dev/null
+
 for loop in epoll io_uring; do
 	[ "$loop" = io_uring ] && ! grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && continue
 
