@@ -726,7 +726,6 @@ static void free_cache(struct gwp_dns_cache *cache)
 		return;
 
 	gwp_dns_cache_free(cache);
-	cache = NULL;
 }
 
 static inline bool validate_restyp(int restyp)

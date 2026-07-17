@@ -90,7 +90,9 @@ void gwp_dns_cache_housekeep(struct gwp_dns_cache *cache);
  * @return int	0 on success, negative error code on failure.
  *
  * Error codes:
- * -ENOENT: Entry not found.
+ * -ENOENT:    Entry not found.
+ * -ETIMEDOUT: Entry found but expired (treated as a miss).
+ * -EINVAL:    Invalid key (empty or too long).
  */
 int gwp_dns_cache_getent(struct gwp_dns_cache *cache, const char *key,
 			 struct gwp_dns_cache_entry **ep);
