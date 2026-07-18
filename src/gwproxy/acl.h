@@ -93,19 +93,28 @@ void gwp_acl_destroy(struct gwp_acl *acl);
  *            composable modifier); @bind.set is false when none matched.
  */
 struct gwp_acl_req {
+	/* Inputs (pointer-sized members first). */
 	const struct gwp_sockaddr	*client;
 	const struct gwp_sockaddr	*target;
 	const char			*domain;
 	const char			*user;
+
+	/*
+	 * Outputs. DNAT, MARK and BIND are independent, composable modifiers: a
+	 * single eval can set any combination (a -j MARK, then a -j BIND, then a
+	 * terminal -j DNAT can all match one connection), so they cannot share a
+	 * union. Ordered largest-first to avoid padding.
+	 */
+	struct gwp_sockaddr		dnat;	/* rewrite; valid iff @dnat_applied */
+	struct gwp_acl_bind		bind;	/* bind spec; valid iff @bind.set */
+	uint32_t			mark;	/* fwmark; valid iff @mark_set */
+
+	/* Small scalars: inputs, then output flags, grouped to pack tightly. */
 	uint16_t			sport;
 	uint16_t			dport;
-	enum gwp_acl_proto		proto;
-
+	uint8_t				proto;	/* enum gwp_acl_proto */
 	bool				dnat_applied;
-	struct gwp_sockaddr		dnat;
 	bool				mark_set;
-	uint32_t			mark;
-	struct gwp_acl_bind		bind;
 };
 
 /*
