@@ -2069,12 +2069,23 @@ int gwp_create_sock_target(struct gwp_wrk *w, struct gwp_sockaddr *addr,
 
 	/*
 	 * Mark the outgoing connection for policy routing / iptables matching.
-	 * A per-connection -j MARK from the ACL overrides the global --mark.
+	 * A per-connection -j MARK from the ACL overrides the global --mark, and
+	 * is strict like -j BIND: if SO_MARK fails (e.g. no CAP_NET_ADMIN) the
+	 * connection is dropped rather than egressing unmarked via the wrong
+	 * route. The coarse global --mark stays best-effort.
 	 */
-	if (so && so->mark_set)
-		setskopt_int(fd, SOL_SOCKET, SO_MARK, (int)so->mark);
-	else if (w->ctx->cfg.mark)
+	if (so && so->mark_set) {
+		r = setskopt_int(fd, SOL_SOCKET, SO_MARK, (int)so->mark);
+		if (unlikely(r < 0)) {
+			pr_err(&w->ctx->lh,
+			       "ACL MARK: SO_MARK=%u failed: %s (CAP_NET_ADMIN required)",
+			       so->mark, strerror(-r));
+			__sys_close(fd);
+			return r;
+		}
+	} else if (w->ctx->cfg.mark) {
 		setskopt_int(fd, SOL_SOCKET, SO_MARK, w->ctx->cfg.mark);
+	}
 
 	/*
 	 * -j BIND: pin the source interface/address before connect. Strict --

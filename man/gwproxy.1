@@ -225,10 +225,19 @@ connection can accumulate a mark and still fall through to a terminal
 .BR ACCEPT / REJECT / DNAT
 or the chain policy. The last matching
 .B \-j MARK
-wins. It needs
-.BR CAP_NET_ADMIN ,
-and applies to TCP target connections (SOCKS5, HTTP, plain and transparent), not
-the UDP relay.
+wins. Like
+.BR "\-j BIND" ,
+it is
+.I strict:
+if setting
+.B SO_MARK
+fails (it needs
+.BR CAP_NET_ADMIN )
+the connection is dropped rather than egressing unmarked via the wrong route.
+It applies to TCP target connections (SOCKS5, HTTP, plain and transparent), not
+the UDP relay. (The coarse global
+.B \-\-mark
+remains best\-effort.)
 .IP
 .B \-j BIND
 .RB ( OUTPUT "-only) with " \-\-to\-source " " \fIaddr\fR [ :\fIport\fR ] " and/or"
