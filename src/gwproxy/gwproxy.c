@@ -959,6 +959,14 @@ bool gwp_inotify_event_matches(const void *buf, size_t len, const char *path)
 			(const struct inotify_event *)((const char *)buf + off);
 		size_t rec = sizeof(*e) + e->len;
 
+		/*
+		 * The kernel dropped events (queue overflow, delivered as a
+		 * nameless wd=-1 record). Our file's change may have been among
+		 * the lost ones, so force a reload rather than miss it.
+		 */
+		if (e->mask & IN_Q_OVERFLOW)
+			return true;
+
 		if (off + rec > len)
 			break;
 		if (e->len && !strcmp(e->name, base))
