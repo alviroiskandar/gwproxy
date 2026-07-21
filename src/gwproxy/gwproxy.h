@@ -511,6 +511,10 @@ void gwp_socks5_reply_addr_from_sockaddr(const struct gwp_sockaddr *src,
 bool gwp_sockaddr_ip_eq(const struct gwp_sockaddr *a,
 			const struct gwp_sockaddr *b);
 
+/* Compare two addresses by family, port, and IP; v4 and v4-mapped v6 differ. */
+bool gwp_sockaddr_eq(const struct gwp_sockaddr *a,
+		     const struct gwp_sockaddr *b);
+
 /* True if the ACL OUTPUT chain permits a @proto connection from @client to
  * @target (allow-all when no ACL is loaded or @target has no resolved IP). */
 bool gwp_ctx_acl_output_allowed(struct gwp_ctx *ctx,

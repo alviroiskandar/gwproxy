@@ -1689,20 +1689,6 @@ static int prep_domain_resolution(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	return 0;
 }
 
-static bool sockaddr_eq(const struct gwp_sockaddr *a,
-			const struct gwp_sockaddr *b)
-{
-	if (a->sa.sa_family != b->sa.sa_family)
-		return false;
-	if (a->sa.sa_family == AF_INET)
-		return a->i4.sin_port == b->i4.sin_port &&
-		       a->i4.sin_addr.s_addr == b->i4.sin_addr.s_addr;
-	if (a->sa.sa_family == AF_INET6)
-		return a->i6.sin6_port == b->i6.sin6_port &&
-		       !memcmp(&a->i6.sin6_addr, &b->i6.sin6_addr, 16);
-	return false;
-}
-
 /* Arm the next relay recvmsg into the front-padded scratch buffer. */
 static void prep_udp_recv(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
@@ -1776,7 +1762,7 @@ static int handle_ev_udp_relay(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	}
 
 	if (gcp->udp_pinned) {
-		client_dgram = sockaddr_eq(&u->src, &gcp->udp_peer);
+		client_dgram = gwp_sockaddr_eq(&u->src, &gcp->udp_peer);
 	} else {
 		/*
 		 * Accept the pinning datagram only from the TCP control

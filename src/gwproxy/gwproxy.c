@@ -2587,6 +2587,19 @@ bool gwp_sockaddr_ip_eq(const struct gwp_sockaddr *a, const struct gwp_sockaddr 
 	return !memcmp(ai, bi, av4 ? 4 : 16);
 }
 
+bool gwp_sockaddr_eq(const struct gwp_sockaddr *a, const struct gwp_sockaddr *b)
+{
+	if (a->sa.sa_family != b->sa.sa_family)
+		return false;
+	if (a->sa.sa_family == AF_INET)
+		return a->i4.sin_port == b->i4.sin_port &&
+		       a->i4.sin_addr.s_addr == b->i4.sin_addr.s_addr;
+	if (a->sa.sa_family == AF_INET6)
+		return a->i6.sin6_port == b->i6.sin6_port &&
+		       !memcmp(&a->i6.sin6_addr, &b->i6.sin6_addr, 16);
+	return false;
+}
+
 int gwp_socks5_addr_to_sockaddr(const struct gwp_socks5_addr *a,
 				struct gwp_sockaddr *sa, socklen_t *slen)
 {
