@@ -1731,7 +1731,7 @@ static int handle_ev_udp_relay(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	struct gwp_iou_udp *u = gcp->udp_iou;
 	unsigned char *base = u->buf + GWP_SOCKS5_UDP_HDR_MAX;
 	int n = cqe->res;
-	bool client_dgram;
+	struct gwp_udp_out out;
 
 	/*
 	 * Once teardown has begun, let the ref drop instead of re-arming; a
@@ -1747,59 +1747,13 @@ static int handle_ev_udp_relay(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		return 0;
 	}
 
-	if (gcp->udp_pinned) {
-		client_dgram = gwp_sockaddr_eq(&u->src, &gcp->udp_peer);
-	} else {
-		/*
-		 * Accept the pinning datagram only from the TCP control
-		 * connection's IP so an off-path source cannot hijack the
-		 * association (RFC 1928).
-		 */
-		if (!gwp_sockaddr_ip_eq(&u->src, &gcp->client_addr)) {
-			prep_udp_recv(w, gcp);
-			return 0;
-		}
-		gcp->udp_peer = u->src;
-		gcp->udp_pinned = true;
-		client_dgram = true;
+	if (gwp_udp_relay_classify(w, gcp, base, (size_t)n, &u->src, &out) ==
+	    GWP_UDP_DROP) {
+		prep_udp_recv(w, gcp);
+		return 0;
 	}
 
-	if (client_dgram) {
-		/* Client -> target: strip the header, forward the payload. */
-		struct gwp_socks5_addr dst;
-		struct gwp_sockaddr tsa;
-		socklen_t tslen;
-		size_t hdr_len;
-
-		if (gwp_socks5_udp_parse_hdr(base, (size_t)n, &dst, &hdr_len) ||
-		    gwp_socks5_addr_to_sockaddr(&dst, &tsa, &tslen)) {
-			prep_udp_recv(w, gcp);	/* bad header or domain target */
-			return 0;
-		}
-		if (!gwp_ctx_acl_output_allowed(w->ctx, &gcp->udp_peer, &tsa,
-						GWP_ACL_PROTO_UDP)) {
-			prep_udp_recv(w, gcp);	/* ACL denied this datagram */
-			return 0;
-		}
-		prep_udp_send(w, gcp, base + hdr_len, (size_t)n - hdr_len,
-			      &tsa, tslen);
-	} else {
-		/* Target -> client: prepend a header in the front slack. */
-		struct gwp_socks5_addr sa;
-		size_t h, hlen;
-
-		gwp_socks5_reply_addr_from_sockaddr(&u->src, &sa);
-		h = (sa.ver == GWP_SOCKS5_ATYP_IPV4) ? 3 + 1 + 4 + 2
-						     : 3 + 1 + 16 + 2;
-		if (gwp_socks5_udp_build_hdr(&sa, base - h, h, &hlen)) {
-			prep_udp_recv(w, gcp);
-			return 0;
-		}
-		/* The relay is dual-stack, so udp_peer is always AF_INET6. */
-		prep_udp_send(w, gcp, base - h, h + (size_t)n, &gcp->udp_peer,
-			      sizeof(gcp->udp_peer.i6));
-	}
-
+	prep_udp_send(w, gcp, out.buf, out.len, &out.dst, out.dstlen);
 	return 0;
 }
 

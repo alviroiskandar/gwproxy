@@ -515,6 +515,35 @@ bool gwp_sockaddr_ip_eq(const struct gwp_sockaddr *a,
 bool gwp_sockaddr_eq(const struct gwp_sockaddr *a,
 		     const struct gwp_sockaddr *b);
 
+enum gwp_udp_act { GWP_UDP_DROP, GWP_UDP_TO_TARGET, GWP_UDP_TO_CLIENT };
+
+struct gwp_udp_out {
+	unsigned char		*buf;
+	size_t			len;
+	struct gwp_sockaddr	dst;
+	socklen_t		dstlen;
+};
+
+/*
+ * SOCKS5 UDP relay per-datagram classifier, shared by both event loops. @base
+ * points at a received datagram of @n bytes, with GWP_SOCKS5_UDP_HDR_MAX bytes
+ * of slack before it; @src is its source. Maintain the client pin
+ * (gcp->udp_peer / gcp->udp_pinned) and decide:
+ *   GWP_UDP_TO_TARGET - client datagram: strip the SOCKS5 header, forward @out
+ *                       to the encapsulated target.
+ *   GWP_UDP_TO_CLIENT - target reply: prepend a SOCKS5 header in the slack, send
+ *                       @out back to the pinned client.
+ *   GWP_UDP_DROP      - unpinned/wrong source, bad header, domain target, or ACL
+ *                       denial.
+ * On a forward verdict @out holds the buffer + destination; each loop performs
+ * the send with its own I/O primitive.
+ */
+enum gwp_udp_act gwp_udp_relay_classify(struct gwp_wrk *w,
+					struct gwp_conn_pair *gcp,
+					unsigned char *base, size_t n,
+					const struct gwp_sockaddr *src,
+					struct gwp_udp_out *out);
+
 /* True if the ACL OUTPUT chain permits a @proto connection from @client to
  * @target (allow-all when no ACL is loaded or @target has no resolved IP). */
 bool gwp_ctx_acl_output_allowed(struct gwp_ctx *ctx,

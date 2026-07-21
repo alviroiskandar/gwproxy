@@ -2623,6 +2623,68 @@ bool gwp_sockaddr_eq(const struct gwp_sockaddr *a, const struct gwp_sockaddr *b)
 	return false;
 }
 
+enum gwp_udp_act gwp_udp_relay_classify(struct gwp_wrk *w,
+					struct gwp_conn_pair *gcp,
+					unsigned char *base, size_t n,
+					const struct gwp_sockaddr *src,
+					struct gwp_udp_out *out)
+{
+	bool client_dgram;
+
+	if (gcp->udp_pinned) {
+		client_dgram = gwp_sockaddr_eq(src, &gcp->udp_peer);
+	} else {
+		/*
+		 * Until the client is pinned nothing can be relayed back, so
+		 * accept only its first datagram, and only from the same IP as
+		 * its TCP control connection (RFC 1928); this keeps an off-path
+		 * source from hijacking the association.
+		 */
+		if (!gwp_sockaddr_ip_eq(src, &gcp->client_addr))
+			return GWP_UDP_DROP;
+		gcp->udp_peer = *src;
+		gcp->udp_pinned = true;
+		client_dgram = true;
+	}
+
+	if (client_dgram) {
+		/* Client -> target: strip the header, forward the payload. */
+		struct gwp_socks5_addr dst;
+		struct gwp_sockaddr tsa;
+		socklen_t tslen;
+		size_t hdr_len;
+
+		if (gwp_socks5_udp_parse_hdr(base, n, &dst, &hdr_len))
+			return GWP_UDP_DROP;
+		if (gwp_socks5_addr_to_sockaddr(&dst, &tsa, &tslen))
+			return GWP_UDP_DROP;	/* domain target: unsupported */
+		if (!gwp_ctx_acl_output_allowed(w->ctx, &gcp->udp_peer, &tsa,
+						GWP_ACL_PROTO_UDP))
+			return GWP_UDP_DROP;	/* ACL denied this datagram */
+		out->buf = base + hdr_len;
+		out->len = n - hdr_len;
+		out->dst = tsa;
+		out->dstlen = tslen;
+		return GWP_UDP_TO_TARGET;
+	} else {
+		/* Target -> client: prepend a header in the front slack. */
+		struct gwp_socks5_addr sa;
+		size_t h, hlen;
+
+		gwp_socks5_reply_addr_from_sockaddr(src, &sa);
+		h = (sa.ver == GWP_SOCKS5_ATYP_IPV4) ? 3 + 1 + 4 + 2
+						     : 3 + 1 + 16 + 2;
+		if (gwp_socks5_udp_build_hdr(&sa, base - h, h, &hlen))
+			return GWP_UDP_DROP;
+		/* The relay is dual-stack, so udp_peer is always AF_INET6. */
+		out->buf = base - h;
+		out->len = h + n;
+		out->dst = gcp->udp_peer;
+		out->dstlen = sizeof(gcp->udp_peer.i6);
+		return GWP_UDP_TO_CLIENT;
+	}
+}
+
 int gwp_socks5_addr_to_sockaddr(const struct gwp_socks5_addr *a,
 				struct gwp_sockaddr *sa, socklen_t *slen)
 {
