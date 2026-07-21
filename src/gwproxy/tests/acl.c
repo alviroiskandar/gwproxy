@@ -503,6 +503,8 @@ static noinline void test_parse_errors(void)
 		"-A INPUT -d 1.2.3.4 -j ACCEPT\n",	    /* -d in INPUT */
 		"-A INPUT --dports 80 -j ACCEPT\n",	    /* --dports in INPUT */
 		"-A OUTPUT -d 1.2.3.4 -m domain --domain x -j ACCEPT\n", /* d+domain */
+		"-A OUTPUT -m domain -j REJECT\n",	    /* -m domain w/o --domain */
+		"-A OUTPUT -m user -j REJECT\n",	    /* -m user w/o --user */
 		"-A OUTPUT -j BOGUS\n",			    /* bad target */
 		"-A OUTPUT -x -j ACCEPT\n",		    /* unknown option */
 		"-A OUTPUT -d 1.2.3.4\n",		    /* no -j */

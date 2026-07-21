@@ -860,6 +860,18 @@ static int parse_rule(struct gwp_acl_ruleset *rs, char **tok, int n)
 		goto out;
 
 	/*
+	 * A declared match module must be followed by its value option: "-m
+	 * domain" needs --domain/--domain-regexp, "-m user" needs
+	 * --user/--user-regexp. Otherwise the module is a no-op and the rule
+	 * silently matches everything (a typo like "--domian" would become an
+	 * unconditional ACCEPT/REJECT).
+	 */
+	if (m_domain && !r->has_domain)
+		goto out;
+	if (m_user && !r->has_user)
+		goto out;
+
+	/*
 	 * Exactly the action's own payload group may be present. The cross-group
 	 * guards above already reject mixing DNAT/MARK/BIND options, so here we
 	 * only require the matching group and forbid a stray one on an action
