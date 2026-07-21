@@ -611,6 +611,15 @@ int gwp_upstream_finalize_dst(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 int gwp_upstream_authority(const struct gwp_socks5_addr *dst, char *buf,
 			   size_t cap);
 
+/*
+ * The upstream proxy handshake succeeded: build our downstream CONNECT reply
+ * (SOCKS5 or HTTP), drop the proxy's @consumed reply bytes from the target
+ * buffer while keeping any early destination data, and splice our reply ahead
+ * of it. Returns 0, or a negative errno if the reply could not be built or fit.
+ */
+int gwp_upstream_splice_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			      size_t consumed);
+
 int gwp_socks5_handle_data(struct gwp_conn_pair *gcp);
 int gwp_handle_conn_state_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 int gwp_handle_conn_state_socks5(struct gwp_wrk *w, struct gwp_conn_pair *gcp);

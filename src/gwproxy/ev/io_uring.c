@@ -1100,33 +1100,11 @@ static int upstream_iou_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			       size_t consumed)
 {
 	struct gwp_ctx *ctx = w->ctx;
-	uint8_t rbuf[512];
-	size_t rlen = 0;
 	int r;
 
-	/* Build the downstream reply for the client (before any early data). */
-	if (gcp->prot_type == GWP_PROT_TYPE_SOCKS5) {
-		rlen = sizeof(rbuf);
-		r = gwp_socks5_build_connect_reply(w, gcp, 0, rbuf, &rlen);
-		if (unlikely(r))
-			return r;
-	} else if (gcp->prot_type == GWP_PROT_TYPE_HTTP) {
-		r = gwp_http_build_connect_reply(gcp->http_conn, rbuf, sizeof(rbuf));
-		if (unlikely(r < 0))
-			return r;
-		rlen = (size_t)r;
-	}
-
-	/* Drop the proxy's CONNECT reply, keep any early destination data. */
-	gwp_conn_buf_advance(&gcp->target, consumed);
-
-	if (rlen) {
-		if (gcp->target.len + rlen > gcp->target.cap)
-			return -ENOBUFS;
-		memmove(gcp->target.buf + rlen, gcp->target.buf, gcp->target.len);
-		memcpy(gcp->target.buf, rbuf, rlen);
-		gcp->target.len += (uint32_t)rlen;
-	}
+	r = gwp_upstream_splice_reply(w, gcp, consumed);
+	if (unlikely(r))
+		return r;
 
 	prep_timer_del_target(w, gcp);
 	gcp->up_tx = false;

@@ -30,6 +30,7 @@ GWPROXY_CC_SOURCES = \
 	$(GWPROXY_DIR)/gwproxy.c \
 	$(GWPROXY_DIR)/log.c \
 	$(GWPROXY_DIR)/net.c \
+	$(GWPROXY_DIR)/upstream.c \
 	$(GWPROXY_DIR)/ev/epoll.c \
 	$(GWPROXY_DIR)/http1.c \
 	$(GWPROXY_DIR)/http.c
