@@ -1142,6 +1142,17 @@ static bool user_match(const struct gwp_acl_rule *r, const char *user)
 static bool rule_matches(const struct gwp_acl_rule *r,
 			 const struct gwp_acl_req *q)
 {
+	/*
+	 * Target-dependent criteria (-d, --dports) cannot be evaluated for a
+	 * domain-only request (socks5h remote-DNS: no resolved IP, @dport unset).
+	 * Such a rule matches NEITHER polarity -- otherwise crit_ok would let a
+	 * negated "! -d"/"! --dports" flip the unknown into a match and fail open
+	 * (e.g. an allow-by-exclusion rule bypassing an internal-range REJECT).
+	 * -m domain / -m user still evaluate here (domain/user are known).
+	 */
+	if (!q->target && (r->has_dst || r->has_dports))
+		return false;
+
 	return crit_ok(r->has_src,
 		       q->client && cidr_match(&r->src, q->client), r->neg_src) &&
 	       crit_ok(r->has_dst,

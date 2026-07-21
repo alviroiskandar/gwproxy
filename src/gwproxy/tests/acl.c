@@ -597,6 +597,41 @@ static noinline void test_parse_errors(void)
 		close(saved);
 }
 
+/*
+ * A domain-only request (no resolved IP, as with a socks5h upstream) carries
+ * target == NULL. A target-dependent -d/--dports rule must match NEITHER
+ * polarity: otherwise a negated allow-by-exclusion rule flips the unevaluable
+ * criterion into a match and fails open past an IP-based REJECT.
+ */
+static noinline void test_domain_only_target_criteria(void)
+{
+	struct gwp_acl *a = NULL;
+
+	assert(!gwp_acl_parse_str(&a,
+		"-P OUTPUT REJECT\n"
+		"-A OUTPUT -d 10.0.0.0/8 -j REJECT\n"
+		"-A OUTPUT ! -d 10.0.0.0/8 -j ACCEPT\n"));
+	/* Neither -d rule may match a domain-only target -> default REJECT. */
+	assert(out(a, NULL, "internal.corp", 0, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+	gwp_acl_destroy(a);
+
+	a = NULL;
+	assert(!gwp_acl_parse_str(&a,
+		"-P OUTPUT REJECT\n"
+		"-A OUTPUT ! --dports 80 -j ACCEPT\n"));
+	assert(out(a, NULL, "internal.corp", 0, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+	gwp_acl_destroy(a);
+
+	/* -m domain still evaluates for a domain-only request (domain is known). */
+	a = NULL;
+	assert(!gwp_acl_parse_str(&a,
+		"-A OUTPUT -m domain --domain internal.corp -j REJECT\n"
+		"-P OUTPUT ACCEPT\n"));
+	assert(out(a, NULL, "internal.corp", 0, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+	assert(out(a, NULL, "other.com", 0, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
+	gwp_acl_destroy(a);
+}
+
 static void run_tests(void)
 {
 	size_t i;
@@ -610,6 +645,7 @@ static void run_tests(void)
 		test_input_and_proto();
 		test_domain();
 		test_domain_regexp();
+		test_domain_only_target_criteria();
 		test_user();
 		test_mark();
 		test_bind();
