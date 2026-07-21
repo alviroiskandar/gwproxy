@@ -1300,8 +1300,19 @@ bool gwp_ctx_acl_target_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp)
 	 * up_dst is still unset here (ver == 0) and is finalised from the
 	 * (already rewritten) target_addr after the upstream connects.
 	 */
-	if (dnat && ctx->upstream.enabled && gcp->up_dst.ver != 0)
+	if (dnat && ctx->upstream.enabled && gcp->up_dst.ver != 0) {
+		__be16 orig_port = gcp->up_dst.port;
+
 		upstream_dst_from_sockaddr(&gcp->target_addr, &gcp->up_dst);
+		/*
+		 * An address-only DNAT (--to <ip> with no port) has no port to
+		 * apply for a domain request (the target IP was unknown at eval
+		 * time), so target_addr carries port 0. Keep the client's
+		 * original requested port instead of connecting to :0.
+		 */
+		if (gcp->up_dst.port == 0)
+			gcp->up_dst.port = orig_port;
+	}
 
 	return true;
 }

@@ -274,6 +274,24 @@ print(s.recv(64).decode().strip())' "$bpp" 2>/dev/null)"
 	assert_files_equal "$WORK/payload.bin" "$WORK/updnath.out" \
 		"$loop socks5h:// upstream DNAT redirected to the wrong target"
 	kill "$GWP_PID" 2>/dev/null
+
+	# socks5h:// address-only DNAT (--to <ip> with no port): the client's
+	# original requested port must be preserved (not clobbered to :0), so a
+	# request to blocked.invalid:$hp reaches the origin on $hp.
+	printf -- '%s\n' \
+		'-A OUTPUT -m domain --domain blocked.invalid -j DNAT --to 127.0.0.1' \
+		'-P OUTPUT ACCEPT' >"$WORK/updnathp.acl"
+	ufp="$(pick_port)"
+	gwp_start "127.0.0.1:$ufp" --as-socks5=1 --event-loop="$loop" \
+		--upstream-proxy="socks5h://127.0.0.1:$uup" \
+		--acl-file="$WORK/updnathp.acl"
+	curl -s --max-time 20 -x "socks5h://127.0.0.1:$ufp" \
+		"http://blocked.invalid:$hp/payload.bin" -o "$WORK/updnathp.out" \
+		|| fail "$loop socks5h:// address-only DNAT lost the original port"
+	assert_files_equal "$WORK/payload.bin" "$WORK/updnathp.out" \
+		"$loop socks5h:// address-only DNAT redirected to the wrong target"
+	kill "$GWP_PID" 2>/dev/null
+
 	kill "$usp" 2>/dev/null
 
 	# Hot reload survives an atomic replace (write-temp + rename-over, as
