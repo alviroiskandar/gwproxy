@@ -567,6 +567,14 @@ void log_conn_pair_created(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 int gwp_socks5_prep_connect_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				  int err);
+
+/*
+ * Build the "ACL denied" downstream reply (SOCKS5 CONNECT refusal or HTTP 403)
+ * into gcp->target.buf, ready for the caller to flush its own way. Logs the
+ * denial. Returns -EACCES (the terminal handshake verdict) once the reply is
+ * built, or a negative errno if it could not be built.
+ */
+int gwp_acl_reject_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 int gwp_socks5_build_connect_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				   int err, void *out, size_t *out_len);
 int gwp_socks5_prepare_target_addr(struct gwp_wrk *w, struct gwp_conn_pair *gcp);

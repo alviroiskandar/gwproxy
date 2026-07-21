@@ -2259,6 +2259,29 @@ int gwp_socks5_prep_connect_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	return 0;
 }
 
+int gwp_acl_reject_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	pr_info(&w->ctx->lh, "ACL denied target %s for client %s (idx=%u)",
+		ip_to_str(&gcp->target_addr), ip_to_str(&gcp->client_addr),
+		gcp->idx);
+
+	if (gcp->prot_type == GWP_PROT_TYPE_SOCKS5) {
+		int r = gwp_socks5_prep_connect_reply(w, gcp, -EACCES);
+
+		if (r)
+			return r;
+	} else if (gcp->prot_type == GWP_PROT_TYPE_HTTP) {
+		int r = gwp_http_build_forbidden_reply(
+				gcp->target.buf + gcp->target.len,
+				gcp->target.cap - gcp->target.len);
+
+		if (r < 0)
+			return r;
+		gcp->target.len += (uint32_t)r;
+	}
+	return -EACCES;
+}
+
 static int queue_dns_resolution(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				const char *host, const char *port)
 {

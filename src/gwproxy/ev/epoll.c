@@ -1513,29 +1513,16 @@ __hot
  */
 static int acl_reject_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
-	pr_info(&w->ctx->lh, "ACL denied target %s for client %s (idx=%u)",
-		ip_to_str(&gcp->target_addr), ip_to_str(&gcp->client_addr),
-		gcp->idx);
+	int r = gwp_acl_reject_reply(w, gcp);
 
-	if (gcp->prot_type == GWP_PROT_TYPE_SOCKS5) {
-		int r = prep_and_send_socks5_rep_connect(w, gcp, -EACCES);
+	if (r != -EACCES)
+		return r;
 
-		if (r)
-			return r;
-	} else if (gcp->prot_type == GWP_PROT_TYPE_HTTP) {
-		int r = gwp_http_build_forbidden_reply(
-				gcp->target.buf + gcp->target.len,
-				gcp->target.cap - gcp->target.len);
+	if (gcp->target.len) {
+		ssize_t sr = __do_send(&gcp->target, &gcp->client);
 
-		if (r < 0)
-			return r;
-		gcp->target.len += (uint32_t)r;
-		if (gcp->target.len) {
-			ssize_t sr = __do_send(&gcp->target, &gcp->client);
-
-			if (sr < 0)
-				return (int)sr;
-		}
+		if (sr < 0)
+			return (int)sr;
 	}
 	return -EACCES;
 }
