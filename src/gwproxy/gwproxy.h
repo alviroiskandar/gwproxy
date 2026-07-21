@@ -620,6 +620,41 @@ int gwp_upstream_authority(const struct gwp_socks5_addr *dst, char *buf,
 int gwp_upstream_splice_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			      size_t consumed);
 
+/* "host:port" for a domain upstream target, else its resolved IP. Returns a
+ * thread-local buffer valid until the next call on the same thread. */
+const char *gwp_upstream_dst_str(struct gwp_conn_pair *gcp);
+
+/*
+ * The next I/O step in the transport-agnostic upstream-proxy handshake state
+ * machine (gwp_upstream_hs_start / gwp_upstream_hs_on_reply). The request bytes
+ * live in gcp->target.buf; the caller performs the send/recv with its own I/O
+ * primitive.
+ */
+enum gwp_upstream_io {
+	GWP_UPSTREAM_IO_SEND,	/* a request is built; flush target.buf */
+	GWP_UPSTREAM_IO_RECV,	/* reply incomplete; read more into target.buf */
+	GWP_UPSTREAM_IO_DONE,	/* tunnel up (reply spliced); start forwarding */
+};
+
+/*
+ * Begin the upstream-proxy handshake: finalize gcp->up_dst and build the SOCKS5
+ * greeting or HTTP CONNECT into gcp->target.buf. Returns GWP_UPSTREAM_IO_SEND,
+ * or a negative errno.
+ */
+int gwp_upstream_hs_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
+
+/*
+ * Fresh proxy bytes were appended to gcp->target.buf: parse the current
+ * handshake state and either build the next request (GWP_UPSTREAM_IO_SEND), ask
+ * for more (GWP_UPSTREAM_IO_RECV), or on final success splice the downstream
+ * reply and report GWP_UPSTREAM_IO_DONE. On failure returns a negative errno
+ * (logging its own pr_err) and, when @notify is non-NULL, sets *@notify true if
+ * the failure is a protocol-level rejection whose downstream client should be
+ * told; the caller owns that notification and all timer / forwarding state.
+ */
+int gwp_upstream_hs_on_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			     bool *notify);
+
 int gwp_socks5_handle_data(struct gwp_conn_pair *gcp);
 int gwp_handle_conn_state_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 int gwp_handle_conn_state_socks5(struct gwp_wrk *w, struct gwp_conn_pair *gcp);

@@ -939,19 +939,6 @@ static int prep_and_send_socks5_rep_connect(struct gwp_wrk *w,
  * Describe the upstream destination for logging. With socks5h:// the real
  * destination is a hostname (target_addr is unset), so show up_dst instead.
  */
-static const char *upstream_dst_str(struct gwp_conn_pair *gcp)
-{
-	static __thread char buf[300];
-
-	if (gcp->up_dst.ver == GWP_SOCKS5_ATYP_DOMAIN) {
-		snprintf(buf, sizeof(buf), "%s:%u", gcp->up_dst.domain.str,
-			 ntohs(gcp->up_dst.port));
-		return buf;
-	}
-
-	return ip_to_str(&gcp->target_addr);
-}
-
 /*
  * A handshake with the upstream proxy failed. Inform the downstream client
  * with a SOCKS5 failure reply where applicable, then return @err so the
@@ -982,57 +969,11 @@ static int upstream_arm(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	return __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_MOD, gcp->target.fd, &ev);
 }
 
-static int upstream_s5_send_userpass(struct gwp_wrk *w,
-				     struct gwp_conn_pair *gcp)
-{
-	struct gwp_upstream *up = &w->ctx->upstream;
-	size_t len = gcp->target.cap;
-	int r;
-
-	gcp->target.len = 0;
-	r = gwp_socks5_cli_build_userpass(up->user, up->ulen, up->pass, up->plen,
-					  gcp->target.buf, &len);
-	if (unlikely(r))
-		return r;
-
-	gcp->target.len = (uint32_t)len;
-	gcp->up_tx = true;
-	gcp->conn_state = CONN_STATE_UPSTREAM_S5_AUTH;
-	return upstream_arm(w, gcp, EPOLLOUT | EPOLLRDHUP);
-}
-
-static int upstream_s5_send_connect(struct gwp_wrk *w,
-				    struct gwp_conn_pair *gcp)
-{
-	size_t len = gcp->target.cap;
-	int r;
-
-	gcp->target.len = 0;
-	r = gwp_socks5_cli_build_connect(&gcp->up_dst, gcp->target.buf, &len);
-	if (unlikely(r))
-		return r;
-
-	gcp->target.len = (uint32_t)len;
-	gcp->up_tx = true;
-	gcp->conn_state = CONN_STATE_UPSTREAM_S5_CONNECT;
-	return upstream_arm(w, gcp, EPOLLOUT | EPOLLRDHUP);
-}
-
-/*
- * The upstream proxy accepted the tunnel (SOCKS5 reply or HTTP CONNECT 2xx).
- * Build the downstream reply for our own client, drop @consumed bytes of the
- * proxy's reply (keeping any early destination data), and start forwarding.
- */
-static int upstream_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
-			   size_t consumed)
+/* The upstream tunnel is up (reply already spliced); start forwarding. */
+static int upstream_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_ctx *ctx = w->ctx;
 	ssize_t sr;
-	int r;
-
-	r = gwp_upstream_splice_reply(w, gcp, consumed);
-	if (unlikely(r))
-		return r;
 
 	if (gcp->timer_fd >= 0) {
 		__sys_close(gcp->timer_fd);
@@ -1045,7 +986,8 @@ static int upstream_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	gcp->target.ep_mask = EPOLLOUT | EPOLLIN | EPOLLRDHUP;
 
 	pr_info(&ctx->lh, "Upstream tunnel established (idx=%u, ca=%s, dst=%s)",
-		gcp->idx, ip_to_str(&gcp->client_addr), upstream_dst_str(gcp));
+		gcp->idx, ip_to_str(&gcp->client_addr),
+		gwp_upstream_dst_str(gcp));
 
 	/* Flush downstream reply (+ early data) to the client. */
 	if (gcp->target.len) {
@@ -1064,156 +1006,14 @@ static int upstream_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	return adjust_epl_mask(w, gcp);
 }
 
-static int upstream_s5_complete(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
-				uint8_t rep, size_t consumed)
-{
-	if (rep != GWP_SOCKS5_REP_SUCCESS) {
-		pr_err(&w->ctx->lh, "Upstream SOCKS5 CONNECT failed (rep=0x%02x, idx=%u, dst=%s)",
-			rep, gcp->idx, upstream_dst_str(gcp));
-		return upstream_fail(w, gcp, -ECONNREFUSED);
-	}
-	return upstream_finish(w, gcp, consumed);
-}
-
-/* Parse the upstream HTTP proxy's CONNECT reply and finish or fail. */
-static int upstream_http_parse(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
-{
-	size_t consumed;
-	int status, r;
-
-	r = gwp_http_cli_parse_connect_reply(gcp->target.buf, gcp->target.len,
-					     &status, &consumed);
-	if (r)
-		return r;	/* -EAGAIN (need more) or -EINVAL (malformed) */
-
-	if (status < 200 || status >= 300) {
-		pr_err(&w->ctx->lh, "Upstream HTTP CONNECT failed (status=%d, idx=%u, dst=%s)",
-			status, gcp->idx, upstream_dst_str(gcp));
-		return upstream_fail(w, gcp, -ECONNREFUSED);
-	}
-	return upstream_finish(w, gcp, consumed);
-}
-
-static int upstream_s5_parse(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
-{
-	struct gwp_ctx *ctx = w->ctx;
-	const uint8_t *buf = (const uint8_t *)gcp->target.buf;
-	size_t len = gcp->target.len;
-	int r;
-
-	switch (gcp->conn_state) {
-	case CONN_STATE_UPSTREAM_S5_METHOD: {
-		uint8_t method;
-
-		r = gwp_socks5_cli_parse_method(buf, len, &method);
-		if (r)
-			return r;
-
-		gwp_conn_buf_advance(&gcp->target, 2);
-		if (method == 0x00)
-			return upstream_s5_send_connect(w, gcp);
-		if (method == 0x02 && ctx->upstream.has_auth)
-			return upstream_s5_send_userpass(w, gcp);
-
-		pr_err(&ctx->lh, "Upstream SOCKS5 proxy selected no acceptable auth method (0x%02x)",
-			method);
-		return upstream_fail(w, gcp, -EACCES);
-	}
-	case CONN_STATE_UPSTREAM_S5_AUTH: {
-		uint8_t status;
-
-		r = gwp_socks5_cli_parse_userpass(buf, len, &status);
-		if (r)
-			return r;
-
-		gwp_conn_buf_advance(&gcp->target, 2);
-		if (status != 0x00) {
-			pr_err(&ctx->lh, "Upstream SOCKS5 authentication failed (idx=%u)",
-				gcp->idx);
-			return upstream_fail(w, gcp, -EACCES);
-		}
-		return upstream_s5_send_connect(w, gcp);
-	}
-	case CONN_STATE_UPSTREAM_S5_CONNECT: {
-		uint8_t rep;
-		size_t consumed;
-
-		r = gwp_socks5_cli_parse_connect(buf, len, &rep, &consumed);
-		if (r)
-			return r;
-
-		return upstream_s5_complete(w, gcp, rep, consumed);
-	}
-	default:
-		return -EINVAL;
-	}
-}
-
-static int upstream_s5_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
-{
-	struct gwp_ctx *ctx = w->ctx;
-	size_t len = gcp->target.cap;
-	int r;
-
-	r = gwp_upstream_finalize_dst(w, gcp);
-	if (unlikely(r)) {
-		pr_err(&ctx->lh, "Failed to prepare upstream destination (idx=%u): %s",
-			gcp->idx, strerror(-r));
-		return r;
-	}
-
-	r = gwp_socks5_cli_build_greeting(ctx->upstream.has_auth,
-					  gcp->target.buf, &len);
-	if (unlikely(r))
-		return r;
-
-	gcp->target.len = (uint32_t)len;
-	gcp->up_tx = true;
-	gcp->conn_state = CONN_STATE_UPSTREAM_S5_METHOD;
-	pr_dbg(&ctx->lh, "Upstream SOCKS5 handshake started (idx=%u, dst=%s)",
-		gcp->idx, upstream_dst_str(gcp));
-	return upstream_arm(w, gcp, EPOLLOUT | EPOLLRDHUP);
-}
-
-/* Kick off an upstream HTTP proxy handshake: send CONNECT, await the 2xx. */
-static int upstream_http_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
-{
-	struct gwp_upstream *up = &w->ctx->upstream;
-	char authority[300];
-	size_t len = 0;
-	int r;
-
-	r = gwp_upstream_finalize_dst(w, gcp);
-	if (unlikely(r)) {
-		pr_err(&w->ctx->lh, "Failed to prepare upstream destination (idx=%u): %s",
-			gcp->idx, strerror(-r));
-		return r;
-	}
-
-	r = gwp_upstream_authority(&gcp->up_dst, authority, sizeof(authority));
-	if (unlikely(r))
-		return r;
-
-	r = gwp_http_cli_build_connect(authority,
-				       up->has_auth ? up->user : NULL, up->ulen,
-				       up->pass, up->plen, gcp->target.buf,
-				       gcp->target.cap, &len);
-	if (unlikely(r))
-		return r;
-
-	gcp->target.len = (uint32_t)len;
-	gcp->up_tx = true;
-	gcp->conn_state = CONN_STATE_UPSTREAM_HTTP_CONNECT;
-	pr_dbg(&w->ctx->lh, "Upstream HTTP CONNECT started (idx=%u, dst=%s)",
-		gcp->idx, authority);
-	return upstream_arm(w, gcp, EPOLLOUT | EPOLLRDHUP);
-}
-
+/* Begin the upstream-proxy handshake and arm the first request send. */
 static int upstream_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
-	if (w->ctx->upstream.type == GWP_UPSTREAM_HTTP)
-		return upstream_http_start(w, gcp);
-	return upstream_s5_start(w, gcp);
+	int r = gwp_upstream_hs_start(w, gcp);
+
+	if (r == GWP_UPSTREAM_IO_SEND)
+		return upstream_arm(w, gcp, EPOLLOUT | EPOLLRDHUP);
+	return r;	/* negative errno */
 }
 
 __hot
@@ -1222,6 +1022,7 @@ static int handle_ev_upstream(struct gwp_wrk *w,
 			      struct epoll_event *ev)
 {
 	ssize_t sr;
+	bool notify;
 	int r;
 
 	/* Transmit phase: flush the pending request to the proxy. */
@@ -1253,18 +1054,19 @@ static int handle_ev_upstream(struct gwp_wrk *w,
 			return -ECONNRESET;
 	}
 
-	if (gcp->conn_state >= CONN_STATE_UPSTREAM_HTTP_MIN &&
-	    gcp->conn_state <= CONN_STATE_UPSTREAM_HTTP_MAX)
-		r = upstream_http_parse(w, gcp);
-	else
-		r = upstream_s5_parse(w, gcp);
-	if (r == -EAGAIN) {
+	r = gwp_upstream_hs_on_reply(w, gcp, &notify);
+	switch (r) {
+	case GWP_UPSTREAM_IO_SEND:
+		return upstream_arm(w, gcp, EPOLLOUT | EPOLLRDHUP);
+	case GWP_UPSTREAM_IO_RECV:
 		if (ev->events & (EPOLLRDHUP | EPOLLHUP))
 			return -ECONNRESET;
 		return upstream_arm(w, gcp, EPOLLIN | EPOLLRDHUP);
+	case GWP_UPSTREAM_IO_DONE:
+		return upstream_finish(w, gcp);
+	default:			/* negative errno */
+		return notify ? upstream_fail(w, gcp, r) : r;
 	}
-
-	return r;
 }
 
 __hot
