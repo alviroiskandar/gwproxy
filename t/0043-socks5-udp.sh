@@ -9,6 +9,8 @@
 # relay (the relay socket is dual-stack), the relay is torn down with its TCP
 # control connection, and plain SOCKS5 CONNECT still works on the same port. The
 # relay is exercised on both event loops (epoll and, when built, io_uring).
+# The datagrams the relay must REFUSE are asserted too: a wrong source address
+# (RFC 1928), a fragmented datagram, and a domain-name target.
 
 . "$(dirname "$0")/lib.sh"
 require curl
@@ -136,6 +138,41 @@ run_loop() {
 		|| fail "$loop CONNECT broke with --udp-associate=0"
 	assert_files_equal "$WORK/payload.bin" "$WORK/noudp.out" \
 		"$loop CONNECT payload corrupted with --udp-associate=0"
+	kill "$GWP_PID" 2>/dev/null
+
+	# (9) What the relay must REFUSE. These are the security and
+	#     robustness edges of the per-datagram path; every one of them
+	#     returns the datagram unrelayed, which is indistinguishable from
+	#     "it worked" unless asserted directly.
+	sp="$(pick_port)"
+	gwp_start "127.0.0.1:$sp" --as-socks5=1 --event-loop="$loop" \
+		--nr-workers=2
+	probe() { python3 "$SERVERS_DIR/socks5_udp_probe.py" "$@"; }
+
+	# A plain datagram still relays -- the control for the cases below.
+	[ "$(probe "$sp" "$ep")" = RELAYED ] \
+		|| fail "$loop relay dropped an ordinary datagram"
+
+	# An empty payload is a valid datagram, not a reason to drop.
+	[ "$(probe --size 0 "$sp" "$ep")" = RELAYED ] \
+		|| fail "$loop relay dropped a 0-byte datagram"
+
+	# RFC 1928: the first datagram must come from the same address as the
+	# TCP control connection, or an off-path host could hijack the
+	# association. 127.0.0.2 is local, so this needs no privilege.
+	[ "$(probe --src-ip 127.0.0.2 "$sp" "$ep")" = DROPPED ] \
+		|| fail "$loop relay accepted a datagram from the wrong source"
+
+	# Fragmentation (FRAG != 0) is not implemented and must be discarded
+	# rather than forwarded with its header still attached.
+	[ "$(probe --frag 1 "$sp" "$ep")" = DROPPED ] \
+		|| fail "$loop relay accepted a fragmented datagram"
+
+	# A domain-name target would need DNS in the datagram path; it is
+	# dropped for now.
+	[ "$(probe --atyp domain --dst localhost "$sp" "$ep")" = DROPPED ] \
+		|| fail "$loop relay accepted a domain-name target"
+
 	kill "$GWP_PID" 2>/dev/null
 }
 
