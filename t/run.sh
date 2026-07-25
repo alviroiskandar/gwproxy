@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-only
 #
-# Run every gwproxy integration test (t/[0-9]*.sh) and print a summary.
-# Exit status is non-zero if any test fails. Skipped tests (exit 77) do not
+# Run the integration tests sequentially and print a summary. This is the
+# by-hand entry point; `make test` drives the same per-test runner through make
+# targets instead, so that `make -jN` decides how many run at once.
+#
+# Exit status is non-zero if any test failed. Skipped tests (exit 77) do not
 # count as failures.
 
 set -u
@@ -15,56 +18,22 @@ if [ ! -x "$GWPROXY" ]; then
 	exit 1
 fi
 
-. "$T_DIR/sweep.sh"
+OUT="${GWP_TEST_OUT:-$T_DIR/../.test-out}"
+rm -rf "$OUT"/integ-*
+mkdir -p "$OUT"
 
 shopt -s nullglob
 tests=("$T_DIR"/[0-9]*.sh)
 shopt -u nullglob
-IFS=$'\n' tests=($(printf '%s\n' "${tests[@]}" | sort)); unset IFS
 
 if [ ${#tests[@]} -eq 0 ]; then
 	echo "no integration tests found in $T_DIR"
 	exit 0
 fi
 
-npass=0
-nfail=0
-nskip=0
-failed=()
-
 for t in "${tests[@]}"; do
-	name="$(basename "$t")"
-	# -k: SIGKILL a test that does not die on the SIGTERM, so one wedged
-	# test cannot stall the whole run.
-	out="$(timeout -k 5 120 bash "$t" 2>&1)"
-	rc=$?
-	# A test killed outright never runs its EXIT trap, so its proxies are
-	# reparented to init and linger. Sweep here, where we always run.
-	gwp_sweep -q
-	case "$rc" in
-	0)
-		echo "ok    $name"
-		npass=$((npass + 1))
-		;;
-	77)
-		reason="$(printf '%s\n' "$out" | sed -n 's/^SKIP: //p' | head -1)"
-		echo "skip  $name${reason:+ - $reason}"
-		nskip=$((nskip + 1))
-		;;
-	*)
-		echo "FAIL  $name (rc=$rc)"
-		printf '%s\n' "$out" | sed 's/^/      /'
-		nfail=$((nfail + 1))
-		failed+=("$name")
-		;;
-	esac
+	name="$(basename "$t" .sh)"
+	"$T_DIR/run-one.sh" integ "$name" "$t" "$OUT/integ-$name.res"
 done
 
-echo "------------------------------------------------------------"
-echo "integration: passed=$npass failed=$nfail skipped=$nskip"
-
-if [ $nfail -ne 0 ]; then
-	echo "FAILED: ${failed[*]}"
-	exit 1
-fi
-exit 0
+exec "$T_DIR/summary.sh" integration "$OUT" --only integ

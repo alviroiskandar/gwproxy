@@ -187,26 +187,42 @@ ifeq ($(CONFIG_IO_URING),y)
 endif
 
 IE=LD_LIBRARY_PATH=$(LD_LIBRARY_PATH):$(shell pwd)
+
+#
+# Tests run one per make target, so `make -jN test` runs N of them at once and
+# make itself schedules the parallelism -- there is no second job-control knob
+# to keep in sync. Each test writes a result file; t/run-one.sh always exits 0
+# so one failure does not stop the rest, and t/summary.sh turns the collected
+# results into the final verdict.
+#
+TEST_OUT = .test-out
+INTEG_SRCS = $(sort $(wildcard t/[0-9]*.sh))
+INTEG_RESULTS = $(patsubst t/%.sh,$(TEST_OUT)/integ-%.res,$(INTEG_SRCS))
+UNIT_RESULTS = $(patsubst $(GWPROXY_DIR)/tests/%.t,$(TEST_OUT)/unit-%.res,$(ALL_TEST_TARGETS))
+
+$(TEST_OUT)/unit-%.res: $(GWPROXY_DIR)/tests/%.t
+	@./t/run-one.sh unit "$*" "$<" "$@"
+
+$(TEST_OUT)/integ-%.res: t/%.sh $(GWPROXY_TARGET)
+	@GWPROXY=./$(GWPROXY_TARGET) ./t/run-one.sh integ "$*" "$<" "$@"
+
 test: test-unit test-integration
 	@echo "All tests completed successfully.";
 
-test-unit: $(LIBGWDNS_TEST_TARGET) $(LIBGWPSOCKS5_TEST_TARGET) $(LIBGWHTTP1_TEST_TARGET) $(LIBGWHTTP_TEST_TARGET) $(LIBGWACL_TEST_TARGET) $(SSL_TEST_TARGET)
+# The results are deleted first so a re-run really re-runs: a test result is
+# not a build artifact that can be considered up to date.
+test-unit: $(ALL_TEST_TARGETS)
 	@echo "Running unit tests...";
-	@echo "Testing libgwdns...";
-	@$(IE) ./$(LIBGWDNS_TEST_TARGET);
-	@echo "Testing libgwpsocks5...";
-	@$(IE) ./$(LIBGWPSOCKS5_TEST_TARGET);
-	@echo "Testing http1...";
-	@$(IE) ./$(LIBGWHTTP1_TEST_TARGET);
-	@echo "Testing http...";
-	@$(IE) ./$(LIBGWHTTP_TEST_TARGET);
-	@echo "Testing acl...";
-	@$(IE) ./$(LIBGWACL_TEST_TARGET);
-	$(RUN_SSL_TEST)
-	@echo "Unit tests completed.";
+	@rm -rf $(TEST_OUT)/unit-*
+	@mkdir -p $(TEST_OUT)
+	@$(MAKE) --no-print-directory $(UNIT_RESULTS)
+	@./t/summary.sh unit $(TEST_OUT) --only unit
 
 test-integration: $(GWPROXY_TARGET)
 	@echo "Running integration tests...";
-	@GWPROXY=./$(GWPROXY_TARGET) ./t/run.sh;
+	@rm -rf $(TEST_OUT)/integ-*
+	@mkdir -p $(TEST_OUT)
+	@$(MAKE) --no-print-directory $(INTEG_RESULTS)
+	@./t/summary.sh integration $(TEST_OUT) --only integ
 
 .PHONY: all clean test test-unit test-integration
