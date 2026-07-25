@@ -20,22 +20,31 @@ struct req_template {
 	const char *domain, *service;
 };
 
+/*
+ * Names that resolve from /etc/hosts alone. A unit test must not depend on
+ * public DNS: on an offline or filtered builder every one of these lookups
+ * fails, the assertion below aborts, and `make test-unit` stops before the
+ * socks5/http1/http/acl binaries ever run -- indistinguishable from a real
+ * regression in gwp_dns_queue(). Repeating a handful of local names keeps the
+ * many-requests shape (queue, workers, eventfd, refcounts, cache inserts) that
+ * this test is actually about, and covers both address families.
+ */
 static const struct req_template req_template[] = {
 	{ "localhost",		"80" },
-	{ "facebook.com",	"80" },
-	{ "google.com",		"443" },
-	{ "github.com",		"443" },
-	{ "example.com",	"80" },
-	{ "twitter.com",	"443" },
-	{ "reddit.com",		"80" },
-	{ "youtube.com",	"443" },
-	{ "wikipedia.org",	"80" },
-	{ "stackoverflow.com",	"443" },
-	{ "amazon.com",		"80" },
-	{ "microsoft.com",	"443" },
-	{ "apple.com",		"80" },
-	{ "linkedin.com",	"443" },
-	{ "bing.com",		"80" },
+	{ "127.0.0.1",		"80" },
+	{ "::1",		"443" },
+	{ "ip6-localhost",	"443" },
+	{ "localhost",		"443" },
+	{ "127.0.0.1",		"443" },
+	{ "::1",		"80" },
+	{ "ip6-localhost",	"80" },
+	{ "localhost",		"8080" },
+	{ "127.0.0.1",		"8080" },
+	{ "::1",		"8080" },
+	{ "ip6-localhost",	"8080" },
+	{ "localhost",		"9090" },
+	{ "127.0.0.1",		"9090" },
+	{ "::1",		"9090" },
 };
 
 static int poll_all_in(struct pollfd *pfd, int n, int timeout)
