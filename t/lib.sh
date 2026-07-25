@@ -30,7 +30,13 @@ _cleanup()
 	done
 	rm -rf "$WORK"
 }
-trap _cleanup EXIT INT TERM
+# The signal handler must exit rather than fall through: a handler that only
+# cleans up lets bash resume the script at the next statement, so the test runs
+# on with its work dir deleted and its servers dead, burying the real failure
+# under bogus errors -- and run.sh's `timeout` stops bounding anything.
+# Exiting from here fires the EXIT trap, so _cleanup still runs exactly once.
+trap _cleanup EXIT
+trap 'exit 143' INT TERM
 
 diag() { echo "# $*" >&2; }
 skip() { echo "SKIP: $*"; exit "$SKIP_CODE"; }

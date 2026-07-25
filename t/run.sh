@@ -32,7 +32,9 @@ failed=()
 
 for t in "${tests[@]}"; do
 	name="$(basename "$t")"
-	out="$(timeout 120 bash "$t" 2>&1)"
+	# -k: SIGKILL a test that does not die on the SIGTERM, so one wedged
+	# test cannot stall the whole run.
+	out="$(timeout -k 5 120 bash "$t" 2>&1)"
 	rc=$?
 	case "$rc" in
 	0)
