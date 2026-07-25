@@ -447,10 +447,18 @@ static void shutdown_gcp(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	if (gcp->flags & GWP_CONN_FLAG_IS_CANCEL)
 		return;
 
+	/*
+	 * IORING_ASYNC_CANCEL_ALL: an fd can carry more than one in-flight
+	 * request -- the plain forwarding path arms a target recv while the
+	 * connect is still pending, and a relay may have a recv and a send
+	 * outstanding at once. Without it the kernel cancels exactly one, and
+	 * every survivor keeps a reference that stops put_gcp() from ever
+	 * reaching zero, leaking the pair and both fds for the process's life.
+	 */
 	if (gcp->target.fd >= 0) {
 		pr_dbg(&ctx->lh, "Cancelling target recv (fd=%d)", gcp->target.fd);
 		s = get_sqe_nofail(w);
-		io_uring_prep_cancel_fd(s, gcp->target.fd, 0);
+		io_uring_prep_cancel_fd(s, gcp->target.fd, IORING_ASYNC_CANCEL_ALL);
 		io_uring_sqe_set_data(s, gcp);
 		s->user_data |= EV_BIT_IOU_TARGET_CANCEL;
 		get_gcp(gcp);
@@ -459,7 +467,7 @@ static void shutdown_gcp(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	if (gcp->client.fd >= 0) {
 		pr_dbg(&ctx->lh, "Cancelling client recv (fd=%d)", gcp->client.fd);
 		s = get_sqe_nofail(w);
-		io_uring_prep_cancel_fd(s, gcp->client.fd, 0);
+		io_uring_prep_cancel_fd(s, gcp->client.fd, IORING_ASYNC_CANCEL_ALL);
 		io_uring_sqe_set_data(s, gcp);
 		s->user_data |= EV_BIT_IOU_CLIENT_CANCEL;
 		get_gcp(gcp);
@@ -468,7 +476,7 @@ static void shutdown_gcp(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	if (gcp->udp_fd >= 0) {
 		pr_dbg(&ctx->lh, "Cancelling UDP relay (fd=%d)", gcp->udp_fd);
 		s = get_sqe_nofail(w);
-		io_uring_prep_cancel_fd(s, gcp->udp_fd, 0);
+		io_uring_prep_cancel_fd(s, gcp->udp_fd, IORING_ASYNC_CANCEL_ALL);
 		io_uring_sqe_set_data(s, gcp);
 		s->user_data |= EV_BIT_IOU_UDP_CANCEL;
 		get_gcp(gcp);
