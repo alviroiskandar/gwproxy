@@ -606,6 +606,15 @@ int gwp_socks5_prep_connect_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
  * built, or a negative errno if it could not be built.
  */
 int gwp_acl_reject_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
+
+/*
+ * Build the "could not reach the origin" reply for whichever protocol the
+ * client speaks -- a SOCKS5 reply carrying the REP for @err, or HTTP 502 --
+ * into gcp->target.buf, ready for the caller to flush its own way. @err is a
+ * negative errno. Returns 0 (including for plain forwarding, which has no
+ * protocol to answer in), or a negative errno if the reply could not be built.
+ */
+int gwp_conn_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int err);
 int gwp_socks5_build_connect_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				   int err, void *out, size_t *out_len);
 int gwp_socks5_prepare_target_addr(struct gwp_wrk *w, struct gwp_conn_pair *gcp);

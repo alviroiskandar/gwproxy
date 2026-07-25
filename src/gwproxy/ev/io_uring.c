@@ -1156,13 +1156,12 @@ static int handle_ev_target_connect(struct gwp_wrk *w, void *udata, int res)
 	if (unlikely(res < 0)) {
 		pr_err(&w->ctx->lh, "Target connect failed: %s", strerror(-res));
 		/*
-		 * RFC 1928 s6: report the failure instead of just hanging up,
-		 * so the client learns the target refused rather than guessing.
-		 * Queued before the error return tears the pair down, as
-		 * acl_reject_target() does.
+		 * Report the failure instead of just hanging up, so the client
+		 * learns the target refused rather than guessing: a SOCKS5 REP
+		 * (RFC 1928 s6) or an HTTP 502. Queued before the error return
+		 * tears the pair down, as acl_reject_target() does.
 		 */
-		if (gcp->prot_type == GWP_PROT_TYPE_SOCKS5 &&
-		    !gwp_socks5_prep_connect_reply(w, gcp, res))
+		if (!gwp_conn_fail_reply(w, gcp, res) && gcp->target.len)
 			prep_send_client(w, gcp);
 		return res;
 	}
@@ -1717,13 +1716,13 @@ static int handle_ev_dns_query(struct gwp_wrk *w, void *udata)
 		gcp->gde = NULL;
 
 		/*
-		 * RFC 1928 s6 wants a reply before we hang up; without one the
-		 * client cannot tell a name that does not resolve from a proxy
-		 * that died. The send is queued before the error return tears
-		 * the pair down, exactly as acl_reject_target() does.
+		 * Answer before hanging up; without a reply the client cannot
+		 * tell a name that does not resolve from a proxy that died.
+		 * SOCKS5 gets a REP (RFC 1928 s6), HTTP a 502. The send is
+		 * queued before the error return tears the pair down, exactly
+		 * as acl_reject_target() does.
 		 */
-		if (gcp->prot_type == GWP_PROT_TYPE_SOCKS5 &&
-		    !gwp_socks5_prep_connect_reply(w, gcp, res))
+		if (!gwp_conn_fail_reply(w, gcp, res) && gcp->target.len)
 			prep_send_client(w, gcp);
 		return res;
 	}

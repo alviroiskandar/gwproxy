@@ -2259,6 +2259,25 @@ int gwp_socks5_prep_connect_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	return 0;
 }
 
+int gwp_conn_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int err)
+{
+	if (gcp->prot_type == GWP_PROT_TYPE_SOCKS5)
+		return gwp_socks5_prep_connect_reply(w, gcp, err);
+
+	if (gcp->prot_type == GWP_PROT_TYPE_HTTP) {
+		int r = gwp_http_build_bad_gateway_reply(
+				gcp->target.buf + gcp->target.len,
+				gcp->target.cap - gcp->target.len);
+
+		if (r < 0)
+			return r;
+		gcp->target.len += (uint32_t)r;
+		return 0;
+	}
+
+	return 0;	/* plain/transparent forwarding speaks no protocol */
+}
+
 int gwp_acl_reject_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	pr_info(&w->ctx->lh, "ACL denied target %s for client %s (idx=%u)",

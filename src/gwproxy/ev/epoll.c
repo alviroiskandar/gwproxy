@@ -1159,10 +1159,11 @@ out_conn_err:
 	 * 0 when it was getsockopt() itself that failed, which would have
 	 * reported success. @r is negative and correct on both paths.
 	 */
-	if (gcp->conn_state == CONN_STATE_SOCKS5_CONNECT) {
-		int x = prep_and_send_socks5_rep_connect(w, gcp, r);
-		if (x)
-			return x;
+	if (!gwp_conn_fail_reply(w, gcp, r) && gcp->target.len) {
+		ssize_t sr = __do_send(&gcp->target, &gcp->client);
+
+		if (unlikely(sr < 0))
+			return (int)sr;
 	}
 	return r;
 }
@@ -1379,11 +1380,11 @@ static int handle_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		 * CONN_STATE_SOCKS5_CONNECT at this point, so key off the
 		 * protocol instead.
 		 */
-		if (gcp->prot_type == GWP_PROT_TYPE_SOCKS5) {
-			int x = prep_and_send_socks5_rep_connect(w, gcp, tfd);
+		if (!gwp_conn_fail_reply(w, gcp, tfd) && gcp->target.len) {
+			ssize_t sr = __do_send(&gcp->target, &gcp->client);
 
-			if (x)
-				return x;
+			if (unlikely(sr < 0))
+				return (int)sr;
 		}
 		return tfd;
 	}
@@ -1492,12 +1493,12 @@ __hot
 static int handle_ev_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_dns_entry *gde = gcp->gde;
-	int r, ct = gcp->conn_state;
+	int r;
 
 	assert(gde);
 	assert(gde->ev_fd >= 0);
-	assert(ct == CONN_STATE_SOCKS5_DNS_QUERY ||
-	       ct == CONN_STATE_HTTP_DNS_QUERY);
+	assert(gcp->conn_state == CONN_STATE_SOCKS5_DNS_QUERY ||
+	       gcp->conn_state == CONN_STATE_HTTP_DNS_QUERY);
 
 	r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_DEL, gde->ev_fd, NULL);
 	if (unlikely(r))
@@ -1508,10 +1509,20 @@ static int handle_ev_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		gcp->target_addr = gde->addr;
 		r = handle_connect(w, gcp);
 	} else {
-		if (ct == CONN_STATE_SOCKS5_DNS_QUERY)
-			r = prep_and_send_socks5_rep_connect(w, gcp, gde->res);
-		else
-			r = -EIO;
+		/*
+		 * The name did not resolve, so the origin is unreachable:
+		 * answer in whatever protocol the client speaks (SOCKS5 REP,
+		 * or HTTP 502) instead of hanging up silently.
+		 */
+		r = gwp_conn_fail_reply(w, gcp, gde->res);
+		if (!r && gcp->target.len) {
+			ssize_t sr = __do_send(&gcp->target, &gcp->client);
+
+			if (unlikely(sr < 0))
+				r = (int)sr;
+		}
+		if (!r)
+			r = gde->res ? gde->res : -EIO;
 	}
 
 	gwp_dns_entry_put(gde);
