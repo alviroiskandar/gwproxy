@@ -15,6 +15,14 @@ hp="$(pick_port)"
 make_payload "$WORK/payload.bin" 200000
 start_httpd "$hp" "$WORK" "1.1"
 
+# An origin that records the Host header it was sent, for the rewrite check.
+op="$(pick_port)"
+hlog="$WORK/host.log"
+python3 "$SERVERS_DIR/header_origin.py" "$op" "$hlog" Host \
+	>"$WORK/header_origin.log" 2>&1 &
+_PIDS+=("$!")
+wait_listen "$op" || fail "header origin did not listen on $op"
+
 for loop in epoll io_uring; do
 	[ "$loop" = io_uring ] && ! grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && continue
 
@@ -35,6 +43,25 @@ for loop in epoll io_uring; do
 		|| fail "[$loop] curl via HTTP forward proxy to hostname target failed"
 	assert_files_equal "$WORK/payload.bin" "$WORK/out2.bin" \
 		"[$loop] HTTP forward proxy corrupted the payload (hostname)"
+
+	# RFC 9112 s3.2.2: the Host forwarded to the origin comes from the URI
+	# authority, not from whatever the client sent. Forwarding the client's
+	# copy would let it aim us at one host while telling the origin another.
+	: >"$hlog"
+	printf 'GET http://127.0.0.1:%s/x HTTP/1.1\r\nHost: evil.example.com\r\n\r\n' \
+		"$op" | timeout 10 python3 -c '
+import socket, sys
+s = socket.create_connection(("::1", int(sys.argv[1])))
+s.sendall(sys.stdin.buffer.read())
+s.settimeout(5)
+try:
+    while s.recv(4096):
+        pass
+except OSError:
+    pass' "$pp" >/dev/null 2>&1
+	got="$(head -1 "$hlog")"
+	[ "$got" = "127.0.0.1:$op" ] \
+		|| fail "[$loop] origin saw Host '$got', want 127.0.0.1:$op"
 
 	kill "$GWP_PID" 2>/dev/null
 done

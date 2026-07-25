@@ -204,7 +204,13 @@ static bool conn_lists(const char *conn, const char *name)
  * header, used to size the scratch buffer (the rewrite is never materially
  * larger). Returns 0 or a negative error.
  */
+/*
+ * Build the origin-form request forwarded upstream. @authority is the URI's
+ * authority, passed as pointer+length because at this point it is still part
+ * of the request line and not NUL-terminated.
+ */
 static int build_forward_request(struct gwp_http_conn *hc, const char *path,
+				 const char *authority, size_t auth_len,
 				 size_t hdr_len)
 {
 	struct gwnet_http_req_hdr *req = &hc->req_hdr;
@@ -227,12 +233,47 @@ static int build_forward_request(struct gwp_http_conn *hc, const char *path,
 		goto too_big;
 	n = (size_t)w;
 
+	/*
+	 * RFC 9112 s3.2.2: with an absolute-form target the proxy MUST ignore
+	 * the Host the client sent and use the authority from the URI instead.
+	 * Forwarding the client's copy lets it point us at one host while
+	 * telling the origin another (vhost confusion, and a way around an ACL
+	 * that matched on the name), and a client that sends no Host at all
+	 * would otherwise leave us emitting an invalid HTTP/1.1 request.
+	 *
+	 * The authority is copied verbatim so an IPv6 literal keeps its
+	 * brackets and an absent port stays absent -- except for userinfo,
+	 * which is not part of the host and must not reach the origin.
+	 */
+	{
+		const char *host = authority;
+		size_t hlen = auth_len;
+		const char *at = memrchr(authority, '@', auth_len);
+
+		if (at) {
+			host = at + 1;
+			hlen = auth_len - (size_t)(host - authority);
+		}
+		if (!hlen) {
+			free(buf);
+			return -EINVAL;
+		}
+
+		w = snprintf(buf + n, cap - n, "Host: %.*s\r\n", (int)hlen,
+			     host);
+		if (w < 0 || (size_t)w >= cap - n)
+			goto too_big;
+		n += (size_t)w;
+	}
+
 	for (i = 0; i < req->fields.nr; i++) {
 		const char *k = req->fields.ff[i].key;
 		const char *v = req->fields.ff[i].val;
 
-		/* Drop hop-by-hop and Connection-listed headers. */
-		if (is_hop_by_hop(k) || conn_lists(conn, k))
+		/* Drop hop-by-hop and Connection-listed headers, and the
+		 * client's Host -- ours is already in place above. */
+		if (is_hop_by_hop(k) || conn_lists(conn, k) ||
+		    !strcasecmp(k, "Host"))
 			continue;
 
 		w = snprintf(buf + n, cap - n, "%s: %s\r\n", k, v);
@@ -288,7 +329,8 @@ static int classify_forward(struct gwp_http_conn *hc, size_t hdr_len,
 	 * authority is isolated (and the path's leading '/' overwritten) only
 	 * afterwards.
 	 */
-	if (build_forward_request(hc, path, hdr_len) < 0)
+	if (build_forward_request(hc, path, authority,
+				  (size_t)(slash - authority), hdr_len) < 0)
 		return GWP_HTTP_ERR;
 
 	if (*slash == '/')
