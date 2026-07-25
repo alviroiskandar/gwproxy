@@ -94,18 +94,29 @@ static const char *http_method_str(uint8_t method)
 
 /*
  * Split a "host:port" authority (a CONNECT target, or the authority of an
- * absolute-form URI) into NUL-terminated @host_p/@port_p in place. IPv6
- * literals in brackets ("[::1]:80") are unwrapped. With no ":port",
- * @default_port is used; pass NULL to require an explicit port. Returns 0 on
- * success or -EINVAL on a malformed authority.
+ * absolute-form URI) into NUL-terminated @host_p/@port_p in place. Any
+ * userinfo is discarded. IPv6 literals in brackets ("[::1]:80") are unwrapped.
+ * With no ":port", @default_port is used; pass NULL to require an explicit
+ * port. Returns 0 on success or -EINVAL on a malformed authority.
  */
 static int split_authority(char *authority, char **host_p, char **port_p,
 			   char *default_port)
 {
-	char *host = authority, *colon = NULL, *end;
+	char *host = authority, *colon = NULL, *end, *at;
 
 	if (!*authority)
 		return -EINVAL;
+
+	/*
+	 * RFC 3986 s3.2: userinfo runs up to the LAST '@' and is not part of
+	 * the host. Drop it before looking for the port separator, or an
+	 * authority like "A:B@C" is split on the colon inside the userinfo and
+	 * yields host "A" -- attacker-chosen, while the authority still reads
+	 * as "C" to anything inspecting the URL.
+	 */
+	at = strrchr(host, '@');
+	if (at)
+		host = at + 1;
 
 	if (*host == '[') {
 		char *rb = strchr(host, ']');

@@ -2480,9 +2480,17 @@ static int prepare_target_addr_domain(struct gwp_wrk *w,
 	 * proxy. up_dst carries the domain and we're ready to connect.
 	 */
 	if (ctx->upstream.enabled && ctx->upstream.remote_dns) {
-		int p = atoi(port);
+		/*
+		 * Strict: atoi() stops at the first non-digit and reports the
+		 * prefix, so a port carrying trailing junk was silently
+		 * accepted. Unlike the resolving paths below, nothing else
+		 * validates this string before it becomes the upstream's
+		 * destination port.
+		 */
+		char *endp;
+		unsigned long p = strtoul(port, &endp, 10);
 
-		if (p <= 0 || p > 65535)
+		if (endp == port || *endp || !p || p > 65535)
 			return -EINVAL;
 		return upstream_dst_from_domain(host, (uint16_t)p, &gcp->up_dst);
 	}
