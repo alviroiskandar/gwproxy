@@ -4,6 +4,9 @@
 # SOCKS5 with a hostname target: point curl at "localhost" (an ATYP=DOMAINNAME
 # request) so gwproxy itself must resolve the name before connecting, then
 # verify the fetched payload is byte-exact, on every available event loop.
+# A name that does not resolve must be answered with REP 0x04 (host
+# unreachable) rather than a bare hang-up, so the client can tell a bad name
+# from a broken proxy.
 
 . "$(dirname "$0")/lib.sh"
 require curl
@@ -23,6 +26,14 @@ for loop in epoll io_uring; do
 		|| fail "[$loop] curl via SOCKS5 to hostname target failed"
 	assert_files_equal "$WORK/payload.bin" "$WORK/out.bin" \
 		"[$loop] SOCKS5 domain proxy corrupted the payload"
+
+	# An unresolvable name gets REP 0x04, not silence. ".invalid" is
+	# reserved by RFC 2606 and never resolves.
+	rep="$(python3 "$SERVERS_DIR/socks5_probe.py" --host ::1 --atyp domain \
+		--dst no-such-host.invalid "$pp" 80)"
+	[ "$rep" = "REP=0x04" ] \
+		|| fail "[$loop] unresolvable name got '$rep' (want REP=0x04)"
+
 	kill "$GWP_PID" 2>/dev/null
 done
 

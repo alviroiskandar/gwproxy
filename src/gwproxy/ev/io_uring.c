@@ -1700,9 +1700,23 @@ static int handle_ev_dns_query(struct gwp_wrk *w, void *udata)
 	struct gwp_dns_entry *gde = gcp->gde;
 
 	if (gde->res) {
+		int res = gde->res;
+
 		pr_info(&ctx->lh, "Failed to resolve domain '%s': %d",
-			gde->name, gde->res);
-		return gde->res;
+			gde->name, res);
+		gwp_dns_entry_put(gde);
+		gcp->gde = NULL;
+
+		/*
+		 * RFC 1928 s6 wants a reply before we hang up; without one the
+		 * client cannot tell a name that does not resolve from a proxy
+		 * that died. The send is queued before the error return tears
+		 * the pair down, exactly as acl_reject_target() does.
+		 */
+		if (gcp->prot_type == GWP_PROT_TYPE_SOCKS5 &&
+		    !gwp_socks5_prep_connect_reply(w, gcp, res))
+			prep_send_client(w, gcp);
+		return res;
 	}
 
 	gcp->target_addr = gde->addr;
