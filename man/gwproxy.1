@@ -50,8 +50,10 @@ and drive I/O with either the
 (default) or
 .B io_uring
 event loop. It recovers gracefully from file\-descriptor exhaustion
-(EMFILE/ENFILE), caches DNS answers for hostname targets, and can mark its own
-outgoing connections with
+(EMFILE/ENFILE), caches DNS answers for hostname targets, tries and races the
+addresses of a multi\-homed name on either loop (see
+.BR "TARGET ADDRESS SELECTION" ),
+and can mark its own outgoing connections with
 .BR SO_MARK .
 .SH OPTIONS
 Every boolean option takes an explicit
@@ -102,7 +104,9 @@ handshake before the connection is dropped. Default:
 .BR \-c ", " \-\-connect\-timeout=\fIsec\fR
 Seconds allowed to establish the connection to the target (or upstream proxy)
 before giving up. This bounds the whole attempt, including every address tried
-for the same name. Default:
+for the same name (see
+.BR "TARGET ADDRESS SELECTION" ).
+Default:
 .BR 5 .
 .TP
 .BR \-D ", " \-\-connect\-attempt\-delay=\fIms\fR
@@ -113,11 +117,14 @@ within this delay it starts the next one alongside it; the first connection to
 succeed wins and the others are dropped. This is what keeps a black\-holed
 address cheap: without racing such an address costs the whole
 .B \-\-connect\-timeout
-before anything else is tried, because nothing ever reports a failure. Set to
+before anything else is tried, because nothing ever reports a failure.
 .B 0
-to disable racing, leaving only sequential fallback, which still steps to the
-next address when one actively fails (refused, unreachable). Ignored when an
-upstream proxy is configured, since every attempt would dial the same proxy.
+or negative disables racing, leaving only sequential fallback, which still
+steps to the next address when one actively fails (refused, unreachable).
+Ignored when an upstream proxy is configured, since every attempt would dial
+the same proxy. Which addresses are tried, in what order and how many, and how
+racing behaves on each event loop, are described under
+.BR "TARGET ADDRESS SELECTION" .
 Default:
 .BR 250 .
 .TP
@@ -275,15 +282,21 @@ if binding the interface
 .RB ( SO_BINDTODEVICE )
 or the source address
 .RB ( bind (2))
-fails \(em including a
+fails, the connection is dropped rather than continued on the wrong source. A
 .B \-\-to\-source
-whose address family does not match the target \(em the connection is dropped
-rather than continued on the wrong source. It generally needs
+whose address family does not match the address being dialled \(em the target,
+or the upstream proxy when chaining \(em is one such failure; when a hostname
+target resolved to addresses of both families, that candidate is skipped
+instead and the connection proceeds on an address of the matching family (see
+.BR "TARGET ADDRESS SELECTION" ).
+It generally needs
 .BR CAP_NET_ADMIN .
 Binding a fixed source
 .I port
 limits concurrency to one connection per identical destination (a 4\-tuple
-clash); omit the port (the default) for an ephemeral source port.
+clash), and defeats multi\-address racing and fallback, since two attempts of
+one connection cannot share a source port; omit the port (the default) for an
+ephemeral source port.
 .RE
 .IP
 Addresses match IPv4 and its IPv4\-mapped IPv6 form equally. A rejected target
@@ -291,7 +304,13 @@ is refused (SOCKS5 reply
 .BR 0x02 ,
 HTTP
 .BR 403 );
-a rejected client connection is closed.
+a rejected client connection is closed. For a hostname target the
+.B OUTPUT
+chain is evaluated once per resolved address, so a
+.B \-d
+match can deny some of a name's addresses while the connection still succeeds
+on another (see
+.BR "TARGET ADDRESS SELECTION" ).
 .IP
 .B \-\-domain\-regexp
 .I pattern
@@ -369,7 +388,23 @@ Both must be given together.
 .SS DNS resolution
 .TP
 .BR \-Q ", " \-\-prefer\-ipv6=\fI0|1\fR
-Prefer IPv6 addresses when resolving proxy hostname targets. Default:
+Choose which address family leads when a proxy hostname target resolves to
+both. With the system resolver the candidate list always interleaves the two
+families and this only picks which one starts it: the default
+.B 0
+tries an IPv4 address first and the first IPv6 address second,
+.B 1
+reverses that order. Neither value suppresses a family or narrows the query,
+and while racing is enabled the preference is worth at most one
+.B \-\-connect\-attempt\-delay
+head start (see
+.BR "TARGET ADDRESS SELECTION" ).
+The built\-in resolver of
+.B \-\-raw\-dns
+instead asks for one record type at a time, so there this selects which is
+queried first \(em A, falling back to AAAA, or the reverse with
+.BR 1 .
+Default:
 .BR 0 .
 .TP
 .BR \-L ", " \-\-dns\-cache\-secs=\fIsec\fR
@@ -390,7 +425,16 @@ Requires a build with the new DNS resolver. Default:
 .TP
 .BR \-r ", " \-\-raw\-dns=\fI0|1\fR
 Use the built\-in raw DNS resolver for SOCKS5/HTTP hostname targets instead of
-the system resolver. Requires a build with the new DNS resolver. Default:
+the system resolver. Requires a build with the new DNS resolver and the
+.B epoll
+event loop; combining it with
+.B \-\-event\-loop=io_uring
+or with
+.B \-\-dns\-cache\-secs
+is rejected at startup. It yields a single address per name, so multi\-address
+fallback and racing do not apply (see
+.BR "TARGET ADDRESS SELECTION" ).
+Default:
 .BR 0 .
 .SS Upstream proxy chaining
 .TP
@@ -592,6 +636,123 @@ host at the proxy. Credentials embedded in the URL authenticate to the upstream.
 An
 .B https://
 upstream (TLS to the proxy) is not supported yet.
+.SH TARGET ADDRESS SELECTION
+A hostname target of a SOCKS5 or HTTP request usually resolves to several
+addresses, and gwproxy tries them as a list of candidates rather than
+committing to one. Only names gwproxy resolves itself get such a list: a
+literal IPv4/IPv6 target, plain
+.B \-\-target
+forwarding and transparent mode each have exactly one destination, the SOCKS5
+UDP relay takes a literal address from every datagram (a domain\-name datagram
+is dropped), and a hostname given to
+.B \-\-target
+is resolved once at startup, to a single address \(em or, with a
+.BR socks5h:// " or " http://
+upstream, not resolved here at all but handed to the proxy.
+.PP
+The candidates are interleaved by address family \(em the preferred family
+first, then the two families alternating. With the default
+.B \-\-prefer\-ipv6=0
+that is the first IPv4 address, the first IPv6 address, the second IPv4
+address, and so on; with
+.B \-\-prefer\-ipv6=1
+the order is mirrored. When one family runs out, the remaining addresses of the
+other follow in order. Within a family the resolver's own order is preserved,
+so the system resolver's RFC 6724 sorting still decides which address of that
+family comes first; only its cross\-family part is overridden. Alternating is
+what makes a family that is broken end to end (a black\-holed IPv6 route is the
+usual case) cost one failed attempt rather than one attempt per address. The
+first candidate is the address a single\-shot selection would have picked, so
+the first attempt is unchanged.
+.PP
+One connection tries at most the first
+.B 4
+addresses of a name \(em a longer answer is truncated without a diagnostic \(em
+so at most four attempts race. Names are resolved with
+.BR AI_ADDRCONFIG ,
+so a family the host has no address configured for contributes no candidates at
+all.
+.PP
+gwproxy starts the first candidate immediately. If it has neither succeeded nor
+failed within
+.BR \-\-connect\-attempt\-delay ,
+the next candidate is started alongside it (Happy Eyeballs, RFC 8305 Section
+5); the first connection to succeed wins and the others are closed. An attempt
+that fails while another is still in flight does not start a replacement at
+that moment \(em the attempt still running may yet succeed, and a
+slow\-but\-working address should not be abandoned because a faster one was
+refused \(em so the next candidate joins on the following delay expiry instead.
+The delay is nominal spacing rather than a guaranteed minimum: an address that
+fails while it is the only attempt in flight is stepped over at once, and the
+candidate after it can then follow in less than a full delay.
+.PP
+.B \-\-connect\-timeout
+bounds the whole operation across every candidate. It is armed once, when the
+first attempt starts, and racing does not extend it, so a name whose addresses
+are all dead still fails after one connect timeout rather than four. With
+.B \-\-connect\-attempt\-delay=0
+(or a negative value) at most one attempt is in flight; sequential fallback
+still steps to the next candidate whenever one actively fails, but a
+black\-holed address is never stepped over \(em the connection dies at
+.B \-\-connect\-timeout
+(SOCKS5 reply
+.BR 0x06 ,
+HTTP
+.BR 504 )
+with the remaining candidates untried.
+.PP
+The
+.B OUTPUT
+chain (see
+.BR \-\-acl\-file )
+is evaluated once per candidate, not once per name, so only the address\-based
+match
+.RB ( "\-d / \-\-destination" )
+can differ between the candidates of one request; the others
+.RB ( "\-s / \-\-source" ", " "\-m domain" ", " "\-m user" ", "
+.BR "\-p / \-\-protocol" ", " \-\-sports " and " \-\-dports )
+see the same values for all of them.
+.BR "\-j DNAT" ", " "\-j MARK" " and " "\-j BIND"
+are likewise applied per candidate, and a
+.B \-j DNAT
+matching every candidate of a name collapses the race onto one destination,
+which is then dialled once per candidate. A candidate the chain denies is
+skipped rather than being fatal, as is one rejected by a strict
+.BR "\-j BIND" ;
+the request fails only once every candidate has been skipped or has failed to
+connect.
+.PP
+With
+.BR \-\-upstream\-proxy ,
+racing is disabled. A
+.B socks5://
+upstream resolves target hostnames locally, so a candidate list still exists
+there: it is used for the per\-candidate
+.B OUTPUT
+evaluation and for the destination named to the upstream, and a failed connect
+to the proxy is retried once per remaining candidate before the client is told.
+A
+.BR socks5h:// " or " http://
+upstream resolves the name itself, so no candidate list is built and exactly
+one connect is made.
+.PP
+Multi\-address fallback and racing work on both the
+.B epoll
+and the
+.B io_uring
+event loop. A racing connection holds one target socket per attempt in flight,
+up to four instead of one, and on
+.B epoll
+it additionally holds a file descriptor for its attempt timer, which the
+.B io_uring
+loop does not need; size the descriptor limit accordingly, or set
+.B \-\-connect\-attempt\-delay=0
+to keep a single attempt in flight.
+.PP
+.B \-\-raw\-dns
+defeats all of this: the built\-in raw resolver yields a single address per name
+(it queries one record type at a time and tries the other only when the first
+yields nothing), so there is nothing to fall back to and nothing to race.
 .SH EVENT LOOPS
 Each worker uses one event loop, selected with
 .BR \-\-event\-loop .
@@ -599,7 +760,13 @@ Each worker uses one event loop, selected with
 is always available and is the default.
 .B io_uring
 is available only in builds configured with io_uring support and is selected at
-run time. All proxy features, including TLS termination, work on both loops.
+run time. All proxy features, including TLS termination and the multi\-address
+racing described under
+.BR "TARGET ADDRESS SELECTION" ,
+work on both loops, except the built\-in raw DNS resolver
+.RB ( \-\-raw\-dns ),
+which requires
+.BR epoll .
 .SH SIGNALS
 .TP
 .BR SIGINT ", " SIGTERM
@@ -723,6 +890,7 @@ or root.
 .BR curl (1),
 .BR iptables (8),
 .BR io_uring (7),
+.BR getaddrinfo (3),
 .BR tcp (7),
 .BR socket (7),
 .BR capabilities (7)
