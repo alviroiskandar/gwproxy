@@ -138,8 +138,15 @@ jobs:
 
       - name: Install Compilers
         run: |
-          sudo apt-get update -y;
-          sudo apt-get install -y ${{matrix.build_args.cc_pkg}};
+          if [[ "${{matrix.build_args.cc_pkg}}" == "clang" ]]; then \
+            wget https://apt.llvm.org/llvm.sh -O /tmp/llvm.sh; \
+            sudo bash /tmp/llvm.sh 23; \
+            sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-23 400; \
+            sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-23 400; \
+          else \
+            sudo apt-get update -y; \
+            sudo apt-get install -y ${{matrix.build_args.cc_pkg}}; \
+          fi;
           # OpenSSL headers for the HTTPS (--use-openssl) build and PCRE2
           # headers for the ACL regexp (--use-pcre) build. Native x86_64 only;
           # the other arches are cross-compiled without target libssl/libpcre2.
