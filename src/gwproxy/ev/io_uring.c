@@ -1237,6 +1237,16 @@ static int handle_ev_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			gcp->idx, gcp->client.fd, gcp->target.fd,
 			ip_to_str(&gcp->client_addr),
 			ip_to_str(&gcp->target_addr));
+
+		/*
+		 * Tell the client the origin timed out (SOCKS5 REP 0x06, HTTP
+		 * 504) rather than hanging up silently. Only once the target
+		 * socket exists -- the other user of this timer is the protocol
+		 * handshake, where nothing has been requested yet.
+		 */
+		if (gcp->target.fd >= 0 &&
+		    !gwp_conn_fail_reply(w, gcp, r) && gcp->target.len)
+			prep_send_client(w, gcp);
 	}
 
 	pr_dbg(&ctx->lh,

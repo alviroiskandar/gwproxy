@@ -1311,6 +1311,21 @@ static int handle_ev_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		gcp->idx, gcp->client.fd, gcp->target.fd,
 		ip_to_str(&gcp->client_addr), ip_to_str(&gcp->target_addr));
 
+	/*
+	 * A target socket that never came up: tell the client the origin timed
+	 * out (SOCKS5 REP 0x06, HTTP 504) instead of just dropping it. Only
+	 * once the target socket exists -- the other user of this timer is the
+	 * protocol handshake, where the client has not asked for anything yet
+	 * and a CONNECT reply would answer a request that was never made.
+	 */
+	if (gcp->target.fd >= 0 && !gcp->is_target_alive &&
+	    !gwp_conn_fail_reply(w, gcp, -ETIMEDOUT) && gcp->target.len) {
+		ssize_t sr = __do_send(&gcp->target, &gcp->client);
+
+		if (unlikely(sr < 0))
+			return (int)sr;
+	}
+
 	return -ETIMEDOUT;
 }
 

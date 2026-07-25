@@ -2261,14 +2261,29 @@ int gwp_socks5_prep_connect_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 
 int gwp_conn_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int err)
 {
+	/*
+	 * The two event loops report a connect timeout with different errnos:
+	 * epoll's timerfd path uses -ETIMEDOUT, io_uring's timeout CQE gives
+	 * -ETIME. Normalise, or the SOCKS5 mapping below would answer the
+	 * generic REP 0x01 on io_uring instead of 0x06 (TTL expired).
+	 */
+	bool timed_out = (err == -ETIMEDOUT || err == -ETIME);
+
+	if (timed_out)
+		err = -ETIMEDOUT;
+
 	if (gcp->prot_type == GWP_PROT_TYPE_SOCKS5)
 		return gwp_socks5_prep_connect_reply(w, gcp, err);
 
 	if (gcp->prot_type == GWP_PROT_TYPE_HTTP) {
-		int r = gwp_http_build_bad_gateway_reply(
-				gcp->target.buf + gcp->target.len,
-				gcp->target.cap - gcp->target.len);
+		void *out = gcp->target.buf + gcp->target.len;
+		size_t cap = gcp->target.cap - gcp->target.len;
+		int r;
 
+		if (timed_out)
+			r = gwp_http_build_gateway_timeout_reply(out, cap);
+		else
+			r = gwp_http_build_bad_gateway_reply(out, cap);
 		if (r < 0)
 			return r;
 		gcp->target.len += (uint32_t)r;

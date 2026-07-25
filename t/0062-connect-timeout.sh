@@ -8,6 +8,11 @@
 # forever, which leaks two fds per attempt and is remotely triggerable. So this
 # checks the client-visible outcome (the proxy closes us) and that the
 # descriptor count returns to its baseline. Exercised on every available loop.
+#
+# It also checks that the client is told WHY, in whichever protocol it speaks:
+# SOCKS5 REP 0x06 (TTL expired) or HTTP 504. The protocol-handshake timeout
+# shares this timer but must stay silent -- the client has not asked for
+# anything yet, so there is nothing to answer.
 
 . "$(dirname "$0")/lib.sh"
 require python3
@@ -72,6 +77,42 @@ for loop in epoll io_uring; do
 	after="$(nfd)"
 	[ "$after" -le $((base + 4)) ] \
 		|| fail "[$loop] descriptors leaked on connect timeout: $base -> $after"
+
+	kill "$GWP_PID" 2>/dev/null
+
+	# The client is told why it was dropped, in its own protocol.
+	sp="$(pick_port)"
+	gwp_start "127.0.0.1:$sp" --as-socks5=1 --as-http=1 \
+		--event-loop="$loop" --nr-workers=2 --connect-timeout=1 \
+		--protocol-timeout=2
+
+	rep="$(python3 "$SERVERS_DIR/socks5_probe.py" --dst 127.0.0.1 \
+		"$sp" "$tport")"
+	[ "$rep" = "REP=0x06" ] \
+		|| fail "[$loop] SOCKS5 connect timeout got '$rep' (want REP=0x06)"
+
+	code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
+		-x "http://127.0.0.1:$sp" "http://127.0.0.1:$tport/x")"
+	[ "$code" = 504 ] \
+		|| fail "[$loop] HTTP connect timeout got $code (want 504)"
+
+	# The same timer also bounds the protocol handshake. A client that
+	# never sends a request must simply be closed: answering a CONNECT
+	# that was never made would be a protocol violation.
+	got="$(python3 - "$sp" <<-'PY'
+	import socket, sys
+	s = socket.create_connection(('127.0.0.1', int(sys.argv[1])))
+	s.settimeout(15)
+	try:
+	    data = s.recv(64)
+	except socket.timeout:
+	    print('HUNG')
+	    raise SystemExit
+	print(repr(data) if data else 'CLOSED')
+	PY
+	)"
+	[ "$got" = CLOSED ] \
+		|| fail "[$loop] idle client got '$got' on handshake timeout (want a silent close)"
 
 	kill "$GWP_PID" 2>/dev/null
 done

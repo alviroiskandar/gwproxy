@@ -99,6 +99,14 @@ int gwp_http_build_forbidden_reply(void *out, size_t out_cap);
 int gwp_http_build_bad_gateway_reply(void *out, size_t out_cap);
 
 /**
+ * Build a "504 Gateway Timeout" reply, for when the connection to the origin
+ * did not complete within --connect-timeout.
+ *
+ * @return	Number of bytes written to @out, or -ENOBUFS if too small.
+ */
+int gwp_http_build_gateway_timeout_reply(void *out, size_t out_cap);
+
+/**
  * Build a "431 Request Header Fields Too Large" reply (RFC 6585 Section 5),
  * for a request header that does not fit in the client buffer.
  *
