@@ -103,6 +103,13 @@ struct gwp_upstream {
 
 int gwp_parse_upstream(const char *url, struct gwp_upstream *up);
 
+/*
+ * How many of a name's addresses one connection may try. The resolver can hand
+ * back more (GWP_DNS_MAX_ADDRS); this bounds what is copied per connection,
+ * since every candidate costs memory in every conn pair.
+ */
+#define GWP_MAX_CONN_CAND	4u
+
 enum {
 	EV_BIT_ACCEPT			= (1ull << 48ull),
 	EV_BIT_EVENTFD			= (2ull << 48ull),
@@ -381,6 +388,22 @@ struct gwp_conn_pair {
 	struct gwp_sockaddr	target_addr;
 
 	/*
+	 * Candidate target addresses, in the order they should be tried (see
+	 * struct gwp_dns_entry). A name that resolves to several addresses
+	 * fills all of them, so a dead address can be stepped over instead of
+	 * failing the connection; a literal IP, a transparent redirect or an
+	 * upstream proxy fills exactly one.
+	 *
+	 * @nr_cand is how many are valid, @next_cand the index of the first
+	 * one not yet tried. target_addr always holds the candidate currently
+	 * being attempted -- it is re-copied from here on every attempt, since
+	 * a "-j DNAT" rule rewrites it in place.
+	 */
+	struct gwp_sockaddr	cand[GWP_MAX_CONN_CAND];
+	uint8_t			nr_cand;
+	uint8_t			next_cand;
+
+	/*
 	 * The hostname the client asked for, when it used a domain target
 	 * (SOCKS5 ATYP 0x03 or an HTTP host), for ACL "-m domain" matching.
 	 * Points into s5_conn/http_conn and stays valid for the connection's
@@ -598,6 +621,16 @@ bool gwp_ctx_acl_output_dnat(struct gwp_ctx *ctx,
 
 /* Convenience wrapper: ACL OUTPUT check for a TCP target (gcp->target_addr). */
 bool gwp_ctx_acl_target_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp);
+
+/*
+ * Install the addresses the connect path may try, in priority order, and reset
+ * the attempt cursor. At most GWP_MAX_CONN_CAND are kept.
+ */
+void gwp_conn_set_candidates(struct gwp_conn_pair *gcp,
+			     const struct gwp_sockaddr *addrs, uint8_t nr);
+/* The one-address case: a literal IP, a transparent redirect, an upstream. */
+void gwp_conn_set_single_candidate(struct gwp_conn_pair *gcp,
+				   const struct gwp_sockaddr *addr);
 
 /* True if the ACL INPUT chain permits an incoming client for @proto (allow-all
  * with no ACL). */

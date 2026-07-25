@@ -2478,6 +2478,30 @@ int gwp_upstream_finalize_dst(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	return upstream_dst_from_sockaddr(&gcp->target_addr, &gcp->up_dst);
 }
 
+void gwp_conn_set_candidates(struct gwp_conn_pair *gcp,
+			     const struct gwp_sockaddr *addrs, uint8_t nr)
+{
+	if (nr > GWP_MAX_CONN_CAND)
+		nr = GWP_MAX_CONN_CAND;
+
+	memcpy(gcp->cand, addrs, (size_t)nr * sizeof(*addrs));
+	gcp->nr_cand = nr;
+	gcp->next_cand = 0;
+
+	/*
+	 * Keep target_addr meaningful for callers that read it before the
+	 * first attempt starts (logging, upstream_dst_from_sockaddr()).
+	 */
+	if (nr)
+		gcp->target_addr = gcp->cand[0];
+}
+
+void gwp_conn_set_single_candidate(struct gwp_conn_pair *gcp,
+				   const struct gwp_sockaddr *addr)
+{
+	gwp_conn_set_candidates(gcp, addr, 1);
+}
+
 static int prepare_target_addr_domain(struct gwp_wrk *w,
 				      struct gwp_conn_pair *gcp,
 				      const char *host, const char *port)
@@ -2512,10 +2536,15 @@ static int prepare_target_addr_domain(struct gwp_wrk *w,
 	if (cfg->use_raw_dns) {
 		return gwp_raw_dns_resolve(w, gcp, host, port);
 	} else {
-		r = gwp_dns_cache_lookup(ctx->dns, host, port, &gcp->target_addr);
+		struct gwp_sockaddr addrs[GWP_MAX_CONN_CAND];
+		uint8_t nr = 0;
+
+		r = gwp_dns_cache_lookup_list(ctx->dns, host, port, addrs,
+					      GWP_MAX_CONN_CAND, &nr);
 		if (!r) {
-			pr_dbg(&ctx->lh, "Found %s:%s in DNS cache %s", host, port,
-				ip_to_str(&gcp->target_addr));
+			gwp_conn_set_candidates(gcp, addrs, nr);
+			pr_dbg(&ctx->lh, "Found %s:%s in DNS cache %s (%u addr)",
+				host, port, ip_to_str(&gcp->target_addr), nr);
 			return 0;
 		}
 
@@ -2558,11 +2587,13 @@ int gwp_socks5_prepare_target_addr(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		memcpy(&ta->i4.sin_addr, &dst->ip4, 4);
 		ta->i4.sin_port = dst->port;
 		ta->i4.sin_family = AF_INET;
+		gwp_conn_set_single_candidate(gcp, ta);
 		return 0;
 	case GWP_SOCKS5_ATYP_IPV6:
 		memcpy(&ta->i6.sin6_addr, &dst->ip6, 16);
 		ta->i6.sin6_port = dst->port;
 		ta->i6.sin6_family = AF_INET6;
+		gwp_conn_set_single_candidate(gcp, ta);
 		return 0;
 	case GWP_SOCKS5_ATYP_DOMAIN:
 		return socks5_prepare_target_addr_domain(w, gcp);

@@ -134,6 +134,11 @@ static int handle_ev_raw_dns_query(struct gwp_wrk *w)
 	if (likely(!ret)) {
 		pr_dbg(&ctx->lh, "Resolved DNS query for %s to %s (gcp_idx=%u)",
 			gcp->gdp->host, ip_to_str(&gcp->target_addr), gcp->idx);
+		/*
+		 * The raw resolver still yields one address per reply, so
+		 * there is nothing to fall back to here yet.
+		 */
+		gwp_conn_set_single_candidate(gcp, &gcp->target_addr);
 		r = handle_connect(w, gcp);
 	} else {
 		if (gcp->conn_state == CONN_STATE_SOCKS5_DNS_QUERY)
@@ -159,6 +164,9 @@ static int handle_ev_raw_dns_query(struct gwp_wrk __unused *w)
 	return -ENOSYS;
 }
 #endif
+
+static int connect_next_candidate(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+				  int err);
 
 __cold
 int gwp_ctx_init_thread_epoll(struct gwp_wrk *w)
@@ -558,8 +566,9 @@ static int __handle_ev_accept(struct gwp_wrk *w)
 			free_conn_pair(w, gcp);
 			return 0;
 		}
+		gwp_conn_set_single_candidate(gcp, &gcp->target_addr);
 	} else if (!cfg->as_socks5 && !cfg->as_http) {
-		gcp->target_addr = ctx->target_addr;
+		gwp_conn_set_single_candidate(gcp, &ctx->target_addr);
 	}
 
 	r = handle_new_client(w, gcp);
@@ -1150,19 +1159,17 @@ static int handle_ev_target_conn_result(struct gwp_wrk *w,
 
 out_conn_err:
 	/*
+	 * This address is dead. Move to the next candidate if the name gave us
+	 * one; connect_next_candidate() reports @r to the client only once
+	 * they are all exhausted.
+	 *
 	 * Pass @r, not @err: socks5_translate_err() keys off negative errnos,
 	 * while @err comes from SO_ERROR and is positive, so every failure
 	 * mapped to REP 0x01 instead of the specific code. @err is also still
 	 * 0 when it was getsockopt() itself that failed, which would have
 	 * reported success. @r is negative and correct on both paths.
 	 */
-	if (!gwp_conn_fail_reply(w, gcp, r) && gcp->target.len) {
-		ssize_t sr = __do_send(&gcp->target, &gcp->client);
-
-		if (unlikely(sr < 0))
-			return (int)sr;
-	}
-	return r;
+	return connect_next_candidate(w, gcp, r);
 }
 
 /*
@@ -1349,14 +1356,142 @@ static int acl_reject_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	return -EACCES;
 }
 
-static int handle_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+/*
+ * Start one connect attempt to gcp->target_addr, which the caller has already
+ * selected and had the ACL approve. Registers the new target fd with epoll.
+ * Returns 0 once the attempt is in flight (or has already completed), or a
+ * negative errno if this attempt could not be started at all -- the caller
+ * decides whether another candidate is worth trying.
+ */
+static int start_connect_attempt(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct epoll_event ev;
 	int tfd, r;
 	bool *p;
 
-	if (!gwp_ctx_acl_target_allowed(w->ctx, gcp))
+	/*
+	 * Drop the previous attempt's socket. Closing it also removes it from
+	 * the epoll set, so no EPOLL_CTL_DEL is needed.
+	 */
+	if (gcp->target.fd >= 0) {
+		__sys_close(gcp->target.fd);
+		gcp->target.fd = -1;
+	}
+	gcp->is_target_alive = false;
+
+	p = &gcp->is_target_alive;
+	if (w->ctx->upstream.enabled) {
+		/* Connect to the upstream proxy, not the real destination. */
+		tfd = gwp_create_sock_target(w, &w->ctx->upstream.addr,
+					     &gcp->acl_sockopt, p, true);
+	} else {
+		tfd = gwp_create_sock_target(w, &gcp->target_addr,
+					     &gcp->acl_sockopt, p, true);
+	}
+	if (unlikely(tfd < 0))
+		return tfd;
+
+	/*
+	 * Force the connect-result path so the upstream handshake runs even if
+	 * connect() completed synchronously.
+	 */
+	if (w->ctx->upstream.enabled)
+		gcp->is_target_alive = false;
+
+	gcp->target.fd = tfd;
+	gcp->target.ep_mask = EPOLLOUT | EPOLLIN | EPOLLRDHUP;
+
+	ev.events = gcp->target.ep_mask;
+	ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_TARGET;
+	r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, gcp->target.fd, &ev);
+	if (unlikely(r))
+		return r;
+
+	return 0;
+}
+
+/*
+ * Start the next candidate address, having already tried (or not yet started)
+ * the others. @err is why the previous attempt failed, reported to the client
+ * if no candidate is left. Returns 0 once an attempt is in flight, or a
+ * negative errno once they are exhausted.
+ *
+ * A candidate the ACL rejects is skipped rather than being fatal: the rule
+ * denied that address, not the name, and another address of the same host may
+ * well be permitted. Only when every candidate is denied does the client get
+ * the ACL rejection.
+ */
+static int connect_next_candidate(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+				  int err)
+{
+	bool acl_denied = false;
+
+	/*
+	 * No candidate list at all: socks5h:// hands the hostname to the
+	 * upstream proxy and never resolves it here, so target_addr stays
+	 * unset and there is exactly one connect to make -- to the upstream.
+	 * Attempt it once, leaving target_addr untouched so the ACL keeps
+	 * seeing "no resolved IP" and matches on -m domain as before.
+	 */
+	if (!gcp->nr_cand) {
+		if (gcp->next_cand)
+			goto exhausted;
+
+		gcp->next_cand = 1;
+		if (!gwp_ctx_acl_target_allowed(w->ctx, gcp))
+			return acl_reject_target(w, gcp);
+
+		err = start_connect_attempt(w, gcp);
+		if (!err)
+			return 0;
+		goto exhausted;
+	}
+
+	while (gcp->next_cand < gcp->nr_cand) {
+		gcp->target_addr = gcp->cand[gcp->next_cand++];
+
+		if (!gwp_ctx_acl_target_allowed(w->ctx, gcp)) {
+			acl_denied = true;
+			continue;
+		}
+
+		acl_denied = false;
+		err = start_connect_attempt(w, gcp);
+		if (!err)
+			return 0;
+
+		pr_dbg(&w->ctx->lh, "Target %s did not start: %s (idx=%u)",
+			ip_to_str(&gcp->target_addr), strerror(-err), gcp->idx);
+
+		/*
+		 * Chaining: every attempt dials the same upstream proxy, so
+		 * walking the target's addresses would just repeat the same
+		 * failure. The candidates still matter for the ACL above and
+		 * for the destination named to the upstream.
+		 */
+		if (w->ctx->upstream.enabled)
+			break;
+	}
+
+	if (acl_denied)
 		return acl_reject_target(w, gcp);
+
+exhausted:
+	pr_dbg(&w->ctx->lh, "No target address left to try (idx=%u): %s",
+		gcp->idx, strerror(-err));
+
+	if (!gwp_conn_fail_reply(w, gcp, err) && gcp->target.len) {
+		ssize_t sr = __do_send(&gcp->target, &gcp->client);
+
+		if (unlikely(sr < 0))
+			return (int)sr;
+	}
+	return err;
+}
+
+static int handle_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	int r;
 
 	if (gcp->timer_fd >= 0) {
 		/*
@@ -1374,75 +1509,49 @@ static int handle_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		gcp->timer_fd = -1;
 	}
 
-	p = &gcp->is_target_alive;
-	if (w->ctx->upstream.enabled) {
-		/* Connect to the upstream proxy, not the real destination. */
-		tfd = gwp_create_sock_target(w, &w->ctx->upstream.addr,
-					     &gcp->acl_sockopt, p, true);
-	} else {
-		tfd = gwp_create_sock_target(w, &gcp->target_addr,
-					     &gcp->acl_sockopt, p, true);
-	}
-	if (unlikely(tfd < 0)) {
-		pr_err(&w->ctx->lh, "Failed to create target socket: %s", strerror(-tfd));
-		/*
-		 * connect() can fail right here rather than through the
-		 * connect-result path -- a refused loopback target does. The
-		 * client still needs its reply, and conn_state is not yet
-		 * CONN_STATE_SOCKS5_CONNECT at this point, so key off the
-		 * protocol instead.
-		 */
-		if (!gwp_conn_fail_reply(w, gcp, tfd) && gcp->target.len) {
-			ssize_t sr = __do_send(&gcp->target, &gcp->client);
-
-			if (unlikely(sr < 0))
-				return (int)sr;
-		}
-		return tfd;
-	}
-
 	/*
-	 * Force the connect-result path so the upstream handshake runs even if
-	 * connect() completed synchronously.
+	 * The connect timeout bounds the whole operation, across every
+	 * candidate address, so it is armed once here rather than per attempt.
 	 */
-	if (w->ctx->upstream.enabled)
-		gcp->is_target_alive = false;
-
 	r = w->ctx->cfg.connect_timeout;
 	if (r > 0) {
+		struct epoll_event tev;
+
 		r = gwp_create_timer(-1, r, 0);
 		if (unlikely(r < 0))
 			return r;
 		gcp->timer_fd = r;
-	}
 
-	gcp->target.fd = tfd;
-	gcp->target.ep_mask = EPOLLOUT | EPOLLIN | EPOLLRDHUP;
+		tev.events = EPOLLIN;
+		tev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_TIMER;
+		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, gcp->timer_fd, &tev);
+		if (unlikely(r))
+			return r;
+	}
 
 	/*
 	 * If epoll_ctl() calls fail, don't bother closing the
 	 * newly created file descriptors as they will be closed
 	 * in free_conn_pair() anyway.
 	 */
-	ev.events = gcp->client.ep_mask;
-	ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_CLIENT;
-	r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_MOD, gcp->client.fd, &ev);
-	if (unlikely(r))
-		return r;
+	{
+		struct epoll_event ev;
 
-	ev.events = gcp->target.ep_mask;
-	ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_TARGET;
-	r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, gcp->target.fd, &ev);
-	if (unlikely(r))
-		return r;
-
-	if (gcp->timer_fd >= 0) {
-		ev.events = EPOLLIN;
-		ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_TIMER;
-		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, gcp->timer_fd, &ev);
+		ev.events = gcp->client.ep_mask;
+		ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_CLIENT;
+		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_MOD, gcp->client.fd, &ev);
 		if (unlikely(r))
 			return r;
 	}
+
+	/*
+	 * Take the first candidate the ACL allows; the same helper walks the
+	 * rest, so a candidate that cannot even be started is not fatal while
+	 * others remain.
+	 */
+	r = connect_next_candidate(w, gcp, -EHOSTUNREACH);
+	if (r)
+		return r;
 
 	r = gcp->conn_state;
 	if (CONN_STATE_SOCKS5_MIN <= r && r <= CONN_STATE_SOCKS5_MAX)
@@ -1510,7 +1619,7 @@ static int handle_ev_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 	log_dns_query(w, gcp, gde);
 	if (likely(!gde->res)) {
-		gcp->target_addr = gde->addrs[0];
+		gwp_conn_set_candidates(gcp, gde->addrs, gde->nr_addrs);
 		r = handle_connect(w, gcp);
 	} else {
 		/*

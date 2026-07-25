@@ -962,7 +962,7 @@ static int __handle_ev_accept(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 	gcp->client.fd = fd;
 	gcp->target.fd = tg_fd;
 	gcp->client_addr = w->iou->accept_addr;
-	gcp->target_addr = fwd_target;
+	gwp_conn_set_single_candidate(gcp, &fwd_target);
 	gcp->is_target_alive = false;
 	r = arm_gcp(w, gcp);
 	if (unlikely(r))
@@ -1737,10 +1737,10 @@ static int handle_ev_dns_query(struct gwp_wrk *w, void *udata)
 		return res;
 	}
 
-	gcp->target_addr = gde->addrs[0];
-	pr_info(&ctx->lh, "Domain '%s' resolved to %s (fd=%d, idx=%u)",
-		gde->name, ip_to_str(&gcp->target_addr), gcp->target.fd,
-		gcp->idx);
+	gwp_conn_set_candidates(gcp, gde->addrs, gde->nr_addrs);
+	pr_info(&ctx->lh, "Domain '%s' resolved to %s (%u addr, fd=%d, idx=%u)",
+		gde->name, ip_to_str(&gcp->target_addr), gcp->nr_cand,
+		gcp->target.fd, gcp->idx);
 
 	gwp_dns_entry_put(gde);
 	gcp->gde = NULL;
