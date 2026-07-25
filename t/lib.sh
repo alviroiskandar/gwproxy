@@ -76,6 +76,11 @@ require_opt()
 		skip "gwproxy has no $1 option"
 }
 
+# wait_listen() drives gwp_start() and start_httpd(), so every test depends on
+# ss(8). Without it each test would instead fail after a 10s poll with a
+# misleading "gwproxy did not listen"; say so up front.
+require ss
+
 # Print a free TCP port that is bindable on the IPv4/IPv6 dual stack, so it is
 # also free for a plain 127.0.0.1 or [::1] bind.
 pick_port()
