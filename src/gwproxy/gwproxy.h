@@ -183,7 +183,7 @@ enum {
 	EV_BIT_IOU_TARGET_SEND		= (9ull << 48ull),
 	EV_BIT_IOU_CLIENT_SEND		= (10ull << 48ull),
 	EV_BIT_IOU_CLOSE		= (11ull << 48ull),
-	EV_BIT_IOU_TARGET_CONNECT	= (12ull << 48ull),
+	/* 12 was the single target connect, now EV_BIT_TARGET_ATTEMPT. */
 	EV_BIT_IOU_TARGET_CANCEL	= (13ull << 48ull),
 	EV_BIT_IOU_CLIENT_CANCEL	= (14ull << 48ull),
 	EV_BIT_IOU_TIMER_DEL		= (15ull << 48ull),
@@ -203,6 +203,19 @@ enum {
 	EV_BIT_IOU_UDP_TX		= (23ull << 48ull),
 	EV_BIT_IOU_UDP_CANCEL		= (24ull << 48ull),
 	EV_BIT_IOU_ACL_FILE		= EV_BIT_ACL_FILE,
+
+	/*
+	 * Happy Eyeballs on io_uring. The attempt-delay timeout shares the
+	 * generic EV_BIT_ATTEMPT_TIMER selector, but it needs a removal key
+	 * distinct from the connect timer's (EV_BIT_IOU_TIMER | gcp): the two
+	 * are live at the same time, and io_uring_prep_timeout_remove()
+	 * addresses a timeout solely by its user_data. A losing attempt's
+	 * socket is retired with its own cancel selector so the completion is
+	 * not mistaken for the adopted target's.
+	 */
+	EV_BIT_IOU_ATTEMPT_TIMER	= EV_BIT_ATTEMPT_TIMER,
+	EV_BIT_IOU_ATTEMPT_TIMER_DEL	= (49ull << 48ull),
+	EV_BIT_IOU_ATTEMPT_CANCEL	= (50ull << 48ull),
 #endif
 };
 
@@ -362,6 +375,15 @@ struct gwp_conn_pair {
 #ifdef CONFIG_IO_URING
 	int				ref_cnt;
 	struct __kernel_timespec	ts;
+	/*
+	 * The Connection Attempt Delay needs its own timespec: an armed
+	 * io_uring timeout keeps reading the struct it was given, so it cannot
+	 * share @ts with the connect timer that is live alongside it.
+	 * @attempt_timer_armed tracks whether one is outstanding, since
+	 * io_uring has no timerfd to test for.
+	 */
+	struct __kernel_timespec	ats;
+	bool				attempt_timer_armed;
 #ifdef CONFIG_HTTPS
 	/*
 	 * Persistent ciphertext scratch for the client's TLS on the io_uring
