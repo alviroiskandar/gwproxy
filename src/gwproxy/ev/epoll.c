@@ -592,6 +592,19 @@ static int handle_ev_accept(struct gwp_wrk *w, struct epoll_event *ev)
 				r = 0;
 				break;
 			}
+			/*
+			 * A per-connection failure: already logged, and the
+			 * pair (if any) already freed. Returning it kills the
+			 * worker, and gwp_ctx_thread_entry() then stops the
+			 * whole proxy -- so a single client hitting
+			 * ECONNABORTED could take every live connection down
+			 * with it. accept(2) says to retry this class, and
+			 * io_uring's loop never propagates it either. Keep
+			 * draining the backlog instead. Otherwise whether the
+			 * error escapes depends only on which of the 32
+			 * iterations it landed on.
+			 */
+			r = 0;
 		}
 	}
 
