@@ -1488,7 +1488,7 @@ static void log_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	}
 
 	pr_dbg(&ctx->lh, "DNS query resolved: %s:%s -> %s (res=%d; idx=%u; cfd=%d; tfd=%d; ca=%s)",
-		gde->name, gde->service, ip_to_str(&gde->addr), gde->res,
+		gde->name, gde->service, ip_to_str(&gde->addrs[0]), gde->res,
 		gcp->idx, gcp->client.fd, gcp->target.fd,
 		ip_to_str(&gcp->client_addr));
 }
@@ -1510,7 +1510,7 @@ static int handle_ev_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 	log_dns_query(w, gcp, gde);
 	if (likely(!gde->res)) {
-		gcp->target_addr = gde->addr;
+		gcp->target_addr = gde->addrs[0];
 		r = handle_connect(w, gcp);
 	} else {
 		/*

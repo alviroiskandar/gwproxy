@@ -14,13 +14,28 @@
 
 struct gwp_dns_wrk;
 
+/*
+ * How many addresses a single name may contribute. A resolver can return far
+ * more; the connect path only ever tries a handful before giving up, so the
+ * rest are dropped rather than carried around per connection.
+ */
+#define GWP_DNS_MAX_ADDRS	8u
+
 struct gwp_dns_entry {
 	char			*name;
 	char			*service;
 	_Atomic(int)		refcnt;
 	int			res;
 	int			ev_fd;
-	struct gwp_sockaddr	addr;
+	/*
+	 * Every usable address for @name, ordered the way they should be
+	 * tried: preferred family first, then families alternating, so a
+	 * family that is broken end to end costs one attempt rather than all
+	 * of them. @addrs[0] is the address a single-shot selection would have
+	 * picked.
+	 */
+	struct gwp_sockaddr	addrs[GWP_DNS_MAX_ADDRS];
+	uint8_t			nr_addrs;
 	struct gwp_dns_entry	*next;
 };
 
@@ -107,9 +122,24 @@ bool gwp_dns_entry_put(struct gwp_dns_entry *entry);
 int gwp_dns_cache_lookup(struct gwp_dns_ctx *ctx, const char *name,
 			 const char *service, struct gwp_sockaddr *addr);
 
+/*
+ * As gwp_dns_cache_lookup(), but returns up to @cap addresses in the order they
+ * should be tried, matching what a cache miss would have produced. *@nr_addrs
+ * receives the count. The cache already stores every A and AAAA record, so this
+ * reads the same entry -- no extra lookup cost.
+ */
+int gwp_dns_cache_lookup_list(struct gwp_dns_ctx *ctx, const char *name,
+			      const char *service, struct gwp_sockaddr *addrs,
+			      uint8_t cap, uint8_t *nr_addrs);
 
+
+/*
+ * Resolve @name/@service into up to @cap addresses, written to @addrs in the
+ * order they should be tried (see struct gwp_dns_entry). *@nr_addrs receives
+ * the count. Returns 0 on success, or -EHOSTUNREACH when nothing resolved.
+ */
 int gwp_dns_resolve(struct gwp_dns_ctx *ctx, const char *name,
-		    const char *service, struct gwp_sockaddr *addr,
-		    uint32_t restyp);
+		    const char *service, struct gwp_sockaddr *addrs,
+		    uint8_t cap, uint8_t *nr_addrs, uint32_t restyp);
 
 #endif /* #ifndef GWP_DNS_H */

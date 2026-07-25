@@ -1737,7 +1737,7 @@ static int handle_ev_dns_query(struct gwp_wrk *w, void *udata)
 		return res;
 	}
 
-	gcp->target_addr = gde->addr;
+	gcp->target_addr = gde->addrs[0];
 	pr_info(&ctx->lh, "Domain '%s' resolved to %s (fd=%d, idx=%u)",
 		gde->name, ip_to_str(&gcp->target_addr), gcp->target.fd,
 		gcp->idx);
