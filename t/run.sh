@@ -15,6 +15,8 @@ if [ ! -x "$GWPROXY" ]; then
 	exit 1
 fi
 
+. "$T_DIR/sweep.sh"
+
 shopt -s nullglob
 tests=("$T_DIR"/[0-9]*.sh)
 shopt -u nullglob
@@ -36,6 +38,9 @@ for t in "${tests[@]}"; do
 	# test cannot stall the whole run.
 	out="$(timeout -k 5 120 bash "$t" 2>&1)"
 	rc=$?
+	# A test killed outright never runs its EXIT trap, so its proxies are
+	# reparented to init and linger. Sweep here, where we always run.
+	gwp_sweep -q
 	case "$rc" in
 	0)
 		echo "ok    $name"

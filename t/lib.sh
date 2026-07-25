@@ -19,6 +19,8 @@ SKIP_CODE=77
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/gwptest.XXXXXX")"
 declare -a _PIDS=()
 
+. "$T_DIR/sweep.sh"
+
 _cleanup()
 {
 	local pid
@@ -28,6 +30,9 @@ _cleanup()
 	for pid in "${_PIDS[@]:-}"; do
 		[ -n "$pid" ] && kill -9 "$pid" 2>/dev/null
 	done
+	# Catch any proxy this test started outside gwp_start (or whose pid we
+	# lost); the runner sweeps again in case we are killed before this runs.
+	gwp_sweep -q
 	rm -rf "$WORK"
 }
 # The signal handler must exit rather than fall through: a handler that only
