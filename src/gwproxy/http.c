@@ -455,6 +455,22 @@ int gwp_http_build_bad_gateway_reply(void *out, size_t out_cap)
 	return (int)len;
 }
 
+int gwp_http_build_too_large_reply(void *out, size_t out_cap)
+{
+	static const char resp[] =
+		"HTTP/1.1 431 Request Header Fields Too Large\r\n"
+		"Content-Length: 0\r\n"
+		"Connection: close\r\n"
+		"\r\n";
+	size_t len = sizeof(resp) - 1;
+
+	if (out_cap < len)
+		return -ENOBUFS;
+
+	memcpy(out, resp, len);
+	return (int)len;
+}
+
 /* Base64-encode @in into the NUL-terminated @out (RFC 4648). */
 static void base64_encode(const unsigned char *in, size_t inlen, char *out)
 {

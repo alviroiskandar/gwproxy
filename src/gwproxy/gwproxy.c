@@ -2927,6 +2927,24 @@ static int http_reject_unauthorized(struct gwp_conn_pair *gcp)
 }
 
 /*
+ * Queue the HTTP 431 reply for a request header that will not fit in the
+ * client buffer, so the client is told its header is too large instead of just
+ * having the connection reset. Same mechanism as the 407 above: written to the
+ * client-bound buffer, flushed by the event loop before teardown. Returns a
+ * negative error so the caller drops the connection.
+ */
+static int http_reject_too_large(struct gwp_conn_pair *gcp)
+{
+	int r = gwp_http_build_too_large_reply(gcp->target.buf + gcp->target.len,
+					       gcp->target.cap - gcp->target.len);
+	if (r < 0)
+		return -E2BIG;
+
+	gcp->target.len += (uint32_t)r;
+	return -E2BIG;
+}
+
+/*
  * Prepend a rewritten origin-form forward request to any request-body bytes
  * already buffered in client.buf, so the forwarding path streams it to the
  * origin.
@@ -2999,7 +3017,7 @@ int gwp_handle_conn_state_http(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		 * busy-spin until the protocol timeout fires.
 		 */
 		if (gcp->client.len >= gcp->client.cap)
-			return -E2BIG;
+			return http_reject_too_large(gcp);
 		return 0;
 	case GWP_HTTP_NEED_AUTH:
 		return http_reject_unauthorized(gcp);
@@ -3007,6 +3025,8 @@ int gwp_handle_conn_state_http(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		return http_connect_target(w, gcp, host, port);
 	case GWP_HTTP_FORWARD:
 		r = http_inject_forward_request(gcp, req, req_len);
+		if (r == -E2BIG)
+			return http_reject_too_large(gcp);
 		if (r < 0)
 			return r;
 		return http_connect_target(w, gcp, host, port);

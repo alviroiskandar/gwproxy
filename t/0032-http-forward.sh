@@ -23,6 +23,10 @@ python3 "$SERVERS_DIR/header_origin.py" "$op" "$hlog" Host \
 _PIDS+=("$!")
 wait_listen "$op" || fail "header origin did not listen on $op"
 
+# Bigger than the 2048-byte default --client-buf-size, the size of an ordinary
+# browser's cookie jar.
+bigval="$(printf 'a%.0s' $(seq 1 3000))"
+
 for loop in epoll io_uring; do
 	[ "$loop" = io_uring ] && ! grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && continue
 
@@ -63,6 +67,27 @@ except OSError:
 	[ "$got" = "127.0.0.1:$op" ] \
 		|| fail "[$loop] origin saw Host '$got', want 127.0.0.1:$op"
 
+	# A request header too large for the client buffer must be answered
+	# with 431, not dropped with a bare reset. The forward path needs the
+	# whole rewritten request to fit, so a few KiB of cookies -- an
+	# ordinary browser request -- exceeds the 2048-byte default.
+	code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
+		-x "http://[::1]:$pp" -H "Cookie: c=$bigval" \
+		"http://127.0.0.1:$hp/payload.bin")"
+	[ "$code" = 431 ] \
+		|| fail "[$loop] oversized header got $code (want 431)"
+
+	kill "$GWP_PID" 2>/dev/null
+
+	# ... and it goes through once the buffer is big enough to hold it.
+	bp="$(pick_port)"
+	gwp_start "[::1]:$bp" --as-http=1 --event-loop="$loop" \
+		--client-buf-size=16384
+	curl -s --max-time 20 -x "http://[::1]:$bp" -H "Cookie: c=$bigval" \
+		"http://127.0.0.1:$hp/payload.bin" -o "$WORK/big.bin" \
+		|| fail "[$loop] forward proxy rejected a 3KiB header at 16K buffer"
+	assert_files_equal "$WORK/payload.bin" "$WORK/big.bin" \
+		"[$loop] big-header forward corrupted the payload"
 	kill "$GWP_PID" 2>/dev/null
 done
 

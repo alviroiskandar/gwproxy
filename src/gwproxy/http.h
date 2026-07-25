@@ -99,6 +99,14 @@ int gwp_http_build_forbidden_reply(void *out, size_t out_cap);
 int gwp_http_build_bad_gateway_reply(void *out, size_t out_cap);
 
 /**
+ * Build a "431 Request Header Fields Too Large" reply (RFC 6585 Section 5),
+ * for a request header that does not fit in the client buffer.
+ *
+ * @return	Number of bytes written to @out, or -ENOBUFS if too small.
+ */
+int gwp_http_build_too_large_reply(void *out, size_t out_cap);
+
+/**
  * Build an upstream "CONNECT <authority> HTTP/1.1" request (used when chaining
  * through an upstream HTTP proxy), with an optional Basic Proxy-Authorization
  * header. @authority is a "host:port" or "[ipv6]:port" string.
