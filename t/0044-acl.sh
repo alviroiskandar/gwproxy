@@ -190,6 +190,16 @@ for loop in epoll io_uring; do
 		"http://127.0.0.1:$hp/payload.bin" -o /dev/null -w '%{http_code}')"
 	[ "$code" = 403 ] \
 		|| fail "$loop -m user over HTTP got $code for user001 (want 403)"
+
+	# The same rule must govern relayed UDP datagrams, which carry the
+	# username of the authenticated control connection: user001's are
+	# dropped, user002's still round-trip.
+	python3 "$SERVERS_DIR/socks5_udp_client.py" --user user001 --pass pw1 \
+		--expect-drop "$uxp" "$ep" 64 >/dev/null \
+		|| fail "$loop -m user did not block user001's UDP datagram"
+	python3 "$SERVERS_DIR/socks5_udp_client.py" --user user002 --pass pw2 \
+		"$uxp" "$ep" 64 >/dev/null \
+		|| fail "$loop -m user wrongly blocked user002's UDP datagram"
 	kill "$GWP_PID" 2>/dev/null
 
 	# -j BIND --to-source pins the outgoing source address. All of

@@ -1258,11 +1258,11 @@ static enum gwp_acl_verdict acl_out(struct gwp_ctx *ctx,
 bool gwp_ctx_acl_output_allowed(struct gwp_ctx *ctx,
 				const struct gwp_sockaddr *client,
 				const struct gwp_sockaddr *target,
-				enum gwp_acl_proto proto)
+				const char *user, enum gwp_acl_proto proto)
 {
 	struct gwp_sockaddr tmp = *target;
 
-	return acl_out(ctx, client, &tmp, NULL, NULL, NULL, NULL, proto,
+	return acl_out(ctx, client, &tmp, NULL, user, NULL, NULL, proto,
 		       false) == GWP_ACL_ACCEPT;
 }
 
@@ -2659,6 +2659,7 @@ enum gwp_udp_act gwp_udp_relay_classify(struct gwp_wrk *w,
 		if (gwp_socks5_addr_to_sockaddr(&dst, &tsa, &tslen))
 			return GWP_UDP_DROP;	/* domain target: unsupported */
 		if (!gwp_ctx_acl_output_allowed(w->ctx, &gcp->udp_peer, &tsa,
+						gcp_req_user(gcp),
 						GWP_ACL_PROTO_UDP))
 			return GWP_UDP_DROP;	/* ACL denied this datagram */
 		out->buf = base + hdr_len;

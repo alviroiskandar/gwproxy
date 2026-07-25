@@ -545,11 +545,13 @@ enum gwp_udp_act gwp_udp_relay_classify(struct gwp_wrk *w,
 					struct gwp_udp_out *out);
 
 /* True if the ACL OUTPUT chain permits a @proto connection from @client to
- * @target (allow-all when no ACL is loaded or @target has no resolved IP). */
+ * @target (allow-all when no ACL is loaded or @target has no resolved IP).
+ * @user is the authenticated username for "-m user", or NULL when the
+ * connection is unauthenticated. */
 bool gwp_ctx_acl_output_allowed(struct gwp_ctx *ctx,
 				const struct gwp_sockaddr *client,
 				const struct gwp_sockaddr *target,
-				enum gwp_acl_proto proto);
+				const char *user, enum gwp_acl_proto proto);
 
 /* As gwp_ctx_acl_output_allowed(), but a matching -j DNAT rewrites *@target and
  * any -j MARK/-j BIND modifiers are written to *@so (ignored when @so is NULL).
