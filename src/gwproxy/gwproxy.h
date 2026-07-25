@@ -55,6 +55,12 @@ struct gwp_cfg {
 	int		nr_workers;
 	int		nr_dns_workers;
 	int		connect_timeout;
+	/*
+	 * Happy Eyeballs Connection Attempt Delay in milliseconds (RFC 8305
+	 * Section 5): how long before the next candidate address joins the
+	 * race. 0 disables racing, leaving plain sequential fallback.
+	 */
+	int		connect_attempt_delay;
 	int		target_buf_size;
 	int		client_buf_size;
 	bool		tcp_nodelay;
@@ -150,6 +156,17 @@ enum {
 	 * It means it waits for the data specific protocol before
 	 * solely forwarding the received data to the destination host.
 	 */
+	/*
+	 * One in-flight connect attempt of a Happy Eyeballs race, plus N for
+	 * the attempt's slot, so the completion can be attributed without
+	 * disturbing the conn-pair pointer in the low bits. Values 32..47 are
+	 * reserved for this.
+	 */
+	EV_BIT_TARGET_ATTEMPT		= (32ull << 48ull),
+
+	/* Fires when it is time to start the next attempt in the race. */
+	EV_BIT_ATTEMPT_TIMER		= (48ull << 48ull),
+
 	EV_BIT_CLIENT_PROT		= (1000ull << 48ull),
 
 #ifdef CONFIG_IO_URING
@@ -404,6 +421,26 @@ struct gwp_conn_pair {
 	uint8_t			next_cand;
 
 	/*
+	 * Connect attempts still in flight, one slot per candidate already
+	 * started, -1 when idle. Happy Eyeballs races several at once, so the
+	 * winner is not known until one of them reports success; the winning
+	 * fd then moves into target.fd and the rest are closed.
+	 *
+	 * @attempt_timer_fd fires when the next attempt should be started. It
+	 * is separate from timer_fd, which bounds the whole connect.
+	 */
+	int			attempt_fd[GWP_MAX_CONN_CAND];
+	int			attempt_timer_fd;
+
+	/*
+	 * The address each attempt actually dialled, captured after the ACL
+	 * ran. It is not simply cand[slot]: a "-j DNAT" rule rewrites the
+	 * destination in place, so the winner must be reported (and used for
+	 * up_dst) as the rewritten address, not the resolved one.
+	 */
+	struct gwp_sockaddr	attempt_addr[GWP_MAX_CONN_CAND];
+
+	/*
 	 * The hostname the client asked for, when it used a domain target
 	 * (SOCKS5 ATYP 0x03 or an HTTP host), for ACL "-m domain" matching.
 	 * Points into s5_conn/http_conn and stays valid for the connection's
@@ -631,6 +668,14 @@ void gwp_conn_set_candidates(struct gwp_conn_pair *gcp,
 /* The one-address case: a literal IP, a transparent redirect, an upstream. */
 void gwp_conn_set_single_candidate(struct gwp_conn_pair *gcp,
 				   const struct gwp_sockaddr *addr);
+
+/*
+ * Close every connect attempt still in flight and the attempt timer, e.g. once
+ * one attempt has won the race or the pair is being torn down. Returns how many
+ * descriptors were closed, which the epoll loop credits to its accept-rearm
+ * accounting.
+ */
+int gwp_conn_close_attempts(struct gwp_conn_pair *gcp);
 
 /* True if the ACL INPUT chain permits an incoming client for @proto (allow-all
  * with no ACL). */

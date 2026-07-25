@@ -101,8 +101,25 @@ handshake before the connection is dropped. Default:
 .TP
 .BR \-c ", " \-\-connect\-timeout=\fIsec\fR
 Seconds allowed to establish the connection to the target (or upstream proxy)
-before giving up. Default:
+before giving up. This bounds the whole attempt, including every address tried
+for the same name. Default:
 .BR 5 .
+.TP
+.BR \-D ", " \-\-connect\-attempt\-delay=\fIms\fR
+Milliseconds to wait before racing the next address of a multi\-homed target,
+as in Happy Eyeballs (RFC 8305 Section 5). When a name resolves to several
+addresses gwproxy starts the first, and if it has neither succeeded nor failed
+within this delay it starts the next one alongside it; the first connection to
+succeed wins and the others are dropped. This is what keeps a black\-holed
+address cheap: without racing such an address costs the whole
+.B \-\-connect\-timeout
+before anything else is tried, because nothing ever reports a failure. Set to
+.B 0
+to disable racing, leaving only sequential fallback, which still steps to the
+next address when one actively fails (refused, unreachable). Ignored when an
+upstream proxy is configured, since every attempt would dial the same proxy.
+Default:
+.BR 250 .
 .TP
 .BR \-p ", " \-\-pid\-file=\fIfile\fR
 Write the process ID to

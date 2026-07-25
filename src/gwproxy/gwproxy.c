@@ -69,6 +69,7 @@ static const struct option long_opts[] = {
 	{ "nr-workers",		required_argument,	NULL,	'w' },
 	{ "nr-dns-workers",	required_argument,	NULL,	'W' },
 	{ "connect-timeout",	required_argument,	NULL,	'c' },
+	{ "connect-attempt-delay", required_argument,	NULL,	'D' },
 	{ "target-buf-size",	required_argument,	NULL,	'T' },
 	{ "client-buf-size",	required_argument,	NULL,	'C' },
 	{ "tcp-nodelay",	required_argument,	NULL,	'd' },
@@ -110,6 +111,7 @@ static const struct gwp_cfg default_opts = {
 	.nr_workers		= 4,
 	.nr_dns_workers		= 4,
 	.connect_timeout	= 5,
+	.connect_attempt_delay	= 250,
 	.target_buf_size	= 2048,
 	.client_buf_size	= 2048,
 	.tcp_nodelay		= 1,
@@ -151,6 +153,7 @@ static void show_help(const char *app)
 	printf("  -w, --nr-workers=nr             Number of worker threads (default: %d)\n", default_opts.nr_workers);
 	printf("  -W, --nr-dns-workers=nr         Number of DNS worker threads for SOCKS5 (default: %d)\n", default_opts.nr_dns_workers);
 	printf("  -c, --connect-timeout=sec       Connection to target timeout in seconds (default: %d)\n", default_opts.connect_timeout);
+	printf("  -D, --connect-attempt-delay=ms  Delay before racing the next target address (Happy Eyeballs); 0 disables racing (default: %d)\n", default_opts.connect_attempt_delay);
 	printf("  -T, --target-buf-size=nr        Target buffer size in bytes (default: %d)\n", default_opts.target_buf_size);
 	printf("  -C, --client-buf-size=nr        Client buffer size in bytes (default: %d)\n", default_opts.client_buf_size);
 	printf("  -d, --tcp-nodelay=0|1           Enable/disable TCP_NODELAY (default: %d)\n", default_opts.tcp_nodelay);
@@ -267,6 +270,9 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 			break;
 		case 'c':
 			cfg->connect_timeout = atoi(optarg);
+			break;
+		case 'D':
+			cfg->connect_attempt_delay = atoi(optarg);
 			break;
 		case 'T':
 			cfg->target_buf_size = atoi(optarg);
@@ -773,6 +779,7 @@ static void gwp_ctx_free_thread_sock_pairs(struct gwp_wrk *w)
 			__sys_close(gcp->timer_fd);
 		if (gcp->udp_fd >= 0)
 			__sys_close(gcp->udp_fd);
+		gwp_conn_close_attempts(gcp);
 		free(gcp->udp_iou);	/* io_uring relay scratch, else NULL */
 
 		/*
@@ -1840,6 +1847,8 @@ struct gwp_conn_pair *gwp_alloc_conn_pair(struct gwp_wrk *w)
 
 	gcp->timer_fd = -1;
 	gcp->udp_fd = -1;
+	gcp->attempt_timer_fd = -1;
+	memset(gcp->attempt_fd, 0xff, sizeof(gcp->attempt_fd));	/* all -1 */
 	gcp->idx = gcs->nr;
 	gcp->conn_state = CONN_STATE_INIT;
 	gcs->pairs[gcs->nr++] = gcp;
@@ -1917,6 +1926,7 @@ int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		__sys_close(gcp->timer_fd);
 	if (gcp->udp_fd >= 0)
 		__sys_close(gcp->udp_fd);
+	gwp_conn_close_attempts(gcp);
 
 #ifdef CONFIG_NEW_DNS_RESOLVER
 	if (w->ctx->cfg.use_raw_dns && gcp->gdp) {
@@ -2476,6 +2486,28 @@ int gwp_upstream_finalize_dst(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		return upstream_dst_from_hostport(ctx->cfg.target, &gcp->up_dst);
 
 	return upstream_dst_from_sockaddr(&gcp->target_addr, &gcp->up_dst);
+}
+
+int gwp_conn_close_attempts(struct gwp_conn_pair *gcp)
+{
+	int n = 0;
+	uint8_t i;
+
+	for (i = 0; i < GWP_MAX_CONN_CAND; i++) {
+		if (gcp->attempt_fd[i] < 0)
+			continue;
+		__sys_close(gcp->attempt_fd[i]);
+		gcp->attempt_fd[i] = -1;
+		n++;
+	}
+
+	if (gcp->attempt_timer_fd >= 0) {
+		__sys_close(gcp->attempt_timer_fd);
+		gcp->attempt_timer_fd = -1;
+		n++;
+	}
+
+	return n;
 }
 
 void gwp_conn_set_candidates(struct gwp_conn_pair *gcp,
