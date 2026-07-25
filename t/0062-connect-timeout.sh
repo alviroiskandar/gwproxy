@@ -70,8 +70,17 @@ for loop in epoll io_uring; do
 	# never freed burns the client fd and the target fd on every attempt.
 	nfd() { ls "/proc/$GWP_PID/fd" 2>/dev/null | wc -l; }
 	base="$(nfd)"
+	# Concurrently: ten independent attempts, each waiting out the same
+	# one-second timeout, so this costs about a second rather than ten.
+	# Collect only these pids, so the wait below does not block on the
+	# servers lib.sh spawned.
+	pids=()
 	for i in $(seq 1 10); do
-		wait_for_close "$pp" 8 >/dev/null
+		wait_for_close "$pp" 8 >/dev/null &
+		pids+=("$!")
+	done
+	for p in "${pids[@]}"; do
+		wait "$p"
 	done
 	sleep 2
 	after="$(nfd)"
