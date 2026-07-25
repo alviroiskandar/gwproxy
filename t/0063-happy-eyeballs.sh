@@ -147,6 +147,31 @@ for loop in epoll io_uring; do
 	else
 		echo "[$loop] blackhole-first: skipped (resolver put the live address first)"
 	fi
+
+	# (c) A denial that is not the reason the request failed. The first
+	#     address is allowed and refuses the connection; the second is
+	#     denied by the ACL. The client must be told the connection was
+	#     refused (REP 0x05), not that the ACL rejected it (REP 0x02) --
+	#     the denial only applies to an address that was never the
+	#     problem.
+	if [ "$(order_of he-refused | cut -d' ' -f1)" = "127.0.0.7" ]; then
+		printf -- '%s\n' \
+			'-A OUTPUT -d 127.0.0.9 -j REJECT' \
+			'-P OUTPUT ACCEPT' >"$WORK/mixed.acl"
+		pp=39713
+		"$GWPROXY" --bind=127.0.0.1:$pp --as-socks5=1 --nr-workers=1 \
+			--acl-file="$WORK/mixed.acl" --event-loop="$loop" \
+			--connect-timeout=10 >/dev/null 2>&1 &
+		gwp_pid=$!
+		sleep 1
+		rep=$(python3 "$ROOT/t/servers/socks5_probe.py" \
+			--atyp domain --dst he-refused "$pp" "$op")
+		echo "[$loop] refused-then-denied: $rep"
+		kill "$gwp_pid" 2>/dev/null
+		[ "$rep" = "REP=0x05" ] || exit 1
+	else
+		echo "[$loop] refused-then-denied: skipped (resolver put the live address first)"
+	fi
 done
 
 rc=0

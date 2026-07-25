@@ -1688,7 +1688,7 @@ static int connect_next_candidate(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			continue;
 		}
 
-		acl_denied = false;
+		gcp->flags |= GWP_CONN_FLAG_ACL_CAND_OK;
 		err = start_connect_attempt(w, gcp, slot);
 		if (!err) {
 			/*
@@ -1719,7 +1719,14 @@ static int connect_next_candidate(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	if (has_inflight_attempt(gcp))
 		return 0;
 
-	if (acl_denied)
+	/*
+	 * The ACL is the reason this request failed only if it denied every
+	 * candidate. Once any address was allowed -- possibly on an earlier
+	 * walk, whose attempt has since failed -- the honest answer is that
+	 * attempt's error, not a rejection that applies to the addresses we
+	 * merely skipped.
+	 */
+	if (acl_denied && !(gcp->flags & GWP_CONN_FLAG_ACL_CAND_OK))
 		return acl_reject_target(w, gcp);
 
 exhausted:

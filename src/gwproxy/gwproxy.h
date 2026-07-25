@@ -344,6 +344,13 @@ enum {
 	GWP_CONN_FLAG_NO_CLOSE_FD	= (1ull << 0ull),
 	GWP_CONN_FLAG_IS_DYING		= (1ull << 1ull),
 	GWP_CONN_FLAG_IS_CANCEL		= (1ull << 2ull),
+	/*
+	 * At least one candidate address made it past the OUTPUT chain, so a
+	 * later denial cannot be the reason the request failed. Sticky for the
+	 * life of the pair: the candidate walk is re-entered once per failed
+	 * attempt, and a local would only remember the most recent walk.
+	 */
+	GWP_CONN_FLAG_ACL_CAND_OK	= (1ull << 3ull),
 };
 
 enum {
