@@ -1155,6 +1155,15 @@ static int handle_ev_target_connect(struct gwp_wrk *w, void *udata, int res)
 
 	if (unlikely(res < 0)) {
 		pr_err(&w->ctx->lh, "Target connect failed: %s", strerror(-res));
+		/*
+		 * RFC 1928 s6: report the failure instead of just hanging up,
+		 * so the client learns the target refused rather than guessing.
+		 * Queued before the error return tears the pair down, as
+		 * acl_reject_target() does.
+		 */
+		if (gcp->prot_type == GWP_PROT_TYPE_SOCKS5 &&
+		    !gwp_socks5_prep_connect_reply(w, gcp, res))
+			prep_send_client(w, gcp);
 		return res;
 	}
 

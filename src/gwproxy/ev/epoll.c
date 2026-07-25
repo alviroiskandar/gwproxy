@@ -1152,8 +1152,15 @@ static int handle_ev_target_conn_result(struct gwp_wrk *w,
 	return adjust_epl_mask(w, gcp);
 
 out_conn_err:
+	/*
+	 * Pass @r, not @err: socks5_translate_err() keys off negative errnos,
+	 * while @err comes from SO_ERROR and is positive, so every failure
+	 * mapped to REP 0x01 instead of the specific code. @err is also still
+	 * 0 when it was getsockopt() itself that failed, which would have
+	 * reported success. @r is negative and correct on both paths.
+	 */
 	if (gcp->conn_state == CONN_STATE_SOCKS5_CONNECT) {
-		int x = prep_and_send_socks5_rep_connect(w, gcp, err);
+		int x = prep_and_send_socks5_rep_connect(w, gcp, r);
 		if (x)
 			return x;
 	}
@@ -1214,6 +1221,15 @@ static int handle_ev_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	int r;
 
 	if (unlikely(ev->events & EPOLLERR)) {
+		/*
+		 * A connect() that failed reports EPOLLERR, so bailing out
+		 * here dropped the client without a reply -- a refused target
+		 * is the common case. Hand it to the connect-result path,
+		 * which reads SO_ERROR and answers with the matching REP.
+		 */
+		if (!gcp->is_target_alive)
+			return handle_ev_target_conn_result(w, gcp);
+
 		pr_err(&w->ctx->lh, "EPOLLERR on target connection event");
 		return -ECONNRESET;
 	}
@@ -1356,6 +1372,19 @@ static int handle_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	}
 	if (unlikely(tfd < 0)) {
 		pr_err(&w->ctx->lh, "Failed to create target socket: %s", strerror(-tfd));
+		/*
+		 * connect() can fail right here rather than through the
+		 * connect-result path -- a refused loopback target does. The
+		 * client still needs its reply, and conn_state is not yet
+		 * CONN_STATE_SOCKS5_CONNECT at this point, so key off the
+		 * protocol instead.
+		 */
+		if (gcp->prot_type == GWP_PROT_TYPE_SOCKS5) {
+			int x = prep_and_send_socks5_rep_connect(w, gcp, tfd);
+
+			if (x)
+				return x;
+		}
 		return tfd;
 	}
 
