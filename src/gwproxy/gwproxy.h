@@ -179,9 +179,39 @@ enum {
 };
 
 
+/*
+ * The event word packs a payload pointer in bits 0..47 and a selector in bits
+ * 48..63. That is sound on Linux because the kernel will not hand userspace a
+ * virtual address above the 47-bit default mapping window unless the process
+ * asks for one with an mmap() hint above 2^47 -- a policy the kernel adopted
+ * *precisely* to keep pointer-tagging schemes like this one working when
+ * 5-level paging widened the hardware VA to 57 bits. See
+ * Documentation/arch/x86/x86_64/5level-paging.rst ("we are not going to
+ * allocate virtual address space above 47-bit by default") and
+ * Documentation/arch/arm64/memory.rst, where the default window is 48-bit and
+ * 52-bit needs the same opt-in. Note bit 47 is live on arm64, which is why the
+ * selector starts at 48 and not 47.
+ *
+ * gwproxy never opts in: every tagged payload comes from calloc(), and there
+ * is no mmap()/MAP_FIXED/arch_prctl() anywhere in this tree. So a 57-bit-VA
+ * host does not break the encoding.
+ *
+ * Do not introduce a high mmap() hint, arm64 MTE/HWASAN heap tagging, or x86
+ * LAM without revisiting this. EV_PTR_OK() is the enforcement, and it is
+ * deliberately not assert(): release builds define NDEBUG (Makefile, configure)
+ * and would compile the check out exactly where it matters.
+ *
+ * Combine the halves arithmetically, never by writing a pointer through one
+ * union member and the selector through another -- on a 32-bit big-endian
+ * target epoll_data.ptr aliases the *high* half of .u64 and the two overlap.
+ */
 #define EV_BIT_ALL	(0xffffull << 48ull)
 #define GET_EV_BIT(X)	((X) & EV_BIT_ALL)
 #define CLEAR_EV_BIT(X)	((X) & ~EV_BIT_ALL)
+#define EV_PTR_OK(P)	(!((uint64_t)(uintptr_t)(P) & EV_BIT_ALL))
+
+static_assert((EV_BIT_CLIENT_PROT & ~EV_BIT_ALL) == 0,
+	      "the largest event selector must fit inside EV_BIT_ALL");
 
 enum {
 	CONN_STATE_INIT			= 0,

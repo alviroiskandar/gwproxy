@@ -45,6 +45,17 @@ static int register_dns_to_epoll(struct gwp_wrk *w)
 		if (res->udp_fd < 0)
 			continue;
 
+		/*
+		 * The only tagged payload that is not a gwp_conn_pair, so it
+		 * needs its own check against the same 48-bit budget.
+		 */
+		if (unlikely(!EV_PTR_OK(res))) {
+			pr_err(&w->ctx->lh,
+			       "BUG: DNS resolver %p has bits 48..63 set; the event word cannot carry it",
+			       (void *)res);
+			return -EOVERFLOW;
+		}
+
 		ev.events = EPOLLIN;
 		ev.data.u64 = PTR_TO_U64(res) | EV_BIT_RAW_DNS_QUERY;
 		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, res->udp_fd, &ev);

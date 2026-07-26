@@ -1815,6 +1815,20 @@ struct gwp_conn_pair *gwp_alloc_conn_pair(struct gwp_wrk *w)
 	if (!gcp)
 		return NULL;
 
+	/*
+	 * Both event loops carry this pointer in the low 48 bits of the event
+	 * word (see EV_BIT_ALL). Refusing the connection is a poor outcome, but
+	 * it is a diagnosable one: proceeding would hand the loops a pointer
+	 * they silently truncate on the way back out.
+	 */
+	if (unlikely(!EV_PTR_OK(gcp))) {
+		pr_err(&ctx->lh,
+		       "BUG: connection pair %p has bits 48..63 set; the event word cannot carry it",
+		       (void *)gcp);
+		free(gcp);
+		return NULL;
+	}
+
 	assert(cfg->target_buf_size > 1);
 	assert(cfg->client_buf_size > 1);
 	r = init_conn(&gcp->target, cfg->target_buf_size);
