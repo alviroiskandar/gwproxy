@@ -46,9 +46,7 @@ static int register_dns_to_epoll(struct gwp_wrk *w)
 			continue;
 
 		ev.events = EPOLLIN;
-		ev.data.u64 = 0;
-		ev.data.ptr = res;
-		ev.data.u64 |= EV_BIT_RAW_DNS_QUERY;
+		ev.data.u64 = PTR_TO_U64(res) | EV_BIT_RAW_DNS_QUERY;
 		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, res->udp_fd, &ev);
 		if (r < 0) {
 			pr_err(&w->ctx->lh,
@@ -442,9 +440,7 @@ static int handle_new_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	if (gcp->target.fd >= 0) {
 		gcp->target.ep_mask = EPOLLOUT | EPOLLIN | EPOLLRDHUP;
 		ev.events = gcp->target.ep_mask;
-		ev.data.u64 = 0;
-		ev.data.ptr = gcp;
-		ev.data.u64 |= EV_BIT_TARGET;
+		ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_TARGET;
 		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, gcp->target.fd, &ev);
 		if (unlikely(r))
 			return r;
@@ -453,18 +449,14 @@ static int handle_new_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	}
 
 	ev.events = gcp->client.ep_mask;
-	ev.data.u64 = 0;
-	ev.data.ptr = gcp;
-	ev.data.u64 |= cl_ev_bit;
+	ev.data.u64 = PTR_TO_U64(gcp) | cl_ev_bit;
 	r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, gcp->client.fd, &ev);
 	if (unlikely(r))
 		return r;
 
 	if (gcp->timer_fd >= 0) {
 		ev.events = EPOLLIN;
-		ev.data.u64 = 0;
-		ev.data.ptr = gcp;
-		ev.data.u64 |= EV_BIT_TIMER;
+		ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_TIMER;
 		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, gcp->timer_fd, &ev);
 		if (unlikely(r))
 			return r;
@@ -692,9 +684,7 @@ static int adjust_epl_mask(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 	if (client_need_ctl) {
 		ev.events = gcp->client.ep_mask;
-		ev.data.u64 = 0;
-		ev.data.ptr = gcp;
-		ev.data.u64 |= EV_BIT_CLIENT;
+		ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_CLIENT;
 
 		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_MOD, gcp->client.fd, &ev);
 		if (unlikely(r))
@@ -703,9 +693,7 @@ static int adjust_epl_mask(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 	if (target_need_ctl) {
 		ev.events = gcp->target.ep_mask;
-		ev.data.u64 = 0;
-		ev.data.ptr = gcp;
-		ev.data.u64 |= EV_BIT_TARGET;
+		ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_TARGET;
 
 		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_MOD, gcp->target.fd, &ev);
 		if (unlikely(r))
@@ -976,9 +964,7 @@ static int upstream_arm(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 
 	gcp->target.ep_mask = mask;
 	ev.events = mask;
-	ev.data.u64 = 0;
-	ev.data.ptr = gcp;
-	ev.data.u64 |= EV_BIT_TARGET;
+	ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_TARGET;
 	return __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_MOD, gcp->target.fd, &ev);
 }
 
@@ -1428,26 +1414,20 @@ static int handle_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	 * in free_conn_pair() anyway.
 	 */
 	ev.events = gcp->client.ep_mask;
-	ev.data.u64 = 0;
-	ev.data.ptr = gcp;
-	ev.data.u64 |= EV_BIT_CLIENT;
+	ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_CLIENT;
 	r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_MOD, gcp->client.fd, &ev);
 	if (unlikely(r))
 		return r;
 
 	ev.events = gcp->target.ep_mask;
-	ev.data.u64 = 0;
-	ev.data.ptr = gcp;
-	ev.data.u64 |= EV_BIT_TARGET;
+	ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_TARGET;
 	r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, gcp->target.fd, &ev);
 	if (unlikely(r))
 		return r;
 
 	if (gcp->timer_fd >= 0) {
 		ev.events = EPOLLIN;
-		ev.data.u64 = 0;
-		ev.data.ptr = gcp;
-		ev.data.u64 |= EV_BIT_TIMER;
+		ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_TIMER;
 		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, gcp->timer_fd, &ev);
 		if (unlikely(r))
 			return r;
@@ -1474,9 +1454,7 @@ static int arm_poll_for_dns_query(struct gwp_wrk *w,
 	assert(gde->ev_fd >= 0);
 
 	ev.events = EPOLLIN;
-	ev.data.u64 = 0;
-	ev.data.ptr = gcp;
-	ev.data.u64 |= EV_BIT_DNS_QUERY;
+	ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_DNS_QUERY;
 
 	r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, gde->ev_fd, &ev);
 	if (unlikely(r))
@@ -1697,9 +1675,7 @@ static int handle_udp_associate(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	}
 
 	ev.events = EPOLLIN;
-	ev.data.u64 = 0;
-	ev.data.ptr = gcp;
-	ev.data.u64 |= EV_BIT_UDP_RELAY;
+	ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_UDP_RELAY;
 	return __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, gcp->udp_fd, &ev);
 }
 
@@ -1822,9 +1798,7 @@ static int handle_ev_client_prot_out(struct gwp_wrk *w, struct gwp_conn_pair *gc
 
 	pr_dbg(&w->ctx->lh, "Handling short send on client prot data");
 	evl.events = gcp->client.ep_mask;
-	evl.data.u64 = 0;
-	evl.data.ptr = gcp;
-	evl.data.u64 |= EV_BIT_CLIENT_PROT;
+	evl.data.u64 = PTR_TO_U64(gcp) | EV_BIT_CLIENT_PROT;
 	r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_MOD, gcp->client.fd, &evl);
 	if (unlikely(r))
 		return r;
@@ -1841,9 +1815,7 @@ static int tls_arm_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 
 	gcp->client.ep_mask = mask;
 	ev.events = mask;
-	ev.data.u64 = 0;
-	ev.data.ptr = gcp;
-	ev.data.u64 |= EV_BIT_CLIENT_PROT;
+	ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_CLIENT_PROT;
 	return __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_MOD, gcp->client.fd, &ev);
 }
 
@@ -2021,8 +1993,7 @@ static int handle_event(struct gwp_wrk *w, struct epoll_event *ev)
 	int r;
 
 	ev_bit = GET_EV_BIT(ev->data.u64);
-	ev->data.u64 = CLEAR_EV_BIT(ev->data.u64);
-	udata = ev->data.ptr;
+	udata = U64_TO_PTR(CLEAR_EV_BIT(ev->data.u64));
 
 	switch (ev_bit) {
 	case EV_BIT_ACCEPT:
