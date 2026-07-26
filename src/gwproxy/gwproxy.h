@@ -113,8 +113,12 @@ enum {
 	EV_BIT_DNS_QUERY		= (7ull << 48ull),
 	EV_BIT_SOCKS5_AUTH_FILE		= (8ull << 48ull),
 
-	EV_BIT_HTTP_CONN		= (18ull << 48ull),
-	EV_BIT_RAW_DNS_QUERY		= (19ull << 48ull),
+	/*
+	 * Raw DNS resolver socket (--raw-dns), epoll only. Values 9-21 belong
+	 * to the io_uring selectors below, so use 26 -- this used to be 19,
+	 * which is EV_BIT_IOU_TLS_HS_SEND.
+	 */
+	EV_BIT_RAW_DNS_QUERY		= (26ull << 48ull),
 
 	/*
 	 * Per-connection UDP relay socket for a SOCKS5 UDP ASSOCIATE. Values
