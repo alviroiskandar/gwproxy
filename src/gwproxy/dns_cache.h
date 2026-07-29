@@ -52,9 +52,13 @@ struct gwp_dns_cache;
  *
  * @param cache_p	Pointer to the cache pointer that will be initialized.
  * @param nr_buckets	Number of buckets for the hash map.
+ * @param max_entries	Maximum number of entries to hold; once reached, inserts
+ *			of new keys are refused (returning -ENOSPC) to bound
+ *			memory. 0 means unlimited.
  * @return int		0 on success, negative error code on failure.
  */
-int gwp_dns_cache_init(struct gwp_dns_cache **cache_p, uint32_t nr_buckets);
+int gwp_dns_cache_init(struct gwp_dns_cache **cache_p, uint32_t nr_buckets,
+		       uint32_t max_entries);
 
 /**
  * Free the DNS cache and all its resources.
@@ -86,7 +90,9 @@ void gwp_dns_cache_housekeep(struct gwp_dns_cache *cache);
  * @return int	0 on success, negative error code on failure.
  *
  * Error codes:
- * -ENOENT: Entry not found.
+ * -ENOENT:    Entry not found.
+ * -ETIMEDOUT: Entry found but expired (treated as a miss).
+ * -EINVAL:    Invalid key (empty or too long).
  */
 int gwp_dns_cache_getent(struct gwp_dns_cache *cache, const char *key,
 			 struct gwp_dns_cache_entry **ep);

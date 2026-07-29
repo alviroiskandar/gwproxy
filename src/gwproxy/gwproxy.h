@@ -52,6 +52,7 @@ struct gwp_cfg {
 	const char	*acl_file;
 	bool		acl_allow_all;	/* skip the built-in default ACL */
 	int		dns_cache_secs;
+	int		dns_cache_max_entries;	/* cap; <=0 = unlimited */
 	int		nr_workers;
 	int		nr_dns_workers;
 	int		connect_timeout;

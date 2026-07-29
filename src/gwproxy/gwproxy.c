@@ -50,6 +50,7 @@
  * short-option string builder below. */
 enum {
 	OPT_ACL_ALLOW_ALL = 0x100,
+	OPT_DNS_CACHE_MAX_ENTRIES,
 };
 
 static const struct option long_opts[] = {
@@ -66,6 +67,7 @@ static const struct option long_opts[] = {
 	{ "acl-file",		required_argument,	NULL,	'a' },
 	{ "acl-allow-all",	no_argument,		NULL,	OPT_ACL_ALLOW_ALL },
 	{ "dns-cache-secs",	required_argument,	NULL,	'L' },
+	{ "dns-cache-max-entries", required_argument,	NULL,	OPT_DNS_CACHE_MAX_ENTRIES },
 	{ "nr-workers",		required_argument,	NULL,	'w' },
 	{ "nr-dns-workers",	required_argument,	NULL,	'W' },
 	{ "connect-timeout",	required_argument,	NULL,	'c' },
@@ -107,6 +109,7 @@ static const struct gwp_cfg default_opts = {
 	.auth_file		= NULL,
 	.acl_file		= NULL,
 	.dns_cache_secs		= 0,
+	.dns_cache_max_entries	= 65536,
 	.nr_workers		= 4,
 	.nr_dns_workers		= 4,
 	.connect_timeout	= 5,
@@ -148,6 +151,7 @@ static void show_help(const char *app)
 	printf("      --acl-allow-all             Do not apply the built-in default ACL (allow all; ignored with --acl-file)\n");
 	printf("  -L, --dns-cache-secs=sec        Proxy DNS cache duration in seconds (default: %d)\n", default_opts.dns_cache_secs);
 	printf("                                  Set to 0 or a negative number to disable DNS caching.\n");
+	printf("      --dns-cache-max-entries=nr  Max DNS cache entries; 0 = unlimited (default: %d)\n", default_opts.dns_cache_max_entries);
 	printf("  -w, --nr-workers=nr             Number of worker threads (default: %d)\n", default_opts.nr_workers);
 	printf("  -W, --nr-dns-workers=nr         Number of DNS worker threads for SOCKS5 (default: %d)\n", default_opts.nr_dns_workers);
 	printf("  -c, --connect-timeout=sec       Connection to target timeout in seconds (default: %d)\n", default_opts.connect_timeout);
@@ -258,6 +262,9 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 			break;
 		case 'L':
 			cfg->dns_cache_secs = atoi(optarg);
+			break;
+		case OPT_DNS_CACHE_MAX_ENTRIES:
+			cfg->dns_cache_max_entries = atoi(optarg);
 			break;
 		case 'w':
 			cfg->nr_workers = atoi(optarg);
@@ -1379,6 +1386,8 @@ static int gwp_ctx_init_dns(struct gwp_ctx *ctx)
 	struct gwp_cfg *cfg = &ctx->cfg;
 	const struct gwp_dns_cfg dns_cfg = {
 		.cache_expiry = cfg->dns_cache_secs,
+		.max_entries = cfg->dns_cache_max_entries > 0 ?
+			       (uint32_t)cfg->dns_cache_max_entries : 0,
 		.restyp = cfg->prefer_ipv6 ? GWP_DNS_RESTYP_PREFER_IPV6 : 0,
 		.nr_workers = cfg->nr_dns_workers
 	};

@@ -360,6 +360,21 @@ Cache proxy DNS answers for this many seconds.
 .B 0
 or negative disables caching. Default:
 .BR 0 .
+The cached IP is still re-checked against the ACL
+.RB ( OUTPUT
+chain) on every connection. Note the cache uses this fixed duration, not the
+authoritative record TTL, so a short\-TTL name may be served stale for up to
+.I sec
+seconds.
+.TP
+.BR \-\-dns\-cache\-max\-entries=\fInr\fR
+Bound the DNS cache to at most
+.I nr
+entries; once full, new hostnames are resolved but not cached (existing entries
+are still served and refreshed) so memory cannot grow without limit.
+.B 0
+means unlimited. Default:
+.BR 65536 .
 .TP
 .BR \-W ", " \-\-nr\-dns\-workers=\fInr\fR
 Number of DNS resolver worker threads. Default:

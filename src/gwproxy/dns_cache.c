@@ -17,6 +17,8 @@
 #include <netdb.h>
 #include <assert.h>
 #include <stdatomic.h>
+#include <unistd.h>
+#include <sys/random.h>
 #include <gwproxy/dns_cache.h>
 #include <arpa/inet.h>
 
@@ -36,19 +38,50 @@ struct dns_hash_map {
 	struct dns_cache_entry	**table;
 	size_t			nr_buckets;
 	size_t			nr_entries;
+	size_t			max_entries;	/* 0 = unlimited */
+	uint64_t		seed;		/* per-cache random hash seed */
 };
 
 struct gwp_dns_cache {
 	pthread_rwlock_t	lock;
 	struct dns_hash_map	map;
+	/*
+	 * Rate-limits the lookup-triggered expiry sweep (see throttled_housekeep).
+	 * A 32-bit seconds counter, not time_t: an 8-byte atomic is not lock-free
+	 * on 32-bit targets and would pull in libatomic. Unsigned wrap of the
+	 * delta is fine for a 1-second throttle.
+	 */
+	_Atomic(uint32_t)	last_housekeep;
 };
 
-/**
- * DJB2 Hash function.
+/* Minimum seconds between two lookup-triggered full sweeps. */
+#define GWP_DNS_HOUSEKEEP_MIN_INTERVAL 1
+
+/*
+ * A per-process random hash seed so an attacker cannot precompute hostnames
+ * that collide into one bucket (offline hash-flooding). getrandom() is
+ * preferred; the fallback mixes time/pid/address, which is not cryptographic
+ * but still unpredictable to a remote attacker.
  */
-static uint64_t hash_key(const unsigned char *key)
+static uint64_t gen_hash_seed(void)
 {
-	uint64_t hash = 5381;
+	uint64_t s;
+
+	if (getrandom(&s, sizeof(s), 0) == (ssize_t)sizeof(s))
+		return s;
+
+	s = (uint64_t)time(NULL);
+	s ^= (uint64_t)getpid() * 0x9e3779b97f4a7c15ULL;
+	s ^= (uint64_t)(uintptr_t)&s;
+	return s ? s : 0x9e3779b97f4a7c15ULL;
+}
+
+/**
+ * DJB2 Hash function, seeded to defeat offline collision precomputation.
+ */
+static uint64_t hash_key(uint64_t seed, const unsigned char *key)
+{
+	uint64_t hash = seed;
 	int c;
 
 	while ((c = *key++))
@@ -57,7 +90,29 @@ static uint64_t hash_key(const unsigned char *key)
 	return hash;
 }
 
-static int dns_map_init(struct dns_hash_map *map, size_t nr_buckets)
+/*
+ * ASCII-lowercase @key into @buf (capacity @cap) and return the length incl. the
+ * NUL terminator, or 0 if it does not fit. DNS is case-insensitive, so keying on
+ * the folded name avoids duplicate entries (and lookup misses) for case-varied
+ * requests. Only A-Z is folded (hostnames are ASCII; avoids locale tolower()).
+ */
+static size_t normalize_key(const char *key, char *buf, size_t cap)
+{
+	size_t i;
+
+	for (i = 0; key[i]; i++) {
+		unsigned char c = (unsigned char)key[i];
+
+		if (i + 1 >= cap)
+			return 0;
+		buf[i] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : (char)c;
+	}
+	buf[i] = '\0';
+	return i + 1;
+}
+
+static int dns_map_init(struct dns_hash_map *map, size_t nr_buckets,
+			size_t max_entries)
 {
 	map->table = calloc(nr_buckets, sizeof(*map->table));
 	if (!map->table)
@@ -65,6 +120,8 @@ static int dns_map_init(struct dns_hash_map *map, size_t nr_buckets)
 
 	map->nr_buckets = nr_buckets;
 	map->nr_entries = 0;
+	map->max_entries = max_entries;
+	map->seed = gen_hash_seed();
 	return 0;
 }
 
@@ -195,10 +252,15 @@ static int dns_map_insert(struct dns_hash_map *map, const char *key,
 			  const struct addrinfo *ai, time_t expired_at)
 {
 	struct dns_cache_entry *de, *cur, *prev = NULL, *next;
+	time_t now = time(NULL);
 	uint64_t hash, idx;
+	char lkey[256];
 	int r;
 
-	r = alloc_dns_entry(&de, key, ai, expired_at);
+	if (!normalize_key(key, lkey, sizeof(lkey)))
+		return -EINVAL;
+
+	r = alloc_dns_entry(&de, lkey, ai, expired_at);
 	if (r)
 		return r;
 
@@ -208,13 +270,17 @@ static int dns_map_insert(struct dns_hash_map *map, const char *key,
 	 *   2) Collision with the same key, replace the entry.
 	 *   3) Collision with a different key, chain the entry.
 	 */
-	hash = hash_key((const unsigned char *)key);
+	hash = hash_key(map->seed, (const unsigned char *)lkey);
 	idx = hash % map->nr_buckets;
 	cur = map->table[idx];
 	if (!cur) {
 		/*
 		 * Case 1. Best case, no collision!
 		 */
+		if (map->max_entries && map->nr_entries >= map->max_entries) {
+			free(de);	/* fresh, unshared alloc (ref_cnt == 1) */
+			return -ENOSPC;
+		}
 		map->table[idx] = de;
 		de->next = NULL;
 		map->nr_entries++;
@@ -263,7 +329,7 @@ static int dns_map_insert(struct dns_hash_map *map, const char *key,
 		 *		- If @cur is expired and prev is not NULL, set
 		 *		@prev->next to @cur->next. Then free @cur.
 		 */
-		while (cur && cur->expired_at <= time(NULL)) {
+		while (cur && cur->expired_at <= now) {
 			/*
 			 * Remove expired entries.
 			 */
@@ -304,7 +370,16 @@ static int dns_map_insert(struct dns_hash_map *map, const char *key,
 	/*
 	 * Case 3. The worst case.
 	 * Collision with a different key or an expired entry.
+	 *
+	 * The collision walk above already reclaimed any expired entries in this
+	 * bucket, so the count reflects live + not-yet-swept entries. Bound the
+	 * cache: once at capacity, refuse new keys (resolution still works, it is
+	 * just not cached) rather than growing without limit.
 	 */
+	if (map->max_entries && map->nr_entries >= map->max_entries) {
+		free(de);	/* fresh, unshared alloc (ref_cnt == 1) */
+		return -ENOSPC;
+	}
 	map->nr_entries++;
 	de->next = NULL;
 	if (prev)
@@ -319,21 +394,23 @@ static int dns_map_lookup_and_get(struct dns_hash_map *map, const char *key,
 				  struct dns_cache_entry **ep)
 {
 	struct dns_cache_entry *cur;
+	time_t now = time(NULL);
 	uint64_t hash, idx;
+	char lkey[256];
 	size_t nl;
 
-	nl = strlen(key) + 1;
+	nl = normalize_key(key, lkey, sizeof(lkey));
 	if (nl <= 1 || nl > 255)
 		return -EINVAL;
 
-	hash = hash_key((const unsigned char *)key);
+	hash = hash_key(map->seed, (const unsigned char *)lkey);
 	idx = hash % map->nr_buckets;
 	cur = map->table[idx];
 
 	while (cur) {
-		if (cur->e.name_len == nl && !memcmp(cur->e.block, key, nl)) {
+		if (cur->e.name_len == nl && !memcmp(cur->e.block, lkey, nl)) {
 
-			if (cur->expired_at <= time(NULL))
+			if (cur->expired_at <= now)
 				return -ETIMEDOUT;
 
 			get_dns_entry(cur);
@@ -346,7 +423,8 @@ static int dns_map_lookup_and_get(struct dns_hash_map *map, const char *key,
 	return -ENOENT;
 }
 
-int gwp_dns_cache_init(struct gwp_dns_cache **cache_p, uint32_t nr_buckets)
+int gwp_dns_cache_init(struct gwp_dns_cache **cache_p, uint32_t nr_buckets,
+		       uint32_t max_entries)
 {
 	struct gwp_dns_cache *cache;
 	int r;
@@ -365,10 +443,11 @@ int gwp_dns_cache_init(struct gwp_dns_cache **cache_p, uint32_t nr_buckets)
 		goto out_free_cache;
 	}
 
-	r = dns_map_init(&cache->map, nr_buckets);
+	r = dns_map_init(&cache->map, nr_buckets, max_entries);
 	if (r)
 		goto out_destroy_lock;
 
+	atomic_init(&cache->last_housekeep, (uint32_t)0);
 	*cache_p = cache;
 	return 0;
 
@@ -399,6 +478,28 @@ int gwp_dns_cache_insert(struct gwp_dns_cache *cache, const char *key,
 	return r;
 }
 
+/*
+ * Sweep expired entries, but at most once per GWP_DNS_HOUSEKEEP_MIN_INTERVAL and
+ * with only one sweeper at a time. Without this, a hot name expiring makes every
+ * concurrent lookup that hits it (-ETIMEDOUT) launch its own O(total) full-table
+ * sweep under the write lock -- a thundering-herd stall recurring at each TTL
+ * boundary. The winner of the timestamp CAS performs the sweep; the rest skip.
+ */
+static void throttled_housekeep(struct gwp_dns_cache *cache)
+{
+	uint32_t now = (uint32_t)time(NULL);
+	uint32_t last = atomic_load_explicit(&cache->last_housekeep,
+					     memory_order_relaxed);
+
+	if (now - last < GWP_DNS_HOUSEKEEP_MIN_INTERVAL)
+		return;
+	if (!atomic_compare_exchange_strong_explicit(&cache->last_housekeep,
+			&last, now, memory_order_relaxed, memory_order_relaxed))
+		return;
+
+	gwp_dns_cache_housekeep(cache);
+}
+
 int gwp_dns_cache_getent(struct gwp_dns_cache *cache, const char *key,
 			 struct gwp_dns_cache_entry **ep)
 {
@@ -411,7 +512,7 @@ int gwp_dns_cache_getent(struct gwp_dns_cache *cache, const char *key,
 	if (de)
 		*ep = &de->e;
 	else if (r == -ETIMEDOUT)
-		gwp_dns_cache_housekeep(cache);
+		throttled_housekeep(cache);
 
 	return r;
 }
@@ -425,6 +526,7 @@ void gwp_dns_cache_putent(struct gwp_dns_cache_entry *e)
 static void dns_map_scan_and_remove_expired(struct dns_hash_map *map)
 {
 	struct dns_cache_entry *next, *cur;
+	time_t now = time(NULL);
 	size_t i;
 
 	for (i = 0; i < map->nr_buckets; i++) {
@@ -432,7 +534,7 @@ static void dns_map_scan_and_remove_expired(struct dns_hash_map *map)
 		map->table[i] = NULL;
 		while (cur) {
 			next = cur->next;
-			if (cur->expired_at <= time(NULL)) {
+			if (cur->expired_at <= now) {
 				map->nr_entries--;
 				put_dns_entry(cur);
 			} else {

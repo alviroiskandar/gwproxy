@@ -24,6 +24,21 @@ for loop in epoll io_uring; do
 	assert_files_equal "$WORK/payload.bin" "$WORK/out.bin" \
 		"[$loop] SOCKS5 domain proxy corrupted the payload"
 	kill "$GWP_PID" 2>/dev/null
+
+	# With DNS caching enabled (bounded), two fetches of the same hostname
+	# must both succeed byte-exact: the first resolves and populates the
+	# cache, the second is served from it.
+	cp="$(pick_port)"
+	gwp_start "[::1]:$cp" --as-socks5=1 --event-loop="$loop" --nr-workers=2 \
+		--dns-cache-secs=60 --dns-cache-max-entries=128
+	for n in 1 2; do
+		curl -s --max-time 20 --proxy "socks5h://[::1]:$cp" \
+			"http://localhost:$hp/payload.bin" -o "$WORK/cout.$n" \
+			|| fail "[$loop] cached SOCKS5 fetch $n failed"
+		assert_files_equal "$WORK/payload.bin" "$WORK/cout.$n" \
+			"[$loop] cached SOCKS5 fetch $n corrupted the payload"
+	done
+	kill "$GWP_PID" 2>/dev/null
 done
 
 pass
