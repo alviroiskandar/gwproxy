@@ -123,9 +123,6 @@ jobs:
             cc: hppa-linux-gnu-gcc
             sanitize: 0
 
-    env:
-      CC: ${{matrix.build_args.cc}}
-
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -136,120 +133,19 @@ jobs:
         run: |
           git checkout ${{ matrix.commit }};
 
-      - name: Install Compilers
+      - name: Install compilers
         run: |
-          if [[ "${{matrix.build_args.cc_pkg}}" == "clang" ]]; then \
-            wget https://apt.llvm.org/llvm.sh -O /tmp/llvm.sh; \
-            sudo bash /tmp/llvm.sh 23; \
-            sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-23 400; \
-            sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-23 400; \
-          else \
-            sudo apt-get update -y; \
-            sudo apt-get install -y ${{matrix.build_args.cc_pkg}}; \
-          fi;
-          # OpenSSL headers for the HTTPS (--use-openssl) build and PCRE2
-          # headers for the ACL regexp (--use-pcre) build. Native x86_64 only;
-          # the other arches are cross-compiled without target libssl/libpcre2.
-          if [ "${{matrix.build_args.arch}}" = "x86_64" ]; then
-            sudo apt-get install -y libssl-dev libpcre2-dev;
-          fi;
+          ./.github/scripts/ci.sh deps \
+            --arch=${{matrix.build_args.arch}} \
+            --cc=${{matrix.build_args.cc}} \
+            --cc-pkg=${{matrix.build_args.cc_pkg}};
 
-      - name: Display compiler versions
+      - name: Build
         run: |
-          ${{matrix.build_args.cc}} --version;
-
-      - name: Build default
-        if: ${{matrix.build_args.sanitize == '0'}}
-        run: |
-          make clean;
-          CFLAGS=-Werror ./configure --cc=${{matrix.build_args.cc}};
-          make -j$(nproc);
-          # Only test for x86_64
-          if [ "${{matrix.build_args.arch}}" = "x86_64" ]; then
-            make -j$(nproc) test;
-          fi;
-
-      - name: Build with --debug
-        if: ${{matrix.build_args.sanitize == '0'}}
-        run: |
-          make clean;
-          CFLAGS=-Werror ./configure --cc=${{matrix.build_args.cc}} --debug;
-          make -j$(nproc);
-          # Only test for x86_64
-          if [ "${{matrix.build_args.arch}}" = "x86_64" ]; then
-            make -j$(nproc) test;
-          fi;
-
-      - name: Build default (with sanitizer)
-        if: ${{matrix.build_args.sanitize == '1'}}
-        run: |
-          make clean;
-          CFLAGS=-Werror ./configure --cc=${{matrix.build_args.cc}} --sanitize;
-          make -j$(nproc);
-          # Only test for x86_64
-          if [ "${{matrix.build_args.arch}}" = "x86_64" ]; then
-            make -j$(nproc) test;
-          fi;
-
-      - name: Build with io-uring
-        run: |
-          rm -vf config.h config.log config.make;
-          make clean;
-          CFLAGS=-Werror ./configure --use-io-uring;
-          make -j$(nproc);
-          if [ "${{matrix.build_args.arch}}" = "x86_64" ]; then
-            make -j$(nproc) test;
-          fi;
-
-      - name: Build with io-uring and --debug
-        run: |
-          rm -vf config.h config.log config.make;
-          make clean;
-          CFLAGS=-Werror ./configure --use-io-uring --debug;
-          make -j$(nproc);
-          if [ "${{matrix.build_args.arch}}" = "x86_64" ]; then
-            make -j$(nproc) test;
-          fi;
-
-      # HTTPS (TLS termination) needs libssl, only installed for native
-      # x86_64, so these steps run there. 'make test' exercises the ssl unit
-      # test and the t/0034 HTTPS integration test (over both event loops),
-      # under the sanitizer too when this matrix row enables it.
-      - name: Build with OpenSSL (HTTPS)
-        if: ${{matrix.build_args.arch == 'x86_64'}}
-        run: |
-          SAN="";
-          if [ "${{matrix.build_args.sanitize}}" = "1" ]; then SAN="--sanitize"; fi;
-          rm -vf config.h config.log config.make;
-          make clean;
-          CFLAGS=-Werror ./configure --cc=${{matrix.build_args.cc}} --use-openssl $SAN;
-          make -j$(nproc);
-          make -j$(nproc) test;
-
-      - name: Build with OpenSSL and io-uring (HTTPS)
-        if: ${{matrix.build_args.arch == 'x86_64'}}
-        run: |
-          SAN="";
-          if [ "${{matrix.build_args.sanitize}}" = "1" ]; then SAN="--sanitize"; fi;
-          rm -vf config.h config.log config.make;
-          make clean;
-          CFLAGS=-Werror ./configure --cc=${{matrix.build_args.cc}} --use-openssl --use-io-uring $SAN;
-          make -j$(nproc);
-          make -j$(nproc) test;
-
-      # PCRE2 (--use-pcre) enables the ACL --domain-regexp / --user-regexp
-      # matches; libpcre2-dev is installed for native x86_64 only. 'make test'
-      # then exercises the regexp unit and integration cases (over both loops).
-      - name: Build with PCRE and io-uring (ACL regexp)
-        if: ${{matrix.build_args.arch == 'x86_64'}}
-        run: |
-          SAN="";
-          if [ "${{matrix.build_args.sanitize}}" = "1" ]; then SAN="--sanitize"; fi;
-          rm -vf config.h config.log config.make;
-          make clean;
-          CFLAGS=-Werror ./configure --cc=${{matrix.build_args.cc}} --use-openssl --use-io-uring --use-pcre $SAN;
-          make -j$(nproc);
-          make -j$(nproc) test;
+          ./.github/scripts/ci.sh build \
+            --arch=${{matrix.build_args.arch}} \
+            --cc=${{matrix.build_args.cc}} \
+            --sanitize=${{matrix.build_args.sanitize}};
 
   alpine-musl-build:
     needs: get_commit_list
@@ -280,75 +176,16 @@ jobs:
       - name: Install build dependencies
         shell: alpine.sh --root {0}
         run: |
-          apk add --no-cache build-base musl-dev linux-headers git openssl-dev \
-            pcre2-dev;
+          # Bootstrap only: bash is what runs the CI script, the script
+          # installs the actual build dependencies so that the package list
+          # travels with the commit under test.
+          apk add --no-cache bash;
+          ./.github/scripts/ci.sh alpine-deps;
 
-      - name: Build default
+      - name: Build
         shell: alpine.sh {0}
         run: |
-          make clean;
-          CFLAGS=-Werror ./configure --cc=gcc;
-          make -j$(nproc);
-          if [ "${{matrix.build_args.arch}}" = "x86_64" ]; then
-            make -j$(nproc) test;
-          fi;
-
-      - name: Build with --debug
-        shell: alpine.sh {0}
-        run: |
-          make clean;
-          CFLAGS=-Werror ./configure --cc=gcc --debug;
-          make -j$(nproc);
-          if [ "${{matrix.build_args.arch}}" = "x86_64" ]; then
-            make -j$(nproc) test;
-          fi;
-
-      - name: Build with io-uring
-        shell: alpine.sh {0}
-        run: |
-          rm -vf config.h config.log config.make;
-          make clean;
-          CFLAGS=-Werror ./configure --cc=gcc --use-io-uring;
-          make -j$(nproc);
-          if [ "${{matrix.build_args.arch}}" = "x86_64" ]; then
-            make -j$(nproc) test;
-          fi;
-
-      - name: Build with io-uring and --debug
-        shell: alpine.sh {0}
-        run: |
-          rm -vf config.h config.log config.make;
-          make clean;
-          CFLAGS=-Werror ./configure --cc=gcc --use-io-uring --debug;
-          make -j$(nproc);
-          if [ "${{matrix.build_args.arch}}" = "x86_64" ]; then
-            make -j$(nproc) test;
-          fi;
-
-      # Compile-test the TLS module (ssl.c) against musl. Like the other
-      # Alpine steps this is build-only ('make test' is gated off here).
-      - name: Build with OpenSSL
-        shell: alpine.sh {0}
-        run: |
-          rm -vf config.h config.log config.make;
-          make clean;
-          CFLAGS=-Werror ./configure --cc=gcc --use-openssl;
-          make -j$(nproc);
-          if [ "${{matrix.build_args.arch}}" = "x86_64" ]; then
-            make -j$(nproc) test;
-          fi;
-
-      # Compile-test the ACL PCRE2 path (--use-pcre) against musl.
-      - name: Build with PCRE
-        shell: alpine.sh {0}
-        run: |
-          rm -vf config.h config.log config.make;
-          make clean;
-          CFLAGS=-Werror ./configure --cc=gcc --use-io-uring --use-pcre;
-          make -j$(nproc);
-          if [ "${{matrix.build_args.arch}}" = "x86_64" ]; then
-            make -j$(nproc) test;
-          fi;
+          ./.github/scripts/ci.sh alpine-build;
 
   codespell:
     needs: get_commit_list
@@ -369,11 +206,8 @@ jobs:
 
       - name: Install codespell
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y codespell
-
-      - name: Display codespell version
-        run: codespell --version
+          ./.github/scripts/ci.sh codespell-deps;
 
       - name: Execute codespell
-        run: codespell --ignore-words=.github/actions/codespell/stopwords man/
+        run: |
+          ./.github/scripts/ci.sh codespell;
