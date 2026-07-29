@@ -39,6 +39,12 @@ void gwp_http_conn_free(struct gwp_http_conn *hc);
 /* Whether the (already classified) request is a forwarding request. */
 bool gwp_http_conn_is_forward(const struct gwp_http_conn *hc);
 
+/*
+ * The authenticated username (Basic proxy auth), or NULL if the request was not
+ * authenticated. Valid until gwp_http_conn_free(); used for ACL "-m user".
+ */
+const char *gwp_http_conn_username(const struct gwp_http_conn *hc);
+
 /**
  * Consume client request bytes and, once the header is complete, classify the
  * request.
@@ -76,6 +82,13 @@ int gwp_http_build_connect_reply(const struct gwp_http_conn *hc, void *out,
  * @return	Number of bytes written to @out, or -ENOBUFS if too small.
  */
 int gwp_http_build_auth_required_reply(void *out, size_t out_cap);
+
+/**
+ * Build a "403 Forbidden" reply (used when an ACL rejects the target).
+ *
+ * @return	Number of bytes written to @out, or -ENOBUFS if too small.
+ */
+int gwp_http_build_forbidden_reply(void *out, size_t out_cap);
 
 /**
  * Build an upstream "CONNECT <authority> HTTP/1.1" request (used when chaining

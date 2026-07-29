@@ -56,7 +56,7 @@ count_redirect()
 }
 
 $SUDO "$GWPROXY" --as-transparent=1 --mark="$MARK" --bind="127.0.0.1:$pp" \
-	--nr-workers=1 --log-level=3 >"$WORK/gwp.log" 2>&1 &
+	--acl-allow-all --nr-workers=1 --log-level=3 >"$WORK/gwp.log" 2>&1 &
 wait_listen "$pp" \
 	|| { sed 's/^/# gwp: /' "$WORK/gwp.log" >&2; fail "gwproxy did not listen on $pp"; }
 

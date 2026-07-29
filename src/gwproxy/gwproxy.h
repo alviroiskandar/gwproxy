@@ -14,6 +14,7 @@
 #include <gwproxy/auth.h>
 #include <gwproxy/http.h>
 #include <gwproxy/dns.h>
+#include <gwproxy/acl.h>
 #include <gwproxy/log.h>
 #include <assert.h>
 #ifdef CONFIG_IO_URING
@@ -35,6 +36,7 @@ struct gwp_ssl_ctx;
 struct gwp_ssl;
 struct gwp_iou_tls;
 struct gwp_iou_udp;
+struct gwp_acl;
 
 struct gwp_cfg {
 	const char	*event_loop;
@@ -42,10 +44,13 @@ struct gwp_cfg {
 	const char	*target;
 	bool		as_socks5;
 	bool		as_http;
+	bool		udp_associate;	/* allow SOCKS5 UDP ASSOCIATE (default on) */
 	bool		prefer_ipv6;
 	bool		use_raw_dns;
 	int		protocol_timeout;
 	const char	*auth_file;
+	const char	*acl_file;
+	bool		acl_allow_all;	/* skip the built-in default ACL */
 	int		dns_cache_secs;
 	int		nr_workers;
 	int		nr_dns_workers;
@@ -118,6 +123,12 @@ enum {
 	EV_BIT_UDP_RELAY		= (22ull << 48ull),
 
 	/*
+	 * inotify watch for the ACL rule file (--acl-file); 23-24 are the
+	 * io_uring UDP relay aliases below, so use 25.
+	 */
+	EV_BIT_ACL_FILE			= (25ull << 48ull),
+
+	/*
 	 * This ev_bit is used for user_data masking during protocol
 	 * initalization.
 	 *
@@ -163,6 +174,7 @@ enum {
 	EV_BIT_IOU_UDP_RX		= EV_BIT_UDP_RELAY,
 	EV_BIT_IOU_UDP_TX		= (23ull << 48ull),
 	EV_BIT_IOU_UDP_CANCEL		= (24ull << 48ull),
+	EV_BIT_IOU_ACL_FILE		= EV_BIT_ACL_FILE,
 #endif
 };
 
@@ -271,6 +283,18 @@ enum {
 
 struct gwp_dns_packet;
 
+/*
+ * Per-connection socket options that the ACL OUTPUT chain can impose on the
+ * outgoing target socket (composable -j MARK / -j BIND modifiers). Built from
+ * the ACL result and applied in gwp_create_sock_target() before connect(). A
+ * NULL pointer (or all-unset fields) means "use the global defaults".
+ */
+struct gwp_conn_sockopt {
+	bool			mark_set;	/* -j MARK: use @mark, not cfg.mark */
+	uint32_t		mark;		/* SO_MARK value */
+	struct gwp_acl_bind	bind;		/* -j BIND: bind.set when present */
+};
+
 struct gwp_conn_pair {
 	struct gwp_conn		target;
 	struct gwp_conn		client;
@@ -321,6 +345,21 @@ struct gwp_conn_pair {
 	};
 	struct gwp_sockaddr	client_addr;
 	struct gwp_sockaddr	target_addr;
+
+	/*
+	 * The hostname the client asked for, when it used a domain target
+	 * (SOCKS5 ATYP 0x03 or an HTTP host), for ACL "-m domain" matching.
+	 * Points into s5_conn/http_conn and stays valid for the connection's
+	 * life; NULL for literal-IP requests.
+	 */
+	const char		*req_domain;
+
+	/*
+	 * Per-connection socket options from the ACL OUTPUT chain (-j MARK /
+	 * -j BIND), filled by gwp_ctx_acl_target_allowed() and applied when the
+	 * target socket is created.
+	 */
+	struct gwp_conn_sockopt	acl_sockopt;
 
 	/*
 	 * Destination requested from the upstream SOCKS5 proxy. Only used
@@ -424,6 +463,11 @@ struct gwp_ctx {
 	struct gwp_cfg			cfg;
 	int				ino_fd;
 	char				*ino_buf;
+	/* ACL rule store (--acl-file) and its own inotify watch. Global to all
+	 * proxy modes, unlike @auth which is prot-only. */
+	struct gwp_acl			*acl;
+	int				acl_ino_fd;
+	char				*acl_ino_buf;
 	_Atomic(int32_t)		nr_fd_closed;
 	_Atomic(int32_t)		nr_accept_stopped;
 };
@@ -431,6 +475,7 @@ struct gwp_ctx {
 struct gwp_conn_pair *gwp_alloc_conn_pair(struct gwp_wrk *w);
 int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 int gwp_create_sock_target(struct gwp_wrk *w, struct gwp_sockaddr *addr,
+			   const struct gwp_conn_sockopt *so,
 			   bool *is_target_alive, bool non_block);
 int gwp_create_timer(int fd, int sec, int nsec);
 void gwp_setup_cli_sock_options(struct gwp_wrk *w, int fd);
@@ -465,9 +510,39 @@ void gwp_socks5_reply_addr_from_sockaddr(const struct gwp_sockaddr *src,
 /* Compare two addresses by IP only, matching IPv4 with its v4-mapped form. */
 bool gwp_sockaddr_ip_eq(const struct gwp_sockaddr *a,
 			const struct gwp_sockaddr *b);
+
+/* True if the ACL OUTPUT chain permits a @proto connection from @client to
+ * @target (allow-all when no ACL is loaded or @target has no resolved IP). */
+bool gwp_ctx_acl_output_allowed(struct gwp_ctx *ctx,
+				const struct gwp_sockaddr *client,
+				const struct gwp_sockaddr *target,
+				enum gwp_acl_proto proto);
+
+/* As gwp_ctx_acl_output_allowed(), but a matching -j DNAT rewrites *@target and
+ * any -j MARK/-j BIND modifiers are written to *@so (ignored when @so is NULL).
+ * For the accept-time plain/transparent path, which has no gwp_conn_pair. */
+bool gwp_ctx_acl_output_dnat(struct gwp_ctx *ctx,
+			     const struct gwp_sockaddr *client,
+			     struct gwp_sockaddr *target,
+			     struct gwp_conn_sockopt *so,
+			     enum gwp_acl_proto proto);
+
+/* Convenience wrapper: ACL OUTPUT check for a TCP target (gcp->target_addr). */
+bool gwp_ctx_acl_target_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp);
+
+/* True if the ACL INPUT chain permits an incoming client for @proto (allow-all
+ * with no ACL). */
+bool gwp_ctx_acl_client_allowed(struct gwp_ctx *ctx,
+				const struct gwp_sockaddr *client,
+				enum gwp_acl_proto proto);
 int gwp_get_orig_dst(int fd, const struct gwp_sockaddr *client,
 		     struct gwp_sockaddr *dst);
 const char *ip_to_str(const struct gwp_sockaddr *gs);
+
+/* True when a drained inotify buffer names the basename of @path. The auth/ACL
+ * reload watches sit on the parent directory (so atomic renames still fire), so
+ * the reload handlers use this to reload only for their own file. */
+bool gwp_inotify_event_matches(const void *buf, size_t len, const char *path);
 
 static inline void gwp_conn_buf_advance(struct gwp_conn *conn, size_t len)
 {

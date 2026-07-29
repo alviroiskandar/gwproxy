@@ -120,6 +120,23 @@ run_loop() {
 	grep -qi refused "$WORK/upstream.$loop.log" \
 		|| fail "$loop UDP ASSOCIATE upstream rejection lacked its error"
 	kill "$GWP_PID" 2>/dev/null
+
+	# (8) --udp-associate=0 rejects the command with REP 0x07 (command not
+	#     supported), while plain CONNECT on the same proxy still works.
+	np="$(pick_port)"
+	gwp_start "127.0.0.1:$np" --as-socks5=1 --event-loop="$loop" \
+		--udp-associate=0
+	if udp_client "$np" "$ep" 64 >"$WORK/noudp.$loop.log" 2>&1; then
+		fail "$loop UDP ASSOCIATE accepted with --udp-associate=0"
+	fi
+	grep -q 'REP=0x07' "$WORK/noudp.$loop.log" \
+		|| fail "$loop --udp-associate=0 did not reply REP 0x07"
+	curl -s --max-time 20 -x "socks5h://127.0.0.1:$np" \
+		"http://127.0.0.1:$hp/payload.bin" -o "$WORK/noudp.out" \
+		|| fail "$loop CONNECT broke with --udp-associate=0"
+	assert_files_equal "$WORK/payload.bin" "$WORK/noudp.out" \
+		"$loop CONNECT payload corrupted with --udp-associate=0"
+	kill "$GWP_PID" 2>/dev/null
 }
 
 run_loop epoll

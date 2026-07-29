@@ -7,6 +7,7 @@
 #include <gwproxy/gwproxy.h>
 #include <gwproxy/common.h>
 #include <gwproxy/log.h>
+#include <gwproxy/acl.h>
 #include <gwproxy/ev/epoll.h>
 #ifdef CONFIG_IO_URING
 #include <gwproxy/ev/io_uring.h>
@@ -45,6 +46,12 @@
 #include <sys/resource.h>
 #include <sys/inotify.h>
 
+/* Long-only options (no short letter): values >= 128 are skipped by the
+ * short-option string builder below. */
+enum {
+	OPT_ACL_ALLOW_ALL = 0x100,
+};
+
 static const struct option long_opts[] = {
 	{ "help",		no_argument,		NULL,	'h' },
 	{ "event-loop",		required_argument,	NULL,	'e' },
@@ -52,9 +59,12 @@ static const struct option long_opts[] = {
 	{ "target",		required_argument,	NULL,	't' },
 	{ "as-socks5",		required_argument,	NULL,	'S' },
 	{ "as-http",		required_argument,	NULL,	'H' },
+	{ "udp-associate",	required_argument,	NULL,	'U' },
 	{ "prefer-ipv6",	required_argument,	NULL,	'Q' },
 	{ "protocol-timeout",	required_argument,	NULL,	'o' },
 	{ "auth-file",		required_argument,	NULL,	'A' },
+	{ "acl-file",		required_argument,	NULL,	'a' },
+	{ "acl-allow-all",	no_argument,		NULL,	OPT_ACL_ALLOW_ALL },
 	{ "dns-cache-secs",	required_argument,	NULL,	'L' },
 	{ "nr-workers",		required_argument,	NULL,	'w' },
 	{ "nr-dns-workers",	required_argument,	NULL,	'W' },
@@ -90,10 +100,12 @@ static const struct gwp_cfg default_opts = {
 	.target			= NULL,
 	.as_socks5		= false,
 	.as_http		= false,
+	.udp_associate		= true,
 	.prefer_ipv6		= false,
 	.use_raw_dns		= false,
 	.protocol_timeout	= 10,
 	.auth_file		= NULL,
+	.acl_file		= NULL,
 	.dns_cache_secs		= 0,
 	.nr_workers		= 4,
 	.nr_dns_workers		= 4,
@@ -127,9 +139,13 @@ static void show_help(const char *app)
 	printf("  -t, --target=addr_port          Target address to connect to\n");
 	printf("  -S, --as-socks5=0|1             Run as a SOCKS5 proxy (default: %d)\n", default_opts.as_socks5);
 	printf("  -H, --as-http=0|1               Run as an HTTP proxy (default: %d)\n", default_opts.as_http);
+	printf("  -U, --udp-associate=0|1         Allow SOCKS5 UDP ASSOCIATE; 0 rejects it with REP 0x07 (default: %d)\n", default_opts.udp_associate);
 	printf("  -Q, --prefer-ipv6=0|1           Prefer IPv6 for proxy DNS queries (default: %d)\n", default_opts.prefer_ipv6);
 	printf("  -o, --protocol-timeout=sec      Timeout for protocol handshake process (default: %d)\n", default_opts.protocol_timeout);
 	printf("  -A, --auth-file=file            File with username:password credentials for SOCKS5 and HTTP auth (default: no auth)\n");
+	printf("  -a, --acl-file=file             iptables-style ACL rule file for target/client filtering\n");
+	printf("                                  (default: a built-in ACL that rejects private/loopback target ranges)\n");
+	printf("      --acl-allow-all             Do not apply the built-in default ACL (allow all; ignored with --acl-file)\n");
 	printf("  -L, --dns-cache-secs=sec        Proxy DNS cache duration in seconds (default: %d)\n", default_opts.dns_cache_secs);
 	printf("                                  Set to 0 or a negative number to disable DNS caching.\n");
 	printf("  -w, --nr-workers=nr             Number of worker threads (default: %d)\n", default_opts.nr_workers);
@@ -146,7 +162,7 @@ static void show_help(const char *app)
 	printf("  -m, --log-level=level           Set log level (0=none, 1=error, 2=warning, 3=info, 4=debug, default: %d)\n", default_opts.log_level);
 	printf("  -f, --log-file=file             Log to the specified file (default: %s)\n", default_opts.log_file);
 	printf("  -p, --pid-file=file             Write PID to the specified file (default is no pid file)\n");
-	printf("  -x, --upstream-proxy=url       Route outgoing connections through an upstream proxy\n");
+	printf("  -x, --upstream-proxy=url        Route outgoing connections through an upstream proxy\n");
 	printf("                                  URL: socks5://[user:pass@]host:port  (local DNS)\n");
 	printf("                                       socks5h://[user:pass@]host:port (proxy resolves the host)\n");
 	printf("                                       http://[user:pass@]host:port    (HTTP CONNECT)\n");
@@ -186,6 +202,9 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 
 	p = short_opts;
 	for (i = 0; i < NR_OPTS; i++) {
+		/* Long-only options use a val >= 128 and have no short letter. */
+		if (long_opts[i].val <= 0 || long_opts[i].val >= 128)
+			continue;
 		*p++ = long_opts[i].val;
 		if (long_opts[i].has_arg == required_argument ||
 		    long_opts[i].has_arg == optional_argument)
@@ -219,6 +238,9 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 		case 'H':
 			cfg->as_http = !!atoi(optarg);
 			break;
+		case 'U':
+			cfg->udp_associate = !!atoi(optarg);
+			break;
 		case 'Q':
 			cfg->prefer_ipv6 = !!atoi(optarg);
 			break;
@@ -227,6 +249,12 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 			break;
 		case 'A':
 			cfg->auth_file = optarg;
+			break;
+		case 'a':
+			cfg->acl_file = optarg;
+			break;
+		case OPT_ACL_ALLOW_ALL:
+			cfg->acl_allow_all = true;
 			break;
 		case 'L':
 			cfg->dns_cache_secs = atoi(optarg);
@@ -876,6 +904,78 @@ static void gwp_ctx_free_threads(struct gwp_ctx *ctx)
 	ctx->workers = NULL;
 }
 
+static const char *path_basename(const char *path)
+{
+	const char *slash = strrchr(path, '/');
+
+	return slash ? slash + 1 : path;
+}
+
+/*
+ * Add an inotify watch that survives an atomic replace of `path`. We watch the
+ * *parent directory*, not the file: an inode watch is silently dropped the
+ * moment an editor, `install`, or `mv` swaps the file via rename, and never
+ * fires again. Watching the directory for IN_CLOSE_WRITE (in-place writes) and
+ * IN_MOVED_TO (rename-into-place) catches both update styles; handlers narrow
+ * the reported events down to the file's basename with
+ * gwp_inotify_event_matches(). Returns the watch descriptor or -errno.
+ */
+static int add_reload_watch(int ino_fd, const char *path)
+{
+	const char *slash = strrchr(path, '/');
+	char dir[PATH_MAX];
+	int r;
+
+	if (!slash) {
+		dir[0] = '.';
+		dir[1] = '\0';
+	} else {
+		size_t n = (size_t)(slash - path);
+
+		if (n == 0)		/* "/file": watch the root directory */
+			n = 1;
+		if (n >= sizeof(dir))
+			return -ENAMETOOLONG;
+		memcpy(dir, path, n);
+		dir[n] = '\0';
+	}
+
+	r = inotify_add_watch(ino_fd, dir, IN_CLOSE_WRITE | IN_MOVED_TO);
+	return (r < 0) ? -errno : r;
+}
+
+/*
+ * True when a drained inotify buffer names the basename of `path`. The reload
+ * watches sit on the parent directory (see add_reload_watch), so handlers call
+ * this to reload only for their own file and ignore unrelated directory churn.
+ */
+bool gwp_inotify_event_matches(const void *buf, size_t len, const char *path)
+{
+	const char *base = path_basename(path);
+	size_t off = 0;
+
+	while (off + sizeof(struct inotify_event) <= len) {
+		const struct inotify_event *e =
+			(const struct inotify_event *)((const char *)buf + off);
+		size_t rec = sizeof(*e) + e->len;
+
+		/*
+		 * The kernel dropped events (queue overflow, delivered as a
+		 * nameless wd=-1 record). Our file's change may have been among
+		 * the lost ones, so force a reload rather than miss it.
+		 */
+		if (e->mask & IN_Q_OVERFLOW)
+			return true;
+
+		if (off + rec > len)
+			break;
+		if (e->len && !strcmp(e->name, base))
+			return true;
+		off += rec;
+	}
+	return false;
+}
+
 /*
  * Load the shared credential store from the auth file (if configured) and set
  * up an inotify watch so it is hot-reloaded on change. The store is shared by
@@ -912,8 +1012,7 @@ static int gwp_ctx_init_auth(struct gwp_ctx *ctx)
 	pr_dbg(&ctx->lh, "Inotify file descriptor initialized (fd=%d)", r);
 
 	ctx->ino_fd = r;
-	r = inotify_add_watch(ctx->ino_fd, cfg->auth_file,
-			      IN_DELETE | IN_CLOSE_WRITE);
+	r = add_reload_watch(ctx->ino_fd, cfg->auth_file);
 	if (r < 0) {
 		pr_err(&ctx->lh, "Failed to add inotify watch: %s", strerror(-r));
 		goto out_err;
@@ -958,6 +1057,296 @@ static void gwp_ctx_free_auth(struct gwp_ctx *ctx)
 	ctx->auth = NULL;
 }
 
+/*
+ * Applied when no --acl-file is given (and --acl-allow-all is not set): an
+ * SSRF-hardening default that rejects outgoing connections to loopback and
+ * private address ranges while accepting all clients. --acl-file overrides it
+ * wholesale; --acl-allow-all disables it (allow everything).
+ */
+static const char gwp_acl_default_rules[] =
+	"-P INPUT ACCEPT\n"
+	"-A OUTPUT -d 10.0.0.0/8 -j REJECT\n"
+	"-A OUTPUT -d 127.0.0.0/8 -j REJECT\n"
+	"-A OUTPUT -d 192.168.0.0/16 -j REJECT\n"
+	"-A OUTPUT -d 172.16.0.0/12 -j REJECT\n"
+	"-A OUTPUT -d fe80::/10 -j REJECT\n"
+	"-A OUTPUT -d fc00::/7 -j REJECT\n"
+	"-P OUTPUT ACCEPT\n";
+
+/*
+ * Load the ACL rule file (--acl-file) and watch it for changes so it is
+ * hot-reloaded, mirroring the auth store. Unlike auth (prot-only), the ACL is
+ * global to every proxy mode, so this is initialised from gwp_ctx_init()
+ * regardless of SOCKS5/HTTP/transparent/plain forwarding. With no file it
+ * applies the built-in default ACL, unless --acl-allow-all leaves it disabled
+ * (NULL, watch fd -1).
+ */
+static int gwp_ctx_init_acl(struct gwp_ctx *ctx)
+{
+	struct gwp_cfg *cfg = &ctx->cfg;
+	int r;
+
+	ctx->acl = NULL;
+	ctx->acl_ino_fd = -1;
+	ctx->acl_ino_buf = NULL;
+
+	if (!cfg->acl_file || !*cfg->acl_file) {
+		if (cfg->acl_allow_all) {
+			pr_dbg(&ctx->lh, "ACL disabled (--acl-allow-all)");
+			return 0;
+		}
+
+		/* No file to watch/reload: the default rules are compiled in. */
+		r = gwp_acl_parse_str(&ctx->acl, gwp_acl_default_rules);
+		if (r < 0) {
+			pr_err(&ctx->lh, "Failed to build default ACL: %s",
+				strerror(-r));
+			ctx->acl = NULL;
+			return r;
+		}
+		pr_info(&ctx->lh,
+			"Applied built-in default ACL (loopback/private targets blocked; --acl-allow-all to disable)");
+		return 0;
+	}
+
+	r = gwp_acl_create(&ctx->acl, cfg->acl_file);
+	if (r < 0) {
+		pr_err(&ctx->lh, "Failed to load ACL file '%s': %s",
+			cfg->acl_file, strerror(-r));
+		return r;
+	}
+
+	r = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+	if (r < 0) {
+		pr_err(&ctx->lh, "Failed to initialize ACL inotify: %s",
+			strerror(-r));
+		goto out_err;
+	}
+	ctx->acl_ino_fd = r;
+
+	r = add_reload_watch(ctx->acl_ino_fd, cfg->acl_file);
+	if (r < 0) {
+		pr_err(&ctx->lh, "Failed to add ACL inotify watch: %s",
+			strerror(-r));
+		goto out_err;
+	}
+
+	ctx->acl_ino_buf = malloc(sizeof(struct inotify_event) + NAME_MAX + 1);
+	if (!ctx->acl_ino_buf) {
+		r = -ENOMEM;
+		goto out_err;
+	}
+
+	pr_info(&ctx->lh, "Loaded ACL file '%s'", cfg->acl_file);
+	return 0;
+
+out_err:
+	if (ctx->acl_ino_fd >= 0) {
+		__sys_close(ctx->acl_ino_fd);
+		ctx->acl_ino_fd = -1;
+	}
+	gwp_acl_destroy(ctx->acl);
+	ctx->acl = NULL;
+	return r;
+}
+
+static void gwp_ctx_free_acl(struct gwp_ctx *ctx)
+{
+	if (ctx->acl_ino_buf) {
+		free(ctx->acl_ino_buf);
+		ctx->acl_ino_buf = NULL;
+	}
+	if (ctx->acl_ino_fd >= 0) {
+		__sys_close(ctx->acl_ino_fd);
+		ctx->acl_ino_fd = -1;
+	}
+	gwp_acl_destroy(ctx->acl);
+	ctx->acl = NULL;
+}
+
+/*
+ * Evaluate the ACL OUTPUT chain for a connection's resolved TCP target. Returns
+ * true when the connection is allowed. With no ACL loaded, or when the target
+ * has no locally-resolved IP (e.g. a socks5h remote-DNS upstream, where only a
+ * domain is known), it is allowed here; domain-based rules are applied
+ * separately once wired in.
+ */
+/* Host-order port of a sockaddr, regardless of family. */
+static uint16_t sa_port_h(const struct gwp_sockaddr *s)
+{
+	return ntohs(s->sa.sa_family == AF_INET ? s->i4.sin_port
+						: s->i6.sin6_port);
+}
+
+static int upstream_dst_from_sockaddr(const struct gwp_sockaddr *sa,
+				      struct gwp_socks5_addr *out);
+
+/*
+ * Evaluate the ACL OUTPUT chain for a connection to @target from @client (with
+ * an optional requested @domain / @user). Returns the verdict; allows (with no
+ * eval) when there is no ACL, or nothing to match on. When @do_dnat is set and a
+ * matching -j DNAT rule produced a concrete address, the rewritten destination
+ * is written back to *@target (for the direct connection and, via the caller,
+ * the upstream) and *@dnat_out (when non-NULL) is set true. Composable -j MARK /
+ * -j BIND modifiers are surfaced in *@so_out.
+ */
+static enum gwp_acl_verdict acl_out(struct gwp_ctx *ctx,
+				    const struct gwp_sockaddr *client,
+				    struct gwp_sockaddr *target,
+				    const char *domain, const char *user,
+				    struct gwp_conn_sockopt *so_out,
+				    bool *dnat_out,
+				    enum gwp_acl_proto proto, bool do_dnat)
+{
+	int fam = target ? target->sa.sa_family : 0;
+	bool have_ip = (fam == AF_INET || fam == AF_INET6);
+	enum gwp_acl_verdict v;
+	struct gwp_acl_req req;
+
+	if (so_out)
+		memset(so_out, 0, sizeof(*so_out));
+	if (dnat_out)
+		*dnat_out = false;
+
+	if (!ctx->acl)
+		return GWP_ACL_ACCEPT;
+	/* A domain-only request (remote-DNS upstream) still matches -m domain. */
+	if (!have_ip && !domain)
+		return GWP_ACL_ACCEPT;
+
+	memset(&req, 0, sizeof(req));
+	req.client = client;
+	req.target = have_ip ? target : NULL;
+	req.domain = domain;
+	req.user = user;
+	req.proto = proto;
+	req.dport = have_ip ? sa_port_h(target) : 0;
+	req.sport = client ? sa_port_h(client) : 0;
+
+	v = gwp_acl_eval_output(ctx->acl, &req);
+	if (v != GWP_ACL_ACCEPT)
+		return v;
+
+	/*
+	 * Apply a matched DNAT when it produced a concrete address, rewriting
+	 * the destination for both the direct path (*target) and, via the
+	 * caller, the upstream destination. A port-only DNAT with no base IP
+	 * (e.g. a socks5h domain request) yields no address and is skipped.
+	 */
+	if (do_dnat && req.dnat_applied && req.dnat.sa.sa_family) {
+		if (have_ip)
+			pr_info(&ctx->lh, "ACL DNAT %s -> %s",
+				ip_to_str(target), ip_to_str(&req.dnat));
+		else
+			pr_info(&ctx->lh, "ACL DNAT %s -> %s",
+				domain ? domain : "?", ip_to_str(&req.dnat));
+		*target = req.dnat;
+		if (dnat_out)
+			*dnat_out = true;
+	}
+	/* Surface composable -j MARK / -j BIND to the socket-creation path. */
+	if (so_out && req.mark_set) {
+		so_out->mark_set = true;
+		so_out->mark = req.mark;
+	}
+	if (so_out && req.bind.set)
+		so_out->bind = req.bind;
+	return v;
+}
+
+/* Verdict only (no DNAT), for the UDP relay's per-datagram target. */
+bool gwp_ctx_acl_output_allowed(struct gwp_ctx *ctx,
+				const struct gwp_sockaddr *client,
+				const struct gwp_sockaddr *target,
+				enum gwp_acl_proto proto)
+{
+	struct gwp_sockaddr tmp = *target;
+
+	return acl_out(ctx, client, &tmp, NULL, NULL, NULL, NULL, proto,
+		       false) == GWP_ACL_ACCEPT;
+}
+
+/* Verdict + DNAT rewrite of *@target, for the accept-time plain/transparent
+ * forwarding path (which has no gwp_conn_pair yet, hence no username). */
+bool gwp_ctx_acl_output_dnat(struct gwp_ctx *ctx,
+			     const struct gwp_sockaddr *client,
+			     struct gwp_sockaddr *target,
+			     struct gwp_conn_sockopt *so,
+			     enum gwp_acl_proto proto)
+{
+	return acl_out(ctx, client, target, NULL, NULL, so, NULL, proto,
+		       true) == GWP_ACL_ACCEPT;
+}
+
+/* The authenticated username for an ACL "-m user" match, or NULL when the
+ * connection carried no proxy authentication. */
+static const char *gcp_req_user(const struct gwp_conn_pair *gcp)
+{
+	if (gcp->prot_type == GWP_PROT_TYPE_SOCKS5 && gcp->s5_conn)
+		return gwp_socks5_conn_username(gcp->s5_conn);
+	if (gcp->prot_type == GWP_PROT_TYPE_HTTP && gcp->http_conn)
+		return gwp_http_conn_username(gcp->http_conn);
+	return NULL;
+}
+
+bool gwp_ctx_acl_target_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp)
+{
+	bool dnat = false;
+	enum gwp_acl_verdict v;
+
+	v = acl_out(ctx, &gcp->client_addr, &gcp->target_addr, gcp->req_domain,
+		    gcp_req_user(gcp), &gcp->acl_sockopt, &dnat,
+		    GWP_ACL_PROTO_TCP, true);
+	if (v != GWP_ACL_ACCEPT)
+		return false;
+
+	/*
+	 * When chaining to an upstream by remote DNS (socks5h), up_dst carries
+	 * the requested hostname. A DNAT has rewritten target_addr to a concrete
+	 * IP, so push that into up_dst too, making the upstream connect to the
+	 * DNAT target instead of resolving the original name. For socks5:// the
+	 * up_dst is still unset here (ver == 0) and is finalised from the
+	 * (already rewritten) target_addr after the upstream connects.
+	 */
+	if (dnat && ctx->upstream.enabled && gcp->up_dst.ver != 0) {
+		__be16 orig_port = gcp->up_dst.port;
+
+		upstream_dst_from_sockaddr(&gcp->target_addr, &gcp->up_dst);
+		/*
+		 * An address-only DNAT (--to <ip> with no port) has no port to
+		 * apply for a domain request (the target IP was unknown at eval
+		 * time), so target_addr carries port 0. Keep the client's
+		 * original requested port instead of connecting to :0.
+		 */
+		if (gcp->up_dst.port == 0)
+			gcp->up_dst.port = orig_port;
+	}
+
+	return true;
+}
+
+/*
+ * Evaluate the ACL INPUT chain for an incoming client. Returns true when the
+ * client is allowed (always so when no ACL is loaded). @proto distinguishes the
+ * client's TCP control connection (accept time) from a UDP association it later
+ * requests.
+ */
+bool gwp_ctx_acl_client_allowed(struct gwp_ctx *ctx,
+				const struct gwp_sockaddr *client,
+				enum gwp_acl_proto proto)
+{
+	struct gwp_acl_req req;
+
+	if (!ctx->acl)
+		return true;
+
+	memset(&req, 0, sizeof(req));
+	req.client = client;
+	req.proto = proto;
+	req.sport = sa_port_h(client);
+	return gwp_acl_eval_input(ctx->acl, &req) == GWP_ACL_ACCEPT;
+}
+
 static int gwp_ctx_init_socks5(struct gwp_ctx *ctx)
 {
 	struct gwp_socks5_cfg s5cfg;
@@ -966,6 +1355,7 @@ static int gwp_ctx_init_socks5(struct gwp_ctx *ctx)
 	pr_dbg(&ctx->lh, "Initializing SOCKS5 context");
 	memset(&s5cfg, 0, sizeof(s5cfg));
 	s5cfg.auth = ctx->auth;
+	s5cfg.udp_associate = ctx->cfg.udp_associate;
 	r = gwp_socks5_ctx_init(&ctx->socks5, &s5cfg);
 	if (r < 0) {
 		pr_err(&ctx->lh, "Failed to initialize SOCKS5 context: %s",
@@ -1312,9 +1702,13 @@ static int gwp_ctx_init(struct gwp_ctx *ctx)
 	if (r < 0)
 		goto out_free_tls;
 
-	r = gwp_ctx_init_dns(ctx);
+	r = gwp_ctx_init_acl(ctx);
 	if (r < 0)
 		goto out_free_prot;
+
+	r = gwp_ctx_init_dns(ctx);
+	if (r < 0)
+		goto out_free_acl;
 
 	r = gwp_ctx_init_threads(ctx);
 	if (r < 0) {
@@ -1326,6 +1720,8 @@ static int gwp_ctx_init(struct gwp_ctx *ctx)
 
 out_free_dns:
 	gwp_ctx_free_dns(ctx);
+out_free_acl:
+	gwp_ctx_free_acl(ctx);
 out_free_prot:
 	gwp_ctx_free_prot(ctx);
 out_free_tls:
@@ -1348,6 +1744,7 @@ static void gwp_ctx_free(struct gwp_ctx *ctx)
 	gwp_ctx_stop(ctx);
 	gwp_ctx_free_threads(ctx);
 	gwp_ctx_free_dns(ctx);
+	gwp_ctx_free_acl(ctx);
 	gwp_ctx_free_prot(ctx);
 	gwp_ctx_free_tls(ctx);
 	gwp_ctx_free_log(ctx);
@@ -1594,6 +1991,55 @@ static int setskopt_int(int fd, int level, int optname, int value)
 	return __sys_setsockopt(fd, level, optname, &value, sizeof(value));
 }
 
+/*
+ * Apply a -j BIND to socket @fd before connect: pin the outgoing interface
+ * (SO_BINDTODEVICE) and/or source address (bind()). Strict -- any failure is
+ * returned so the caller drops the connection rather than proceeding on the
+ * default route/source (which would leak traffic via the wrong path). @dst is
+ * the address about to be connected, used to require a matching source family.
+ * Both operations generally need CAP_NET_ADMIN.
+ */
+static int apply_conn_bind(struct gwp_wrk *w, int fd,
+			   const struct gwp_sockaddr *dst,
+			   const struct gwp_acl_bind *b)
+{
+	int r;
+
+	if (b->iface[0]) {
+		r = __sys_setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE,
+				     b->iface, (socklen_t)strlen(b->iface));
+		if (unlikely(r < 0)) {
+			pr_err(&w->ctx->lh,
+			       "ACL BIND: SO_BINDTODEVICE(%s) failed: %s (CAP_NET_ADMIN required)",
+			       b->iface, strerror(-r));
+			return r;
+		}
+	}
+
+	if (b->have_src) {
+		const struct gwp_sockaddr *s = &b->src;
+		socklen_t len;
+
+		/* The source family must match the socket/target family. */
+		if (s->sa.sa_family != dst->sa.sa_family) {
+			pr_err(&w->ctx->lh,
+			       "ACL BIND: --to-source family does not match target %s",
+			       ip_to_str(dst));
+			return -EAFNOSUPPORT;
+		}
+
+		len = (s->sa.sa_family == AF_INET) ? sizeof(struct sockaddr_in)
+						   : sizeof(struct sockaddr_in6);
+		r = __sys_bind(fd, &s->sa, len);
+		if (unlikely(r < 0)) {
+			pr_err(&w->ctx->lh, "ACL BIND: bind(%s) failed: %s",
+			       ip_to_str(s), strerror(-r));
+			return r;
+		}
+	}
+	return 0;
+}
+
 void gwp_setup_cli_sock_options(struct gwp_wrk *w, int fd)
 {
 	struct gwp_cfg *cfg = &w->ctx->cfg;
@@ -1616,6 +2062,7 @@ void gwp_setup_cli_sock_options(struct gwp_wrk *w, int fd)
 
 __hot
 int gwp_create_sock_target(struct gwp_wrk *w, struct gwp_sockaddr *addr,
+			   const struct gwp_conn_sockopt *so,
 			   bool *is_target_alive, bool non_block)
 {
 	int t = SOCK_STREAM | SOCK_CLOEXEC | (non_block ? SOCK_NONBLOCK : 0);
@@ -1628,9 +2075,38 @@ int gwp_create_sock_target(struct gwp_wrk *w, struct gwp_sockaddr *addr,
 
 	gwp_setup_cli_sock_options(w, fd);
 
-	/* Mark the outgoing connection for policy routing / iptables matching. */
-	if (w->ctx->cfg.mark)
+	/*
+	 * Mark the outgoing connection for policy routing / iptables matching.
+	 * A per-connection -j MARK from the ACL overrides the global --mark, and
+	 * is strict like -j BIND: if SO_MARK fails (e.g. no CAP_NET_ADMIN) the
+	 * connection is dropped rather than egressing unmarked via the wrong
+	 * route. The coarse global --mark stays best-effort.
+	 */
+	if (so && so->mark_set) {
+		r = setskopt_int(fd, SOL_SOCKET, SO_MARK, (int)so->mark);
+		if (unlikely(r < 0)) {
+			pr_err(&w->ctx->lh,
+			       "ACL MARK: SO_MARK=%u failed: %s (CAP_NET_ADMIN required)",
+			       so->mark, strerror(-r));
+			__sys_close(fd);
+			return r;
+		}
+	} else if (w->ctx->cfg.mark) {
 		setskopt_int(fd, SOL_SOCKET, SO_MARK, w->ctx->cfg.mark);
+	}
+
+	/*
+	 * -j BIND: pin the source interface/address before connect. Strict --
+	 * a failure drops the connection rather than falling back to the wrong
+	 * source (see apply_conn_bind).
+	 */
+	if (so && so->bind.set) {
+		r = apply_conn_bind(w, fd, addr, &so->bind);
+		if (unlikely(r)) {
+			__sys_close(fd);
+			return r;
+		}
+	}
 
 	/*
 	 * Do not connect if non_block is false, as we
@@ -1939,6 +2415,9 @@ static int prepare_target_addr_domain(struct gwp_wrk *w,
 	struct gwp_cfg *cfg = &ctx->cfg;
 	int r;
 
+	/* Remember the requested hostname for ACL "-m domain" matching. */
+	gcp->req_domain = host;
+
 	/*
 	 * socks5h://: don't resolve locally; hand the hostname to the upstream
 	 * proxy. up_dst carries the domain and we're ready to connect.
@@ -2179,6 +2658,18 @@ int gwp_socks5_udp_associate_setup(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	 */
 	if (ctx->upstream.enabled) {
 		rep = GWP_SOCKS5_REP_COMMAND_NOT_SUPPORTED;
+		goto reply;
+	}
+
+	/*
+	 * Re-check the INPUT chain for this client as a UDP request: a "-p udp"
+	 * rule cannot match at accept time, where the control connection is TCP.
+	 */
+	if (!gwp_ctx_acl_client_allowed(ctx, &gcp->client_addr,
+					GWP_ACL_PROTO_UDP)) {
+		pr_info(&ctx->lh, "ACL denied UDP ASSOCIATE for client %s",
+			ip_to_str(&gcp->client_addr));
+		rep = GWP_SOCKS5_REP_NOT_ALLOWED;
 		goto reply;
 	}
 

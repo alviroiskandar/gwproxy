@@ -43,6 +43,9 @@ for opt do
 	--use-openssl)
 		use_openssl="yes";
 	;;
+	--use-pcre)
+		use_pcre="yes";
+	;;
 	--sanitize)
 		use_sanitize="yes";
 	;;
@@ -96,6 +99,7 @@ Options: [defaults in brackets after descriptions]
   --sanitize               Enable sanitizers (default: no)
   --use-new-dns-resolver   Use the new DNS resolver feature (default: no)
   --use-openssl            Enable HTTPS (OpenSSL TLS) support (default: no)
+  --use-pcre               Enable PCRE2 regexp matches in the ACL (default: no)
 EOF
 exit 0;
 fi
@@ -378,6 +382,31 @@ EOF
 	else
 		print_supp "no" "${l}";
 		fatal "ERROR: --use-openssl requested but OpenSSL (libssl/libcrypto) was not found. Install the development package, e.g. 'sudo apt install libssl-dev'.";
+	fi;
+fi;
+
+if test "${use_pcre}" = "yes"; then
+	cat > $tmp_c << EOF
+#include <pcre2.h>
+int main(void)
+{
+	int err;
+	PCRE2_SIZE off;
+	pcre2_code *re = pcre2_compile((PCRE2_SPTR)"a", 1, 0, &err, &off, (void *)0);
+	pcre2_code_free(re);
+	return 0;
+}
+EOF
+	l="Do we have PCRE2 (libpcre2-8)?";
+	if compile_cc "-DPCRE2_CODE_UNIT_WIDTH=8" "-lpcre2-8" "PCRE2"; then
+		add_config "CONFIG_PCRE";
+		CFLAGS="${CFLAGS} -DPCRE2_CODE_UNIT_WIDTH=8";
+		CXXFLAGS="${CXXFLAGS} -DPCRE2_CODE_UNIT_WIDTH=8";
+		LIB_LDFLAGS="${LIB_LDFLAGS} -lpcre2-8";
+		print_supp "yes" "${l}";
+	else
+		print_supp "no" "${l}";
+		fatal "ERROR: --use-pcre requested but PCRE2 (libpcre2-8) was not found. Install the development package, e.g. 'sudo apt install libpcre2-dev'.";
 	fi;
 fi;
 
