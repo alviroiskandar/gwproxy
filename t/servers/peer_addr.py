@@ -28,7 +28,10 @@ s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind((host, port))
 s.listen(16)
 while True:
-    c, addr = s.accept()
+    try:
+        c, addr = s.accept()
+    except OSError:
+        continue
     line = "%s %d" % (addr[0], addr[1]) if with_port else addr[0]
     try:
         if logpath:
@@ -36,5 +39,13 @@ while True:
                 f.write(line + "\n")
                 f.flush()
         c.sendall((line + "\n").encode())
+    except OSError:
+        # One connection must never take the server down. A proxy that is
+        # killed mid-reply, or a client that vanishes, resets this socket and
+        # sendall() raises; letting that escape ends the accept loop, and then
+        # every later connection is refused. The test that first notices then
+        # reports whatever assertion it was making -- "the source was not
+        # pinned" -- when the truth is that the origin died several cases ago.
+        pass
     finally:
         c.close()
