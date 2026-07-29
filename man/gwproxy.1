@@ -54,7 +54,8 @@ event loop. It recovers gracefully from file\-descriptor exhaustion
 addresses of a multi\-homed name on either loop (see
 .BR "TARGET ADDRESS SELECTION" ),
 and can mark its own outgoing connections with
-.BR SO_MARK .
+.B SO_MARK
+and pin them to a chosen source address or network interface.
 .SH OPTIONS
 Every boolean option takes an explicit
 .B 0
@@ -256,7 +257,9 @@ it is
 if setting
 .B SO_MARK
 fails (it needs
-.BR CAP_NET_ADMIN )
+.B CAP_NET_ADMIN
+or, since Linux 5.11,
+.BR CAP_NET_RAW )
 the connection is dropped rather than egressing unmarked via the wrong route.
 It applies to TCP target connections (SOCKS5, HTTP, plain and transparent), not
 the UDP relay. (The coarse global
@@ -276,7 +279,16 @@ tunnel. At least one of
 is required. Like
 .BR MARK ,
 it is a composable modifier (the last match wins) and applies to the same TCP
-target connections. It is
+target connections. It
+.I replaces
+the global
+.BR \-\-bind\-source / \-\-bind\-iface
+default wholesale for the connections it matches, rather than merging with it:
+a rule carrying only
+.B \-\-to\-iface
+leaves the connection on its default source address, it does not inherit
+.BR \-\-bind\-source .
+It is
 .I strict:
 if binding the interface
 .RB ( SO_BINDTODEVICE )
@@ -289,8 +301,10 @@ or the upstream proxy when chaining \(em is one such failure; when a hostname
 target resolved to addresses of both families, that candidate is skipped
 instead and the connection proceeds on an address of the matching family (see
 .BR "TARGET ADDRESS SELECTION" ).
-It generally needs
-.BR CAP_NET_ADMIN .
+Neither pinning needs a capability of its own:
+.B SO_BINDTODEVICE
+has been unprivileged since Linux 5.7, and binding a source address that is
+configured locally never required one.
 Binding a fixed source
 .I port
 limits concurrency to one connection per identical destination (a 4\-tuple
@@ -473,10 +487,73 @@ Set
 .B SO_MARK
 (fwmark) on outgoing connections, for policy routing and iptables matching.
 Requires
-.BR CAP_NET_ADMIN .
+.B CAP_NET_ADMIN
+or, since Linux 5.11,
+.BR CAP_NET_RAW .
 .B 0
 disables it. Default:
 .BR 0 .
+.TP
+.BR \-B ", " \-\-bind\-source=\fIaddr\fR [ :\fIport\fR ]
+Pin every outgoing connection to this source address with
+.BR bind (2).
+This is the global default for the ACL's
+.BR "\-j BIND \-\-to\-source" ,
+and takes the same argument: an IP literal, never a hostname \(em an IPv4
+address, a bare IPv6 address, or a bracketed
+.RI [ v6 ]
+when a
+.I port
+follows. Omit the port (the default) for an ephemeral source port; pinning a
+fixed one limits concurrency to a single connection per destination and defeats
+multi\-address racing, as described under
+.BR \-\-acl\-file .
+A source whose address family differs from the address being dialled is
+.I skipped
+rather than refused: an IPv4
+.B \-\-bind\-source
+leaves an IPv6 target on its default source, so setting one does not quietly
+turn a dual\-stack proxy into a single\-family one. (An ACL
+.B \-\-to\-source
+that mismatches stays an error \(em an explicit rule naming the wrong family is
+a mistake, a default that cannot apply is not.) Default: unset.
+.TP
+.BR \-I ", " \-\-bind\-iface=\fIname\fR
+Pin every outgoing connection to this network interface
+.RB ( SO_BINDTODEVICE ),
+the global default for the ACL's
+.BR "\-j BIND \-\-to\-iface" .
+It has been unprivileged since Linux 5.7; older kernels wanted
+.BR CAP_NET_RAW .
+Only the length of
+.I name
+is validated at startup (at most 15 characters), not its existence, so an
+interface that only appears later \(em a WireGuard or PPP link \(em is a valid
+value; until it exists, every outgoing connection fails. Default: unset.
+.IP
+Both options are
+.I strict:
+if the bind fails, the connection is dropped rather than egressing from the
+wrong source or out of the wrong interface, which is the leak they exist to
+prevent. In this they differ from the global
+.BR \-\-mark ,
+which stays best\-effort. They apply to TCP target connections \(em SOCKS5,
+HTTP, plain and transparent forwarding, and the hop to an
+.B \-\-upstream\-proxy
+\(em but not to the SOCKS5 UDP relay, matching the reach of
+.BR "\-j BIND" .
+A matching
+.B \-j BIND
+rule
+.I replaces
+them wholesale for the connections it matches: a rule carrying only
+.B \-\-to\-iface
+does not inherit
+.BR \-\-bind\-source ,
+just as
+.B \-j MARK
+replaces rather than merges with
+.BR \-\-mark .
 .TP
 .BR \-T ", " \-\-target\-buf\-size=\fInr\fR
 Size in bytes of the per\-connection buffer for target\(->client data. Default:
@@ -633,7 +710,9 @@ iptables \-t nat \-A OUTPUT \-p tcp \-\-dport 80 \-m mark ! \-\-mark 1 \\
 .PP
 .B \-\-mark
 requires
-.BR CAP_NET_ADMIN ,
+.B CAP_NET_ADMIN
+or
+.BR CAP_NET_RAW ,
 and installing the iptables rules requires the corresponding privileges;
 both typically need root.
 .SH UPSTREAM CHAINING
@@ -733,7 +812,9 @@ are likewise applied per candidate, and a
 matching every candidate of a name collapses the race onto one destination,
 which is then dialled once per candidate. A candidate the chain denies is
 skipped rather than being fatal, as is one rejected by a strict
-.BR "\-j BIND" ;
+.B \-j BIND
+or by the global
+.BR \-\-bind\-source / \-\-bind\-iface ;
 the request fails only once every candidate has been skipped or has failed to
 connect.
 .PP
@@ -862,6 +943,20 @@ Use the io_uring event loop and set SO_MARK 100 on outgoing packets:
 gwproxy \-\-bind='[::]:1080' \-\-as\-socks5=1 \-\-event\-loop=io_uring \-\-mark=100
 .EE
 .RE
+.PP
+Send all egress out of a WireGuard interface, from that interface's address,
+while one customer's traffic (matched by the address it comes from) leaves via
+the second tunnel instead \(em the rule replaces both defaults at once:
+.RS 4
+.EX
+gwproxy \-\-bind='[::]:1080' \-\-as\-socks5=1 \-\-acl\-file=acl.txt \\
+    \-\-bind\-iface=wg0 \-\-bind\-source=10.7.0.2
+
+$ cat acl.txt
+\-A OUTPUT \-s 192.168.9.0/24 \-j BIND \-\-to\-iface wg1 \-\-to\-source 10.8.0.2
+\-P OUTPUT ACCEPT
+.EE
+.RE
 .SH AVAILABILITY
 Some features are enabled at build time by
 .BR ./configure :
@@ -896,7 +991,15 @@ for the full list.
 .SH NOTES
 .B \-\-mark
 requires
-.BR CAP_NET_ADMIN .
+.B CAP_NET_ADMIN
+or, since Linux 5.11,
+.BR CAP_NET_RAW .
+.B \-\-bind\-iface
+.RB ( SO_BINDTODEVICE )
+needs no privilege on Linux 5.7 and later; older kernels required
+.BR CAP_NET_RAW .
+.B \-\-bind\-source
+needs none for an address that is configured locally.
 Transparent mode requires iptables REDIRECT rules, which typically need root.
 Binding to a privileged port (< 1024) requires
 .B CAP_NET_BIND_SERVICE

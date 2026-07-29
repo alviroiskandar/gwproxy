@@ -46,6 +46,17 @@ struct gwp_acl_bind {
 };
 
 /*
+ * Parse a -j BIND source spec -- "ip", "ip:port", "[v6]", "[v6]:port", or a
+ * bare IPv6 literal -- into @out. Literal addresses only, no DNS (acl.c stays
+ * self-contained). Returns 0, or -EINVAL on a malformed spec.
+ *
+ * Exported because the global default for -j BIND (the --bind-source option)
+ * must accept exactly the syntax a rule's --to-source does; sharing the parser
+ * is what keeps the two from drifting apart.
+ */
+int gwp_acl_parse_bind_source(const char *s, struct gwp_sockaddr *out);
+
+/*
  * Parse an ACL rule file at @path into a new ACL. Returns 0 and stores the ACL
  * in *@out on success; a negative errno on failure (a bad rule is reported to
  * stderr with its line number). An empty/NULL @path yields *@out == NULL,

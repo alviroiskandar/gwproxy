@@ -76,3 +76,76 @@ gwp_sweep()
 		echo "swept $n stray gwproxy process(es)" >&2
 	return 0
 }
+
+# gwp_kill_priv <pid>: stop a gwproxy that was started as `$SUDO gwproxy ... &`,
+# where <pid> is the $! recorded at that point.
+#
+# The privileged tests cannot use gwp_sweep() for this. The proxy runs as root,
+# so an unprivileged /proc/<pid>/exe readlink returns nothing at all and the
+# process is invisible to the very matching rule above -- the scan has to run as
+# root, which is what this wrapper adds.
+#
+# <pid> is sudo's, not necessarily the proxy's, and which of the two it is
+# depends on configuration: with `Defaults use_pty` sudo stays resident and runs
+# the proxy as its child in a process group of its own, and without it sudo
+# execs the proxy in place, so the proxy IS <pid>. Killing <pid> alone therefore
+# reaches the proxy only in the second case, which is why this walks the process
+# tree and stops every gwproxy that is <pid> or descends from it.
+#
+# That ancestry test is also what scopes the kill to THIS test, the job the
+# process group does in gwp_sweep(). The group is unusable here precisely
+# because sudo may have moved the proxy into one of its own, so under `make -jN`
+# a group- or name-based kill could take out a concurrent test's proxy.
+gwp_kill_priv()
+{
+	local pid="$1" bin="${GWPROXY:-}"
+
+	[ -n "$pid" ] || return 0
+	[ -n "$bin" ] || return 0
+	bin="$(readlink -f "$bin" 2>/dev/null || printf '%s' "$bin")"
+	[ -n "$bin" ] || return 0
+
+	${SUDO:-} env GWP_KP_BIN="$bin" GWP_KP_ROOT="$pid" bash -c '
+		bin=$GWP_KP_BIN
+		root=$GWP_KP_ROOT
+
+		ppid_of() {
+			local st
+			st=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+			st=${st##*) }
+			set -- $st
+			printf "%s" "$2"
+		}
+
+		# descends <pid> <ancestor>: true when <ancestor> is <pid> or is
+		# reached by walking up. The bound stops a pid-reuse cycle from
+		# spinning forever.
+		descends() {
+			local p="$1" want="$2" n=0
+			while [ -n "$p" ] && [ "$p" != 0 ] && [ "$p" != 1 ] \
+			      && [ "$n" -lt 64 ]; do
+				[ "$p" = "$want" ] && return 0
+				p=$(ppid_of "$p") || return 1
+				n=$((n + 1))
+			done
+			return 1
+		}
+
+		for pass in TERM KILL; do
+			hit=0
+			for p in $(ls /proc 2>/dev/null | grep -E "^[0-9]+$"); do
+				exe=$(readlink "/proc/$p/exe" 2>/dev/null) || continue
+				case "$exe" in
+				"$bin"|"$bin (deleted)") ;;
+				*) continue ;;
+				esac
+				descends "$p" "$root" || continue
+				kill "-$pass" "$p" 2>/dev/null && hit=1
+			done
+			[ "$hit" = 1 ] || break
+			[ "$pass" = TERM ] && sleep 0.2
+		done
+	' 2>/dev/null
+
+	return 0
+}
