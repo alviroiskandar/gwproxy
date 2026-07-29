@@ -75,6 +75,14 @@ struct gwp_cfg {
 	const char	*dns_servers;
 	const char	*upstream_proxy;
 	int		mark;
+	/*
+	 * Global default for the ACL's -j BIND: the source address
+	 * (--bind-source, "ip[:port]") and/or interface (--bind-iface) to pin
+	 * outgoing connections to. Kept as the raw strings the user gave; they
+	 * are parsed once into gwp_ctx::bind_def at startup.
+	 */
+	const char	*bind_source;
+	const char	*bind_iface;
 	bool		as_transparent;
 	const char	*tls_cert;
 	const char	*tls_key;
@@ -583,6 +591,14 @@ struct gwp_ctx {
 	struct gwp_ssl_ctx		*ssl_ctx;
 	struct gwp_dns_ctx		*dns;
 	struct gwp_upstream		upstream;
+	/*
+	 * Parsed --bind-source/--bind-iface: the source pin applied to every
+	 * outgoing connection that no ACL -j BIND rule claimed. Built once at
+	 * startup so the connect path never parses anything, and shaped like an
+	 * ACL bind so both tiers share one apply path. @set is false when
+	 * neither option was given.
+	 */
+	struct gwp_acl_bind		bind_def;
 	struct gwp_cfg			cfg;
 	int				ino_fd;
 	char				*ino_buf;

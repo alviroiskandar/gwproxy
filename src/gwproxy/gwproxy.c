@@ -83,6 +83,8 @@ static const struct option long_opts[] = {
 	{ "pid-file",		required_argument,	NULL,	'p' },
 	{ "upstream-proxy",	required_argument,	NULL,	'x' },
 	{ "mark",		required_argument,	NULL,	'M' },
+	{ "bind-source",	required_argument,	NULL,	'B' },
+	{ "bind-iface",		required_argument,	NULL,	'I' },
 	{ "as-transparent",	required_argument,	NULL,	'R' },
 #ifdef CONFIG_HTTPS
 	{ "tls-cert",		required_argument,	NULL,	'E' },
@@ -126,6 +128,8 @@ static const struct gwp_cfg default_opts = {
 	.dns_servers		= "1.1.1.1",
 	.upstream_proxy	= NULL,
 	.mark			= 0,
+	.bind_source		= NULL,
+	.bind_iface		= NULL,
 	.as_transparent		= false
 };
 
@@ -170,6 +174,11 @@ static void show_help(const char *app)
 	printf("                                       socks5h://[user:pass@]host:port (proxy resolves the host)\n");
 	printf("                                       http://[user:pass@]host:port    (HTTP CONNECT)\n");
 	printf("  -M, --mark=nr                   Set SO_MARK (fwmark) on outgoing connections (needs CAP_NET_ADMIN; 0 = off)\n");
+	printf("  -B, --bind-source=ip[:port]     Bind outgoing connections to this source address (default -j BIND --to-source)\n");
+	printf("                                  Skipped for targets of the other address family; omit the port for an ephemeral one\n");
+	printf("  -I, --bind-iface=name           Bind outgoing connections to this interface (SO_BINDTODEVICE, needs CAP_NET_ADMIN)\n");
+	printf("                                  Both are strict: a failed bind drops the connection. An ACL -j BIND rule replaces\n");
+	printf("                                  them wholesale for the connections it matches\n");
 	printf("  -R, --as-transparent=0|1        Transparent proxy: take the target from SO_ORIGINAL_DST (iptables REDIRECT) (default: %d)\n", default_opts.as_transparent);
 #ifdef CONFIG_HTTPS
 	printf("  -E, --tls-cert=file             PEM certificate chain; enables TLS termination on the listener (auto-detected per connection)\n");
@@ -312,6 +321,12 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 			break;
 		case 'M':
 			cfg->mark = atoi(optarg);
+			break;
+		case 'B':
+			cfg->bind_source = optarg;
+			break;
+		case 'I':
+			cfg->bind_iface = optarg;
 			break;
 		case 'R':
 			cfg->as_transparent = !!atoi(optarg);
@@ -1587,6 +1602,57 @@ int gwp_parse_upstream(const char *url, struct gwp_upstream *up)
 	return 0;
 }
 
+/*
+ * Turn --bind-source/--bind-iface into the ready-made bind spec the connect
+ * path applies when no ACL -j BIND rule claimed the connection. Done once here
+ * rather than per connection, and validated here so a typo (a malformed
+ * address, an interface name that cannot fit IFNAMSIZ) is a startup error
+ * instead of every connection quietly failing later.
+ *
+ * The interface is not probed against the running system: a device named here
+ * may legitimately appear after gwproxy starts (a WireGuard or PPP link), and
+ * the strict per-connection bind already fails safe until it does.
+ */
+__cold
+static int gwp_ctx_init_bind_def(struct gwp_ctx *ctx)
+{
+	struct gwp_acl_bind *b = &ctx->bind_def;
+	struct gwp_cfg *cfg = &ctx->cfg;
+	size_t l;
+
+	memset(b, 0, sizeof(*b));
+
+	if (cfg->bind_iface) {
+		l = strlen(cfg->bind_iface);
+		if (!l || l >= sizeof(b->iface)) {
+			pr_err(&ctx->lh,
+			       "Invalid --bind-iface value '%s': an interface name is 1 to %zu characters",
+			       cfg->bind_iface, sizeof(b->iface) - 1);
+			return -EINVAL;
+		}
+		memcpy(b->iface, cfg->bind_iface, l + 1);
+		b->set = true;
+	}
+
+	if (cfg->bind_source) {
+		if (gwp_acl_parse_bind_source(cfg->bind_source, &b->src)) {
+			pr_err(&ctx->lh,
+			       "Invalid --bind-source value '%s': expected an IP literal, optionally 'ip:port' or '[v6]:port'",
+			       cfg->bind_source);
+			return -EINVAL;
+		}
+		b->have_src = true;
+		b->set = true;
+	}
+
+	if (b->set)
+		pr_info(&ctx->lh, "Outgoing connections bind to source %s on interface %s by default",
+			b->have_src ? ip_to_str(&b->src) : "(any)",
+			b->iface[0] ? b->iface : "(any)");
+
+	return 0;
+}
+
 #ifdef CONFIG_HTTPS
 __cold
 static int gwp_ctx_init_tls(struct gwp_ctx *ctx)
@@ -1639,6 +1705,10 @@ static int gwp_ctx_init(struct gwp_ctx *ctx)
 		return r;
 
 	r = gwp_ctx_parse_ev(ctx);
+	if (r < 0)
+		goto out_free_log;
+
+	r = gwp_ctx_init_bind_def(ctx);
 	if (r < 0)
 		goto out_free_log;
 
@@ -2016,17 +2086,26 @@ static int setskopt_int(int fd, int level, int optname, int value)
 }
 
 /*
- * Apply a -j BIND to socket @fd before connect: pin the outgoing interface
+ * Apply a bind spec to socket @fd before connect: pin the outgoing interface
  * (SO_BINDTODEVICE) and/or source address (bind()). Strict -- any failure is
  * returned so the caller drops the connection rather than proceeding on the
  * default route/source (which would leak traffic via the wrong path). @dst is
  * the address about to be connected, used to require a matching source family.
  * Both operations generally need CAP_NET_ADMIN.
+ *
+ * @b is either an ACL -j BIND rule or, when @global, the --bind-source /
+ * --bind-iface default. The only difference is the family mismatch: an explicit
+ * rule that names a source of the wrong family is a configuration error and is
+ * refused, whereas the global default must not turn a dual-stack proxy into a
+ * single-family one -- an IPv4 --bind-source simply does not apply to an IPv6
+ * target, so the source is skipped and the connection proceeds. An interface
+ * has no family, so --bind-iface still applies to every target.
  */
 static int apply_conn_bind(struct gwp_wrk *w, int fd,
 			   const struct gwp_sockaddr *dst,
-			   const struct gwp_acl_bind *b)
+			   const struct gwp_acl_bind *b, bool global)
 {
+	const char *tag = global ? "bind default" : "ACL BIND";
 	int r;
 
 	if (b->iface[0]) {
@@ -2034,8 +2113,8 @@ static int apply_conn_bind(struct gwp_wrk *w, int fd,
 				     b->iface, (socklen_t)strlen(b->iface));
 		if (unlikely(r < 0)) {
 			pr_err(&w->ctx->lh,
-			       "ACL BIND: SO_BINDTODEVICE(%s) failed: %s (CAP_NET_ADMIN required)",
-			       b->iface, strerror(-r));
+			       "%s: SO_BINDTODEVICE(%s) failed: %s (CAP_NET_ADMIN required)",
+			       tag, b->iface, strerror(-r));
 			return r;
 		}
 	}
@@ -2046,6 +2125,12 @@ static int apply_conn_bind(struct gwp_wrk *w, int fd,
 
 		/* The source family must match the socket/target family. */
 		if (s->sa.sa_family != dst->sa.sa_family) {
+			if (global) {
+				pr_dbg(&w->ctx->lh,
+				       "bind default: --bind-source does not apply to target %s (other address family)",
+				       ip_to_str(dst));
+				return 0;
+			}
 			pr_err(&w->ctx->lh,
 			       "ACL BIND: --to-source family does not match target %s",
 			       ip_to_str(dst));
@@ -2056,8 +2141,8 @@ static int apply_conn_bind(struct gwp_wrk *w, int fd,
 						   : sizeof(struct sockaddr_in6);
 		r = __sys_bind(fd, &s->sa, len);
 		if (unlikely(r < 0)) {
-			pr_err(&w->ctx->lh, "ACL BIND: bind(%s) failed: %s",
-			       ip_to_str(s), strerror(-r));
+			pr_err(&w->ctx->lh, "%s: bind(%s) failed: %s",
+			       tag, ip_to_str(s), strerror(-r));
 			return r;
 		}
 	}
@@ -2120,12 +2205,22 @@ int gwp_create_sock_target(struct gwp_wrk *w, struct gwp_sockaddr *addr,
 	}
 
 	/*
-	 * -j BIND: pin the source interface/address before connect. Strict --
-	 * a failure drops the connection rather than falling back to the wrong
-	 * source (see apply_conn_bind).
+	 * Pin the source interface/address before connect. Strict -- a failure
+	 * drops the connection rather than falling back to the wrong source
+	 * (see apply_conn_bind). A matching ACL -j BIND rule replaces the
+	 * global --bind-source/--bind-iface default wholesale, exactly as -j
+	 * MARK replaces --mark: a rule that names only an interface must not
+	 * silently inherit the global source address, which would apply a
+	 * policy neither the rule nor the default describes.
 	 */
 	if (so && so->bind.set) {
-		r = apply_conn_bind(w, fd, addr, &so->bind);
+		r = apply_conn_bind(w, fd, addr, &so->bind, false);
+		if (unlikely(r)) {
+			__sys_close(fd);
+			return r;
+		}
+	} else if (w->ctx->bind_def.set) {
+		r = apply_conn_bind(w, fd, addr, &w->ctx->bind_def, true);
 		if (unlikely(r)) {
 			__sys_close(fd);
 			return r;

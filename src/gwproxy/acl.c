@@ -538,9 +538,10 @@ static int parse_port_num(const char *s, uint16_t *out)
 /*
  * Parse a -j BIND --to-source argument (a literal source address, optionally
  * with a port) into @out: "ip", "ip:port", "[v6]:port", or a bare IPv6 literal.
- * No DNS -- acl.c is self-contained. Returns 0 on success, -1 on error.
+ * No DNS -- acl.c is self-contained. Returns 0 on success, -EINVAL on error.
+ * Also used by the global --bind-source default (see acl.h).
  */
-static int parse_source(const char *s, struct gwp_sockaddr *out)
+int gwp_acl_parse_bind_source(const char *s, struct gwp_sockaddr *out)
 {
 	char host[64];
 	const char *colon;
@@ -555,20 +556,20 @@ static int parse_source(const char *s, struct gwp_sockaddr *out)
 		size_t n;
 
 		if (!end)
-			return -1;
+			return -EINVAL;
 		n = (size_t)(end - s - 1);
 		if (n >= sizeof(host))
-			return -1;
+			return -EINVAL;
 		memcpy(host, s + 1, n);
 		host[n] = '\0';
 		if (inet_pton(AF_INET6, host, &a6) != 1)
-			return -1;
+			return -EINVAL;
 		s = end + 1;
 		if (*s == ':') {
 			if (parse_port_num(s + 1, &port))
-				return -1;
+				return -EINVAL;
 		} else if (*s) {
-			return -1;
+			return -EINVAL;
 		}
 		out->i6.sin6_family = AF_INET6;
 		out->i6.sin6_addr = a6;
@@ -587,18 +588,18 @@ static int parse_source(const char *s, struct gwp_sockaddr *out)
 		size_t n = (size_t)(colon - s);
 
 		if (n >= sizeof(host))
-			return -1;
+			return -EINVAL;
 		memcpy(host, s, n);
 		host[n] = '\0';
 		if (parse_port_num(colon + 1, &port))
-			return -1;
+			return -EINVAL;
 	} else {
 		if (strlen(s) >= sizeof(host))
-			return -1;
+			return -EINVAL;
 		strcpy(host, s);
 	}
 	if (inet_pton(AF_INET, host, &a4) != 1)
-		return -1;
+		return -EINVAL;
 	out->i4.sin_family = AF_INET;
 	out->i4.sin_addr = a4;
 	out->i4.sin_port = htons(port);
@@ -838,7 +839,7 @@ static int parse_rule(struct gwp_acl_ruleset *rs, char **tok, int n)
 			/* BIND payload: may pair with --to-iface, not DNAT/MARK. */
 			v = next_val(tok, n, &i);
 			if (neg || !v || have_to || have_setmark || have_src ||
-			    parse_source(v, &r->act.bind.src))
+			    gwp_acl_parse_bind_source(v, &r->act.bind.src))
 				goto out;
 			r->act.bind.have_src = true;
 			have_src = true;
