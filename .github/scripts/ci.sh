@@ -48,9 +48,14 @@ CLANG_VERSION="23"
 # have no target libssl/libpcre2 available.
 DEB_EXTRA_PACKAGES="libssl-dev libpcre2-dev"
 
-# Alpine/musl build dependencies. "bash" is intentionally absent: the caller
-# has to install it to be able to run this script at all.
-APK_PACKAGES="build-base musl-dev linux-headers git openssl-dev pcre2-dev"
+# Alpine/musl build dependencies, followed by what the test suite needs:
+# bash for t/*.sh, python3 for the helper servers in t/servers, curl as the
+# HTTP client the integration tests drive, the openssl CLI to mint the test
+# certificates, and coreutils/util-linux/iproute2 for timeout(1), setsid(1)
+# and ss(8), whose busybox applets do not take the options the tests use.
+# The caller still has to install bash itself before it can run this script.
+APK_PACKAGES="build-base musl-dev linux-headers git openssl-dev pcre2-dev
+	bash python3 curl openssl coreutils util-linux iproute2"
 
 # Parallelism for make. Overridable for local runs.
 JOBS="${JOBS:-$(nproc 2>/dev/null || echo 1)}"
@@ -303,28 +308,12 @@ cmd_alpine_deps()
 cmd_alpine_build()
 {
 	#
-	# The Alpine job is BUILD ONLY -- it compile-tests gwproxy against musl
-	# and does not run the test suite.
+	# Alpine runs on the native x86_64 runner, so unlike the cross-compiled
+	# rows of the build job it can execute what it builds. Run the tests.
 	#
-	# This used to be an accident rather than a decision: every Alpine step
-	# guarded "make test" with
-	#
-	#	[ "${{matrix.build_args.arch}}" = "x86_64" ]
-	#
-	# while that job's matrix only has a "commit" axis and no build_args at
-	# all. The expression expanded to the empty string, so the guard read
-	# [ "" = "x86_64" ] and the tests have never run here. Two of the steps
-	# had already grown comments describing the job as build-only.
-	#
-	# The behaviour is kept as-is so that moving the commands into this
-	# script stays a pure refactor, but the gate is now stated outright
-	# instead of being an artefact of an undefined matrix key.
-	#
-	local run_tests=0
+	local run_tests=1
 
 	enter_topdir
-
-	printf 'NOTE: the Alpine/musl job is build-only, "make test" is not run\n'
 
 	build_variant "default" 0 "${run_tests}" \
 		--cc=gcc
@@ -334,10 +323,10 @@ cmd_alpine_build()
 		--cc=gcc --use-io-uring
 	build_variant "io_uring + debug" 1 "${run_tests}" \
 		--cc=gcc --use-io-uring --debug
-	# Compile-test the TLS module (ssl.c) against musl.
+	# Exercise the TLS module (ssl.c) against musl.
 	build_variant "openssl" 1 "${run_tests}" \
 		--cc=gcc --use-openssl
-	# Compile-test the ACL PCRE2 path against musl.
+	# Exercise the ACL PCRE2 path against musl.
 	build_variant "pcre" 1 "${run_tests}" \
 		--cc=gcc --use-io-uring --use-pcre
 }
