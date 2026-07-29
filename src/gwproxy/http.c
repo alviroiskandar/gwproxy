@@ -94,18 +94,29 @@ static const char *http_method_str(uint8_t method)
 
 /*
  * Split a "host:port" authority (a CONNECT target, or the authority of an
- * absolute-form URI) into NUL-terminated @host_p/@port_p in place. IPv6
- * literals in brackets ("[::1]:80") are unwrapped. With no ":port",
- * @default_port is used; pass NULL to require an explicit port. Returns 0 on
- * success or -EINVAL on a malformed authority.
+ * absolute-form URI) into NUL-terminated @host_p/@port_p in place. Any
+ * userinfo is discarded. IPv6 literals in brackets ("[::1]:80") are unwrapped.
+ * With no ":port", @default_port is used; pass NULL to require an explicit
+ * port. Returns 0 on success or -EINVAL on a malformed authority.
  */
 static int split_authority(char *authority, char **host_p, char **port_p,
 			   char *default_port)
 {
-	char *host = authority, *colon = NULL, *end;
+	char *host = authority, *colon = NULL, *end, *at;
 
 	if (!*authority)
 		return -EINVAL;
+
+	/*
+	 * RFC 3986 s3.2: userinfo runs up to the LAST '@' and is not part of
+	 * the host. Drop it before looking for the port separator, or an
+	 * authority like "A:B@C" is split on the colon inside the userinfo and
+	 * yields host "A" -- attacker-chosen, while the authority still reads
+	 * as "C" to anything inspecting the URL.
+	 */
+	at = strrchr(host, '@');
+	if (at)
+		host = at + 1;
 
 	if (*host == '[') {
 		char *rb = strchr(host, ']');
@@ -204,7 +215,13 @@ static bool conn_lists(const char *conn, const char *name)
  * header, used to size the scratch buffer (the rewrite is never materially
  * larger). Returns 0 or a negative error.
  */
+/*
+ * Build the origin-form request forwarded upstream. @authority is the URI's
+ * authority, passed as pointer+length because at this point it is still part
+ * of the request line and not NUL-terminated.
+ */
 static int build_forward_request(struct gwp_http_conn *hc, const char *path,
+				 const char *authority, size_t auth_len,
 				 size_t hdr_len)
 {
 	struct gwnet_http_req_hdr *req = &hc->req_hdr;
@@ -227,12 +244,47 @@ static int build_forward_request(struct gwp_http_conn *hc, const char *path,
 		goto too_big;
 	n = (size_t)w;
 
+	/*
+	 * RFC 9112 s3.2.2: with an absolute-form target the proxy MUST ignore
+	 * the Host the client sent and use the authority from the URI instead.
+	 * Forwarding the client's copy lets it point us at one host while
+	 * telling the origin another (vhost confusion, and a way around an ACL
+	 * that matched on the name), and a client that sends no Host at all
+	 * would otherwise leave us emitting an invalid HTTP/1.1 request.
+	 *
+	 * The authority is copied verbatim so an IPv6 literal keeps its
+	 * brackets and an absent port stays absent -- except for userinfo,
+	 * which is not part of the host and must not reach the origin.
+	 */
+	{
+		const char *host = authority;
+		size_t hlen = auth_len;
+		const char *at = memrchr(authority, '@', auth_len);
+
+		if (at) {
+			host = at + 1;
+			hlen = auth_len - (size_t)(host - authority);
+		}
+		if (!hlen) {
+			free(buf);
+			return -EINVAL;
+		}
+
+		w = snprintf(buf + n, cap - n, "Host: %.*s\r\n", (int)hlen,
+			     host);
+		if (w < 0 || (size_t)w >= cap - n)
+			goto too_big;
+		n += (size_t)w;
+	}
+
 	for (i = 0; i < req->fields.nr; i++) {
 		const char *k = req->fields.ff[i].key;
 		const char *v = req->fields.ff[i].val;
 
-		/* Drop hop-by-hop and Connection-listed headers. */
-		if (is_hop_by_hop(k) || conn_lists(conn, k))
+		/* Drop hop-by-hop and Connection-listed headers, and the
+		 * client's Host -- ours is already in place above. */
+		if (is_hop_by_hop(k) || conn_lists(conn, k) ||
+		    !strcasecmp(k, "Host"))
 			continue;
 
 		w = snprintf(buf + n, cap - n, "%s: %s\r\n", k, v);
@@ -288,7 +340,8 @@ static int classify_forward(struct gwp_http_conn *hc, size_t hdr_len,
 	 * authority is isolated (and the path's leading '/' overwritten) only
 	 * afterwards.
 	 */
-	if (build_forward_request(hc, path, hdr_len) < 0)
+	if (build_forward_request(hc, path, authority,
+				  (size_t)(slash - authority), hdr_len) < 0)
 		return GWP_HTTP_ERR;
 
 	if (*slash == '/')
@@ -385,6 +438,54 @@ int gwp_http_build_forbidden_reply(void *out, size_t out_cap)
 {
 	static const char resp[] =
 		"HTTP/1.1 403 Forbidden\r\n"
+		"Content-Length: 0\r\n"
+		"Connection: close\r\n"
+		"\r\n";
+	size_t len = sizeof(resp) - 1;
+
+	if (out_cap < len)
+		return -ENOBUFS;
+
+	memcpy(out, resp, len);
+	return (int)len;
+}
+
+int gwp_http_build_bad_gateway_reply(void *out, size_t out_cap)
+{
+	static const char resp[] =
+		"HTTP/1.1 502 Bad Gateway\r\n"
+		"Content-Length: 0\r\n"
+		"Connection: close\r\n"
+		"\r\n";
+	size_t len = sizeof(resp) - 1;
+
+	if (out_cap < len)
+		return -ENOBUFS;
+
+	memcpy(out, resp, len);
+	return (int)len;
+}
+
+int gwp_http_build_gateway_timeout_reply(void *out, size_t out_cap)
+{
+	static const char resp[] =
+		"HTTP/1.1 504 Gateway Timeout\r\n"
+		"Content-Length: 0\r\n"
+		"Connection: close\r\n"
+		"\r\n";
+	size_t len = sizeof(resp) - 1;
+
+	if (out_cap < len)
+		return -ENOBUFS;
+
+	memcpy(out, resp, len);
+	return (int)len;
+}
+
+int gwp_http_build_too_large_reply(void *out, size_t out_cap)
+{
+	static const char resp[] =
+		"HTTP/1.1 431 Request Header Fields Too Large\r\n"
 		"Content-Length: 0\r\n"
 		"Connection: close\r\n"
 		"\r\n";

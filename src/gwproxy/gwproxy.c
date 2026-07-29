@@ -1265,11 +1265,11 @@ static enum gwp_acl_verdict acl_out(struct gwp_ctx *ctx,
 bool gwp_ctx_acl_output_allowed(struct gwp_ctx *ctx,
 				const struct gwp_sockaddr *client,
 				const struct gwp_sockaddr *target,
-				enum gwp_acl_proto proto)
+				const char *user, enum gwp_acl_proto proto)
 {
 	struct gwp_sockaddr tmp = *target;
 
-	return acl_out(ctx, client, &tmp, NULL, NULL, NULL, NULL, proto,
+	return acl_out(ctx, client, &tmp, NULL, user, NULL, NULL, proto,
 		       false) == GWP_ACL_ACCEPT;
 }
 
@@ -1824,6 +1824,20 @@ struct gwp_conn_pair *gwp_alloc_conn_pair(struct gwp_wrk *w)
 	if (!gcp)
 		return NULL;
 
+	/*
+	 * Both event loops carry this pointer in the low 48 bits of the event
+	 * word (see EV_BIT_ALL). Refusing the connection is a poor outcome, but
+	 * it is a diagnosable one: proceeding would hand the loops a pointer
+	 * they silently truncate on the way back out.
+	 */
+	if (unlikely(!EV_PTR_OK(gcp))) {
+		pr_err(&ctx->lh,
+		       "BUG: connection pair %p has bits 48..63 set; the event word cannot carry it",
+		       (void *)gcp);
+		free(gcp);
+		return NULL;
+	}
+
 	assert(cfg->target_buf_size > 1);
 	assert(cfg->client_buf_size > 1);
 	r = init_conn(&gcp->target, cfg->target_buf_size);
@@ -2268,6 +2282,40 @@ int gwp_socks5_prep_connect_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	return 0;
 }
 
+int gwp_conn_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int err)
+{
+	/*
+	 * The two event loops report a connect timeout with different errnos:
+	 * epoll's timerfd path uses -ETIMEDOUT, io_uring's timeout CQE gives
+	 * -ETIME. Normalise, or the SOCKS5 mapping below would answer the
+	 * generic REP 0x01 on io_uring instead of 0x06 (TTL expired).
+	 */
+	bool timed_out = (err == -ETIMEDOUT || err == -ETIME);
+
+	if (timed_out)
+		err = -ETIMEDOUT;
+
+	if (gcp->prot_type == GWP_PROT_TYPE_SOCKS5)
+		return gwp_socks5_prep_connect_reply(w, gcp, err);
+
+	if (gcp->prot_type == GWP_PROT_TYPE_HTTP) {
+		void *out = gcp->target.buf + gcp->target.len;
+		size_t cap = gcp->target.cap - gcp->target.len;
+		int r;
+
+		if (timed_out)
+			r = gwp_http_build_gateway_timeout_reply(out, cap);
+		else
+			r = gwp_http_build_bad_gateway_reply(out, cap);
+		if (r < 0)
+			return r;
+		gcp->target.len += (uint32_t)r;
+		return 0;
+	}
+
+	return 0;	/* plain/transparent forwarding speaks no protocol */
+}
+
 int gwp_acl_reject_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	pr_info(&w->ctx->lh, "ACL denied target %s for client %s (idx=%u)",
@@ -2455,9 +2503,17 @@ static int prepare_target_addr_domain(struct gwp_wrk *w,
 	 * proxy. up_dst carries the domain and we're ready to connect.
 	 */
 	if (ctx->upstream.enabled && ctx->upstream.remote_dns) {
-		int p = atoi(port);
+		/*
+		 * Strict: atoi() stops at the first non-digit and reports the
+		 * prefix, so a port carrying trailing junk was silently
+		 * accepted. Unlike the resolving paths below, nothing else
+		 * validates this string before it becomes the upstream's
+		 * destination port.
+		 */
+		char *endp;
+		unsigned long p = strtoul(port, &endp, 10);
 
-		if (p <= 0 || p > 65535)
+		if (endp == port || *endp || !p || p > 65535)
 			return -EINVAL;
 		return upstream_dst_from_domain(host, (uint16_t)p, &gcp->up_dst);
 	}
@@ -2668,6 +2724,7 @@ enum gwp_udp_act gwp_udp_relay_classify(struct gwp_wrk *w,
 		if (gwp_socks5_addr_to_sockaddr(&dst, &tsa, &tslen))
 			return GWP_UDP_DROP;	/* domain target: unsupported */
 		if (!gwp_ctx_acl_output_allowed(w->ctx, &gcp->udp_peer, &tsa,
+						gcp_req_user(gcp),
 						GWP_ACL_PROTO_UDP))
 			return GWP_UDP_DROP;	/* ACL denied this datagram */
 		out->buf = base + hdr_len;
@@ -2916,6 +2973,24 @@ static int http_reject_unauthorized(struct gwp_conn_pair *gcp)
 }
 
 /*
+ * Queue the HTTP 431 reply for a request header that will not fit in the
+ * client buffer, so the client is told its header is too large instead of just
+ * having the connection reset. Same mechanism as the 407 above: written to the
+ * client-bound buffer, flushed by the event loop before teardown. Returns a
+ * negative error so the caller drops the connection.
+ */
+static int http_reject_too_large(struct gwp_conn_pair *gcp)
+{
+	int r = gwp_http_build_too_large_reply(gcp->target.buf + gcp->target.len,
+					       gcp->target.cap - gcp->target.len);
+	if (r < 0)
+		return -E2BIG;
+
+	gcp->target.len += (uint32_t)r;
+	return -E2BIG;
+}
+
+/*
  * Prepend a rewritten origin-form forward request to any request-body bytes
  * already buffered in client.buf, so the forwarding path streams it to the
  * origin.
@@ -2988,7 +3063,7 @@ int gwp_handle_conn_state_http(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		 * busy-spin until the protocol timeout fires.
 		 */
 		if (gcp->client.len >= gcp->client.cap)
-			return -E2BIG;
+			return http_reject_too_large(gcp);
 		return 0;
 	case GWP_HTTP_NEED_AUTH:
 		return http_reject_unauthorized(gcp);
@@ -2996,6 +3071,8 @@ int gwp_handle_conn_state_http(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		return http_connect_target(w, gcp, host, port);
 	case GWP_HTTP_FORWARD:
 		r = http_inject_forward_request(gcp, req, req_len);
+		if (r == -E2BIG)
+			return http_reject_too_large(gcp);
 		if (r < 0)
 			return r;
 		return http_connect_target(w, gcp, host, port);

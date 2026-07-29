@@ -53,6 +53,15 @@ for loop in epoll io_uring; do
 	[ "$got" = 8000 ] \
 		|| fail "[$loop] origin received $got body bytes, expected 8000"
 
+	# (c) The interim response must actually reach the client. curl waits
+	#     only ~1s for the 100 Continue and then sends the body anyway, so
+	#     the assertions above hold even if the 100 never arrives. This
+	#     client writes no body byte until it sees the 100, so a proxy that
+	#     withholds origin->client data until the client writes more is
+	#     caught here instead of silently passing.
+	python3 "$SERVERS_DIR/expect_client.py" "$pp" "$op" \
+		|| fail "[$loop] proxy did not relay the origin's 100 Continue"
+
 	kill "$GWP_PID" 2>/dev/null
 done
 

@@ -447,10 +447,18 @@ static void shutdown_gcp(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	if (gcp->flags & GWP_CONN_FLAG_IS_CANCEL)
 		return;
 
+	/*
+	 * IORING_ASYNC_CANCEL_ALL: an fd can carry more than one in-flight
+	 * request -- the plain forwarding path arms a target recv while the
+	 * connect is still pending, and a relay may have a recv and a send
+	 * outstanding at once. Without it the kernel cancels exactly one, and
+	 * every survivor keeps a reference that stops put_gcp() from ever
+	 * reaching zero, leaking the pair and both fds for the process's life.
+	 */
 	if (gcp->target.fd >= 0) {
 		pr_dbg(&ctx->lh, "Cancelling target recv (fd=%d)", gcp->target.fd);
 		s = get_sqe_nofail(w);
-		io_uring_prep_cancel_fd(s, gcp->target.fd, 0);
+		io_uring_prep_cancel_fd(s, gcp->target.fd, IORING_ASYNC_CANCEL_ALL);
 		io_uring_sqe_set_data(s, gcp);
 		s->user_data |= EV_BIT_IOU_TARGET_CANCEL;
 		get_gcp(gcp);
@@ -459,7 +467,7 @@ static void shutdown_gcp(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	if (gcp->client.fd >= 0) {
 		pr_dbg(&ctx->lh, "Cancelling client recv (fd=%d)", gcp->client.fd);
 		s = get_sqe_nofail(w);
-		io_uring_prep_cancel_fd(s, gcp->client.fd, 0);
+		io_uring_prep_cancel_fd(s, gcp->client.fd, IORING_ASYNC_CANCEL_ALL);
 		io_uring_sqe_set_data(s, gcp);
 		s->user_data |= EV_BIT_IOU_CLIENT_CANCEL;
 		get_gcp(gcp);
@@ -468,7 +476,7 @@ static void shutdown_gcp(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	if (gcp->udp_fd >= 0) {
 		pr_dbg(&ctx->lh, "Cancelling UDP relay (fd=%d)", gcp->udp_fd);
 		s = get_sqe_nofail(w);
-		io_uring_prep_cancel_fd(s, gcp->udp_fd, 0);
+		io_uring_prep_cancel_fd(s, gcp->udp_fd, IORING_ASYNC_CANCEL_ALL);
 		io_uring_sqe_set_data(s, gcp);
 		s->user_data |= EV_BIT_IOU_UDP_CANCEL;
 		get_gcp(gcp);
@@ -1147,6 +1155,14 @@ static int handle_ev_target_connect(struct gwp_wrk *w, void *udata, int res)
 
 	if (unlikely(res < 0)) {
 		pr_err(&w->ctx->lh, "Target connect failed: %s", strerror(-res));
+		/*
+		 * Report the failure instead of just hanging up, so the client
+		 * learns the target refused rather than guessing: a SOCKS5 REP
+		 * (RFC 1928 s6) or an HTTP 502. Queued before the error return
+		 * tears the pair down, as acl_reject_target() does.
+		 */
+		if (!gwp_conn_fail_reply(w, gcp, res) && gcp->target.len)
+			prep_send_client(w, gcp);
 		return res;
 	}
 
@@ -1221,6 +1237,16 @@ static int handle_ev_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			gcp->idx, gcp->client.fd, gcp->target.fd,
 			ip_to_str(&gcp->client_addr),
 			ip_to_str(&gcp->target_addr));
+
+		/*
+		 * Tell the client the origin timed out (SOCKS5 REP 0x06, HTTP
+		 * 504) rather than hanging up silently. Only once the target
+		 * socket exists -- the other user of this timer is the protocol
+		 * handshake, where nothing has been requested yet.
+		 */
+		if (gcp->target.fd >= 0 &&
+		    !gwp_conn_fail_reply(w, gcp, r) && gcp->target.len)
+			prep_send_client(w, gcp);
 	}
 
 	pr_dbg(&ctx->lh,
@@ -1692,12 +1718,26 @@ static int handle_ev_dns_query(struct gwp_wrk *w, void *udata)
 	struct gwp_dns_entry *gde = gcp->gde;
 
 	if (gde->res) {
+		int res = gde->res;
+
 		pr_info(&ctx->lh, "Failed to resolve domain '%s': %d",
-			gde->name, gde->res);
-		return gde->res;
+			gde->name, res);
+		gwp_dns_entry_put(gde);
+		gcp->gde = NULL;
+
+		/*
+		 * Answer before hanging up; without a reply the client cannot
+		 * tell a name that does not resolve from a proxy that died.
+		 * SOCKS5 gets a REP (RFC 1928 s6), HTTP a 502. The send is
+		 * queued before the error return tears the pair down, exactly
+		 * as acl_reject_target() does.
+		 */
+		if (!gwp_conn_fail_reply(w, gcp, res) && gcp->target.len)
+			prep_send_client(w, gcp);
+		return res;
 	}
 
-	gcp->target_addr = gde->addr;
+	gcp->target_addr = gde->addrs[0];
 	pr_info(&ctx->lh, "Domain '%s' resolved to %s (fd=%d, idx=%u)",
 		gde->name, ip_to_str(&gcp->target_addr), gcp->target.fd,
 		gcp->idx);

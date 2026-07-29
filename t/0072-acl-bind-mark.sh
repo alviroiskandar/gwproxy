@@ -47,9 +47,16 @@ cleanup_priv()
 {
 	$SUDO "$IPT" -D OUTPUT -p tcp -d 127.0.0.1 --dport "$hp" -m mark --mark "$MARK" \
 		-j ACCEPT -m comment --comment "$CMT" 2>/dev/null
-	[ -n "$CUR_PORT" ] && $SUDO pkill -f "bind=127.0.0.1:$CUR_PORT" 2>/dev/null
+	# CUR_PORT is not assigned until start_priv() runs, but this handler is
+	# installed before that. Under lib.sh's `set -u` a bare $CUR_PORT would
+	# abort the handler on any earlier exit -- leaving the root-installed
+	# iptables rule above undeleted on the host.
+	[ -n "${CUR_PORT:-}" ] && $SUDO pkill -f "bind=127.0.0.1:$CUR_PORT" 2>/dev/null
+	return 0
 }
-trap 'cleanup_priv; _cleanup' EXIT INT TERM
+# _cleanup exits via the EXIT trap in lib.sh; chain ours ahead of it.
+trap 'cleanup_priv; _cleanup' EXIT
+trap 'exit 143' INT TERM
 
 count_rule()
 {
