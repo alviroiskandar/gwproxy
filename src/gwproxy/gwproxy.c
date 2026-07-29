@@ -173,10 +173,10 @@ static void show_help(const char *app)
 	printf("                                  URL: socks5://[user:pass@]host:port  (local DNS)\n");
 	printf("                                       socks5h://[user:pass@]host:port (proxy resolves the host)\n");
 	printf("                                       http://[user:pass@]host:port    (HTTP CONNECT)\n");
-	printf("  -M, --mark=nr                   Set SO_MARK (fwmark) on outgoing connections (needs CAP_NET_ADMIN; 0 = off)\n");
+	printf("  -M, --mark=nr                   Set SO_MARK (fwmark) on outgoing connections (needs CAP_NET_ADMIN or CAP_NET_RAW; 0 = off)\n");
 	printf("  -B, --bind-source=ip[:port]     Bind outgoing connections to this source address (default -j BIND --to-source)\n");
 	printf("                                  Skipped for targets of the other address family; omit the port for an ephemeral one\n");
-	printf("  -I, --bind-iface=name           Bind outgoing connections to this interface (SO_BINDTODEVICE, needs CAP_NET_ADMIN)\n");
+	printf("  -I, --bind-iface=name           Bind outgoing connections to this interface (SO_BINDTODEVICE)\n");
 	printf("                                  Both are strict: a failed bind drops the connection. An ACL -j BIND rule replaces\n");
 	printf("                                  them wholesale for the connections it matches\n");
 	printf("  -R, --as-transparent=0|1        Transparent proxy: take the target from SO_ORIGINAL_DST (iptables REDIRECT) (default: %d)\n", default_opts.as_transparent);
@@ -1761,7 +1761,7 @@ static int gwp_ctx_init(struct gwp_ctx *ctx)
 					     &ctx->cfg.mark, sizeof(ctx->cfg.mark));
 			__sys_close(tfd);
 			if (r) {
-				pr_err(&ctx->lh, "Cannot set --mark=%d (SO_MARK): %s (CAP_NET_ADMIN required)",
+				pr_err(&ctx->lh, "Cannot set --mark=%d (SO_MARK): %s (CAP_NET_ADMIN or CAP_NET_RAW required)",
 				       ctx->cfg.mark, strerror(-r));
 				goto out_free_log;
 			}
@@ -2091,7 +2091,10 @@ static int setskopt_int(int fd, int level, int optname, int value)
  * returned so the caller drops the connection rather than proceeding on the
  * default route/source (which would leak traffic via the wrong path). @dst is
  * the address about to be connected, used to require a matching source family.
- * Both operations generally need CAP_NET_ADMIN.
+ * Neither operation needs a capability of its own: SO_BINDTODEVICE has been
+ * unprivileged since Linux 5.7 (it wanted CAP_NET_RAW, never CAP_NET_ADMIN,
+ * before that), and bind() to a locally configured address never needed one.
+ * A source port below 1024 still needs CAP_NET_BIND_SERVICE.
  *
  * @b is either an ACL -j BIND rule or, when @global, the --bind-source /
  * --bind-iface default. The only difference is the family mismatch: an explicit
@@ -2113,7 +2116,7 @@ static int apply_conn_bind(struct gwp_wrk *w, int fd,
 				     b->iface, (socklen_t)strlen(b->iface));
 		if (unlikely(r < 0)) {
 			pr_err(&w->ctx->lh,
-			       "%s: SO_BINDTODEVICE(%s) failed: %s (CAP_NET_ADMIN required)",
+			       "%s: SO_BINDTODEVICE(%s) failed: %s (no such interface, or a kernel older than 5.7 without CAP_NET_RAW)",
 			       tag, b->iface, strerror(-r));
 			return r;
 		}
@@ -2187,15 +2190,16 @@ int gwp_create_sock_target(struct gwp_wrk *w, struct gwp_sockaddr *addr,
 	/*
 	 * Mark the outgoing connection for policy routing / iptables matching.
 	 * A per-connection -j MARK from the ACL overrides the global --mark, and
-	 * is strict like -j BIND: if SO_MARK fails (e.g. no CAP_NET_ADMIN) the
-	 * connection is dropped rather than egressing unmarked via the wrong
-	 * route. The coarse global --mark stays best-effort.
+	 * is strict like -j BIND: if SO_MARK fails (it needs CAP_NET_ADMIN or,
+	 * since Linux 5.11, CAP_NET_RAW) the connection is dropped rather than
+	 * egressing unmarked via the wrong route. The coarse global --mark stays
+	 * best-effort.
 	 */
 	if (so && so->mark_set) {
 		r = setskopt_int(fd, SOL_SOCKET, SO_MARK, (int)so->mark);
 		if (unlikely(r < 0)) {
 			pr_err(&w->ctx->lh,
-			       "ACL MARK: SO_MARK=%u failed: %s (CAP_NET_ADMIN required)",
+			       "ACL MARK: SO_MARK=%u failed: %s (CAP_NET_ADMIN or CAP_NET_RAW required)",
 			       so->mark, strerror(-r));
 			__sys_close(fd);
 			return r;

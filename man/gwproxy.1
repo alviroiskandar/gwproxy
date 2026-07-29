@@ -257,7 +257,9 @@ it is
 if setting
 .B SO_MARK
 fails (it needs
-.BR CAP_NET_ADMIN )
+.B CAP_NET_ADMIN
+or, since Linux 5.11,
+.BR CAP_NET_RAW )
 the connection is dropped rather than egressing unmarked via the wrong route.
 It applies to TCP target connections (SOCKS5, HTTP, plain and transparent), not
 the UDP relay. (The coarse global
@@ -299,8 +301,10 @@ or the upstream proxy when chaining \(em is one such failure; when a hostname
 target resolved to addresses of both families, that candidate is skipped
 instead and the connection proceeds on an address of the matching family (see
 .BR "TARGET ADDRESS SELECTION" ).
-It generally needs
-.BR CAP_NET_ADMIN .
+Neither pinning needs a capability of its own:
+.B SO_BINDTODEVICE
+has been unprivileged since Linux 5.7, and binding a source address that is
+configured locally never required one.
 Binding a fixed source
 .I port
 limits concurrency to one connection per identical destination (a 4\-tuple
@@ -468,7 +472,9 @@ Set
 .B SO_MARK
 (fwmark) on outgoing connections, for policy routing and iptables matching.
 Requires
-.BR CAP_NET_ADMIN .
+.B CAP_NET_ADMIN
+or, since Linux 5.11,
+.BR CAP_NET_RAW .
 .B 0
 disables it. Default:
 .BR 0 .
@@ -502,8 +508,8 @@ Pin every outgoing connection to this network interface
 .RB ( SO_BINDTODEVICE ),
 the global default for the ACL's
 .BR "\-j BIND \-\-to\-iface" .
-It generally needs
-.BR CAP_NET_ADMIN .
+It has been unprivileged since Linux 5.7; older kernels wanted
+.BR CAP_NET_RAW .
 Only the length of
 .I name
 is validated at startup (at most 15 characters), not its existence, so an
@@ -689,7 +695,9 @@ iptables \-t nat \-A OUTPUT \-p tcp \-\-dport 80 \-m mark ! \-\-mark 1 \\
 .PP
 .B \-\-mark
 requires
-.BR CAP_NET_ADMIN ,
+.B CAP_NET_ADMIN
+or
+.BR CAP_NET_RAW ,
 and installing the iptables rules requires the corresponding privileges;
 both typically need root.
 .SH UPSTREAM CHAINING
@@ -968,12 +976,15 @@ for the full list.
 .SH NOTES
 .B \-\-mark
 requires
-.BR CAP_NET_ADMIN ,
-as does
+.B CAP_NET_ADMIN
+or, since Linux 5.11,
+.BR CAP_NET_RAW .
 .B \-\-bind\-iface
-.RB ( SO_BINDTODEVICE ).
+.RB ( SO_BINDTODEVICE )
+needs no privilege on Linux 5.7 and later; older kernels required
+.BR CAP_NET_RAW .
 .B \-\-bind\-source
-needs no privilege for an address that is configured locally.
+needs none for an address that is configured locally.
 Transparent mode requires iptables REDIRECT rules, which typically need root.
 Binding to a privileged port (< 1024) requires
 .B CAP_NET_BIND_SERVICE

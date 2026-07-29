@@ -4,8 +4,9 @@
 # --bind-source: the global default source address for outgoing (target)
 # connections, and how an ACL "-j BIND" rule overrides it. Binding a source
 # address that is already configured locally needs no privilege, so this test
-# runs everywhere; the interface half of the feature (--bind-iface) needs
-# CAP_NET_ADMIN and lives in 0074-bind-iface.sh.
+# runs everywhere; the interface half of the feature (--bind-iface) needs a
+# second path to the origin to be worth asserting on, so it needs root to build
+# one and lives in 0074-bind-iface.sh.
 #
 # Every 127.0.0.0/8 address is local on Linux, so 127.0.0.2 and friends are
 # bindable sources that the origin can tell apart from the 127.0.0.1 the kernel

@@ -4,8 +4,9 @@
 # --bind-iface: the global default egress interface for outgoing (target)
 # connections, and how an ACL "-j BIND" rule overrides it.
 #
-# SO_BINDTODEVICE needs CAP_NET_ADMIN and, to be worth asserting on, a second
-# path to the origin -- so the test builds one: a veth pair with one end in a
+# SO_BINDTODEVICE itself has been unprivileged since Linux 5.7, but to be worth
+# asserting on it needs a second path to the origin, and building one needs
+# root: the test makes a veth pair with one end in a
 # fresh network namespace, the origin server inside that namespace, and two
 # addresses on the host end. That makes the assertions sharp. Binding the wrong
 # device leaves the origin unreachable, so "the connection was dropped" really
@@ -118,9 +119,11 @@ pinned="$(peer_src "$NET.2" "$pa" "$NET.3")"
 [ "$pinned" = "$NET.3" ] || \
 	skip "a pinned source is not observable here (saw '${pinned:-<none>}'; NAT on $NET.0/24?)"
 
-# gwproxy needs CAP_NET_ADMIN here, so it runs under sudo; killing the sudo
-# wrapper's pid would not reliably reach the child, hence pkill on the bind
-# string. $1 = listen port, rest = extra arguments.
+# gwproxy runs under sudo here to match the root-owned namespace plumbing, not
+# because the bind needs a capability (SO_BINDTODEVICE is unprivileged on Linux
+# 5.7 and later); killing the sudo wrapper's pid would not reliably reach the
+# child, hence pkill on the bind string. $1 = listen port, rest = extra
+# arguments.
 start_priv()
 {
 	CUR_PORT="$1"

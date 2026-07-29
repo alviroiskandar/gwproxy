@@ -150,10 +150,11 @@ REDIRECT (which avoids a redirect loop):
   iptables -t nat -A OUTPUT -p tcp --dport 80 -m mark ! --mark 1 \
       -j REDIRECT --to-ports 1080
 
-Note that --mark and --bind-iface require CAP_NET_ADMIN, and transparent
-mode requires the iptables rules to be installed; all typically need root
-privileges. --bind-source needs no privilege as long as the address is
-configured locally.
+Note that --mark requires CAP_NET_ADMIN or, since Linux 5.11, CAP_NET_RAW,
+and transparent mode requires the iptables rules to be installed; both
+typically need root privileges. --bind-iface (SO_BINDTODEVICE) needs no
+privilege on Linux 5.7 and later -- older kernels wanted CAP_NET_RAW -- and
+--bind-source needs none as long as the address is configured locally.
 
 
 Contributing

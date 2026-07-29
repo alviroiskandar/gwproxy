@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-only
 #
-# ACL -j MARK and -j BIND on the outgoing (target) socket. These need
-# CAP_NET_ADMIN (SO_MARK, SO_BINDTODEVICE), so the whole test is skipped
-# without root or passwordless sudo. It checks, on every event loop:
+# ACL -j MARK and -j BIND on the outgoing (target) socket. SO_MARK needs
+# CAP_NET_ADMIN or CAP_NET_RAW, and the iptables mark match needs root, so the
+# whole test is skipped without root or passwordless sudo. It checks, on every event loop:
 #   * a per-rule -j MARK --set-mark N tags the outgoing connection (an iptables
 #     mark match counts the packets), independent of the global --mark;
 #   * -j BIND --to-iface lo binds the connection to a device and still works;
