@@ -56,6 +56,12 @@ struct gwp_cfg {
 	int		nr_workers;
 	int		nr_dns_workers;
 	int		connect_timeout;
+	/*
+	 * Happy Eyeballs Connection Attempt Delay in milliseconds (RFC 8305
+	 * Section 5): how long before the next candidate address joins the
+	 * race. 0 disables racing, leaving plain sequential fallback.
+	 */
+	int		connect_attempt_delay;
 	int		target_buf_size;
 	int		client_buf_size;
 	bool		tcp_nodelay;
@@ -104,6 +110,13 @@ struct gwp_upstream {
 
 int gwp_parse_upstream(const char *url, struct gwp_upstream *up);
 
+/*
+ * How many of a name's addresses one connection may try. The resolver can hand
+ * back more (GWP_DNS_MAX_ADDRS); this bounds what is copied per connection,
+ * since every candidate costs memory in every conn pair.
+ */
+#define GWP_MAX_CONN_CAND	4u
+
 enum {
 	EV_BIT_ACCEPT			= (1ull << 48ull),
 	EV_BIT_EVENTFD			= (2ull << 48ull),
@@ -144,6 +157,17 @@ enum {
 	 * It means it waits for the data specific protocol before
 	 * solely forwarding the received data to the destination host.
 	 */
+	/*
+	 * One in-flight connect attempt of a Happy Eyeballs race, plus N for
+	 * the attempt's slot, so the completion can be attributed without
+	 * disturbing the conn-pair pointer in the low bits. Values 32..47 are
+	 * reserved for this.
+	 */
+	EV_BIT_TARGET_ATTEMPT		= (32ull << 48ull),
+
+	/* Fires when it is time to start the next attempt in the race. */
+	EV_BIT_ATTEMPT_TIMER		= (48ull << 48ull),
+
 	EV_BIT_CLIENT_PROT		= (1000ull << 48ull),
 
 #ifdef CONFIG_IO_URING
@@ -160,7 +184,7 @@ enum {
 	EV_BIT_IOU_TARGET_SEND		= (9ull << 48ull),
 	EV_BIT_IOU_CLIENT_SEND		= (10ull << 48ull),
 	EV_BIT_IOU_CLOSE		= (11ull << 48ull),
-	EV_BIT_IOU_TARGET_CONNECT	= (12ull << 48ull),
+	/* 12 was the single target connect, now EV_BIT_TARGET_ATTEMPT. */
 	EV_BIT_IOU_TARGET_CANCEL	= (13ull << 48ull),
 	EV_BIT_IOU_CLIENT_CANCEL	= (14ull << 48ull),
 	EV_BIT_IOU_TIMER_DEL		= (15ull << 48ull),
@@ -180,6 +204,19 @@ enum {
 	EV_BIT_IOU_UDP_TX		= (23ull << 48ull),
 	EV_BIT_IOU_UDP_CANCEL		= (24ull << 48ull),
 	EV_BIT_IOU_ACL_FILE		= EV_BIT_ACL_FILE,
+
+	/*
+	 * Happy Eyeballs on io_uring. The attempt-delay timeout shares the
+	 * generic EV_BIT_ATTEMPT_TIMER selector, but it needs a removal key
+	 * distinct from the connect timer's (EV_BIT_IOU_TIMER | gcp): the two
+	 * are live at the same time, and io_uring_prep_timeout_remove()
+	 * addresses a timeout solely by its user_data. A losing attempt's
+	 * socket is retired with its own cancel selector so the completion is
+	 * not mistaken for the adopted target's.
+	 */
+	EV_BIT_IOU_ATTEMPT_TIMER	= EV_BIT_ATTEMPT_TIMER,
+	EV_BIT_IOU_ATTEMPT_TIMER_DEL	= (49ull << 48ull),
+	EV_BIT_IOU_ATTEMPT_CANCEL	= (50ull << 48ull),
 #endif
 };
 
@@ -308,6 +345,13 @@ enum {
 	GWP_CONN_FLAG_NO_CLOSE_FD	= (1ull << 0ull),
 	GWP_CONN_FLAG_IS_DYING		= (1ull << 1ull),
 	GWP_CONN_FLAG_IS_CANCEL		= (1ull << 2ull),
+	/*
+	 * At least one candidate address made it past the OUTPUT chain, so a
+	 * later denial cannot be the reason the request failed. Sticky for the
+	 * life of the pair: the candidate walk is re-entered once per failed
+	 * attempt, and a local would only remember the most recent walk.
+	 */
+	GWP_CONN_FLAG_ACL_CAND_OK	= (1ull << 3ull),
 };
 
 enum {
@@ -339,6 +383,15 @@ struct gwp_conn_pair {
 #ifdef CONFIG_IO_URING
 	int				ref_cnt;
 	struct __kernel_timespec	ts;
+	/*
+	 * The Connection Attempt Delay needs its own timespec: an armed
+	 * io_uring timeout keeps reading the struct it was given, so it cannot
+	 * share @ts with the connect timer that is live alongside it.
+	 * @attempt_timer_armed tracks whether one is outstanding, since
+	 * io_uring has no timerfd to test for.
+	 */
+	struct __kernel_timespec	ats;
+	bool				attempt_timer_armed;
 #ifdef CONFIG_HTTPS
 	/*
 	 * Persistent ciphertext scratch for the client's TLS on the io_uring
@@ -380,6 +433,42 @@ struct gwp_conn_pair {
 	};
 	struct gwp_sockaddr	client_addr;
 	struct gwp_sockaddr	target_addr;
+
+	/*
+	 * Candidate target addresses, in the order they should be tried (see
+	 * struct gwp_dns_entry). A name that resolves to several addresses
+	 * fills all of them, so a dead address can be stepped over instead of
+	 * failing the connection; a literal IP, a transparent redirect or an
+	 * upstream proxy fills exactly one.
+	 *
+	 * @nr_cand is how many are valid, @next_cand the index of the first
+	 * one not yet tried. target_addr always holds the candidate currently
+	 * being attempted -- it is re-copied from here on every attempt, since
+	 * a "-j DNAT" rule rewrites it in place.
+	 */
+	struct gwp_sockaddr	cand[GWP_MAX_CONN_CAND];
+	uint8_t			nr_cand;
+	uint8_t			next_cand;
+
+	/*
+	 * Connect attempts still in flight, one slot per candidate already
+	 * started, -1 when idle. Happy Eyeballs races several at once, so the
+	 * winner is not known until one of them reports success; the winning
+	 * fd then moves into target.fd and the rest are closed.
+	 *
+	 * @attempt_timer_fd fires when the next attempt should be started. It
+	 * is separate from timer_fd, which bounds the whole connect.
+	 */
+	int			attempt_fd[GWP_MAX_CONN_CAND];
+	int			attempt_timer_fd;
+
+	/*
+	 * The address each attempt actually dialled, captured after the ACL
+	 * ran. It is not simply cand[slot]: a "-j DNAT" rule rewrites the
+	 * destination in place, so the winner must be reported (and used for
+	 * up_dst) as the rewritten address, not the resolved one.
+	 */
+	struct gwp_sockaddr	attempt_addr[GWP_MAX_CONN_CAND];
 
 	/*
 	 * The hostname the client asked for, when it used a domain target
@@ -599,6 +688,24 @@ bool gwp_ctx_acl_output_dnat(struct gwp_ctx *ctx,
 
 /* Convenience wrapper: ACL OUTPUT check for a TCP target (gcp->target_addr). */
 bool gwp_ctx_acl_target_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp);
+
+/*
+ * Install the addresses the connect path may try, in priority order, and reset
+ * the attempt cursor. At most GWP_MAX_CONN_CAND are kept.
+ */
+void gwp_conn_set_candidates(struct gwp_conn_pair *gcp,
+			     const struct gwp_sockaddr *addrs, uint8_t nr);
+/* The one-address case: a literal IP, a transparent redirect, an upstream. */
+void gwp_conn_set_single_candidate(struct gwp_conn_pair *gcp,
+				   const struct gwp_sockaddr *addr);
+
+/*
+ * Close every connect attempt still in flight and the attempt timer, e.g. once
+ * one attempt has won the race or the pair is being torn down. Returns how many
+ * descriptors were closed, which the epoll loop credits to its accept-rearm
+ * accounting.
+ */
+int gwp_conn_close_attempts(struct gwp_conn_pair *gcp);
 
 /* True if the ACL INPUT chain permits an incoming client for @proto (allow-all
  * with no ACL). */
