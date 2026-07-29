@@ -99,9 +99,12 @@ void gwp_acl_destroy(struct gwp_acl *acl);
  *   @dnat_applied  true if a -j DNAT rule matched; @dnat then holds the rewrite.
  *   @mark_set/@mark  true and the fwmark from the last matched -j MARK rule.
  *                    MARK is a composable modifier: it records state and eval
- *                    keeps matching (only ACCEPT/REJECT/DNAT terminate).
+ *                    keeps matching, so a later rule (or the policy) decides
+ *                    the verdict -- unless that rule carries --accept, which
+ *                    makes it terminal and accept on the spot.
  *   @bind    the source/interface from the last matched -j BIND rule (also a
- *            composable modifier); @bind.set is false when none matched.
+ *            composable modifier, and likewise terminal with --accept);
+ *            @bind.set is false when none matched.
  */
 struct gwp_acl_req {
 	/* Inputs (pointer-sized members first). */

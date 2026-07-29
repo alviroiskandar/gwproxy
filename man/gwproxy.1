@@ -250,7 +250,11 @@ connection can accumulate a mark and still fall through to a terminal
 .BR ACCEPT / REJECT / DNAT
 or the chain policy. The last matching
 .B \-j MARK
-wins. Like
+wins. Add
+.B \-\-accept
+(see below) to make a single rule set the mark
+.I and
+terminate. Like
 .BR "\-j BIND" ,
 it is
 .I strict:
@@ -278,8 +282,9 @@ tunnel. At least one of
 .B \-\-to\-iface
 is required. Like
 .BR MARK ,
-it is a composable modifier (the last match wins) and applies to the same TCP
-target connections. It
+it is a composable modifier (the last match wins), takes
+.B \-\-accept
+the same way, and applies to the same TCP target connections. It
 .I replaces
 the global
 .BR \-\-bind\-source / \-\-bind\-iface
@@ -312,6 +317,36 @@ clash), and defeats multi\-address racing and fallback, since two attempts of
 one connection cannot share a source port; omit the port (the default) for an
 ephemeral source port.
 .RE
+.IP
+.B \-\-accept
+.IP
+Valid only on
+.BR "\-j MARK" " and " "\-j BIND" ,
+and takes no argument: apply the modifier and then stop traversing the chain,
+accepting the connection. It turns a composable modifier into a terminal action,
+so
+.RS
+.IP
+.EX
+\-A OUTPUT \-d 1.2.3.4/32 \-j BIND \-\-to\-source 192.168.1.2 \-\-accept
+.EE
+.RE
+.IP
+does the work of a
+.B \-j BIND
+rule followed by an identically matched
+.BR "\-j ACCEPT" ,
+in one rule and one match. That is the point: a chain that would otherwise test
+the same condition twice tests it once. A rule that does not match is unaffected
+\(em
+.B \-\-accept
+only fires when the rule fires.
+.IP
+It is rejected on
+.BR ACCEPT " and " REJECT ,
+where it is respectively redundant and self\-contradictory, and on
+.BR DNAT ,
+which already terminates. Its position among a rule's options does not matter.
 .IP
 Addresses match IPv4 and its IPv4\-mapped IPv6 form equally. A rejected target
 is refused (SOCKS5 reply
