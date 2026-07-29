@@ -425,6 +425,7 @@ static void test_auth_userpass(void)
 	assert(!r);
 	assert(auth);
 	cfg.auth = auth;
+	cfg.udp_associate = true;
 	r = gwp_socks5_ctx_init(&ctx, &cfg);
 	assert(!r);
 	assert(ctx);
@@ -535,6 +536,7 @@ static void test_auth_userpass_empty_password(void)
 	assert(!r);
 	assert(auth);
 	cfg.auth = auth;
+	cfg.udp_associate = true;
 	r = gwp_socks5_ctx_init(&ctx, &cfg);
 	assert(!r);
 	assert(ctx);
@@ -911,6 +913,7 @@ static void test_enobufs_combined_with_multi_state_at_once(void)
 	assert(!r);
 	assert(auth);
 	cfg.auth = auth;
+	cfg.udp_associate = true;
 	r = gwp_socks5_ctx_init(&ctx, &cfg);
 	assert(!r);
 	assert(ctx);

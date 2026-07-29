@@ -118,6 +118,20 @@ Run as a SOCKS5 proxy. Default:
 Run as an HTTP proxy (CONNECT and forwarding). Default:
 .BR 0 .
 .TP
+.BR \-U ", " \-\-udp\-associate=\fI0|1\fR
+Allow the SOCKS5
+.B UDP ASSOCIATE
+command. When
+.BR 0 ,
+the proxy rejects it with reply
+.B 0x07
+(command not supported), leaving TCP
+.B CONNECT
+unaffected; only meaningful with
+.BR \-\-as\-socks5 .
+Default:
+.BR 1 .
+.TP
 .BR \-R ", " \-\-as\-transparent=\fI0|1\fR
 Run as a transparent proxy, taking the target from
 .B SO_ORIGINAL_DST
@@ -149,6 +163,179 @@ credentials, one per line, shared by SOCKS5 (RFC 1929) and HTTP "Basic" (RFC
 credentials. The file is watched and hot\-reloaded on change. Without it, no
 authentication is required (see
 .BR "AUTHENTICATION" ).
+.SS Access control
+.TP
+.BR \-a ", " \-\-acl\-file=\fIfile\fR
+Load an iptables\-style access\-control list that filters incoming clients
+.RB ( INPUT " chain)"
+and outgoing targets
+.RB ( OUTPUT " chain)."
+The file is watched and hot\-reloaded on change, and a malformed file is
+rejected (at startup, or by keeping the previous rules on reload). When
+.B \-\-acl\-file
+is not given, a built\-in default ACL is applied instead (see
+.BR \-\-acl\-allow\-all
+below). Each line is one directive, evaluated top\-to\-bottom
+with first\-match\-wins; a chain's policy applies when nothing matches:
+.RS
+.IP \(bu 3
+.BI "\-P " "chain target"
+\(em set a chain's default policy
+.RB ( ACCEPT " or " REJECT ).
+.IP \(bu 3
+.BI "\-A " "chain [matches] " "\fB\-j\fR " target
+\(em append a rule. Matches, each negatable with a leading
+.BR ! :
+.BR \-s / \-\-source " and " \-d / \-\-destination " (" IP/CIDR ", "
+.B \-d
+is
+.BR OUTPUT "-only), " "\-m domain \-\-domain" " (" OUTPUT "-only, target"
+hostname; or
+.B \-\-domain\-regexp
+for a PCRE match, see below),
+.BR "\-m user \-\-user" " (" OUTPUT "-only, the authenticated username; or"
+.B \-\-user\-regexp
+for a PCRE match),
+.BR \-p / \-\-protocol " (" tcp / udp "), " \-\-sports " and " \-\-dports
+(a port, a
+.IR lo \- hi
+range, or a comma list;
+.B \-\-dports
+is
+.BR OUTPUT "-only). The target is " ACCEPT ", " REJECT ", " DNAT
+.RB ( OUTPUT "-only) with " \-\-to\-destination " " \fIaddr\fR [ :\fIport\fR ],
+which rewrites the destination (address and/or port, either optional) and, like
+iptables, is terminal \(em it accepts the connection and stops matching (DNAT
+applies to SOCKS5, HTTP, plain and transparent forwarding and, when chaining, to
+the destination handed to an upstream proxy \(em including replacing a
+.B socks5h://
+hostname with the rewritten IP \(em but not the UDP relay), or
+.B MARK
+.RB ( OUTPUT "-only) with " \-\-set\-mark " " \fInum\fR "."
+.IP
+.B \-j MARK
+sets the fwmark
+.RB ( SO_MARK )
+on the outgoing target socket, overriding the global
+.BR \-\-mark ,
+for policy routing / iptables matching. Unlike iptables it is a
+.I composable modifier
+here, not a terminal action: it records the mark and eval keeps matching, so a
+connection can accumulate a mark and still fall through to a terminal
+.BR ACCEPT / REJECT / DNAT
+or the chain policy. The last matching
+.B \-j MARK
+wins. Like
+.BR "\-j BIND" ,
+it is
+.I strict:
+if setting
+.B SO_MARK
+fails (it needs
+.BR CAP_NET_ADMIN )
+the connection is dropped rather than egressing unmarked via the wrong route.
+It applies to TCP target connections (SOCKS5, HTTP, plain and transparent), not
+the UDP relay. (The coarse global
+.B \-\-mark
+remains best\-effort.)
+.IP
+.B \-j BIND
+.RB ( OUTPUT "-only) with " \-\-to\-source " " \fIaddr\fR [ :\fIport\fR ] " and/or"
+.B \-\-to\-iface
+.IR ifname ,
+pins the outgoing connection to a source address (and/or port) and/or a network
+interface \(em e.g. to route a given user's egress out of a specific WireGuard
+tunnel. At least one of
+.B \-\-to\-source
+/
+.B \-\-to\-iface
+is required. Like
+.BR MARK ,
+it is a composable modifier (the last match wins) and applies to the same TCP
+target connections. It is
+.I strict:
+if binding the interface
+.RB ( SO_BINDTODEVICE )
+or the source address
+.RB ( bind (2))
+fails \(em including a
+.B \-\-to\-source
+whose address family does not match the target \(em the connection is dropped
+rather than continued on the wrong source. It generally needs
+.BR CAP_NET_ADMIN .
+Binding a fixed source
+.I port
+limits concurrency to one connection per identical destination (a 4\-tuple
+clash); omit the port (the default) for an ephemeral source port.
+.RE
+.IP
+Addresses match IPv4 and its IPv4\-mapped IPv6 form equally. A rejected target
+is refused (SOCKS5 reply
+.BR 0x02 ,
+HTTP
+.BR 403 );
+a rejected client connection is closed.
+.IP
+.B \-\-domain\-regexp
+.I pattern
+(an alternative to
+.BR \-\-domain ,
+also under
+.BR "\-m domain" )
+matches the requested hostname with a PCRE. It requires a build with PCRE2
+support (see
+.BR "AVAILABILITY" )
+and is rejected otherwise. The pattern is matched
+.I raw
+and unanchored (case\-insensitively): it can match anywhere in the hostname
+unless you anchor it yourself with
+.BR ^ " and " $ .
+A pattern must contain no whitespace (rules are whitespace\-tokenised).
+.IP
+.BR "\-m user \-\-user" " " \fIname\fR
+matches the username the client authenticated as (via
+.BR \-\-auth\-file );
+.B \-\-user\-regexp
+takes a PCRE instead (case\-sensitive, raw/unanchored, needs
+.BR \-\-use\-pcre ).
+It is
+.B OUTPUT
+\-only and matches nothing when the connection is unauthenticated, so it only
+has effect together with
+.BR \-\-auth\-file .
+The
+.BR \-\-user\-regexp
+option, like
+.BR \-\-domain\-regexp ,
+requires a PCRE2 build.
+.TP
+.B \-\-acl\-allow\-all
+Do not apply the built\-in default ACL; allow all targets (the behaviour before
+a default ACL existed). This is ignored when
+.B \-\-acl\-file
+is given \(em the file's rules always apply as written.
+.PP
+.RS
+When neither
+.B \-\-acl\-file
+nor
+.B \-\-acl\-allow\-all
+is given, gwproxy applies a built\-in default ACL that rejects outgoing
+connections to loopback and private address ranges (SSRF hardening) while
+accepting all clients:
+.RS
+.nf
+\-P INPUT ACCEPT
+\-A OUTPUT \-d 10.0.0.0/8 \-j REJECT
+\-A OUTPUT \-d 127.0.0.0/8 \-j REJECT
+\-A OUTPUT \-d 192.168.0.0/16 \-j REJECT
+\-A OUTPUT \-d 172.16.0.0/12 \-j REJECT
+\-A OUTPUT \-d fe80::/10 \-j REJECT
+\-A OUTPUT \-d fc00::/7 \-j REJECT
+\-P OUTPUT ACCEPT
+.fi
+.RE
+.RE
 .SS TLS termination (HTTPS proxy)
 These options require a build with OpenSSL support (see
 .BR "AVAILABILITY" ).
@@ -496,6 +683,13 @@ builds the raw DNS resolver, enabling
 .B \-\-raw\-dns
 and
 .BR \-\-dns\-server .
+.IP \(bu 3
+.B \-\-use\-pcre
+builds PCRE2 regexp matches for the ACL, enabling
+.B \-\-domain\-regexp
+and
+.BR \-\-user\-regexp ;
+without it those rule options are rejected.
 .PP
 Options for features not compiled in are rejected. Run
 .B ./configure \-\-help

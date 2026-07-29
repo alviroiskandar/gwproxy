@@ -11,6 +11,7 @@
 #include <gwproxy/ev/io_uring.h>
 #include <gwproxy/gwproxy.h>
 #include <gwproxy/common.h>
+#include <gwproxy/acl.h>
 #include <stdlib.h>
 #include <inttypes.h>
 #include <sys/eventfd.h>
@@ -874,6 +875,12 @@ static int __handle_ev_accept(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 	int fd = cqe->res, tg_fd, r;
 	struct gwp_conn_pair *gcp;
 	struct gwp_sockaddr tdst;
+	/* The plain/transparent forwarding target, possibly DNAT-rewritten. For
+	 * SOCKS5/HTTP it stays the --target placeholder set during the handshake. */
+	struct gwp_sockaddr fwd_target = ctx->target_addr;
+	/* Per-conn ACL socket options (-j MARK/BIND) for the plain/transparent
+	 * path; copied onto the gcp once it exists. */
+	struct gwp_conn_sockopt fwd_so;
 
 	if (unlikely(fd < 0)) {
 		if (fd == -EAGAIN || fd == -EINTR)
@@ -881,6 +888,14 @@ static int __handle_ev_accept(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 
 		/* Resource errors are classified and logged by handle_ev_accept(). */
 		return fd;
+	}
+
+	if (!gwp_ctx_acl_client_allowed(ctx, &w->iou->accept_addr,
+					GWP_ACL_PROTO_TCP)) {
+		pr_info(&ctx->lh, "ACL denied client %s",
+			ip_to_str(&w->iou->accept_addr));
+		prep_close(w, fd);
+		return 0;
 	}
 
 	/* Transparent proxy: take the target from SO_ORIGINAL_DST. */
@@ -897,15 +912,28 @@ static int __handle_ev_accept(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 	if (!ctx->cfg.as_socks5 && !ctx->cfg.as_http) {
 		struct gwp_sockaddr *ca;
 
-		/* Connect to the upstream proxy, the original dst, or --target. */
-		if (ctx->upstream.enabled)
-			ca = &ctx->upstream.addr;
-		else if (transparent)
-			ca = &tdst;
-		else
-			ca = &ctx->target_addr;
+		/*
+		 * Plain and transparent forwarding connect at accept time (no
+		 * handshake, no reply): enforce the OUTPUT chain on the ultimate
+		 * target and drop the connection if it is denied. A -j DNAT rule
+		 * rewrites fwd_target in place, which is then used for both the
+		 * socket and gcp->target_addr below.
+		 */
+		fwd_target = transparent ? tdst : ctx->target_addr;
+		if (!gwp_ctx_acl_output_dnat(ctx, &w->iou->accept_addr,
+					     &fwd_target, &fwd_so,
+					     GWP_ACL_PROTO_TCP)) {
+			pr_info(&ctx->lh, "ACL denied target %s for client %s",
+				ip_to_str(&fwd_target),
+				ip_to_str(&w->iou->accept_addr));
+			prep_close(w, fd);
+			return 0;
+		}
 
-		tg_fd = gwp_create_sock_target(w, ca, NULL, false);
+		/* Connect to the upstream proxy or the (rewritten) target. */
+		ca = ctx->upstream.enabled ? &ctx->upstream.addr : &fwd_target;
+
+		tg_fd = gwp_create_sock_target(w, ca, &fwd_so, NULL, false);
 		if (unlikely(tg_fd < 0)) {
 			pr_err(&ctx->lh, "Create target socket: %s", strerror(-tg_fd));
 			goto out_close;
@@ -926,7 +954,7 @@ static int __handle_ev_accept(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 	gcp->client.fd = fd;
 	gcp->target.fd = tg_fd;
 	gcp->client_addr = w->iou->accept_addr;
-	gcp->target_addr = transparent ? tdst : ctx->target_addr;
+	gcp->target_addr = fwd_target;
 	gcp->is_target_alive = false;
 	r = arm_gcp(w, gcp);
 	if (unlikely(r))
@@ -1590,6 +1618,34 @@ static int handle_ev_target_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	return 0;
 }
 
+/*
+ * The ACL rejected this target: queue a client reply (SOCKS5 REP 0x02, or HTTP
+ * 403) and return an error so the connection is torn down. The reply send is
+ * best-effort (it may be cancelled by the teardown), matching the other
+ * io_uring rejection paths.
+ */
+static int acl_reject_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	pr_info(&w->ctx->lh, "ACL denied target %s for client %s (idx=%u)",
+		ip_to_str(&gcp->target_addr), ip_to_str(&gcp->client_addr),
+		gcp->idx);
+
+	if (gcp->prot_type == GWP_PROT_TYPE_SOCKS5) {
+		if (!gwp_socks5_prep_connect_reply(w, gcp, -EACCES))
+			prep_send_client(w, gcp);
+	} else if (gcp->prot_type == GWP_PROT_TYPE_HTTP) {
+		int r = gwp_http_build_forbidden_reply(
+				gcp->target.buf + gcp->target.len,
+				gcp->target.cap - gcp->target.len);
+
+		if (r >= 0) {
+			gcp->target.len += (uint32_t)r;
+			prep_send_client(w, gcp);
+		}
+	}
+	return -EACCES;
+}
+
 static int handle_prot_connect_target(struct gwp_wrk *w,
 				      struct gwp_conn_pair *gcp)
 {
@@ -1597,11 +1653,14 @@ static int handle_prot_connect_target(struct gwp_wrk *w,
 	struct gwp_sockaddr *ca = &gcp->target_addr;
 	int r;
 
+	if (!gwp_ctx_acl_target_allowed(ctx, gcp))
+		return acl_reject_target(w, gcp);
+
 	/* The socket connects to the upstream proxy when enabled. */
 	if (ctx->upstream.enabled)
 		ca = &ctx->upstream.addr;
 
-	r = gwp_create_sock_target(w, ca, NULL, false);
+	r = gwp_create_sock_target(w, ca, &gcp->acl_sockopt, NULL, false);
 	if (r < 0) {
 		pr_err(&w->ctx->lh, "Create target socket: %s", strerror(-r));
 		return r;
@@ -1743,6 +1802,11 @@ static int handle_ev_udp_relay(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		if (gwp_socks5_udp_parse_hdr(base, (size_t)n, &dst, &hdr_len) ||
 		    gwp_socks5_addr_to_sockaddr(&dst, &tsa, &tslen)) {
 			prep_udp_recv(w, gcp);	/* bad header or domain target */
+			return 0;
+		}
+		if (!gwp_ctx_acl_output_allowed(w->ctx, &gcp->udp_peer, &tsa,
+						GWP_ACL_PROTO_UDP)) {
+			prep_udp_recv(w, gcp);	/* ACL denied this datagram */
 			return 0;
 		}
 		prep_udp_send(w, gcp, base + hdr_len, (size_t)n - hdr_len,
@@ -1937,13 +2001,45 @@ static void prep_auth_reload(struct gwp_wrk *w)
 	s->user_data = EV_BIT_IOU_SOCKS5_AUTH_FILE;
 }
 
-static int handle_ev_auth_file(struct gwp_wrk *w)
+static int handle_ev_auth_file(struct gwp_wrk *w, int res)
 {
 	struct gwp_ctx *ctx = w->ctx;
 
 	prep_auth_reload(w);
+	if (res <= 0 || !gwp_inotify_event_matches(ctx->ino_buf, (size_t)res,
+						   ctx->cfg.auth_file))
+		return 0;
+
 	gwp_auth_reload(ctx->auth);
 	pr_info(&ctx->lh, "Reloaded authentication file");
+	return 0;
+}
+
+static void prep_acl_reload(struct gwp_wrk *w)
+{
+	static const size_t l = sizeof(struct inotify_event) + NAME_MAX + 1;
+	struct gwp_ctx *ctx = w->ctx;
+	struct io_uring_sqe *s;
+
+	assert(ctx->acl);
+	s = get_sqe_nofail(w);
+	io_uring_prep_read(s, ctx->acl_ino_fd, ctx->acl_ino_buf, l, 0);
+	s->user_data = EV_BIT_IOU_ACL_FILE;
+}
+
+static int handle_ev_acl_file(struct gwp_wrk *w, int res)
+{
+	struct gwp_ctx *ctx = w->ctx;
+
+	prep_acl_reload(w);
+	if (res <= 0 || !gwp_inotify_event_matches(ctx->acl_ino_buf, (size_t)res,
+						   ctx->cfg.acl_file))
+		return 0;
+
+	if (gwp_acl_reload(ctx->acl))
+		pr_warn(&ctx->lh, "Failed to reload ACL file; keeping current rules");
+	else
+		pr_info(&ctx->lh, "Reloaded ACL file");
 	return 0;
 }
 
@@ -2030,7 +2126,10 @@ static int handle_event(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 		break;
 	case EV_BIT_IOU_SOCKS5_AUTH_FILE:
 		pr_dbg(&ctx->lh, "Handling SOCKS5 auth file reload event: %d", cqe->res);
-		return handle_ev_auth_file(w);
+		return handle_ev_auth_file(w, cqe->res);
+	case EV_BIT_IOU_ACL_FILE:
+		pr_dbg(&ctx->lh, "Handling ACL file reload event: %d", cqe->res);
+		return handle_ev_acl_file(w, cqe->res);
 	case EV_BIT_IOU_TARGET_CANCEL:
 		gcp = udata;
 		pr_dbg(&ctx->lh, "Handling target cancel event: %d", cqe->res);
@@ -2128,6 +2227,9 @@ int gwp_ctx_thread_entry_io_uring(struct gwp_wrk *w)
 
 	if (w->idx == 0 && ctx->ino_fd >= 0)
 		prep_auth_reload(w);
+
+	if (w->idx == 0 && ctx->acl_ino_fd >= 0)
+		prep_acl_reload(w);
 
 	io_uring_set_iowait(&w->iou->ring, false);
 	arm_accept(w);

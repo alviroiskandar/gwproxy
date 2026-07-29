@@ -52,7 +52,7 @@ count_rule()
 before="$(count_rule)"
 
 $SUDO "$GWPROXY" --bind="127.0.0.1:$pp" --target="127.0.0.1:$hp" --mark="$MARK" \
-	--nr-workers=1 --log-level=3 >"$WORK/gwp.log" 2>&1 &
+	--acl-allow-all --nr-workers=1 --log-level=3 >"$WORK/gwp.log" 2>&1 &
 wait_listen "$pp" \
 	|| { sed 's/^/# gwp: /' "$WORK/gwp.log" >&2; fail "gwproxy did not listen on $pp"; }
 

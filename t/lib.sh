@@ -50,6 +50,14 @@ require_io_uring()
 		skip "gwproxy built without io_uring"
 }
 
+# Skip unless gwproxy was built with PCRE2 support (--use-pcre), needed by the
+# ACL --domain-regexp / --user-regexp matches.
+require_pcre()
+{
+	grep -q 'CONFIG_PCRE' "$ROOT/config.h" 2>/dev/null || \
+		skip "gwproxy built without PCRE (--use-pcre)"
+}
+
 # Skip unless gwproxy advertises a given long option in --help.
 require_opt()
 {
@@ -91,11 +99,22 @@ wait_listen()
 # gwp_start <bind> [args...]: start gwproxy bound to <bind> (e.g. "[::1]:1080"
 # or "127.0.0.1:1080") and wait until it is listening. Sets GWP_PID. The log
 # is captured under $WORK and dumped on failure.
+#
+# gwproxy applies a built-in default ACL (blocking loopback/private targets)
+# when no --acl-file is given. The test servers live on loopback, so unless a
+# test opts into the ACL (its own --acl-file) or already disables it, inject
+# --acl-allow-all so proxying to loopback works -- restoring the pre-default
+# "no ACL" behaviour these tests were written against.
 gwp_start()
 {
 	local bind="$1"; shift
 	local port="${bind##*:}"
 	local log="$WORK/gwp.$port.log"
+
+	case " $* " in
+	*" --acl-file"*|*" --acl-allow-all "*) ;;
+	*) set -- "$@" --acl-allow-all ;;
+	esac
 
 	"$GWPROXY" --bind="$bind" --log-level=3 "$@" >"$log" 2>&1 &
 	local pid=$!

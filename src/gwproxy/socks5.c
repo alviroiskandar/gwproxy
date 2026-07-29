@@ -26,10 +26,14 @@ int gwp_socks5_ctx_init(struct gwp_socks5_ctx **ctx_p,
 
 	/*
 	 * The credential store is owned by the caller (shared with the HTTP
-	 * proxy front-end); we only borrow the pointer.
+	 * proxy front-end); we only borrow the pointer. A NULL cfg means
+	 * "defaults": no auth, and UDP ASSOCIATE enabled (the standard command).
 	 */
-	if (cfg)
+	ctx->udp_associate = true;
+	if (cfg) {
 		ctx->auth = cfg->auth;
+		ctx->udp_associate = cfg->udp_associate;
+	}
 
 	*ctx_p = ctx;
 	return 0;
@@ -67,6 +71,11 @@ void gwp_socks5_conn_free(struct gwp_socks5_conn *conn)
 
 	atomic_fetch_sub(&conn->ctx->nr_clients, 1);
 	free(conn);
+}
+
+const char *gwp_socks5_conn_username(const struct gwp_socks5_conn *conn)
+{
+	return (conn && conn->user_len) ? conn->user : NULL;
 }
 
 struct data_arg {
@@ -311,6 +320,10 @@ static int handle_state_auth_userpass(struct data_arg *d)
 		/* STATUS = 0x00 (success) */
 		resp[1] = 0x00;
 		d->conn->state = GWP_SOCKS5_ST_CMD;
+		/* Remember the username for ACL "-m user" matching (ulen <= 255). */
+		memcpy(d->conn->user, u, ulen);
+		d->conn->user[ulen] = '\0';
+		d->conn->user_len = (uint8_t)ulen;
 	} else {
 		/* STATUS = 0x01 (failure) */
 		resp[1] = 0x01;
@@ -539,6 +552,9 @@ static int handle_state_cmd(struct data_arg *d)
 	case 0x01: /* CONNECT */
 		return handle_cmd_connect(d);
 	case 0x03: /* UDP ASSOCIATE */
+		if (!d->ctx->udp_associate)
+			return set_err_reply(d,
+					GWP_SOCKS5_REP_COMMAND_NOT_SUPPORTED);
 		return handle_cmd_udp_associate(d);
 
 	/*

@@ -7,6 +7,7 @@
 #endif
 #include <gwproxy/ev/epoll.h>
 #include <gwproxy/common.h>
+#include <gwproxy/acl.h>
 #include <stdlib.h>
 #include <inttypes.h>
 #include <sys/epoll.h>
@@ -206,6 +207,14 @@ int gwp_ctx_init_thread_epoll(struct gwp_wrk *w)
 			goto out_free_events;
 	}
 
+	if (w->idx == 0 && (ctx->acl_ino_fd >= 0)) {
+		ev.events = EPOLLIN;
+		ev.data.u64 = EV_BIT_ACL_FILE;
+		r = __sys_epoll_ctl(ep_fd, EPOLL_CTL_ADD, ctx->acl_ino_fd, &ev);
+		if (unlikely(r))
+			goto out_free_events;
+	}
+
 	r = register_dns_to_epoll(w);
 	if (r)
 		goto out_free_events;
@@ -377,11 +386,24 @@ static int handle_new_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		bool *p = &gcp->is_target_alive;
 		struct gwp_sockaddr *ca = &gcp->target_addr;
 
+		/*
+		 * Plain and transparent forwarding connect at accept time (no
+		 * SOCKS5/HTTP handshake, hence no reply): enforce the OUTPUT
+		 * chain here and drop the connection if the target is denied.
+		 */
+		if (!gwp_ctx_acl_target_allowed(ctx, gcp)) {
+			pr_info(&ctx->lh, "ACL denied target %s for client %s",
+				ip_to_str(&gcp->target_addr),
+				ip_to_str(&gcp->client_addr));
+			return -EACCES;
+		}
+
 		/* With an upstream proxy, connect to the proxy instead. */
 		if (ctx->upstream.enabled)
 			ca = &ctx->upstream.addr;
 
-		target_fd = gwp_create_sock_target(w, ca, p, true);
+		target_fd = gwp_create_sock_target(w, ca, &gcp->acl_sockopt, p,
+						   true);
 		if (target_fd < 0) {
 			pr_err(&ctx->lh, "Failed to create target socket: %s",
 				strerror(-target_fd));
@@ -516,6 +538,14 @@ static int __handle_ev_accept(struct gwp_wrk *w)
 	gcp->client.fd = fd;
 	pr_dbg(&ctx->lh, "New connection from %s (fd=%d)",
 		ip_to_str(&gcp->client_addr), fd);
+
+	if (!gwp_ctx_acl_client_allowed(ctx, &gcp->client_addr,
+					GWP_ACL_PROTO_TCP)) {
+		pr_info(&ctx->lh, "ACL denied client %s",
+			ip_to_str(&gcp->client_addr));
+		free_conn_pair(w, gcp);
+		return 0;
+	}
 
 	if (cfg->as_transparent) {
 		r = gwp_get_orig_dst(fd, &gcp->client_addr, &gcp->target_addr);
@@ -1475,11 +1505,49 @@ static int handle_ev_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 }
 
 __hot
+/*
+ * The ACL rejected this target: tell the client (SOCKS5 REP 0x02, or HTTP 403)
+ * and return an error so the caller tears the connection down. The reply is
+ * sent synchronously here, so it works from both the handshake and the async
+ * DNS-completion callers of handle_connect().
+ */
+static int acl_reject_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	pr_info(&w->ctx->lh, "ACL denied target %s for client %s (idx=%u)",
+		ip_to_str(&gcp->target_addr), ip_to_str(&gcp->client_addr),
+		gcp->idx);
+
+	if (gcp->prot_type == GWP_PROT_TYPE_SOCKS5) {
+		int r = prep_and_send_socks5_rep_connect(w, gcp, -EACCES);
+
+		if (r)
+			return r;
+	} else if (gcp->prot_type == GWP_PROT_TYPE_HTTP) {
+		int r = gwp_http_build_forbidden_reply(
+				gcp->target.buf + gcp->target.len,
+				gcp->target.cap - gcp->target.len);
+
+		if (r < 0)
+			return r;
+		gcp->target.len += (uint32_t)r;
+		if (gcp->target.len) {
+			ssize_t sr = __do_send(&gcp->target, &gcp->client);
+
+			if (sr < 0)
+				return (int)sr;
+		}
+	}
+	return -EACCES;
+}
+
 static int handle_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct epoll_event ev;
 	int tfd, r;
 	bool *p;
+
+	if (!gwp_ctx_acl_target_allowed(w->ctx, gcp))
+		return acl_reject_target(w, gcp);
 
 	if (gcp->timer_fd >= 0) {
 		/*
@@ -1500,9 +1568,11 @@ static int handle_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	p = &gcp->is_target_alive;
 	if (w->ctx->upstream.enabled) {
 		/* Connect to the upstream proxy, not the real destination. */
-		tfd = gwp_create_sock_target(w, &w->ctx->upstream.addr, p, true);
+		tfd = gwp_create_sock_target(w, &w->ctx->upstream.addr,
+					     &gcp->acl_sockopt, p, true);
 	} else {
-		tfd = gwp_create_sock_target(w, &gcp->target_addr, p, true);
+		tfd = gwp_create_sock_target(w, &gcp->target_addr,
+					     &gcp->acl_sockopt, p, true);
 	}
 	if (unlikely(tfd < 0)) {
 		pr_err(&w->ctx->lh, "Failed to create target socket: %s", strerror(-tfd));
@@ -1656,8 +1726,41 @@ static int handle_ev_auth_file(struct gwp_wrk *w)
 		return (int)r;
 	}
 
+	if (!gwp_inotify_event_matches(w->ctx->ino_buf, (size_t)r,
+				       w->ctx->cfg.auth_file))
+		return 0;
+
 	gwp_auth_reload(w->ctx->auth);
 	pr_info(&w->ctx->lh, "Reloaded authentication file");
+	return 0;
+}
+
+static int handle_ev_acl_file(struct gwp_wrk *w)
+{
+	static const size_t l = sizeof(struct inotify_event) + NAME_MAX + 1;
+	struct gwp_ctx *ctx = w->ctx;
+	ssize_t r;
+
+	assert(ctx->acl);
+
+	r = __sys_read(ctx->acl_ino_fd, ctx->acl_ino_buf, l);
+	if (unlikely(r < 0)) {
+		if (r == -EINTR || r == -EAGAIN)
+			return 0;
+
+		pr_err(&ctx->lh, "Failed to read ACL inotify event: %s",
+			strerror((int)-r));
+		return (int)r;
+	}
+
+	if (!gwp_inotify_event_matches(ctx->acl_ino_buf, (size_t)r,
+				       ctx->cfg.acl_file))
+		return 0;
+
+	if (gwp_acl_reload(ctx->acl))
+		pr_warn(&ctx->lh, "Failed to reload ACL file; keeping current rules");
+	else
+		pr_info(&ctx->lh, "Reloaded ACL file");
 	return 0;
 }
 
@@ -1773,6 +1876,9 @@ static int handle_ev_udp_relay(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 				continue;
 			if (gwp_socks5_addr_to_sockaddr(&dst, &tsa, &tslen))
 				continue;	/* domain target: unsupported */
+			if (!gwp_ctx_acl_output_allowed(w->ctx, &gcp->udp_peer,
+							&tsa, GWP_ACL_PROTO_UDP))
+				continue;	/* ACL denied this datagram */
 			__sys_sendto(fd, buf + off + hdr_len,
 				     (size_t)n - hdr_len, MSG_NOSIGNAL,
 				     &tsa.sa, tslen);
@@ -2169,6 +2275,9 @@ static int handle_event(struct gwp_wrk *w, struct epoll_event *ev)
 		break;
 	case EV_BIT_SOCKS5_AUTH_FILE:
 		r = handle_ev_auth_file(w);
+		break;
+	case EV_BIT_ACL_FILE:
+		r = handle_ev_acl_file(w);
 		break;
 	case EV_BIT_RAW_DNS_QUERY:
 		r = handle_ev_raw_dns_query(w);

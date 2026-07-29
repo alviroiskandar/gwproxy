@@ -320,7 +320,8 @@ static int base64_decode(const char *in, size_t inlen, unsigned char *out,
 	return (int)olen;
 }
 
-bool gwp_auth_check_basic(struct gwp_auth *auth, const char *hdr_val)
+bool gwp_auth_check_basic_ex(struct gwp_auth *auth, const char *hdr_val,
+			     char *user_out, size_t user_cap)
 {
 	unsigned char dec[GWP_AUTH_BASIC_DEC_MAX];
 	const char *b64;
@@ -351,6 +352,20 @@ bool gwp_auth_check_basic(struct gwp_auth *auth, const char *hdr_val)
 
 	ulen = (size_t)((const unsigned char *)colon - dec);
 	plen = (size_t)dlen - ulen - 1;
-	return gwp_auth_check(auth, (const char *)dec, ulen,
-			      (const char *)colon + 1, plen);
+	if (!gwp_auth_check(auth, (const char *)dec, ulen,
+			    (const char *)colon + 1, plen))
+		return false;
+
+	if (user_out && user_cap) {
+		size_t n = ulen < user_cap - 1 ? ulen : user_cap - 1;
+
+		memcpy(user_out, dec, n);
+		user_out[n] = '\0';
+	}
+	return true;
+}
+
+bool gwp_auth_check_basic(struct gwp_auth *auth, const char *hdr_val)
+{
+	return gwp_auth_check_basic_ex(auth, hdr_val, NULL, 0);
 }
