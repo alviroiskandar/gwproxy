@@ -16,6 +16,11 @@
 # Covered, on every event loop:
 #   * --bind-source alone pins the source address, in both the "ip" and the
 #     "ip:port" spelling;
+#   * the "ip:port" spelling pins the source PORT too, not just the address --
+#     the address half passing says nothing about the port half;
+#   * --bind-source applies to the hop toward an --upstream-proxy, which the
+#     manual promises and which no other case here exercises: every other
+#     assertion watches a direct target connection;
 #   * an ACL "-j BIND --to-source" rule wins over the global default;
 #   * a global source of the wrong address family is SKIPPED, not fatal: an
 #     IPv4 --bind-source must not break IPv6 targets on a dual-stack proxy;
@@ -45,12 +50,19 @@ print(s.recv(64).decode().strip())' "$1" "$2" ${3:+"$3"} 2>/dev/null
 
 pa4="$(pick_port)"
 pa6="$(pick_port)"
+pap="$(pick_port)"
 python3 "$SERVERS_DIR/peer_addr.py" 127.0.0.1 "$pa4" >"$WORK/peer4.log" 2>&1 &
 _PIDS+=("$!")
 python3 "$SERVERS_DIR/peer_addr.py" ::1 "$pa6" >"$WORK/peer6.log" 2>&1 &
 _PIDS+=("$!")
+# Reports "<ip> <port>", and also logs it to a file so it can double as the
+# stand-in upstream proxy below, where gwproxy is the one doing the dialling.
+python3 "$SERVERS_DIR/peer_addr.py" 127.0.0.1 "$pap" --with-port \
+	--log "$WORK/peerport.log" >"$WORK/peerp.log" 2>&1 &
+_PIDS+=("$!")
 wait_listen "$pa4" || fail "the IPv4 peer-address server did not start"
 wait_listen "$pa6" || fail "the IPv6 peer-address server did not start"
+wait_listen "$pap" || fail "the port-reporting peer-address server did not start"
 
 # The whole test rests on the origin seeing 127.0.0.1 when nothing is pinned,
 # and something else when a source is; if that is not true here, every
@@ -89,6 +101,38 @@ for loop in epoll io_uring; do
 	kill "$GWP_PID" 2>/dev/null
 	[ "$src" = 127.0.0.4 ] || \
 		fail "[$loop] --bind-source=ip:port did not pin the source (saw '${src:-<none>}')"
+
+	# ...and the port half of "ip:port" reaches the wire too. Asserting the
+	# address alone would pass just as well with the port silently dropped,
+	# which is the whole of what this case adds.
+	sp="$(pick_port)"
+	p="$(pick_port)"
+	gwp_start "127.0.0.1:$p" --target="127.0.0.1:$pap" --nr-workers=1 \
+		--event-loop="$loop" --bind-source="127.0.0.4:$sp"
+	srcp="$(peer_src 127.0.0.1 "$p")"
+	kill "$GWP_PID" 2>/dev/null
+	[ "$srcp" = "127.0.0.4 $sp" ] || \
+		fail "[$loop] --bind-source=ip:port did not pin the source port (wanted '127.0.0.4 $sp', saw '${srcp:-<none>}')"
+
+	# The hop toward an upstream proxy is pinned as well. peer_addr.py plays
+	# the upstream: gwproxy dials it, it records the source it was dialled
+	# from and hangs up. The SOCKS5 handshake then fails, and that is fine --
+	# the claim under test is about the source of the TCP connection to the
+	# upstream, not about the tunnel completing.
+	: >"$WORK/peerport.log"
+	p="$(pick_port)"
+	gwp_start "127.0.0.1:$p" --target="127.0.0.1:$pa4" --nr-workers=1 \
+		--event-loop="$loop" --bind-source=127.0.0.5 \
+		--upstream-proxy="socks5://127.0.0.1:$pap"
+	peer_src 127.0.0.1 "$p" >/dev/null 2>&1
+	for _ in $(seq 1 50); do
+		[ -s "$WORK/peerport.log" ] && break
+		sleep 0.1
+	done
+	kill "$GWP_PID" 2>/dev/null
+	upsrc="$(cut -d' ' -f1 <"$WORK/peerport.log" 2>/dev/null | head -1)"
+	[ "$upsrc" = 127.0.0.5 ] || \
+		fail "[$loop] --bind-source did not pin the upstream hop (saw '${upsrc:-<none>}')"
 
 	# An ACL rule overrides the global default.
 	p="$(pick_port)"
