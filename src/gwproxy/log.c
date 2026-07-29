@@ -52,6 +52,7 @@ void __pr_log(FILE *handle, int level, const char *fmt, ...)
 	fprintf(handle, "[%s][%s][%08d]: %s\n", time_buf, ls, __sys_gettid(), pb);
 	if (unlikely(pb != loc_buf))
 		free(pb);
+	fflush(handle);
 out:
 	va_end(ap2);
 	va_end(ap);
