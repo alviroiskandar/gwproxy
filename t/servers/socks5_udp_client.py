@@ -7,15 +7,27 @@
 # checks each is echoed back byte-exact.
 #
 # Usage: socks5_udp_client.py [--delay S] [--proxy-host H] [--target-host H] \
-#            proxy_port echo_port size...
+#            [--user U --pass P] [--expect-drop] proxy_port echo_port size...
 # The proxy and target hosts default to 127.0.0.1; pass an IPv6 literal (e.g.
 # ::1) to exercise IPv6 and cross-address-family relaying.
+#
+# With --user/--pass the control connection authenticates with RFC 1929
+# username/password instead of the "no authentication" method, which is what
+# an ACL "-m user" rule needs in order to see a username.
+#
+# With --expect-drop the relay is expected NOT to forward the datagrams: the
+# client succeeds only if no echo comes back. Use it to assert that a datagram
+# is denied (by an ACL) or discarded (an unsupported header), as opposed to
+# merely asserting that some unrelated failure occurred.
 import socket, struct, sys, time
 
 argv = sys.argv[1:]
 delay = 0.0
 proxy_host = '127.0.0.1'
 target_host = '127.0.0.1'
+user = None
+password = None
+expect_drop = False
 
 
 def take_opt(name):
@@ -36,6 +48,11 @@ if v is not None:
 v = take_opt('--target-host')
 if v is not None:
     target_host = v
+user = take_opt('--user')
+password = take_opt('--pass')
+if '--expect-drop' in argv:
+    argv.remove('--expect-drop')
+    expect_drop = True
 
 pp = int(argv[0]); ep = int(argv[1])
 sizes = [int(x) for x in argv[2:]] or [64]
@@ -62,8 +79,20 @@ pfam = socket.AF_INET6 if ':' in proxy_host else socket.AF_INET
 t = socket.socket(pfam, socket.SOCK_STREAM)
 t.settimeout(10)
 t.connect((proxy_host, pp))
-t.sendall(b'\x05\x01\x00')
-assert t.recv(2) == b'\x05\x00', 'method selection failed'
+if user is not None:
+    t.sendall(b'\x05\x02\x00\x02')	# offer no-auth and username/password
+else:
+    t.sendall(b'\x05\x01\x00')
+sel = t.recv(2)
+assert len(sel) == 2 and sel[0] == 5, 'method selection failed'
+if sel[1] == 0x02:
+    assert user is not None, 'proxy demanded auth but no credentials given'
+    u8 = user.encode(); p8 = (password or '').encode()
+    t.sendall(b'\x01' + bytes([len(u8)]) + u8 + bytes([len(p8)]) + p8)
+    st = t.recv(2)
+    assert st[:1] == b'\x01' and st[1] == 0, 'username/password auth rejected'
+else:
+    assert sel[1] == 0x00, 'proxy selected method 0x%02x' % sel[1]
 # UDP ASSOCIATE, DST 0.0.0.0:0 (source not yet known).
 t.sendall(b'\x05\x03\x00\x01\x00\x00\x00\x00\x00\x00')
 rep = t.recv(4)
@@ -89,8 +118,16 @@ for sz in sizes:
         try:
             data, _ = u.recvfrom(65535)
         except socket.timeout:
+            if expect_drop:		# no echo is the expected outcome
+                break
             continue
         got = data[skip_reply_hdr(data):]
         break
-    assert got == payload, 'echo mismatch at size %d' % sz
-print('OK: %d datagram size(s) relayed' % len(sizes))
+    if expect_drop:
+        assert got is None, 'datagram of size %d was relayed, want dropped' % sz
+    else:
+        assert got == payload, 'echo mismatch at size %d' % sz
+if expect_drop:
+    print('OK: %d datagram size(s) dropped' % len(sizes))
+else:
+    print('OK: %d datagram size(s) relayed' % len(sizes))

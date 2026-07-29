@@ -56,87 +56,76 @@ static void put_all_entries(struct gwp_dns_entry *head)
 	}
 }
 
-static bool iterate_addr_list(struct addrinfo *res, struct gwp_sockaddr *gs,
-			      uint32_t rt)
+static void copy_ai_addr(struct gwp_sockaddr *gs, const struct addrinfo *ai)
 {
-	struct addrinfo *ai;
+	if (ai->ai_family == AF_INET)
+		gs->i4 = *(struct sockaddr_in *)ai->ai_addr;
+	else
+		gs->i6 = *(struct sockaddr_in6 *)ai->ai_addr;
+}
 
-	if (!res)
-		return false;
+/*
+ * Collect up to @cap addresses from @res into @out, ordered the way the connect
+ * path wants to try them: the preferred family first, then the two families
+ * alternating. Alternating matters -- when a family is broken end to end (a
+ * black-holed IPv6 route is the usual case), interleaving costs one failed
+ * attempt instead of one per address before the working family is reached.
+ *
+ * Within a family the resolver's own order is preserved; glibc already sorts
+ * that per RFC 6724, and the previous code discarded that ordering by scanning
+ * for a family.
+ *
+ * @out[0] is the address the old single-shot selection would have returned, so
+ * callers that only look at the first entry keep their existing behaviour.
+ *
+ * Returns the number of addresses written.
+ */
+static uint8_t collect_addr_list(struct addrinfo *res, struct gwp_sockaddr *out,
+				 uint8_t cap, uint32_t rt)
+{
+	const struct addrinfo *v4[GWP_DNS_MAX_ADDRS];
+	const struct addrinfo *v6[GWP_DNS_MAX_ADDRS];
+	uint8_t nr_v4 = 0, nr_v6 = 0, n = 0, i;
+	const struct addrinfo *ai;
+	bool v6_first;
 
-	/*
-	 * Handle IPV4_ONLY and IPV6_ONLY cases together.
-	 */
-	if (rt == GWP_DNS_RESTYP_IPV4_ONLY ||
-	    rt == GWP_DNS_RESTYP_IPV6_ONLY) {
-		int fm = (rt == GWP_DNS_RESTYP_IPV4_ONLY) ? AF_INET : AF_INET6;
+	if (!res || !cap)
+		return 0;
 
-		for (ai = res; ai; ai = ai->ai_next) {
-			if (ai->ai_family != fm)
-				continue;
-			if (fm == AF_INET)
-				gs->i4 = *(struct sockaddr_in *)ai->ai_addr;
-			else
-				gs->i6 = *(struct sockaddr_in6 *)ai->ai_addr;
-			return true;
-		}
-		return false;
-	}
+	if (cap > GWP_DNS_MAX_ADDRS)
+		cap = GWP_DNS_MAX_ADDRS;
 
-	/*
-	 * Handle PREFER_IPV6 and PREFER_IPV4 cases together.
-	 */
-	if (rt == GWP_DNS_RESTYP_PREFER_IPV6 ||
-	    rt == GWP_DNS_RESTYP_PREFER_IPV4) {
-		int prm = (rt == GWP_DNS_RESTYP_PREFER_IPV6) ? AF_INET6
-							     : AF_INET;
-		int sec = (prm == AF_INET6) ? AF_INET : AF_INET6;
-		struct sockaddr *fallback = NULL;
-
-		for (ai = res; ai; ai = ai->ai_next) {
-			if (ai->ai_family != prm) {
-				if (ai->ai_family == sec && !fallback)
-					fallback = ai->ai_addr;
-				continue;
-			}
-
-			if (prm == AF_INET)
-				gs->i4 = *(struct sockaddr_in *)ai->ai_addr;
-			else
-				gs->i6 = *(struct sockaddr_in6 *)ai->ai_addr;
-			return true;
-		}
-
-		if (!fallback)
-			return false;
-
-		if (sec == AF_INET)
-			gs->i4 = *(struct sockaddr_in *)fallback;
-		else
-			gs->i6 = *(struct sockaddr_in6 *)fallback;
-
-		return true;
-	}
-
-	/*
-	 * Default case: prefer IPv4, then IPv6. This mirrors fetch_addr()'s
-	 * DEFAULT handling so that a cache hit and a cache miss select the
-	 * same address family for the same host.
-	 */
 	for (ai = res; ai; ai = ai->ai_next) {
 		if (ai->ai_family == AF_INET) {
-			gs->i4 = *(struct sockaddr_in *)ai->ai_addr;
-			return true;
-		}
-	}
-	for (ai = res; ai; ai = ai->ai_next) {
-		if (ai->ai_family == AF_INET6) {
-			gs->i6 = *(struct sockaddr_in6 *)ai->ai_addr;
-			return true;
+			if (rt != GWP_DNS_RESTYP_IPV6_ONLY && nr_v4 < cap)
+				v4[nr_v4++] = ai;
+		} else if (ai->ai_family == AF_INET6) {
+			if (rt != GWP_DNS_RESTYP_IPV4_ONLY && nr_v6 < cap)
+				v6[nr_v6++] = ai;
 		}
 	}
 
-	return false;
+	/*
+	 * DEFAULT leads with IPv4 to match fetch_addr()'s DEFAULT handling, so
+	 * a cache hit and a cache miss agree on the first address.
+	 */
+	v6_first = (rt == GWP_DNS_RESTYP_PREFER_IPV6);
+
+	for (i = 0; n < cap && (i < nr_v4 || i < nr_v6); i++) {
+		const struct addrinfo *a, *b;
+
+		a = v6_first ? (i < nr_v6 ? v6[i] : NULL)
+			     : (i < nr_v4 ? v4[i] : NULL);
+		b = v6_first ? (i < nr_v4 ? v4[i] : NULL)
+			     : (i < nr_v6 ? v6[i] : NULL);
+
+		if (a)
+			copy_ai_addr(&out[n++], a);
+		if (b && n < cap)
+			copy_ai_addr(&out[n++], b);
+	}
+
+	return n;
 }
 
 static void prep_hints(struct addrinfo *hints, uint32_t restyp)
@@ -165,11 +154,11 @@ static void try_pass_result_to_cache(struct gwp_dns_ctx *ctx, const char *name,
 }
 
 int gwp_dns_resolve(struct gwp_dns_ctx *ctx, const char *name,
-		    const char *service, struct gwp_sockaddr *addr,
-		    uint32_t restyp)
+		    const char *service, struct gwp_sockaddr *addrs,
+		    uint8_t cap, uint8_t *nr_addrs, uint32_t restyp)
 {
 	struct addrinfo *res = NULL, hints;
-	bool found;
+	uint8_t n;
 	int r;
 
 	prep_hints(&hints, restyp);
@@ -177,14 +166,15 @@ int gwp_dns_resolve(struct gwp_dns_ctx *ctx, const char *name,
 	if (r)
 		return -EHOSTUNREACH;
 
-	found = iterate_addr_list(res, addr, restyp);
-	if (found)
+	n = collect_addr_list(res, addrs, cap, restyp);
+	if (n)
 		try_pass_result_to_cache(ctx, name, res);
 
 	if (res)
 		freeaddrinfo(res);
 
-	return found ? 0 : -EHOSTUNREACH;
+	*nr_addrs = n;
+	return n ? 0 : -EHOSTUNREACH;
 }
 
 static void gwp_dns_entry_free(struct gwp_dns_entry *e)
@@ -379,7 +369,9 @@ static void dispatch_batch_result(int r, struct gwp_dns_ctx *ctx,
 
 		if (r || gai_error(dbq->reqs[i])) {
 			e->res = -EHOSTUNREACH;
-		} else if (!iterate_addr_list(ai, &e->addr, restyp)) {
+		} else if (!(e->nr_addrs = collect_addr_list(ai, e->addrs,
+							     GWP_DNS_MAX_ADDRS,
+							     restyp))) {
 			e->res = -EHOSTUNREACH;
 		} else {
 			e->res = 0;
@@ -493,7 +485,9 @@ static void process_queue_entry_single(struct gwp_dns_ctx *ctx)
 		goto out;
 	}
 
-	e->res = gwp_dns_resolve(ctx, e->name, e->service, &e->addr, ctx->cfg.restyp);
+	e->res = gwp_dns_resolve(ctx, e->name, e->service, e->addrs,
+				 GWP_DNS_MAX_ADDRS, &e->nr_addrs,
+				 ctx->cfg.restyp);
 	eventfd_write(e->ev_fd, 1);
 	gwp_dns_entry_put(e);
 out:
@@ -696,6 +690,76 @@ static uint32_t cache_bucket_count(uint32_t max_entries)
 	else if (n > (1u << 20))
 		n = (1u << 20);
 	return n;
+}
+
+static void fetch_i4_at(struct gwp_dns_cache_entry *e, uint8_t idx,
+			struct gwp_sockaddr *addr, uint16_t port)
+{
+	uint8_t *b = gwp_dns_cache_entget_i4(e) + ((size_t)idx * 4u);
+
+	memset(addr, 0, sizeof(*addr));
+	addr->i4.sin_family = AF_INET;
+	addr->i4.sin_port = htons(port);
+	memcpy(&addr->i4.sin_addr, b, 4);
+}
+
+static void fetch_i6_at(struct gwp_dns_cache_entry *e, uint8_t idx,
+			struct gwp_sockaddr *addr, uint16_t port)
+{
+	uint8_t *b = gwp_dns_cache_entget_i6(e) + ((size_t)idx * 16u);
+
+	memset(addr, 0, sizeof(*addr));
+	addr->i6.sin6_family = AF_INET6;
+	addr->i6.sin6_port = htons(port);
+	memcpy(&addr->i6.sin6_addr, b, 16);
+}
+
+int gwp_dns_cache_lookup_list(struct gwp_dns_ctx *ctx, const char *name,
+			      const char *service, struct gwp_sockaddr *addrs,
+			      uint8_t cap, uint8_t *nr_addrs)
+{
+	struct gwp_dns_cache_entry *e;
+	uint8_t nr_v4, nr_v6, n = 0, i;
+	uint32_t rt = ctx->cfg.restyp;
+	bool v6_first;
+	uint16_t port;
+	int r;
+
+	if (!ctx->cache)
+		return -ENOSYS;
+	if (!cap)
+		return -EINVAL;
+	if (cap > GWP_DNS_MAX_ADDRS)
+		cap = GWP_DNS_MAX_ADDRS;
+
+	r = gwp_dns_cache_getent(ctx->cache, name, &e);
+	if (r)
+		return r;
+
+	port = service ? (uint16_t)atoi(service) : 0;
+	nr_v4 = (rt == GWP_DNS_RESTYP_IPV6_ONLY) ? 0 : e->nr_i4;
+	nr_v6 = (rt == GWP_DNS_RESTYP_IPV4_ONLY) ? 0 : e->nr_i6;
+
+	/* Same interleave and the same leading family as collect_addr_list(). */
+	v6_first = (rt == GWP_DNS_RESTYP_PREFER_IPV6);
+
+	for (i = 0; n < cap && (i < nr_v4 || i < nr_v6); i++) {
+		if (v6_first) {
+			if (i < nr_v6)
+				fetch_i6_at(e, i, &addrs[n++], port);
+			if (i < nr_v4 && n < cap)
+				fetch_i4_at(e, i, &addrs[n++], port);
+		} else {
+			if (i < nr_v4)
+				fetch_i4_at(e, i, &addrs[n++], port);
+			if (i < nr_v6 && n < cap)
+				fetch_i6_at(e, i, &addrs[n++], port);
+		}
+	}
+
+	gwp_dns_cache_putent(e);
+	*nr_addrs = n;
+	return n ? 0 : -EHOSTUNREACH;
 }
 
 static int init_cache(struct gwp_dns_ctx *ctx)

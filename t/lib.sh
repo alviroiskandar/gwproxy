@@ -19,6 +19,8 @@ SKIP_CODE=77
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/gwptest.XXXXXX")"
 declare -a _PIDS=()
 
+. "$T_DIR/sweep.sh"
+
 _cleanup()
 {
 	local pid
@@ -28,9 +30,18 @@ _cleanup()
 	for pid in "${_PIDS[@]:-}"; do
 		[ -n "$pid" ] && kill -9 "$pid" 2>/dev/null
 	done
+	# Catch any proxy this test started outside gwp_start (or whose pid we
+	# lost); the runner sweeps again in case we are killed before this runs.
+	gwp_sweep -q
 	rm -rf "$WORK"
 }
-trap _cleanup EXIT INT TERM
+# The signal handler must exit rather than fall through: a handler that only
+# cleans up lets bash resume the script at the next statement, so the test runs
+# on with its work dir deleted and its servers dead, burying the real failure
+# under bogus errors -- and run.sh's `timeout` stops bounding anything.
+# Exiting from here fires the EXIT trap, so _cleanup still runs exactly once.
+trap _cleanup EXIT
+trap 'exit 143' INT TERM
 
 diag() { echo "# $*" >&2; }
 skip() { echo "SKIP: $*"; exit "$SKIP_CODE"; }
@@ -64,6 +75,11 @@ require_opt()
 	"$GWPROXY" --help 2>&1 | grep -q -- "$1" || \
 		skip "gwproxy has no $1 option"
 }
+
+# wait_listen() drives gwp_start() and start_httpd(), so every test depends on
+# ss(8). Without it each test would instead fail after a 10s poll with a
+# misleading "gwproxy did not listen"; say so up front.
+require ss
 
 # Print a free TCP port that is bindable on the IPv4/IPv6 dual stack, so it is
 # also free for a plain 127.0.0.1 or [::1] bind.

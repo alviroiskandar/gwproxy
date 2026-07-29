@@ -14,11 +14,24 @@ hp="$(pick_port)"
 make_payload "$WORK/payload.bin" 20000
 start_httpd "$hp" "$WORK" "1.1"
 
-# A UDP echo server for the UDP-relay ACL checks (binds synchronously).
+# Wait for a UDP socket to be bound, rather than assuming a fixed delay was
+# long enough -- on a loaded machine it is not, and the failure looks like a
+# relay bug rather than a slow start.
+wait_udp_bound()			# $1=port
+{
+	local i
+	for i in $(seq 1 50); do
+		ss -uanH "sport = :$1" 2>/dev/null | grep -q . && return 0
+		sleep 0.1
+	done
+	fail "UDP server did not bind on $1"
+}
+
+# A UDP echo server for the UDP-relay ACL checks.
 ep="$(pick_port)"
 python3 "$SERVERS_DIR/udp_echo.py" 127.0.0.1 "$ep" >"$WORK/udp_echo.log" 2>&1 &
 _PIDS+=("$!")
-sleep 0.3
+wait_udp_bound "$ep"
 
 # A malformed ACL is rejected at startup (gwproxy exits non-zero, no listener).
 printf -- '-A OUTPUT -j BOGUS\n' >"$WORK/bad.acl"
@@ -190,6 +203,16 @@ for loop in epoll io_uring; do
 		"http://127.0.0.1:$hp/payload.bin" -o /dev/null -w '%{http_code}')"
 	[ "$code" = 403 ] \
 		|| fail "$loop -m user over HTTP got $code for user001 (want 403)"
+
+	# The same rule must govern relayed UDP datagrams, which carry the
+	# username of the authenticated control connection: user001's are
+	# dropped, user002's still round-trip.
+	python3 "$SERVERS_DIR/socks5_udp_client.py" --user user001 --pass pw1 \
+		--expect-drop "$uxp" "$ep" 64 >/dev/null \
+		|| fail "$loop -m user did not block user001's UDP datagram"
+	python3 "$SERVERS_DIR/socks5_udp_client.py" --user user002 --pass pw2 \
+		"$uxp" "$ep" 64 >/dev/null \
+		|| fail "$loop -m user wrongly blocked user002's UDP datagram"
 	kill "$GWP_PID" 2>/dev/null
 
 	# -j BIND --to-source pins the outgoing source address. All of
@@ -199,7 +222,7 @@ for loop in epoll io_uring; do
 	python3 "$SERVERS_DIR/peer_addr.py" 127.0.0.1 "$pa" \
 		>"$WORK/peer.log" 2>&1 &
 	_PIDS+=("$!")
-	sleep 0.3
+	wait_listen "$pa" || fail "$loop peer_addr server did not listen"
 	printf -- '%s\n' '-A OUTPUT -j BIND --to-source 127.0.0.2' \
 		'-P OUTPUT ACCEPT' >"$WORK/bind.acl"
 	bpp="$(pick_port)"
@@ -372,6 +395,7 @@ print(s.recv(64).decode().strip())' "$bpp" 2>/dev/null)"
 		--acl-file="$WORK/ok.acl"
 	python3 "$SERVERS_DIR/socks5_udp_client.py" "$up" "$ep" 64 \
 		|| fail "$loop UDP datagram to an allowed target failed"
+	kill "$GWP_PID" 2>/dev/null
 
 	# INPUT with -p udp: the UDP ASSOCIATE is refused, but TCP still works
 	# (the rule is protocol-specific).

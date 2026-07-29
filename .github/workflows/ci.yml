@@ -159,7 +159,7 @@ jobs:
           make -j$(nproc);
           # Only test for x86_64
           if [ "${{matrix.build_args.arch}}" = "x86_64" ]; then
-            make test;
+            make -j$(nproc) test;
           fi;
 
       - name: Build with --debug
@@ -170,7 +170,7 @@ jobs:
           make -j$(nproc);
           # Only test for x86_64
           if [ "${{matrix.build_args.arch}}" = "x86_64" ]; then
-            make test;
+            make -j$(nproc) test;
           fi;
 
       - name: Build default (with sanitizer)
@@ -181,7 +181,7 @@ jobs:
           make -j$(nproc);
           # Only test for x86_64
           if [ "${{matrix.build_args.arch}}" = "x86_64" ]; then
-            make test;
+            make -j$(nproc) test;
           fi;
 
       - name: Build with io-uring
@@ -191,7 +191,7 @@ jobs:
           CFLAGS=-Werror ./configure --use-io-uring;
           make -j$(nproc);
           if [ "${{matrix.build_args.arch}}" = "x86_64" ]; then
-            make test;
+            make -j$(nproc) test;
           fi;
 
       - name: Build with io-uring and --debug
@@ -201,7 +201,7 @@ jobs:
           CFLAGS=-Werror ./configure --use-io-uring --debug;
           make -j$(nproc);
           if [ "${{matrix.build_args.arch}}" = "x86_64" ]; then
-            make test;
+            make -j$(nproc) test;
           fi;
 
       # HTTPS (TLS termination) needs libssl, only installed for native
@@ -217,7 +217,7 @@ jobs:
           make clean;
           CFLAGS=-Werror ./configure --cc=${{matrix.build_args.cc}} --use-openssl $SAN;
           make -j$(nproc);
-          make test;
+          make -j$(nproc) test;
 
       - name: Build with OpenSSL and io-uring (HTTPS)
         if: ${{matrix.build_args.arch == 'x86_64'}}
@@ -228,7 +228,7 @@ jobs:
           make clean;
           CFLAGS=-Werror ./configure --cc=${{matrix.build_args.cc}} --use-openssl --use-io-uring $SAN;
           make -j$(nproc);
-          make test;
+          make -j$(nproc) test;
 
       # PCRE2 (--use-pcre) enables the ACL --domain-regexp / --user-regexp
       # matches; libpcre2-dev is installed for native x86_64 only. 'make test'
@@ -242,7 +242,7 @@ jobs:
           make clean;
           CFLAGS=-Werror ./configure --cc=${{matrix.build_args.cc}} --use-openssl --use-io-uring --use-pcre $SAN;
           make -j$(nproc);
-          make test;
+          make -j$(nproc) test;
 
   alpine-musl-build:
     needs: get_commit_list
@@ -283,7 +283,7 @@ jobs:
           CFLAGS=-Werror ./configure --cc=gcc;
           make -j$(nproc);
           if [ "${{matrix.build_args.arch}}" = "x86_64" ]; then
-            make test;
+            make -j$(nproc) test;
           fi;
 
       - name: Build with --debug
@@ -293,7 +293,7 @@ jobs:
           CFLAGS=-Werror ./configure --cc=gcc --debug;
           make -j$(nproc);
           if [ "${{matrix.build_args.arch}}" = "x86_64" ]; then
-            make test;
+            make -j$(nproc) test;
           fi;
 
       - name: Build with io-uring
@@ -304,7 +304,7 @@ jobs:
           CFLAGS=-Werror ./configure --cc=gcc --use-io-uring;
           make -j$(nproc);
           if [ "${{matrix.build_args.arch}}" = "x86_64" ]; then
-            make test;
+            make -j$(nproc) test;
           fi;
 
       - name: Build with io-uring and --debug
@@ -315,7 +315,7 @@ jobs:
           CFLAGS=-Werror ./configure --cc=gcc --use-io-uring --debug;
           make -j$(nproc);
           if [ "${{matrix.build_args.arch}}" = "x86_64" ]; then
-            make test;
+            make -j$(nproc) test;
           fi;
 
       # Compile-test the TLS module (ssl.c) against musl. Like the other
@@ -328,7 +328,7 @@ jobs:
           CFLAGS=-Werror ./configure --cc=gcc --use-openssl;
           make -j$(nproc);
           if [ "${{matrix.build_args.arch}}" = "x86_64" ]; then
-            make test;
+            make -j$(nproc) test;
           fi;
 
       # Compile-test the ACL PCRE2 path (--use-pcre) against musl.
@@ -340,7 +340,7 @@ jobs:
           CFLAGS=-Werror ./configure --cc=gcc --use-io-uring --use-pcre;
           make -j$(nproc);
           if [ "${{matrix.build_args.arch}}" = "x86_64" ]; then
-            make test;
+            make -j$(nproc) test;
           fi;
 
   codespell:

@@ -9,3 +9,4 @@
 /config.h
 /config.log
 /config.make
+.test-out/

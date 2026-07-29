@@ -45,10 +45,19 @@ static int register_dns_to_epoll(struct gwp_wrk *w)
 		if (res->udp_fd < 0)
 			continue;
 
+		/*
+		 * The only tagged payload that is not a gwp_conn_pair, so it
+		 * needs its own check against the same 48-bit budget.
+		 */
+		if (unlikely(!EV_PTR_OK(res))) {
+			pr_err(&w->ctx->lh,
+			       "BUG: DNS resolver %p has bits 48..63 set; the event word cannot carry it",
+			       (void *)res);
+			return -EOVERFLOW;
+		}
+
 		ev.events = EPOLLIN;
-		ev.data.u64 = 0;
-		ev.data.ptr = res;
-		ev.data.u64 |= EV_BIT_RAW_DNS_QUERY;
+		ev.data.u64 = PTR_TO_U64(res) | EV_BIT_RAW_DNS_QUERY;
 		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, res->udp_fd, &ev);
 		if (r < 0) {
 			pr_err(&w->ctx->lh,
@@ -442,9 +451,7 @@ static int handle_new_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	if (gcp->target.fd >= 0) {
 		gcp->target.ep_mask = EPOLLOUT | EPOLLIN | EPOLLRDHUP;
 		ev.events = gcp->target.ep_mask;
-		ev.data.u64 = 0;
-		ev.data.ptr = gcp;
-		ev.data.u64 |= EV_BIT_TARGET;
+		ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_TARGET;
 		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, gcp->target.fd, &ev);
 		if (unlikely(r))
 			return r;
@@ -453,18 +460,14 @@ static int handle_new_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	}
 
 	ev.events = gcp->client.ep_mask;
-	ev.data.u64 = 0;
-	ev.data.ptr = gcp;
-	ev.data.u64 |= cl_ev_bit;
+	ev.data.u64 = PTR_TO_U64(gcp) | cl_ev_bit;
 	r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, gcp->client.fd, &ev);
 	if (unlikely(r))
 		return r;
 
 	if (gcp->timer_fd >= 0) {
 		ev.events = EPOLLIN;
-		ev.data.u64 = 0;
-		ev.data.ptr = gcp;
-		ev.data.u64 |= EV_BIT_TIMER;
+		ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_TIMER;
 		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, gcp->timer_fd, &ev);
 		if (unlikely(r))
 			return r;
@@ -592,6 +595,19 @@ static int handle_ev_accept(struct gwp_wrk *w, struct epoll_event *ev)
 				r = 0;
 				break;
 			}
+			/*
+			 * A per-connection failure: already logged, and the
+			 * pair (if any) already freed. Returning it kills the
+			 * worker, and gwp_ctx_thread_entry() then stops the
+			 * whole proxy -- so a single client hitting
+			 * ECONNABORTED could take every live connection down
+			 * with it. accept(2) says to retry this class, and
+			 * io_uring's loop never propagates it either. Keep
+			 * draining the backlog instead. Otherwise whether the
+			 * error escapes depends only on which of the 32
+			 * iterations it landed on.
+			 */
+			r = 0;
 		}
 	}
 
@@ -679,9 +695,7 @@ static int adjust_epl_mask(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 	if (client_need_ctl) {
 		ev.events = gcp->client.ep_mask;
-		ev.data.u64 = 0;
-		ev.data.ptr = gcp;
-		ev.data.u64 |= EV_BIT_CLIENT;
+		ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_CLIENT;
 
 		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_MOD, gcp->client.fd, &ev);
 		if (unlikely(r))
@@ -690,9 +704,7 @@ static int adjust_epl_mask(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 	if (target_need_ctl) {
 		ev.events = gcp->target.ep_mask;
-		ev.data.u64 = 0;
-		ev.data.ptr = gcp;
-		ev.data.u64 |= EV_BIT_TARGET;
+		ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_TARGET;
 
 		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_MOD, gcp->target.fd, &ev);
 		if (unlikely(r))
@@ -963,9 +975,7 @@ static int upstream_arm(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 
 	gcp->target.ep_mask = mask;
 	ev.events = mask;
-	ev.data.u64 = 0;
-	ev.data.ptr = gcp;
-	ev.data.u64 |= EV_BIT_TARGET;
+	ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_TARGET;
 	return __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_MOD, gcp->target.fd, &ev);
 }
 
@@ -1139,10 +1149,18 @@ static int handle_ev_target_conn_result(struct gwp_wrk *w,
 	return adjust_epl_mask(w, gcp);
 
 out_conn_err:
-	if (gcp->conn_state == CONN_STATE_SOCKS5_CONNECT) {
-		int x = prep_and_send_socks5_rep_connect(w, gcp, err);
-		if (x)
-			return x;
+	/*
+	 * Pass @r, not @err: socks5_translate_err() keys off negative errnos,
+	 * while @err comes from SO_ERROR and is positive, so every failure
+	 * mapped to REP 0x01 instead of the specific code. @err is also still
+	 * 0 when it was getsockopt() itself that failed, which would have
+	 * reported success. @r is negative and correct on both paths.
+	 */
+	if (!gwp_conn_fail_reply(w, gcp, r) && gcp->target.len) {
+		ssize_t sr = __do_send(&gcp->target, &gcp->client);
+
+		if (unlikely(sr < 0))
+			return (int)sr;
 	}
 	return r;
 }
@@ -1201,6 +1219,15 @@ static int handle_ev_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	int r;
 
 	if (unlikely(ev->events & EPOLLERR)) {
+		/*
+		 * A connect() that failed reports EPOLLERR, so bailing out
+		 * here dropped the client without a reply -- a refused target
+		 * is the common case. Hand it to the connect-result path,
+		 * which reads SO_ERROR and answers with the matching REP.
+		 */
+		if (!gcp->is_target_alive)
+			return handle_ev_target_conn_result(w, gcp);
+
 		pr_err(&w->ctx->lh, "EPOLLERR on target connection event");
 		return -ECONNRESET;
 	}
@@ -1281,6 +1308,21 @@ static int handle_ev_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		gcp->idx, gcp->client.fd, gcp->target.fd,
 		ip_to_str(&gcp->client_addr), ip_to_str(&gcp->target_addr));
 
+	/*
+	 * A target socket that never came up: tell the client the origin timed
+	 * out (SOCKS5 REP 0x06, HTTP 504) instead of just dropping it. Only
+	 * once the target socket exists -- the other user of this timer is the
+	 * protocol handshake, where the client has not asked for anything yet
+	 * and a CONNECT reply would answer a request that was never made.
+	 */
+	if (gcp->target.fd >= 0 && !gcp->is_target_alive &&
+	    !gwp_conn_fail_reply(w, gcp, -ETIMEDOUT) && gcp->target.len) {
+		ssize_t sr = __do_send(&gcp->target, &gcp->client);
+
+		if (unlikely(sr < 0))
+			return (int)sr;
+	}
+
 	return -ETIMEDOUT;
 }
 
@@ -1343,6 +1385,19 @@ static int handle_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	}
 	if (unlikely(tfd < 0)) {
 		pr_err(&w->ctx->lh, "Failed to create target socket: %s", strerror(-tfd));
+		/*
+		 * connect() can fail right here rather than through the
+		 * connect-result path -- a refused loopback target does. The
+		 * client still needs its reply, and conn_state is not yet
+		 * CONN_STATE_SOCKS5_CONNECT at this point, so key off the
+		 * protocol instead.
+		 */
+		if (!gwp_conn_fail_reply(w, gcp, tfd) && gcp->target.len) {
+			ssize_t sr = __do_send(&gcp->target, &gcp->client);
+
+			if (unlikely(sr < 0))
+				return (int)sr;
+		}
 		return tfd;
 	}
 
@@ -1370,26 +1425,20 @@ static int handle_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	 * in free_conn_pair() anyway.
 	 */
 	ev.events = gcp->client.ep_mask;
-	ev.data.u64 = 0;
-	ev.data.ptr = gcp;
-	ev.data.u64 |= EV_BIT_CLIENT;
+	ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_CLIENT;
 	r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_MOD, gcp->client.fd, &ev);
 	if (unlikely(r))
 		return r;
 
 	ev.events = gcp->target.ep_mask;
-	ev.data.u64 = 0;
-	ev.data.ptr = gcp;
-	ev.data.u64 |= EV_BIT_TARGET;
+	ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_TARGET;
 	r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, gcp->target.fd, &ev);
 	if (unlikely(r))
 		return r;
 
 	if (gcp->timer_fd >= 0) {
 		ev.events = EPOLLIN;
-		ev.data.u64 = 0;
-		ev.data.ptr = gcp;
-		ev.data.u64 |= EV_BIT_TIMER;
+		ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_TIMER;
 		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, gcp->timer_fd, &ev);
 		if (unlikely(r))
 			return r;
@@ -1416,9 +1465,7 @@ static int arm_poll_for_dns_query(struct gwp_wrk *w,
 	assert(gde->ev_fd >= 0);
 
 	ev.events = EPOLLIN;
-	ev.data.u64 = 0;
-	ev.data.ptr = gcp;
-	ev.data.u64 |= EV_BIT_DNS_QUERY;
+	ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_DNS_QUERY;
 
 	r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, gde->ev_fd, &ev);
 	if (unlikely(r))
@@ -1441,7 +1488,7 @@ static void log_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	}
 
 	pr_dbg(&ctx->lh, "DNS query resolved: %s:%s -> %s (res=%d; idx=%u; cfd=%d; tfd=%d; ca=%s)",
-		gde->name, gde->service, ip_to_str(&gde->addr), gde->res,
+		gde->name, gde->service, ip_to_str(&gde->addrs[0]), gde->res,
 		gcp->idx, gcp->client.fd, gcp->target.fd,
 		ip_to_str(&gcp->client_addr));
 }
@@ -1450,12 +1497,12 @@ __hot
 static int handle_ev_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_dns_entry *gde = gcp->gde;
-	int r, ct = gcp->conn_state;
+	int r;
 
 	assert(gde);
 	assert(gde->ev_fd >= 0);
-	assert(ct == CONN_STATE_SOCKS5_DNS_QUERY ||
-	       ct == CONN_STATE_HTTP_DNS_QUERY);
+	assert(gcp->conn_state == CONN_STATE_SOCKS5_DNS_QUERY ||
+	       gcp->conn_state == CONN_STATE_HTTP_DNS_QUERY);
 
 	r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_DEL, gde->ev_fd, NULL);
 	if (unlikely(r))
@@ -1463,13 +1510,23 @@ static int handle_ev_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 	log_dns_query(w, gcp, gde);
 	if (likely(!gde->res)) {
-		gcp->target_addr = gde->addr;
+		gcp->target_addr = gde->addrs[0];
 		r = handle_connect(w, gcp);
 	} else {
-		if (ct == CONN_STATE_SOCKS5_DNS_QUERY)
-			r = prep_and_send_socks5_rep_connect(w, gcp, gde->res);
-		else
-			r = -EIO;
+		/*
+		 * The name did not resolve, so the origin is unreachable:
+		 * answer in whatever protocol the client speaks (SOCKS5 REP,
+		 * or HTTP 502) instead of hanging up silently.
+		 */
+		r = gwp_conn_fail_reply(w, gcp, gde->res);
+		if (!r && gcp->target.len) {
+			ssize_t sr = __do_send(&gcp->target, &gcp->client);
+
+			if (unlikely(sr < 0))
+				r = (int)sr;
+		}
+		if (!r)
+			r = gde->res ? gde->res : -EIO;
 	}
 
 	gwp_dns_entry_put(gde);
@@ -1629,9 +1686,7 @@ static int handle_udp_associate(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	}
 
 	ev.events = EPOLLIN;
-	ev.data.u64 = 0;
-	ev.data.ptr = gcp;
-	ev.data.u64 |= EV_BIT_UDP_RELAY;
+	ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_UDP_RELAY;
 	return __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, gcp->udp_fd, &ev);
 }
 
@@ -1754,9 +1809,7 @@ static int handle_ev_client_prot_out(struct gwp_wrk *w, struct gwp_conn_pair *gc
 
 	pr_dbg(&w->ctx->lh, "Handling short send on client prot data");
 	evl.events = gcp->client.ep_mask;
-	evl.data.u64 = 0;
-	evl.data.ptr = gcp;
-	evl.data.u64 |= EV_BIT_CLIENT_PROT;
+	evl.data.u64 = PTR_TO_U64(gcp) | EV_BIT_CLIENT_PROT;
 	r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_MOD, gcp->client.fd, &evl);
 	if (unlikely(r))
 		return r;
@@ -1773,9 +1826,7 @@ static int tls_arm_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 
 	gcp->client.ep_mask = mask;
 	ev.events = mask;
-	ev.data.u64 = 0;
-	ev.data.ptr = gcp;
-	ev.data.u64 |= EV_BIT_CLIENT_PROT;
+	ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_CLIENT_PROT;
 	return __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_MOD, gcp->client.fd, &ev);
 }
 
@@ -1953,8 +2004,7 @@ static int handle_event(struct gwp_wrk *w, struct epoll_event *ev)
 	int r;
 
 	ev_bit = GET_EV_BIT(ev->data.u64);
-	ev->data.u64 = CLEAR_EV_BIT(ev->data.u64);
-	udata = ev->data.ptr;
+	udata = U64_TO_PTR(CLEAR_EV_BIT(ev->data.u64));
 
 	switch (ev_bit) {
 	case EV_BIT_ACCEPT:

@@ -114,8 +114,12 @@ enum {
 	EV_BIT_DNS_QUERY		= (7ull << 48ull),
 	EV_BIT_SOCKS5_AUTH_FILE		= (8ull << 48ull),
 
-	EV_BIT_HTTP_CONN		= (18ull << 48ull),
-	EV_BIT_RAW_DNS_QUERY		= (19ull << 48ull),
+	/*
+	 * Raw DNS resolver socket (--raw-dns), epoll only. Values 9-21 belong
+	 * to the io_uring selectors below, so use 26 -- this used to be 19,
+	 * which is EV_BIT_IOU_TLS_HS_SEND.
+	 */
+	EV_BIT_RAW_DNS_QUERY		= (26ull << 48ull),
 
 	/*
 	 * Per-connection UDP relay socket for a SOCKS5 UDP ASSOCIATE. Values
@@ -180,9 +184,39 @@ enum {
 };
 
 
+/*
+ * The event word packs a payload pointer in bits 0..47 and a selector in bits
+ * 48..63. That is sound on Linux because the kernel will not hand userspace a
+ * virtual address above the 47-bit default mapping window unless the process
+ * asks for one with an mmap() hint above 2^47 -- a policy the kernel adopted
+ * *precisely* to keep pointer-tagging schemes like this one working when
+ * 5-level paging widened the hardware VA to 57 bits. See
+ * Documentation/arch/x86/x86_64/5level-paging.rst ("we are not going to
+ * allocate virtual address space above 47-bit by default") and
+ * Documentation/arch/arm64/memory.rst, where the default window is 48-bit and
+ * 52-bit needs the same opt-in. Note bit 47 is live on arm64, which is why the
+ * selector starts at 48 and not 47.
+ *
+ * gwproxy never opts in: every tagged payload comes from calloc(), and there
+ * is no mmap()/MAP_FIXED/arch_prctl() anywhere in this tree. So a 57-bit-VA
+ * host does not break the encoding.
+ *
+ * Do not introduce a high mmap() hint, arm64 MTE/HWASAN heap tagging, or x86
+ * LAM without revisiting this. EV_PTR_OK() is the enforcement, and it is
+ * deliberately not assert(): release builds define NDEBUG (Makefile, configure)
+ * and would compile the check out exactly where it matters.
+ *
+ * Combine the halves arithmetically, never by writing a pointer through one
+ * union member and the selector through another -- on a 32-bit big-endian
+ * target epoll_data.ptr aliases the *high* half of .u64 and the two overlap.
+ */
 #define EV_BIT_ALL	(0xffffull << 48ull)
 #define GET_EV_BIT(X)	((X) & EV_BIT_ALL)
 #define CLEAR_EV_BIT(X)	((X) & ~EV_BIT_ALL)
+#define EV_PTR_OK(P)	(!((uint64_t)(uintptr_t)(P) & EV_BIT_ALL))
+
+static_assert((EV_BIT_CLIENT_PROT & ~EV_BIT_ALL) == 0,
+	      "the largest event selector must fit inside EV_BIT_ALL");
 
 enum {
 	CONN_STATE_INIT			= 0,
@@ -546,11 +580,13 @@ enum gwp_udp_act gwp_udp_relay_classify(struct gwp_wrk *w,
 					struct gwp_udp_out *out);
 
 /* True if the ACL OUTPUT chain permits a @proto connection from @client to
- * @target (allow-all when no ACL is loaded or @target has no resolved IP). */
+ * @target (allow-all when no ACL is loaded or @target has no resolved IP).
+ * @user is the authenticated username for "-m user", or NULL when the
+ * connection is unauthenticated. */
 bool gwp_ctx_acl_output_allowed(struct gwp_ctx *ctx,
 				const struct gwp_sockaddr *client,
 				const struct gwp_sockaddr *target,
-				enum gwp_acl_proto proto);
+				const char *user, enum gwp_acl_proto proto);
 
 /* As gwp_ctx_acl_output_allowed(), but a matching -j DNAT rewrites *@target and
  * any -j MARK/-j BIND modifiers are written to *@so (ignored when @so is NULL).
@@ -605,6 +641,15 @@ int gwp_socks5_prep_connect_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
  * built, or a negative errno if it could not be built.
  */
 int gwp_acl_reject_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
+
+/*
+ * Build the "could not reach the origin" reply for whichever protocol the
+ * client speaks -- a SOCKS5 reply carrying the REP for @err, or HTTP 502 --
+ * into gcp->target.buf, ready for the caller to flush its own way. @err is a
+ * negative errno. Returns 0 (including for plain forwarding, which has no
+ * protocol to answer in), or a negative errno if the reply could not be built.
+ */
+int gwp_conn_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int err);
 int gwp_socks5_build_connect_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				   int err, void *out, size_t *out_len);
 int gwp_socks5_prepare_target_addr(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
