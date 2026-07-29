@@ -512,6 +512,39 @@ void gwp_socks5_reply_addr_from_sockaddr(const struct gwp_sockaddr *src,
 bool gwp_sockaddr_ip_eq(const struct gwp_sockaddr *a,
 			const struct gwp_sockaddr *b);
 
+/* Compare two addresses by family, port, and IP; v4 and v4-mapped v6 differ. */
+bool gwp_sockaddr_eq(const struct gwp_sockaddr *a,
+		     const struct gwp_sockaddr *b);
+
+enum gwp_udp_act { GWP_UDP_DROP, GWP_UDP_TO_TARGET, GWP_UDP_TO_CLIENT };
+
+struct gwp_udp_out {
+	unsigned char		*buf;
+	size_t			len;
+	struct gwp_sockaddr	dst;
+	socklen_t		dstlen;
+};
+
+/*
+ * SOCKS5 UDP relay per-datagram classifier, shared by both event loops. @base
+ * points at a received datagram of @n bytes, with GWP_SOCKS5_UDP_HDR_MAX bytes
+ * of slack before it; @src is its source. Maintain the client pin
+ * (gcp->udp_peer / gcp->udp_pinned) and decide:
+ *   GWP_UDP_TO_TARGET - client datagram: strip the SOCKS5 header, forward @out
+ *                       to the encapsulated target.
+ *   GWP_UDP_TO_CLIENT - target reply: prepend a SOCKS5 header in the slack, send
+ *                       @out back to the pinned client.
+ *   GWP_UDP_DROP      - unpinned/wrong source, bad header, domain target, or ACL
+ *                       denial.
+ * On a forward verdict @out holds the buffer + destination; each loop performs
+ * the send with its own I/O primitive.
+ */
+enum gwp_udp_act gwp_udp_relay_classify(struct gwp_wrk *w,
+					struct gwp_conn_pair *gcp,
+					unsigned char *base, size_t n,
+					const struct gwp_sockaddr *src,
+					struct gwp_udp_out *out);
+
 /* True if the ACL OUTPUT chain permits a @proto connection from @client to
  * @target (allow-all when no ACL is loaded or @target has no resolved IP). */
 bool gwp_ctx_acl_output_allowed(struct gwp_ctx *ctx,
@@ -564,12 +597,64 @@ void log_conn_pair_created(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 int gwp_socks5_prep_connect_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				  int err);
+
+/*
+ * Build the "ACL denied" downstream reply (SOCKS5 CONNECT refusal or HTTP 403)
+ * into gcp->target.buf, ready for the caller to flush its own way. Logs the
+ * denial. Returns -EACCES (the terminal handshake verdict) once the reply is
+ * built, or a negative errno if it could not be built.
+ */
+int gwp_acl_reject_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 int gwp_socks5_build_connect_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				   int err, void *out, size_t *out_len);
 int gwp_socks5_prepare_target_addr(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 int gwp_upstream_finalize_dst(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 int gwp_upstream_authority(const struct gwp_socks5_addr *dst, char *buf,
 			   size_t cap);
+
+/*
+ * The upstream proxy handshake succeeded: build our downstream CONNECT reply
+ * (SOCKS5 or HTTP), drop the proxy's @consumed reply bytes from the target
+ * buffer while keeping any early destination data, and splice our reply ahead
+ * of it. Returns 0, or a negative errno if the reply could not be built or fit.
+ */
+int gwp_upstream_splice_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			      size_t consumed);
+
+/* "host:port" for a domain upstream target, else its resolved IP. Returns a
+ * thread-local buffer valid until the next call on the same thread. */
+const char *gwp_upstream_dst_str(struct gwp_conn_pair *gcp);
+
+/*
+ * The next I/O step in the transport-agnostic upstream-proxy handshake state
+ * machine (gwp_upstream_hs_start / gwp_upstream_hs_on_reply). The request bytes
+ * live in gcp->target.buf; the caller performs the send/recv with its own I/O
+ * primitive.
+ */
+enum gwp_upstream_io {
+	GWP_UPSTREAM_IO_SEND,	/* a request is built; flush target.buf */
+	GWP_UPSTREAM_IO_RECV,	/* reply incomplete; read more into target.buf */
+	GWP_UPSTREAM_IO_DONE,	/* tunnel up (reply spliced); start forwarding */
+};
+
+/*
+ * Begin the upstream-proxy handshake: finalize gcp->up_dst and build the SOCKS5
+ * greeting or HTTP CONNECT into gcp->target.buf. Returns GWP_UPSTREAM_IO_SEND,
+ * or a negative errno.
+ */
+int gwp_upstream_hs_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
+
+/*
+ * Fresh proxy bytes were appended to gcp->target.buf: parse the current
+ * handshake state and either build the next request (GWP_UPSTREAM_IO_SEND), ask
+ * for more (GWP_UPSTREAM_IO_RECV), or on final success splice the downstream
+ * reply and report GWP_UPSTREAM_IO_DONE. On failure returns a negative errno
+ * (logging its own pr_err) and, when @notify is non-NULL, sets *@notify true if
+ * the failure is a protocol-level rejection whose downstream client should be
+ * told; the caller owns that notification and all timer / forwarding state.
+ */
+int gwp_upstream_hs_on_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			     bool *notify);
 
 int gwp_socks5_handle_data(struct gwp_conn_pair *gcp);
 int gwp_handle_conn_state_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
