@@ -8,8 +8,12 @@ termination on the listener (HTTPS proxy).
 Features
 --------
   - Plain TCP-to-TCP forwarding to a fixed --target.
-  - SOCKS5 CONNECT proxy (RFC 1928):
-      - IPv4, IPv6 and domain-name (ATYP) targets.
+  - SOCKS5 proxy (RFC 1928):
+      - CONNECT to IPv4, IPv6 and domain-name (ATYP) targets.
+      - UDP ASSOCIATE: relay UDP datagrams to IPv4/IPv6 targets (on both
+        the epoll and io_uring loops). Datagrams to domain-name targets
+        are dropped (no per-datagram DNS yet), and the command is refused
+        when an upstream proxy is configured (UDP is not chained).
       - Username/password authentication (RFC 1929), or no authentication.
   - HTTP proxy:
       - CONNECT tunneling.

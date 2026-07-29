@@ -17,10 +17,18 @@ enum gwp_socks5_state {
 	GWP_SOCKS5_ST_INIT		= 0,
 	GWP_SOCKS5_ST_CMD		= 100,
 	GWP_SOCKS5_ST_CMD_CONNECT	= 101,
+	GWP_SOCKS5_ST_CMD_UDP_ASSOCIATE	= 102,
 	GWP_SOCKS5_ST_AUTH_USERPASS	= 200,
 	GWP_SOCKS5_ST_FORWARDING	= 300,
+	GWP_SOCKS5_ST_UDP_ASSOCIATED	= 400,
 	GWP_SOCKS5_ST_ERR		= 500,
 };
+
+/*
+ * Largest SOCKS5 UDP relay header (RFC 1928 section 7):
+ * RSV(2) + FRAG(1) + ATYP(1) + ADDR(1 len + 255 domain) + PORT(2).
+ */
+#define GWP_SOCKS5_UDP_HDR_MAX	(2 + 1 + 1 + 1 + 255 + 2)
 
 enum gwp_socks5_atyp {
 	GWP_SOCKS5_ATYP_IPV4		= 0x01,
@@ -178,6 +186,48 @@ int gwp_socks5_conn_cmd_connect_res(struct gwp_socks5_conn *conn,
 				    const struct gwp_socks5_addr *bind_addr,
 				    uint8_t rep, void *out_buf,
 				    size_t *out_len);
+
+/**
+ * Construct the reply to a SOCKS5 UDP ASSOCIATE command. @bind_addr is the
+ * proxy's UDP relay endpoint (from getsockname() on the relay socket) that the
+ * client will send its datagrams to. On a success reply (rep == 0x00) the
+ * connection state becomes GWP_SOCKS5_ST_UDP_ASSOCIATED; otherwise
+ * GWP_SOCKS5_ST_ERR. Same buffer semantics and errors as
+ * gwp_socks5_conn_cmd_connect_res().
+ */
+int gwp_socks5_conn_cmd_udp_associate_res(struct gwp_socks5_conn *conn,
+					  const struct gwp_socks5_addr *bind_addr,
+					  uint8_t rep, void *out_buf,
+					  size_t *out_len);
+
+/*
+ * SOCKS5 UDP relay datagram header codec (RFC 1928 section 7). Stateless.
+ *
+ *   +----+------+------+----------+----------+----------+
+ *   |RSV | FRAG | ATYP | DST.ADDR | DST.PORT |   DATA   |
+ *   +----+------+------+----------+----------+----------+
+ *   | 2  |  1   |  1   | Variable |    2     | Variable |
+ */
+
+/**
+ * Parse the relay header at the front of a datagram. On success @addr receives
+ * the encapsulated address (the target for client->proxy datagrams) and
+ * *@hdr_len the offset where DATA begins, and 0 is returned.
+ *
+ * @return	0 on success; -EAGAIN if @len is shorter than the header;
+ *		-EINVAL on a malformed header; -ENOTSUP if FRAG != 0 (this
+ *		relay does not reassemble fragments).
+ */
+int gwp_socks5_udp_parse_hdr(const void *buf, size_t len,
+			     struct gwp_socks5_addr *addr, size_t *hdr_len);
+
+/**
+ * Build a relay header (RSV = 0, FRAG = 0, then @addr) into @buf, for wrapping a
+ * target's reply back to the client. On success *@hdr_len holds the header
+ * length. Returns 0, -ENOBUFS if @cap is too small, or -EINVAL on a bad @addr.
+ */
+int gwp_socks5_udp_build_hdr(const struct gwp_socks5_addr *addr, void *buf,
+			     size_t cap, size_t *hdr_len);
 
 /*
  * SOCKS5 client-side helpers.

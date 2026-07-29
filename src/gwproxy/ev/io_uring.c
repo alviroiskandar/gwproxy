@@ -61,6 +61,23 @@ static inline bool client_is_tls(const struct gwp_conn_pair *gcp)
 }
 #endif /* CONFIG_HTTPS */
 
+/*
+ * Per-connection scratch for the io_uring SOCKS5 UDP relay. An async recvmsg /
+ * sendmsg must own a stable buffer and msghdr for the whole operation (epoll
+ * relays synchronously into a per-worker buffer instead), so this is
+ * per-connection. The relay runs serially - at most one recvmsg or sendmsg is
+ * in flight at a time - so a single buffer/msghdr pair suffices. @buf receives
+ * datagrams at offset GWP_SOCKS5_UDP_HDR_MAX so a reply header can be prepended
+ * in place, exactly like the epoll path.
+ */
+struct gwp_iou_udp {
+	struct msghdr		mh;
+	struct iovec		iov;
+	struct gwp_sockaddr	src;	/* recvmsg source of the last datagram */
+	struct gwp_sockaddr	dst;	/* sendmsg destination                 */
+	unsigned char		buf[GWP_UDP_RELAY_BUFSZ];
+};
+
 __cold
 int gwp_ctx_init_thread_io_uring(struct gwp_wrk *w)
 {
@@ -204,7 +221,7 @@ static void get_gcp(struct gwp_conn_pair *gcp)
 static bool put_gcp(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	int x = gcp->ref_cnt--;
-	int tg_fd, cl_fd;
+	int tg_fd, cl_fd, ud_fd;
 
 	pr_dbg(&w->ctx->lh,
 		"Put connection pair (idx=%u, cfd=%d, tfd=%d, tmfd=%d, ca=%s, ta=%s, ref_cnt=%d)",
@@ -221,13 +238,22 @@ static bool put_gcp(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 	tg_fd = gcp->target.fd;
 	cl_fd = gcp->client.fd;
+	ud_fd = gcp->udp_fd;
 	gcp->flags |= GWP_CONN_FLAG_NO_CLOSE_FD;
+	/*
+	 * All relay SQEs have drained (ref_cnt hit 0), so the async recvmsg /
+	 * sendmsg no longer touch the scratch or the fd; free/close them here.
+	 */
+	free(gcp->udp_iou);
+	gcp->udp_iou = NULL;
 	gwp_free_conn_pair(w, gcp);
 
 	if (tg_fd >= 0)
 		prep_close(w, tg_fd);
 	if (cl_fd >= 0)
 		prep_close(w, cl_fd);
+	if (ud_fd >= 0)
+		prep_close(w, ud_fd);
 
 	return true;
 }
@@ -435,6 +461,15 @@ static void shutdown_gcp(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		io_uring_prep_cancel_fd(s, gcp->client.fd, 0);
 		io_uring_sqe_set_data(s, gcp);
 		s->user_data |= EV_BIT_IOU_CLIENT_CANCEL;
+		get_gcp(gcp);
+	}
+
+	if (gcp->udp_fd >= 0) {
+		pr_dbg(&ctx->lh, "Cancelling UDP relay (fd=%d)", gcp->udp_fd);
+		s = get_sqe_nofail(w);
+		io_uring_prep_cancel_fd(s, gcp->udp_fd, 0);
+		io_uring_sqe_set_data(s, gcp);
+		s->user_data |= EV_BIT_IOU_UDP_CANCEL;
 		get_gcp(gcp);
 	}
 
@@ -1595,6 +1630,187 @@ static int prep_domain_resolution(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	return 0;
 }
 
+static bool sockaddr_eq(const struct gwp_sockaddr *a,
+			const struct gwp_sockaddr *b)
+{
+	if (a->sa.sa_family != b->sa.sa_family)
+		return false;
+	if (a->sa.sa_family == AF_INET)
+		return a->i4.sin_port == b->i4.sin_port &&
+		       a->i4.sin_addr.s_addr == b->i4.sin_addr.s_addr;
+	if (a->sa.sa_family == AF_INET6)
+		return a->i6.sin6_port == b->i6.sin6_port &&
+		       !memcmp(&a->i6.sin6_addr, &b->i6.sin6_addr, 16);
+	return false;
+}
+
+/* Arm the next relay recvmsg into the front-padded scratch buffer. */
+static void prep_udp_recv(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	struct gwp_iou_udp *u = gcp->udp_iou;
+	struct io_uring_sqe *s = get_sqe_nofail(w);
+
+	u->iov.iov_base = u->buf + GWP_SOCKS5_UDP_HDR_MAX;
+	u->iov.iov_len = 65535;
+	memset(&u->mh, 0, sizeof(u->mh));
+	u->mh.msg_name = &u->src;
+	u->mh.msg_namelen = sizeof(u->src);
+	u->mh.msg_iov = &u->iov;
+	u->mh.msg_iovlen = 1;
+	io_uring_prep_recvmsg(s, gcp->udp_fd, &u->mh, 0);
+	io_uring_sqe_set_data(s, gcp);
+	s->user_data |= EV_BIT_IOU_UDP_RX;
+	get_gcp(gcp);
+}
+
+/* Arm a relay sendmsg of @buf[0..len) to @dst (part of the same scratch). */
+static void prep_udp_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			  unsigned char *buf, size_t len,
+			  const struct gwp_sockaddr *dst, socklen_t dstlen)
+{
+	struct gwp_iou_udp *u = gcp->udp_iou;
+	struct io_uring_sqe *s = get_sqe_nofail(w);
+
+	u->dst = *dst;
+	u->iov.iov_base = buf;
+	u->iov.iov_len = len;
+	memset(&u->mh, 0, sizeof(u->mh));
+	u->mh.msg_name = &u->dst;
+	u->mh.msg_namelen = dstlen;
+	u->mh.msg_iov = &u->iov;
+	u->mh.msg_iovlen = 1;
+	io_uring_prep_sendmsg(s, gcp->udp_fd, &u->mh, MSG_NOSIGNAL);
+	io_uring_sqe_set_data(s, gcp);
+	s->user_data |= EV_BIT_IOU_UDP_TX;
+	get_gcp(gcp);
+}
+
+/*
+ * A relay recvmsg completed. Decide direction by source (the same logic as the
+ * epoll handle_ev_udp_relay): a datagram from the pinned client is unwrapped
+ * and forwarded to its target; any other source is a target reply, wrapped and
+ * sent to the client. A forwarded datagram issues one sendmsg and the relay
+ * re-arms the recv only once that completes (handle_ev_udp_tx); a dropped
+ * datagram re-arms the recv immediately. See the epoll handler for the design
+ * limitations (stateless replies, same-family targets, no domain targets).
+ */
+static int handle_ev_udp_relay(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			       struct io_uring_cqe *cqe)
+{
+	struct gwp_iou_udp *u = gcp->udp_iou;
+	unsigned char *base = u->buf + GWP_SOCKS5_UDP_HDR_MAX;
+	int n = cqe->res;
+	bool client_dgram;
+
+	/*
+	 * Once teardown has begun, let the ref drop instead of re-arming; a
+	 * fresh recv would keep the association alive forever (see the
+	 * udp_fd cancel in shutdown_gcp).
+	 */
+	if (gcp->flags & GWP_CONN_FLAG_IS_CANCEL)
+		return -ECANCELED;
+
+	if (n < 0) {
+		/* Datagram-level error (e.g. a prior send bounced); keep going. */
+		prep_udp_recv(w, gcp);
+		return 0;
+	}
+
+	if (gcp->udp_pinned) {
+		client_dgram = sockaddr_eq(&u->src, &gcp->udp_peer);
+	} else {
+		/*
+		 * Accept the pinning datagram only from the TCP control
+		 * connection's IP so an off-path source cannot hijack the
+		 * association (RFC 1928).
+		 */
+		if (!gwp_sockaddr_ip_eq(&u->src, &gcp->client_addr)) {
+			prep_udp_recv(w, gcp);
+			return 0;
+		}
+		gcp->udp_peer = u->src;
+		gcp->udp_pinned = true;
+		client_dgram = true;
+	}
+
+	if (client_dgram) {
+		/* Client -> target: strip the header, forward the payload. */
+		struct gwp_socks5_addr dst;
+		struct gwp_sockaddr tsa;
+		socklen_t tslen;
+		size_t hdr_len;
+
+		if (gwp_socks5_udp_parse_hdr(base, (size_t)n, &dst, &hdr_len) ||
+		    gwp_socks5_addr_to_sockaddr(&dst, &tsa, &tslen)) {
+			prep_udp_recv(w, gcp);	/* bad header or domain target */
+			return 0;
+		}
+		prep_udp_send(w, gcp, base + hdr_len, (size_t)n - hdr_len,
+			      &tsa, tslen);
+	} else {
+		/* Target -> client: prepend a header in the front slack. */
+		struct gwp_socks5_addr sa;
+		size_t h, hlen;
+
+		gwp_socks5_reply_addr_from_sockaddr(&u->src, &sa);
+		h = (sa.ver == GWP_SOCKS5_ATYP_IPV4) ? 3 + 1 + 4 + 2
+						     : 3 + 1 + 16 + 2;
+		if (gwp_socks5_udp_build_hdr(&sa, base - h, h, &hlen)) {
+			prep_udp_recv(w, gcp);
+			return 0;
+		}
+		/* The relay is dual-stack, so udp_peer is always AF_INET6. */
+		prep_udp_send(w, gcp, base - h, h + (size_t)n, &gcp->udp_peer,
+			      sizeof(gcp->udp_peer.i6));
+	}
+
+	return 0;
+}
+
+/* A relay sendmsg completed; read the next datagram (errors are dropped). */
+static int handle_ev_udp_tx(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			    struct io_uring_cqe *cqe)
+{
+	(void)cqe;
+	if (gcp->flags & GWP_CONN_FLAG_IS_CANCEL)
+		return -ECANCELED;
+	prep_udp_recv(w, gcp);
+	return 0;
+}
+
+/*
+ * The SOCKS5 UDP ASSOCIATE reply has been queued to the client; bring the relay
+ * online. The TCP control connection is now idle, so drop its handshake timeout
+ * (else it fires and tears the association down) and keep only a recv on it to
+ * notice the client closing. Then start relaying datagrams on udp_fd.
+ */
+static int arm_udp_relay(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	int r;
+
+	gcp->udp_iou = calloc(1, sizeof(*gcp->udp_iou));
+	if (unlikely(!gcp->udp_iou))
+		return -ENOMEM;
+
+	r = prep_nr_sqes(w, 3);
+	if (unlikely(r < 0))
+		return r;
+
+	if (w->ctx->cfg.protocol_timeout > 0) {
+		/*
+		 * Mark the pair alive before removing the timer so a timeout
+		 * that fires in the race window is treated as benign by
+		 * handle_ev_timer() (mirrors the TCP connect path).
+		 */
+		gcp->is_target_alive = true;
+		prep_timer_del_target(w, gcp);
+	}
+
+	prep_recv_client_prot(w, gcp);
+	prep_udp_recv(w, gcp);
+	return 0;
+}
+
 /*
  * Act on the result of a protocol handler (SOCKS5 or HTTP), mirroring the epoll
  * chk_socks5()/chk_http(): a pending DNS lookup arms a poll; a fully-decoded
@@ -1612,6 +1828,9 @@ static int chk_prot_result(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int r)
 	if (r == 0 &&
 	    (ct == CONN_STATE_SOCKS5_CONNECT || ct == CONN_STATE_HTTP_CONNECT))
 		return handle_prot_connect_target(w, gcp);
+
+	if (r == 0 && ct == CONN_STATE_SOCKS5_UDP_ASSOCIATE)
+		return arm_udp_relay(w, gcp);
 
 	if (r == 0 || r == -EAGAIN) {
 		/* Handshake incomplete; read more from the client. */
@@ -1655,6 +1874,17 @@ static int handle_ev_client_prot(struct gwp_wrk *w,
 	if (r < 0) {
 		return r;
 	} else if (!r) {
+		prep_recv_client_prot(w, gcp);
+		return 0;
+	}
+
+	/*
+	 * Once the UDP association is up the TCP control connection is idle and
+	 * only watched for close (r < 0, handled above). Discard any stray
+	 * bytes and keep watching.
+	 */
+	if (gcp->conn_state == CONN_STATE_SOCKS5_UDP_ASSOCIATE) {
+		gcp->client.len = 0;
 		prep_recv_client_prot(w, gcp);
 		return 0;
 	}
@@ -1765,6 +1995,20 @@ static int handle_event(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 	case EV_BIT_IOU_CLIENT_PROT:
 		pr_dbg(&ctx->lh, "Handling client protocol event: %d", cqe->res);
 		r = handle_ev_client_prot(w, udata, cqe);
+		break;
+	case EV_BIT_IOU_UDP_RX:
+		pr_dbg(&ctx->lh, "Handling UDP relay recv event: %d", cqe->res);
+		r = handle_ev_udp_relay(w, udata, cqe);
+		break;
+	case EV_BIT_IOU_UDP_TX:
+		pr_dbg(&ctx->lh, "Handling UDP relay send event: %d", cqe->res);
+		r = handle_ev_udp_tx(w, udata, cqe);
+		break;
+	case EV_BIT_IOU_UDP_CANCEL:
+		gcp = udata;
+		pr_dbg(&ctx->lh, "Handling UDP relay cancel event: %d", cqe->res);
+		assert(gcp->flags & GWP_CONN_FLAG_IS_CANCEL);
+		r = 0;
 		break;
 #ifdef CONFIG_HTTPS
 	case EV_BIT_IOU_TLS_DETECT:

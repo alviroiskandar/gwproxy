@@ -515,6 +515,7 @@ static int set_err_reply(struct data_arg *d, uint8_t err_code)
  *      the authentication method in use.
  */
 static int handle_cmd_connect(struct data_arg *d);
+static int handle_cmd_udp_associate(struct data_arg *d);
 static int handle_state_cmd(struct data_arg *d)
 {
 	size_t len = *d->in_len, exp_len;
@@ -537,14 +538,14 @@ static int handle_state_cmd(struct data_arg *d)
 	switch (buf[1]) {
 	case 0x01: /* CONNECT */
 		return handle_cmd_connect(d);
+	case 0x03: /* UDP ASSOCIATE */
+		return handle_cmd_udp_associate(d);
 
 	/*
 	 * TODO(ammarfaizi2):
-	 * Implement BIND and UDP ASSOCIATE commands. For now,
-	 * we just return an error.
+	 * Implement the BIND command. For now, we just return an error.
 	 */
 	case 0x02: /* BIND */
-	case 0x03: /* UDP ASSOCIATE */
 	default:
 		/*
 		 * 0x07 = Command not supported.
@@ -553,10 +554,14 @@ static int handle_state_cmd(struct data_arg *d)
 	}
 }
 
-static int handle_cmd_connect(struct data_arg *d)
+/*
+ * Parse the ATYP + ADDR + PORT tail shared by the CONNECT and UDP ASSOCIATE
+ * requests into @da, advancing the input buffer past it. @buf points at the
+ * ATYP byte's request (index 3). Returns 0, -EAGAIN if incomplete, or a
+ * set_err_reply() result for an unsupported ATYP.
+ */
+static int parse_request_addr(struct data_arg *d, struct gwp_socks5_addr *da)
 {
-	struct gwp_socks5_addr *da = &d->conn->dst_addr;
-	struct gwp_socks5_conn *conn = d->conn;
 	size_t len = *d->in_len, exp_len;
 	const uint8_t *buf = d->in_buf;
 	uint8_t atyp, domlen = 0;
@@ -565,21 +570,12 @@ static int handle_cmd_connect(struct data_arg *d)
 	atyp = buf[3];
 	switch (atyp) {
 	case GWP_SOCKS5_ATYP_IPV4:
-		/*
-		 * IPv4 address and port.
-		 */
 		exp_len += 4 + 2;
 		break;
 	case GWP_SOCKS5_ATYP_IPV6:
-		/*
-		 * IPv6 address and port.
-		 */
 		exp_len += 16 + 2;
 		break;
 	case GWP_SOCKS5_ATYP_DOMAIN:
-		/*
-		 * Domain name and port.
-		 */
 		exp_len += 1; /* Length of domain name */
 		if (len < exp_len)
 			return -EAGAIN;
@@ -593,7 +589,6 @@ static int handle_cmd_connect(struct data_arg *d)
 	if (len < exp_len)
 		return -EAGAIN;
 
-	/* Copy the address and port into the connection structure. */
 	switch (atyp) {
 	case GWP_SOCKS5_ATYP_IPV4:
 		da->ver = GWP_SOCKS5_ATYP_IPV4;
@@ -614,8 +609,35 @@ static int handle_cmd_connect(struct data_arg *d)
 		break;
 	}
 
-	conn->state = GWP_SOCKS5_ST_CMD_CONNECT;
 	advance_in_buf(d, exp_len);
+	return 0;
+}
+
+static int handle_cmd_connect(struct data_arg *d)
+{
+	int r = parse_request_addr(d, &d->conn->dst_addr);
+
+	if (r)
+		return r;
+
+	d->conn->state = GWP_SOCKS5_ST_CMD_CONNECT;
+	return 0;
+}
+
+/*
+ * UDP ASSOCIATE: the DST.ADDR/DST.PORT names the address the client will send
+ * datagrams from (often 0.0.0.0:0, "not yet known"). Keep it in dst_addr; the
+ * relay uses it to pin the client, or pins from the first datagram. The proxy
+ * opens the relay socket and answers with its endpoint from the event loop.
+ */
+static int handle_cmd_udp_associate(struct data_arg *d)
+{
+	int r = parse_request_addr(d, &d->conn->dst_addr);
+
+	if (r)
+		return r;
+
+	d->conn->state = GWP_SOCKS5_ST_CMD_UDP_ASSOCIATE;
 	return 0;
 }
 
@@ -647,6 +669,7 @@ repeat:
 		r = handle_state_cmd(&arg);
 		break;
 	case GWP_SOCKS5_ST_CMD_CONNECT:
+	case GWP_SOCKS5_ST_CMD_UDP_ASSOCIATE:
 		r = 0;
 		goto out;
 	default:
@@ -698,7 +721,8 @@ static int __gwp_socks5_conn_cmd_connect_res(struct data_arg *arg,
 	size_t resp_len = 0;
 	uint8_t resp[1024];
 
-	if (arg->conn->state != GWP_SOCKS5_ST_CMD_CONNECT)
+	if (arg->conn->state != GWP_SOCKS5_ST_CMD_CONNECT &&
+	    arg->conn->state != GWP_SOCKS5_ST_CMD_UDP_ASSOCIATE)
 		return -EINVAL;
 
 	resp[0] = 0x05; /* VER */
@@ -742,6 +766,31 @@ int gwp_socks5_conn_cmd_connect_res(struct gwp_socks5_conn *conn,
 
 	if (r != -ENOBUFS)
 		conn->state = (rep == 0x00) ? GWP_SOCKS5_ST_FORWARDING
+					    : GWP_SOCKS5_ST_ERR;
+
+	return r;
+}
+
+int gwp_socks5_conn_cmd_udp_associate_res(struct gwp_socks5_conn *conn,
+					  const struct gwp_socks5_addr *bind_addr,
+					  uint8_t rep, void *out_buf,
+					  size_t *out_len)
+{
+	struct data_arg arg = {
+		.ctx = conn->ctx,
+		.conn = conn,
+		.in_buf = NULL,
+		.in_len = NULL,
+		.out_buf = out_buf,
+		.out_len = out_len,
+		.tot_out_len = 0,
+		.tot_advance = 0
+	};
+	int r = __gwp_socks5_conn_cmd_connect_res(&arg, bind_addr, rep);
+	*out_len = arg.tot_out_len;
+
+	if (r != -ENOBUFS)
+		conn->state = (rep == 0x00) ? GWP_SOCKS5_ST_UDP_ASSOCIATED
 					    : GWP_SOCKS5_ST_ERR;
 
 	return r;
@@ -927,5 +976,82 @@ int gwp_socks5_cli_parse_connect(const void *buf, size_t len,
 
 	*rep = b[1];
 	*consumed = need;
+	return 0;
+}
+
+int gwp_socks5_udp_parse_hdr(const void *buf, size_t len,
+			     struct gwp_socks5_addr *addr, size_t *hdr_len)
+{
+	const uint8_t *b = buf;
+	uint8_t atyp;
+	size_t need;
+
+	/* RSV(2) + FRAG(1) + ATYP(1). */
+	if (len < 4)
+		return -EAGAIN;
+	if (b[2] != 0x00)
+		return -ENOTSUP;	/* we do not reassemble fragments */
+
+	atyp = b[3];
+	switch (atyp) {
+	case GWP_SOCKS5_ATYP_IPV4:
+		need = 4 + 4 + 2;
+		if (len < need)
+			return -EAGAIN;
+		addr->ver = GWP_SOCKS5_ATYP_IPV4;
+		memcpy(addr->ip4, &b[4], 4);
+		memcpy(&addr->port, &b[8], 2);
+		break;
+	case GWP_SOCKS5_ATYP_IPV6:
+		need = 4 + 16 + 2;
+		if (len < need)
+			return -EAGAIN;
+		addr->ver = GWP_SOCKS5_ATYP_IPV6;
+		memcpy(addr->ip6, &b[4], 16);
+		memcpy(&addr->port, &b[20], 2);
+		break;
+	case GWP_SOCKS5_ATYP_DOMAIN: {
+		uint8_t domlen;
+
+		if (len < 5)
+			return -EAGAIN;
+		domlen = b[4];
+		need = 4 + 1 + domlen + 2;
+		if (len < need)
+			return -EAGAIN;
+		addr->ver = GWP_SOCKS5_ATYP_DOMAIN;
+		addr->domain.len = domlen;
+		memcpy(addr->domain.str, &b[5], domlen);
+		addr->domain.str[domlen] = '\0';
+		memcpy(&addr->port, &b[5 + domlen], 2);
+		break;
+	}
+	default:
+		return -EINVAL;
+	}
+
+	*hdr_len = need;
+	return 0;
+}
+
+int gwp_socks5_udp_build_hdr(const struct gwp_socks5_addr *addr, void *buf,
+			     size_t cap, size_t *hdr_len)
+{
+	uint8_t *b = buf;
+	int al = gwp_socks5_addr_len(addr);
+	size_t total;
+
+	if (al < 0)
+		return -EINVAL;
+
+	total = 3 + (size_t)al;	/* RSV(2) + FRAG(1) + ATYP + addr + port */
+	if (cap < total)
+		return -ENOBUFS;
+
+	b[0] = 0x00;	/* RSV */
+	b[1] = 0x00;
+	b[2] = 0x00;	/* FRAG */
+	gwp_socks5_addr_encode(&b[3], addr);
+	*hdr_len = total;
 	return 0;
 }

@@ -986,11 +986,133 @@ static void test_enobufs_combined_with_multi_state_at_once(void)
 	unlink(cred_file);
 }
 
+static void test_udp_associate(void)
+{
+	/* UDP ASSOCIATE with DST 0.0.0.0:0 (client source not yet known). */
+	static const uint8_t in[] = {
+		0x05, 0x03, 0x00, 0x01, /* VER, CMD=UDP ASSOCIATE, RSV, ATYP */
+		0x00, 0x00, 0x00, 0x00, /* DST.ADDR: 0.0.0.0 */
+		0x00, 0x00              /* DST.PORT: 0 */
+	};
+	static const struct gwp_socks5_addr bind_addr = {
+		.ver = GWP_SOCKS5_ATYP_IPV4,
+		.port = 0xaaaa,
+		.ip4 = { 0x7f, 0x00, 0x00, 0x01 }
+	};
+	struct gwp_socks5_conn *conn;
+	struct gwp_socks5_ctx *ctx;
+	size_t in_len, out_len;
+	uint8_t out[64];
+	int r;
+
+	test_socks5_init_ctx_no_auth(&ctx);
+	conn = test_socks5_alloc_conn(ctx);
+	test_socks5_do_handshake_no_auth(ctx, conn);
+
+	in_len = sizeof(in);
+	out_len = sizeof(out);
+	r = gwp_socks5_conn_handle_data(conn, in, &in_len, out, &out_len);
+	assert(!r);
+	assert(in_len == sizeof(in));
+	assert(out_len == 0);
+	assert(conn->state == GWP_SOCKS5_ST_CMD_UDP_ASSOCIATE);
+
+	/* Reply with the relay endpoint. */
+	out_len = sizeof(out);
+	r = gwp_socks5_conn_cmd_udp_associate_res(conn, &bind_addr,
+						  GWP_SOCKS5_REP_SUCCESS, out,
+						  &out_len);
+	assert(!r);
+	assert(out_len == 10);
+	assert(out[0] == 0x05);			/* VER */
+	assert(out[1] == 0x00);			/* REP: success */
+	assert(out[2] == 0x00);			/* RSV */
+	assert(out[3] == GWP_SOCKS5_ATYP_IPV4);	/* ATYP */
+	assert(!memcmp(&out[4], "\x7f\x00\x00\x01", 4));	/* BND.ADDR */
+	assert(!memcmp(&out[8], "\xaa\xaa", 2));		/* BND.PORT */
+	assert(conn->state == GWP_SOCKS5_ST_UDP_ASSOCIATED);
+	assert(ctx->nr_clients == 1);
+
+	gwp_socks5_conn_free(conn);
+	gwp_socks5_ctx_free(ctx);
+}
+
+static void test_udp_hdr_codec(void)
+{
+	struct gwp_socks5_addr a, got;
+	uint8_t buf[GWP_SOCKS5_UDP_HDR_MAX + 16];
+	uint8_t dg[128];
+	size_t hlen, plen;
+	int r;
+
+	/* IPv4 round-trip, with trailing DATA on parse. */
+	memset(&a, 0, sizeof(a));
+	a.ver = GWP_SOCKS5_ATYP_IPV4;
+	memcpy(a.ip4, "\x08\x08\x08\x08", 4);
+	memcpy(&a.port, "\x00\x35", 2);		/* 53 */
+	r = gwp_socks5_udp_build_hdr(&a, buf, sizeof(buf), &hlen);
+	assert(!r && hlen == 3 + 1 + 4 + 2);
+	assert(buf[0] == 0 && buf[1] == 0 && buf[2] == 0);
+	assert(buf[3] == GWP_SOCKS5_ATYP_IPV4);
+	memcpy(dg, buf, hlen);
+	memcpy(dg + hlen, "hello", 5);
+	r = gwp_socks5_udp_parse_hdr(dg, hlen + 5, &got, &plen);
+	assert(!r && plen == hlen);
+	assert(got.ver == GWP_SOCKS5_ATYP_IPV4);
+	assert(!memcmp(got.ip4, a.ip4, 4));
+	assert(!memcmp(&got.port, &a.port, 2));
+	assert(!memcmp(dg + plen, "hello", 5));
+
+	/* IPv6 round-trip. */
+	memset(&a, 0, sizeof(a));
+	a.ver = GWP_SOCKS5_ATYP_IPV6;
+	memcpy(a.ip6, "\x20\x01\x0d\xb8\x00\x00\x00\x00"
+		      "\x00\x00\x00\x00\x00\x00\x00\x01", 16);
+	memcpy(&a.port, "\x01\xbb", 2);		/* 443 */
+	r = gwp_socks5_udp_build_hdr(&a, buf, sizeof(buf), &hlen);
+	assert(!r && hlen == 3 + 1 + 16 + 2);
+	r = gwp_socks5_udp_parse_hdr(buf, hlen, &got, &plen);
+	assert(!r && plen == hlen && got.ver == GWP_SOCKS5_ATYP_IPV6);
+	assert(!memcmp(got.ip6, a.ip6, 16));
+
+	/* Domain round-trip. */
+	memset(&a, 0, sizeof(a));
+	a.ver = GWP_SOCKS5_ATYP_DOMAIN;
+	a.domain.len = 11;
+	memcpy(a.domain.str, "example.com", 12);
+	memcpy(&a.port, "\x00\x50", 2);
+	r = gwp_socks5_udp_build_hdr(&a, buf, sizeof(buf), &hlen);
+	assert(!r && hlen == 3 + 1 + 1 + 11 + 2);
+	r = gwp_socks5_udp_parse_hdr(buf, hlen, &got, &plen);
+	assert(!r && got.ver == GWP_SOCKS5_ATYP_DOMAIN && got.domain.len == 11);
+	assert(!memcmp(got.domain.str, "example.com", 11));
+
+	/* FRAG != 0 -> unsupported. */
+	memcpy(dg, "\x00\x00\x01\x01\x08\x08\x08\x08\x00\x35", 10);
+	r = gwp_socks5_udp_parse_hdr(dg, 10, &got, &plen);
+	assert(r == -ENOTSUP);
+
+	/* Truncated header -> need more. */
+	r = gwp_socks5_udp_parse_hdr(dg, 3, &got, &plen);
+	assert(r == -EAGAIN);
+
+	/* Unknown ATYP -> malformed. */
+	memcpy(dg, "\x00\x00\x00\x09\x00\x00\x00\x00", 8);
+	r = gwp_socks5_udp_parse_hdr(dg, 8, &got, &plen);
+	assert(r == -EINVAL);
+
+	/* Build into too small a buffer. */
+	r = gwp_socks5_udp_build_hdr(&a, buf, 4, &hlen);
+	assert(r == -ENOBUFS);
+}
+
 static void gwp_socks5_run_tests(void)
 {
 	size_t i;
 
 	for (i = 0; i < 5000; i++) {
+		test_udp_associate();
+		test_udp_hdr_codec();
 		test_connect_ipv4();
 		test_connect_ipv6();
 		test_connect_domain();
