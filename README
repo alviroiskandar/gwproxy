@@ -45,7 +45,8 @@ Features
     build time and selected at run time).
   - Multi-threaded workers using SO_REUSEPORT, with graceful recovery from
     file-descriptor exhaustion (EMFILE/ENFILE).
-  - DNS caching for SOCKS5/HTTP hostname targets.
+  - Opt-in DNS caching for SOCKS5/HTTP hostname targets (--dns-cache-secs),
+    bounded by --dns-cache-max-entries; cached IPs are still ACL-checked.
   - Per-socket tuning: TCP_NODELAY, TCP_QUICKACK and TCP keepalive.
   - Dual-stack IPv4/IPv6 listening.
   - Configurable log level and log file, and an optional PID file.

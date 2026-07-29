@@ -34,6 +34,7 @@ enum {
 
 struct gwp_dns_cfg {
 	int		cache_expiry;	/* In seconds. <= 0 to disable cache. */
+	uint32_t	max_entries;	/* Max cache entries; 0 = unlimited. */
 	uint32_t	nr_workers;
 	uint32_t	restyp;
 };

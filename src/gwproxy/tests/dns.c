@@ -8,9 +8,14 @@
 #include <stdio.h>
 #include <assert.h>
 #include <gwproxy/dns.h>
+#include <gwproxy/dns_cache.h>
 #include <poll.h>
 #include <errno.h>
 #include <string.h>
+#include <time.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 #ifndef ARRAY_SIZE
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
@@ -136,10 +141,137 @@ static void test_dns_cache(void)
 	gwp_dns_ctx_free(ctx);
 }
 
+/* A throwaway one-address (IPv4) addrinfo for direct cache-layer tests. */
+static void fill_ai_v4(struct addrinfo *ai, struct sockaddr_in *sa)
+{
+	memset(sa, 0, sizeof(*sa));
+	sa->sin_family = AF_INET;
+	sa->sin_addr.s_addr = htonl(0x7f000001);	/* 127.0.0.1 */
+	memset(ai, 0, sizeof(*ai));
+	ai->ai_family = AF_INET;
+	ai->ai_addr = (struct sockaddr *)sa;
+	ai->ai_addrlen = sizeof(*sa);
+}
+
+/*
+ * Exercise the cache layer directly (no network): the max-entries cap must
+ * refuse new keys once full while still allowing same-key replacement.
+ */
+static void test_dns_cache_cap(void)
+{
+	struct gwp_dns_cache *cache = NULL;
+	struct gwp_dns_cache_entry *e;
+	struct sockaddr_in sa;
+	struct addrinfo ai;
+	char key[32];
+	int r, i;
+
+	fill_ai_v4(&ai, &sa);
+
+	r = gwp_dns_cache_init(&cache, 16, 4);	/* cap = 4 entries */
+	assert(!r && cache);
+
+	/* Fill to capacity: four distinct keys are accepted. */
+	for (i = 0; i < 4; i++) {
+		snprintf(key, sizeof(key), "host%d.example", i);
+		r = gwp_dns_cache_insert(cache, key, &ai, time(NULL) + 100);
+		assert(!r);
+	}
+
+	/* A fifth distinct key is refused and not cached. */
+	r = gwp_dns_cache_insert(cache, "host4.example", &ai, time(NULL) + 100);
+	assert(r == -ENOSPC);
+	r = gwp_dns_cache_getent(cache, "host4.example", &e);
+	assert(r == -ENOENT);
+
+	/* Existing keys remain; replacing one (same key) is allowed when full. */
+	r = gwp_dns_cache_getent(cache, "host0.example", &e);
+	assert(!r);
+	gwp_dns_cache_putent(e);
+	r = gwp_dns_cache_insert(cache, "host0.example", &ai, time(NULL) + 100);
+	assert(!r);
+
+	gwp_dns_cache_free(cache);
+}
+
+/* Keys are case-insensitive: a mixed-case insert is found by any case. */
+static void test_dns_cache_case(void)
+{
+	struct gwp_dns_cache *cache = NULL;
+	struct gwp_dns_cache_entry *e;
+	struct sockaddr_in sa;
+	struct addrinfo ai;
+	int r;
+
+	fill_ai_v4(&ai, &sa);
+	r = gwp_dns_cache_init(&cache, 16, 0);
+	assert(!r && cache);
+
+	r = gwp_dns_cache_insert(cache, "MixedCase.Example", &ai, time(NULL) + 100);
+	assert(!r);
+	r = gwp_dns_cache_getent(cache, "mixedcase.example", &e);
+	assert(!r);
+	gwp_dns_cache_putent(e);
+	r = gwp_dns_cache_getent(cache, "MIXEDCASE.EXAMPLE", &e);
+	assert(!r);
+	gwp_dns_cache_putent(e);
+
+	/* A differently-cased insert replaces, not duplicates, the same key. */
+	r = gwp_dns_cache_insert(cache, "MIXEDCASE.example", &ai, time(NULL) + 100);
+	assert(!r);
+	r = gwp_dns_cache_getent(cache, "mixedcase.example", &e);
+	assert(!r);
+	gwp_dns_cache_putent(e);
+
+	gwp_dns_cache_free(cache);
+}
+
+/*
+ * An already-expired entry is not returned, and a reference obtained before a
+ * same-key replace stays valid until released (the documented guarantee; run
+ * under ASan this also checks there is no use-after-free).
+ */
+static void test_dns_cache_expiry_refcount(void)
+{
+	struct gwp_dns_cache_entry *e, *e2;
+	struct gwp_dns_cache *cache = NULL;
+	struct sockaddr_in sa;
+	struct addrinfo ai;
+	int r;
+
+	fill_ai_v4(&ai, &sa);
+	r = gwp_dns_cache_init(&cache, 16, 0);
+	assert(!r && cache);
+
+	/* Expired-on-insert: lookup reports a miss, not the stale entry. */
+	r = gwp_dns_cache_insert(cache, "old.example", &ai, time(NULL) - 1);
+	assert(!r);
+	r = gwp_dns_cache_getent(cache, "old.example", &e);
+	assert(r == -ETIMEDOUT || r == -ENOENT);
+
+	/* A held reference survives a same-key replace. */
+	r = gwp_dns_cache_insert(cache, "live.example", &ai, time(NULL) + 100);
+	assert(!r);
+	r = gwp_dns_cache_getent(cache, "live.example", &e);	/* ref held */
+	assert(!r);
+	r = gwp_dns_cache_insert(cache, "live.example", &ai, time(NULL) + 100);
+	assert(!r);						/* replaced */
+	assert(e->name_len > 0);				/* stale ref still readable */
+	r = gwp_dns_cache_getent(cache, "live.example", &e2);	/* fresh entry */
+	assert(!r);
+	gwp_dns_cache_putent(e2);
+	gwp_dns_cache_putent(e);				/* frees the old entry */
+
+	gwp_dns_cache_free(cache);
+}
+
 int main(void)
 {
 	test_basic_dns_multiple_requests();
 	test_dns_cache();
+	test_dns_cache_cap();
+	test_dns_cache_case();
+	test_dns_cache_expiry_refcount();
 	printf("All tests passed.\n");
 	return 0;
 }

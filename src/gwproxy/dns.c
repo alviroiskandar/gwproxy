@@ -685,8 +685,22 @@ int gwp_dns_cache_lookup(struct gwp_dns_ctx *ctx, const char *name,
 	return r;
 }
 
+/* Size the bucket array from the entry cap for a ~1.0 load factor, clamped to
+ * a sane range; fall back to a fixed size when the cap is unlimited (0). */
+static uint32_t cache_bucket_count(uint32_t max_entries)
+{
+	uint32_t n = max_entries ? max_entries : 65536;
+
+	if (n < 1024)
+		n = 1024;
+	else if (n > (1u << 20))
+		n = (1u << 20);
+	return n;
+}
+
 static int init_cache(struct gwp_dns_ctx *ctx)
 {
+	uint32_t max = ctx->cfg.max_entries;
 	struct gwp_dns_cache *cache;
 	int r;
 
@@ -698,7 +712,7 @@ static int init_cache(struct gwp_dns_ctx *ctx)
 		return 0;
 	}
 
-	r = gwp_dns_cache_init(&cache, 8192);
+	r = gwp_dns_cache_init(&cache, cache_bucket_count(max), max);
 	if (r)
 		return r;
 
@@ -712,7 +726,6 @@ static void free_cache(struct gwp_dns_cache *cache)
 		return;
 
 	gwp_dns_cache_free(cache);
-	cache = NULL;
 }
 
 static inline bool validate_restyp(int restyp)
