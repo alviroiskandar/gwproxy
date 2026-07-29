@@ -47,11 +47,11 @@ cleanup_priv()
 {
 	$SUDO "$IPT" -D OUTPUT -p tcp -d 127.0.0.1 --dport "$hp" -m mark --mark "$MARK" \
 		-j ACCEPT -m comment --comment "$CMT" 2>/dev/null
-	# CUR_PORT is not assigned until start_priv() runs, but this handler is
-	# installed before that. Under lib.sh's `set -u` a bare $CUR_PORT would
+	# PRIV_PID is not assigned until start_priv() runs, but this handler is
+	# installed before that. Under lib.sh's `set -u` a bare $PRIV_PID would
 	# abort the handler on any earlier exit -- leaving the root-installed
 	# iptables rule above undeleted on the host.
-	[ -n "${CUR_PORT:-}" ] && $SUDO pkill -f "bind=127.0.0.1:$CUR_PORT" 2>/dev/null
+	[ -n "${PRIV_PID:-}" ] && gwp_kill_priv "$PRIV_PID"
 	return 0
 }
 # _cleanup exits via the EXIT trap in lib.sh; chain ours ahead of it.
@@ -63,23 +63,25 @@ count_rule()
 	$SUDO "$IPT" -nvxL OUTPUT | awk -v c="$CMT" '$0 ~ c { print $1; f=1 } END { if (!f) print -1 }'
 }
 
-# Start gwproxy under sudo (for CAP_NET_ADMIN) on a given loop + acl file. The
-# process runs as root, so it is stopped with pkill on its bind string (killing
-# the sudo wrapper's PID would not reliably reach the child). $1=port $2=target
-# $3=acl $4=loop ; records CUR_PORT.
+# Start gwproxy under sudo (SO_MARK needs CAP_NET_ADMIN or CAP_NET_RAW) on a
+# given loop + acl file. $! is sudo's pid rather than the proxy's, so it is
+# recorded as PRIV_PID and handed to gwp_kill_priv(), which finds the proxy
+# below it by /proc/<pid>/exe. $1=port $2=target $3=acl $4=loop ; records
+# CUR_PORT and PRIV_PID.
 start_priv()
 {
 	CUR_PORT="$1"
 	$SUDO "$GWPROXY" --bind="127.0.0.1:$1" --target="$2" \
 		--acl-file="$3" --event-loop="$4" --nr-workers=1 \
 		--log-level=3 >"$WORK/priv.log" 2>&1 &
+	PRIV_PID=$!
 	wait_listen "$1" \
 		|| { sed 's/^/# gwp: /' "$WORK/priv.log" >&2; fail "gwproxy did not listen on $1"; }
 }
 
 stop_priv()
 {
-	$SUDO pkill -f "bind=127.0.0.1:$CUR_PORT" 2>/dev/null
+	gwp_kill_priv "${PRIV_PID:-}"
 }
 
 for loop in epoll io_uring; do

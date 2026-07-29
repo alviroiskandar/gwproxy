@@ -50,11 +50,11 @@ NET=192.0.2
 
 cleanup_priv()
 {
-	# CUR_PORT/PEER_PID are only assigned once the run gets that far, but
+	# PRIV_PID/PEER_PID are only assigned once the run gets that far, but
 	# this handler is installed before that: under lib.sh's `set -u` a bare
 	# reference would abort it on an early exit, leaving a root-owned
 	# namespace and interface behind on the host.
-	[ -n "${CUR_PORT:-}" ] && $SUDO pkill -f "bind=127.0.0.1:$CUR_PORT" 2>/dev/null
+	[ -n "${PRIV_PID:-}" ] && gwp_kill_priv "$PRIV_PID"
 	[ -n "${PEER_PID:-}" ] && $SUDO kill "$PEER_PID" 2>/dev/null
 	$SUDO "$IP" link del "$VH" 2>/dev/null
 	$SUDO "$IP" netns del "$NS" 2>/dev/null
@@ -121,9 +121,9 @@ pinned="$(peer_src "$NET.2" "$pa" "$NET.3")"
 
 # gwproxy runs under sudo here to match the root-owned namespace plumbing, not
 # because the bind needs a capability (SO_BINDTODEVICE is unprivileged on Linux
-# 5.7 and later); killing the sudo wrapper's pid would not reliably reach the
-# child, hence pkill on the bind string. $1 = listen port, rest = extra
-# arguments.
+# 5.7 and later). $! is sudo's pid rather than the proxy's, so it is recorded as
+# PRIV_PID and handed to gwp_kill_priv(), which finds the proxy below it by
+# /proc/<pid>/exe. $1 = listen port, rest = extra arguments.
 start_priv()
 {
 	CUR_PORT="$1"
@@ -131,6 +131,7 @@ start_priv()
 	$SUDO "$GWPROXY" --bind="127.0.0.1:$CUR_PORT" --target="$NET.2:$pa" \
 		--nr-workers=1 --log-level=3 --event-loop="$loop" "$@" \
 		>"$WORK/priv.log" 2>&1 &
+	PRIV_PID=$!
 	wait_listen "$CUR_PORT" || {
 		sed 's/^/# gwp: /' "$WORK/priv.log" >&2
 		fail "[$loop] gwproxy did not listen on $CUR_PORT (args: $*)"
@@ -139,7 +140,7 @@ start_priv()
 
 stop_priv()
 {
-	$SUDO pkill -f "bind=127.0.0.1:$CUR_PORT" 2>/dev/null
+	gwp_kill_priv "${PRIV_PID:-}"
 	sleep 0.2
 	return 0
 }

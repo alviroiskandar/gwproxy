@@ -43,7 +43,8 @@ cleanup_priv()
 {
 	$SUDO "$IPT" -t nat -D OUTPUT -p tcp -d 127.0.0.1 --dport "$hp" -m mark ! --mark "$MARK" \
 		-j REDIRECT --to-ports "$pp" -m comment --comment "$CMT" 2>/dev/null
-	$SUDO pkill -f "bind=127.0.0.1:$pp" 2>/dev/null
+	[ -n "${PRIV_PID:-}" ] && gwp_kill_priv "$PRIV_PID"
+	return 0
 }
 trap 'cleanup_priv; _cleanup' EXIT INT TERM
 
@@ -57,6 +58,7 @@ count_redirect()
 
 $SUDO "$GWPROXY" --as-transparent=1 --mark="$MARK" --bind="127.0.0.1:$pp" \
 	--acl-allow-all --nr-workers=1 --log-level=3 >"$WORK/gwp.log" 2>&1 &
+PRIV_PID=$!
 wait_listen "$pp" \
 	|| { sed 's/^/# gwp: /' "$WORK/gwp.log" >&2; fail "gwproxy did not listen on $pp"; }
 
