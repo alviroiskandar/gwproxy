@@ -320,6 +320,47 @@ static noinline void test_mark(void)
 	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_REJECT);
 	assert(req.mark_set && req.mark == 2);
 	gwp_acl_destroy(a);
+
+	/*
+	 * --accept makes MARK terminal: the mark is recorded and traversal
+	 * stops, so the REJECT below it -- which decides the verdict in the
+	 * case above -- is never reached.
+	 */
+	a = NULL;
+	assert(!gwp_acl_parse_str(&a,
+		"-A OUTPUT -d 1.2.3.4 -j MARK --set-mark 1 --accept\n"
+		"-A OUTPUT -d 1.2.3.4 -j MARK --set-mark 2\n"
+		"-A OUTPUT -d 1.2.3.4 -j REJECT\n"
+		"-P OUTPUT ACCEPT\n"));
+	memset(&req, 0, sizeof(req));
+	req.target = &t; req.dport = 80; req.proto = GWP_ACL_PROTO_TCP;
+	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_ACCEPT);
+	assert(req.mark_set && req.mark == 1);	/* not overridden by the 2 */
+	gwp_acl_destroy(a);
+
+	/* Token order is free: --accept may come before its -j. */
+	a = NULL;
+	assert(!gwp_acl_parse_str(&a,
+		"-A OUTPUT -d 1.2.3.4 --accept -j MARK --set-mark 9\n"
+		"-A OUTPUT -d 1.2.3.4 -j REJECT\n"
+		"-P OUTPUT ACCEPT\n"));
+	memset(&req, 0, sizeof(req));
+	req.target = &t; req.dport = 80; req.proto = GWP_ACL_PROTO_TCP;
+	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_ACCEPT);
+	assert(req.mark_set && req.mark == 9);
+	gwp_acl_destroy(a);
+
+	/* --accept only fires when the rule actually matches. */
+	a = NULL;
+	assert(!gwp_acl_parse_str(&a,
+		"-A OUTPUT -d 9.9.9.9 -j MARK --set-mark 5 --accept\n"
+		"-A OUTPUT -d 1.2.3.4 -j REJECT\n"
+		"-P OUTPUT ACCEPT\n"));
+	memset(&req, 0, sizeof(req));
+	req.target = &t; req.dport = 80; req.proto = GWP_ACL_PROTO_TCP;
+	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_REJECT);
+	assert(!req.mark_set);
+	gwp_acl_destroy(a);
 }
 
 static noinline void test_bind(void)
@@ -376,6 +417,31 @@ static noinline void test_bind(void)
 	req.target = &t; req.dport = 80; req.proto = GWP_ACL_PROTO_TCP;
 	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_REJECT);
 	assert(req.bind.set && !strcmp(req.bind.iface, "eth0"));
+	gwp_acl_destroy(a);
+
+	/*
+	 * The same pair with --accept: identical rules, opposite verdict,
+	 * because BIND now terminates instead of falling through.
+	 */
+	a = NULL;
+	assert(!gwp_acl_parse_str(&a,
+		"-A OUTPUT -d 1.2.3.4 -j BIND --to-iface eth0 --accept\n"
+		"-A OUTPUT -d 1.2.3.4 -j REJECT\n-P OUTPUT ACCEPT\n"));
+	memset(&req, 0, sizeof(req));
+	req.target = &t; req.dport = 80; req.proto = GWP_ACL_PROTO_TCP;
+	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_ACCEPT);
+	assert(req.bind.set && !strcmp(req.bind.iface, "eth0"));
+	gwp_acl_destroy(a);
+
+	/* --accept alongside a source spec, and against a REJECT policy. */
+	a = NULL;
+	assert(!gwp_acl_parse_str(&a,
+		"-A OUTPUT -d 1.2.3.4 -j BIND --to-source 10.0.0.9 --accept\n"
+		"-P OUTPUT REJECT\n"));
+	memset(&req, 0, sizeof(req));
+	req.target = &t; req.dport = 80; req.proto = GWP_ACL_PROTO_TCP;
+	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_ACCEPT);
+	assert(req.bind.set && req.bind.have_src);
 	gwp_acl_destroy(a);
 }
 
@@ -529,6 +595,12 @@ static noinline void test_parse_errors(void)
 		"-A OUTPUT -j BIND --to-source notanip\n",	    /* bad source */
 		"-A OUTPUT -j BIND --to-source 1.1.1.1 --to-source 2.2.2.2\n", /* dup src */
 		"-A OUTPUT -j BIND --to-iface toolonginterfacename0\n", /* iface >= 16 */
+		"-A OUTPUT -j ACCEPT --accept\n",		    /* --accept on ACCEPT */
+		"-A OUTPUT -j REJECT --accept\n",		    /* --accept on REJECT */
+		"-A OUTPUT -j DNAT --to 1.2.3.4 --accept\n",	    /* DNAT already terminal */
+		"-A OUTPUT -j MARK --set-mark 5 --accept --accept\n", /* dup --accept */
+		"-A OUTPUT -j MARK --set-mark 5 ! --accept\n",	    /* negated --accept */
+		"-A OUTPUT -d 1.2.3.4 --accept\n",		    /* --accept w/o -j */
 		"-A INPUT -s 1.2.3.4 -j DNAT --to-destination 5.6.7.8\n", /* DNAT in INPUT */
 		"-A OUTPUT -d 999.0.0.1 -j REJECT\n",	    /* bad CIDR */
 		"-A OUTPUT -d 1.2.3.4/33 -j REJECT\n",	    /* bad prefix */

@@ -104,6 +104,40 @@ for loop in epoll io_uring; do
 		|| fail "[$loop] -j MARK not seen on the outgoing connection ($before -> $after)"
 	stop_priv
 
+	# The same MARK rule with --accept: it terminates, so the REJECT below
+	# it is never reached and the fetch still succeeds -- and the counter
+	# still moves, proving the mark was applied on the way out rather than
+	# the rule being skipped. Without --accept these rules deny everything.
+	printf -- '%s\n' \
+		"-A OUTPUT -p tcp --dports $hp -j MARK --set-mark $MARK --accept" \
+		'-A OUTPUT -j REJECT' '-P OUTPUT ACCEPT' >"$WORK/markacc.acl"
+	app="$(pick_port)"
+	start_priv "$app" "127.0.0.1:$hp" "$WORK/markacc.acl" "$loop"
+	before="$(count_rule)"
+	curl -s --max-time 15 "http://127.0.0.1:$app/payload.bin" -o "$WORK/ma.out" \
+		|| fail "[$loop] -j MARK --accept did not terminate before the REJECT"
+	assert_files_equal "$WORK/payload.bin" "$WORK/ma.out" \
+		"[$loop] -j MARK --accept proxy corrupted the payload"
+	after="$(count_rule)"
+	diag "[$loop] --accept marked-packet counter: before=$before after=$after"
+	[ "$after" -gt "$before" ] \
+		|| fail "[$loop] -j MARK --accept did not mark the connection ($before -> $after)"
+	stop_priv
+
+	# Control for the case above: drop --accept and the same pair of rules
+	# rejects the connection, so the success above is the flag's doing.
+	printf -- '%s\n' \
+		"-A OUTPUT -p tcp --dports $hp -j MARK --set-mark $MARK" \
+		'-A OUTPUT -j REJECT' '-P OUTPUT ACCEPT' >"$WORK/marknoacc.acl"
+	npp="$(pick_port)"
+	start_priv "$npp" "127.0.0.1:$hp" "$WORK/marknoacc.acl" "$loop"
+	if curl -s --max-time 10 "http://127.0.0.1:$npp/payload.bin" \
+		-o "$WORK/mn.out" 2>/dev/null; then
+		stop_priv
+		fail "[$loop] MARK without --accept did not fall through to REJECT"
+	fi
+	stop_priv
+
 	# -j BIND --to-iface lo: SO_BINDTODEVICE succeeds and traffic flows.
 	printf -- '%s\n' '-A OUTPUT -j BIND --to-iface lo' \
 		'-P OUTPUT ACCEPT' >"$WORK/bindif.acl"
