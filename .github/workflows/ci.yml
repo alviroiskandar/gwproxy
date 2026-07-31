@@ -8,7 +8,7 @@ on:
 
 jobs:
   get_commit_list:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
         with:
@@ -33,7 +33,7 @@ jobs:
 
   build:
     needs: get_commit_list
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
@@ -149,7 +149,7 @@ jobs:
 
   alpine-musl-build:
     needs: get_commit_list
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     strategy:
       matrix:
         commit: ${{ fromJson(needs.get_commit_list.outputs.commit_list) }}
@@ -189,7 +189,7 @@ jobs:
 
   codespell:
     needs: get_commit_list
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     strategy:
       matrix:
         commit: ${{ fromJson(needs.get_commit_list.outputs.commit_list) }}
