@@ -111,6 +111,13 @@ struct gwp_acl_rule {
 	bool			has_user : 1, neg_user : 1;
 	bool			domain_is_re : 1;	/* --domain-regexp */
 	bool			user_is_re : 1;		/* --user-regexp */
+	/*
+	 * --accept on a MARK/BIND rule: apply the modifier, then stop and
+	 * accept. Saves writing the same match twice (once to set the mark or
+	 * bind, once for a following -j ACCEPT) when the rule is known to be
+	 * the final word for the connections it matches.
+	 */
+	bool			then_accept : 1;
 	uint8_t			proto : 1;	/* enum gwp_acl_proto */
 	uint8_t			action : 3;	/* enum gwp_acl_action */
 };
@@ -660,6 +667,7 @@ static int parse_rule(struct gwp_acl_ruleset *rs, char **tok, int n)
 	/* At most one -j action payload group may be present (they share a union). */
 	bool have_to = false, have_setmark = false;
 	bool have_src = false, have_iface = false;
+	bool have_accept = false;	/* --accept: MARK/BIND become terminal */
 	const char *v;
 	int i, ret = -EINVAL;
 
@@ -850,6 +858,16 @@ static int parse_rule(struct gwp_acl_ruleset *rs, char **tok, int n)
 				goto out;
 			memcpy(r->act.bind.iface, v, strlen(v) + 1);
 			have_iface = true;
+		} else if (!strcmp(o, "--accept")) {
+			/*
+			 * Takes no value, so no next_val() here -- a following
+			 * token is the next option, not this one's argument.
+			 * Which actions may carry it is checked after the loop,
+			 * where -j is known regardless of token order.
+			 */
+			if (neg || have_accept)
+				goto out;
+			have_accept = true;
 		} else {
 			goto out;		/* unknown option */
 		}
@@ -884,18 +902,29 @@ static int parse_rule(struct gwp_acl_ruleset *rs, char **tok, int n)
 			goto out;
 		if (!have_to)			/* DNAT needs --to */
 			goto out;
+		if (have_accept)		/* DNAT already terminates */
+			goto out;
 		break;
 	case GWP_ACL_ACT_MARK:
 		if (!have_setmark)		/* MARK needs --set-mark */
 			goto out;
+		r->then_accept = have_accept;
 		break;
 	case GWP_ACL_ACT_BIND:
 		if (!have_src && !have_iface)	/* BIND needs a source or iface */
 			goto out;
 		r->act.bind.set = true;
+		r->then_accept = have_accept;
 		break;
 	default:				/* ACCEPT / REJECT: no payload */
 		if (have_to || have_setmark || have_src || have_iface)
+			goto out;
+		/*
+		 * --accept only means something on a modifier. On ACCEPT it is
+		 * redundant and on REJECT it contradicts the action, so take it
+		 * as a mistake rather than silently ignoring it.
+		 */
+		if (have_accept)
 			goto out;
 		break;
 	}
@@ -1248,14 +1277,19 @@ static enum gwp_acl_verdict eval_chain(const struct gwp_acl_rule *head,
 			/*
 			 * Modifier: record the fwmark and keep matching. A later
 			 * MARK overrides it; a terminal rule (or the policy) then
-			 * decides the verdict.
+			 * decides the verdict. With --accept the rule is terminal
+			 * itself, so nothing below it can override or re-match.
 			 */
 			req->mark = r->act.setmark;
 			req->mark_set = true;
+			if (r->then_accept)
+				return GWP_ACL_ACCEPT;
 			continue;
 		case GWP_ACL_ACT_BIND:
 			/* Modifier: record the source/iface bind, keep matching. */
 			req->bind = r->act.bind;
+			if (r->then_accept)
+				return GWP_ACL_ACCEPT;
 			continue;
 		case GWP_ACL_ACT_DNAT:
 			/*

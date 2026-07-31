@@ -66,6 +66,15 @@ socks5_connect_rep() {			# $1=proxy_port $2=dst_ip $3=dst_port
 	PY
 }
 
+# Connect to a plain-forward proxy and print the source address the origin
+# reported, or nothing at all when the connection was dropped without a reply
+# (which is what an OUTPUT REJECT looks like on the plain path).
+plain_peer_src() {			# $1=proxy_port
+	python3 -c 'import socket,sys
+s=socket.create_connection(("127.0.0.1", int(sys.argv[1]))); s.settimeout(10)
+print(s.recv(64).decode().strip())' "$1" 2>/dev/null
+}
+
 # Built-in default ACL: with no --acl-file (and no --acl-allow-all) gwproxy
 # rejects loopback/private targets. Launch directly to bypass gwp_start's
 # automatic --acl-allow-all injection.
@@ -228,12 +237,36 @@ for loop in epoll io_uring; do
 	bpp="$(pick_port)"
 	gwp_start "127.0.0.1:$bpp" --target="127.0.0.1:$pa" \
 		--event-loop="$loop" --acl-file="$WORK/bind.acl"
-	src="$(python3 -c 'import socket,sys
-s=socket.create_connection(("127.0.0.1", int(sys.argv[1]))); s.settimeout(10)
-print(s.recv(64).decode().strip())' "$bpp" 2>/dev/null)"
+	src="$(plain_peer_src "$bpp")"
 	[ "$src" = 127.0.0.2 ] \
 		|| fail "$loop BIND --to-source: server saw '$src' (want 127.0.0.2)"
 	kill "$GWP_PID" 2>/dev/null
+
+	# --accept makes BIND terminal. The two rule files below differ only by
+	# that flag, so the pair pins the behaviour from both sides: without it
+	# traversal reaches the REJECT and the connection dies, with it it stops
+	# at the BIND -- and the source is still pinned, proving --accept ends
+	# the walk rather than skipping the modifier.
+	printf -- '%s\n' '-A OUTPUT -j BIND --to-source 127.0.0.2' \
+		'-A OUTPUT -j REJECT' '-P OUTPUT ACCEPT' >"$WORK/bind-noacc.acl"
+	printf -- '%s\n' '-A OUTPUT -j BIND --to-source 127.0.0.2 --accept' \
+		'-A OUTPUT -j REJECT' '-P OUTPUT ACCEPT' >"$WORK/bind-acc.acl"
+
+	bnp="$(pick_port)"
+	gwp_start "127.0.0.1:$bnp" --target="127.0.0.1:$pa" \
+		--event-loop="$loop" --acl-file="$WORK/bind-noacc.acl"
+	src="$(plain_peer_src "$bnp")"
+	kill "$GWP_PID" 2>/dev/null
+	[ -z "$src" ] \
+		|| fail "$loop BIND without --accept did not fall through to REJECT (saw '$src')"
+
+	bap="$(pick_port)"
+	gwp_start "127.0.0.1:$bap" --target="127.0.0.1:$pa" \
+		--event-loop="$loop" --acl-file="$WORK/bind-acc.acl"
+	src="$(plain_peer_src "$bap")"
+	kill "$GWP_PID" 2>/dev/null
+	[ "$src" = 127.0.0.2 ] \
+		|| fail "$loop BIND --accept did not stop at the BIND (saw '${src:-<none>}')"
 
 	# -j DNAT rewrites the destination: a CONNECT to a dead port is
 	# redirected to the real origin and succeeds.
