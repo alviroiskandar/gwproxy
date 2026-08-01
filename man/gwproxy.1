@@ -592,11 +592,18 @@ replaces rather than merges with
 .TP
 .BR \-T ", " \-\-target\-buf\-size=\fInr\fR
 Size in bytes of the per\-connection buffer for target\(->client data. Default:
-.BR 2048 .
+.BR 16384 .
 .TP
 .BR \-C ", " \-\-client\-buf\-size=\fInr\fR
 Size in bytes of the per\-connection buffer for client\(->target data. Default:
-.BR 2048 .
+.BR 16384 .
+.IP
+Each connection allocates both, so the pair costs
+.B 32
+KiB of buffer; 10,000 concurrent connections is about
+.B 312
+MiB. Lower them if memory matters more than syscall count, raise them for
+fewer, larger reads and writes.
 .TP
 .BR \-d ", " \-\-tcp\-nodelay=\fI0|1\fR
 Enable

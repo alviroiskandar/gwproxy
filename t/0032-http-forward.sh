@@ -23,8 +23,8 @@ python3 "$SERVERS_DIR/header_origin.py" "$op" "$hlog" Host \
 _PIDS+=("$!")
 wait_listen "$op" || fail "header origin did not listen on $op"
 
-# Bigger than the 2048-byte default --client-buf-size, the size of an ordinary
-# browser's cookie jar.
+# About the size of an ordinary browser's cookie jar: too big for a 2 KiB
+# client buffer, comfortably inside the 16 KiB default.
 bigval="$(printf 'a%.0s' $(seq 1 3000))"
 
 for loop in epoll io_uring; do
@@ -32,6 +32,7 @@ for loop in epoll io_uring; do
 
 	pp="$(pick_port)"
 	gwp_start "[::1]:$pp" --as-http=1 --event-loop="$loop" --nr-workers=2
+	pp_pid="$GWP_PID"
 
 	# IPv4-literal target. No --proxytunnel: curl issues a plain forward-proxy
 	# GET with an absolute-form request-target.
@@ -69,26 +70,30 @@ except OSError:
 
 	# A request header too large for the client buffer must be answered
 	# with 431, not dropped with a bare reset. The forward path needs the
-	# whole rewritten request to fit, so a few KiB of cookies -- an
-	# ordinary browser request -- exceeds the 2048-byte default.
+	# whole rewritten request to fit. The size is pinned explicitly rather
+	# than leaning on the default, so this keeps discriminating whatever the
+	# default becomes.
+	sp="$(pick_port)"
+	gwp_start "[::1]:$sp" --as-http=1 --event-loop="$loop" \
+		--client-buf-size=2048
 	code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
+		-x "http://[::1]:$sp" -H "Cookie: c=$bigval" \
+		"http://127.0.0.1:$hp/payload.bin")"
+	kill "$GWP_PID" 2>/dev/null
+	[ "$code" = 431 ] \
+		|| fail "[$loop] oversized header at 2048 got $code (want 431)"
+
+	# ... and the same request goes straight through on the default buffer,
+	# which is the point of the 16 KiB default: an ordinary browser request
+	# should not need tuning.
+	code="$(curl -s -o "$WORK/big.bin" -w '%{http_code}' --max-time 20 \
 		-x "http://[::1]:$pp" -H "Cookie: c=$bigval" \
 		"http://127.0.0.1:$hp/payload.bin")"
-	[ "$code" = 431 ] \
-		|| fail "[$loop] oversized header got $code (want 431)"
-
-	kill "$GWP_PID" 2>/dev/null
-
-	# ... and it goes through once the buffer is big enough to hold it.
-	bp="$(pick_port)"
-	gwp_start "[::1]:$bp" --as-http=1 --event-loop="$loop" \
-		--client-buf-size=16384
-	curl -s --max-time 20 -x "http://[::1]:$bp" -H "Cookie: c=$bigval" \
-		"http://127.0.0.1:$hp/payload.bin" -o "$WORK/big.bin" \
-		|| fail "[$loop] forward proxy rejected a 3KiB header at 16K buffer"
+	[ "$code" = 200 ] \
+		|| fail "[$loop] 3KiB header at the default buffer got $code (want 200)"
 	assert_files_equal "$WORK/payload.bin" "$WORK/big.bin" \
 		"[$loop] big-header forward corrupted the payload"
-	kill "$GWP_PID" 2>/dev/null
+	kill "$pp_pid" 2>/dev/null
 done
 
 pass
