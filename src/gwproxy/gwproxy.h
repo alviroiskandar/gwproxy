@@ -383,23 +383,28 @@ struct gwp_conn_sockopt {
 };
 
 struct gwp_conn_pair {
+	/*
+	 * Field order here is deliberate: members are grouped by alignment,
+	 * widest first, with the one-byte scalars collected at the end. Laid
+	 * out in logical order instead, the small members scatter and leave
+	 * 22 bytes of holes. Keep new members in the group that matches their
+	 * alignment rather than next to the code that uses them; `pahole -C
+	 * gwp_conn_pair src/gwproxy/gwproxy.c.o` reports the damage if not.
+	 */
 	struct gwp_conn		target;
 	struct gwp_conn		client;
-	bool			is_target_alive;
-	uint8_t			prot_type;
+	uint64_t		flags;
 
 #ifdef CONFIG_IO_URING
-	int				ref_cnt;
 	struct __kernel_timespec	ts;
 	/*
 	 * The Connection Attempt Delay needs its own timespec: an armed
 	 * io_uring timeout keeps reading the struct it was given, so it cannot
 	 * share @ts with the connect timer that is live alongside it.
-	 * @attempt_timer_armed tracks whether one is outstanding, since
+	 * @attempt_timer_armed (below) tracks whether one is outstanding, since
 	 * io_uring has no timerfd to test for.
 	 */
 	struct __kernel_timespec	ats;
-	bool				attempt_timer_armed;
 #ifdef CONFIG_HTTPS
 	/*
 	 * Persistent ciphertext scratch for the client's TLS on the io_uring
@@ -411,26 +416,6 @@ struct gwp_conn_pair {
 #endif
 #endif
 
-	uint64_t		flags;
-	int			conn_state;
-	int			timer_fd;
-
-	/*
-	 * SOCKS5 UDP ASSOCIATE relay. @udp_fd is the per-connection bound UDP
-	 * socket the client sends datagrams to (-1 when not a UDP association);
-	 * its lifetime is tied to this (TCP control) connection. @udp_peer is
-	 * the client's UDP source address, pinned from its first datagram
-	 * (@udp_pinned); datagrams from other sources are treated as replies
-	 * from targets. @udp_iou is the io_uring relay's per-connection async
-	 * scratch (msghdr + buffer), NULL on the epoll loop which relays
-	 * synchronously into the per-worker udp_buf.
-	 */
-	int			udp_fd;
-	bool			udp_pinned;
-	struct gwp_sockaddr	udp_peer;
-	struct gwp_iou_udp	*udp_iou;
-
-	uint32_t		idx;
 	union {
 		struct gwp_socks5_conn	*s5_conn;
 		struct gwp_http_conn	*http_conn;
@@ -439,6 +424,55 @@ struct gwp_conn_pair {
 		struct gwp_dns_entry	*gde;
 		struct gwp_dns_packet	*gdp;
 	};
+
+	/*
+	 * @udp_iou is the io_uring UDP relay's per-connection async scratch
+	 * (msghdr + buffer), NULL on the epoll loop which relays synchronously
+	 * into the per-worker udp_buf.
+	 */
+	struct gwp_iou_udp	*udp_iou;
+
+	/*
+	 * The hostname the client asked for, when it used a domain target
+	 * (SOCKS5 ATYP 0x03 or an HTTP host), for ACL "-m domain" matching.
+	 * Points into s5_conn/http_conn and stays valid for the connection's
+	 * life; NULL for literal-IP requests.
+	 */
+	const char		*req_domain;
+
+	int			conn_state;
+	int			timer_fd;
+	/*
+	 * @udp_fd is the per-connection bound UDP socket a SOCKS5 UDP
+	 * ASSOCIATE client sends datagrams to (-1 when not a UDP association);
+	 * its lifetime is tied to this (TCP control) connection.
+	 */
+	int			udp_fd;
+	/*
+	 * @attempt_timer_fd fires when the next connect attempt should be
+	 * started. It is separate from timer_fd, which bounds the whole
+	 * connect.
+	 */
+	int			attempt_timer_fd;
+	uint32_t		idx;
+#ifdef CONFIG_IO_URING
+	int			ref_cnt;
+#endif
+
+	/*
+	 * Connect attempts still in flight, one slot per candidate already
+	 * started, -1 when idle. Happy Eyeballs races several at once, so the
+	 * winner is not known until one of them reports success; the winning
+	 * fd then moves into target.fd and the rest are closed.
+	 */
+	int			attempt_fd[GWP_MAX_CONN_CAND];
+
+	/*
+	 * @udp_peer is the UDP client's source address, pinned from its first
+	 * datagram (@udp_pinned); datagrams from other sources are treated as
+	 * replies from targets.
+	 */
+	struct gwp_sockaddr	udp_peer;
 	struct gwp_sockaddr	client_addr;
 	struct gwp_sockaddr	target_addr;
 
@@ -455,20 +489,6 @@ struct gwp_conn_pair {
 	 * a "-j DNAT" rule rewrites it in place.
 	 */
 	struct gwp_sockaddr	cand[GWP_MAX_CONN_CAND];
-	uint8_t			nr_cand;
-	uint8_t			next_cand;
-
-	/*
-	 * Connect attempts still in flight, one slot per candidate already
-	 * started, -1 when idle. Happy Eyeballs races several at once, so the
-	 * winner is not known until one of them reports success; the winning
-	 * fd then moves into target.fd and the rest are closed.
-	 *
-	 * @attempt_timer_fd fires when the next attempt should be started. It
-	 * is separate from timer_fd, which bounds the whole connect.
-	 */
-	int			attempt_fd[GWP_MAX_CONN_CAND];
-	int			attempt_timer_fd;
 
 	/*
 	 * The address each attempt actually dialled, captured after the ACL
@@ -477,14 +497,6 @@ struct gwp_conn_pair {
 	 * up_dst) as the rewritten address, not the resolved one.
 	 */
 	struct gwp_sockaddr	attempt_addr[GWP_MAX_CONN_CAND];
-
-	/*
-	 * The hostname the client asked for, when it used a domain target
-	 * (SOCKS5 ATYP 0x03 or an HTTP host), for ACL "-m domain" matching.
-	 * Points into s5_conn/http_conn and stays valid for the connection's
-	 * life; NULL for literal-IP requests.
-	 */
-	const char		*req_domain;
 
 	/*
 	 * Per-connection socket options from the ACL OUTPUT chain (-j MARK /
@@ -497,15 +509,28 @@ struct gwp_conn_pair {
 	 * Destination requested from the upstream SOCKS5 proxy. Only used
 	 * when ctx->upstream.enabled. For socks5:// this is filled from
 	 * target_addr (an IP); for socks5h:// it carries the hostname.
+	 *
+	 * This is the single largest member (262 bytes, mostly the 256-byte
+	 * domain buffer) and is dead weight on every connection that does not
+	 * chain through an upstream proxy.
 	 */
 	struct gwp_socks5_addr	up_dst;
 
+	/* One-byte scalars last, so they pack instead of each opening a hole. */
+	bool			is_target_alive;
+	uint8_t			prot_type;
+	bool			udp_pinned;
 	/*
 	 * True while an upstream-handshake request is still being flushed to
 	 * the proxy (target buffer holds outbound bytes); false while awaiting
 	 * a reply.
 	 */
 	bool			up_tx;
+	uint8_t			nr_cand;
+	uint8_t			next_cand;
+#ifdef CONFIG_IO_URING
+	bool			attempt_timer_armed;
+#endif
 };
 
 
