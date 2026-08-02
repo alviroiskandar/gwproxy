@@ -18,7 +18,9 @@
 #include <assert.h>
 #include <stdatomic.h>
 #include <unistd.h>
+#ifdef CONFIG_HAVE_GETRANDOM
 #include <sys/random.h>
+#endif
 #include <gwproxy/dns_cache.h>
 #include <arpa/inet.h>
 
@@ -62,13 +64,20 @@ struct gwp_dns_cache {
  * that collide into one bucket (offline hash-flooding). getrandom() is
  * preferred; the fallback mixes time/pid/address, which is not cryptographic
  * but still unpredictable to a remote attacker.
+ *
+ * The fallback covers two cases: getrandom() failing at run time, and libcs
+ * that do not provide it at all (Termux on Android, say), where calling it
+ * would not even compile -- hence the configure probe rather than a bare
+ * __has_include or a version check.
  */
 static uint64_t gen_hash_seed(void)
 {
 	uint64_t s;
 
+#ifdef CONFIG_HAVE_GETRANDOM
 	if (getrandom(&s, sizeof(s), 0) == (ssize_t)sizeof(s))
 		return s;
+#endif
 
 	s = (uint64_t)time(NULL);
 	s ^= (uint64_t)getpid() * 0x9e3779b97f4a7c15ULL;

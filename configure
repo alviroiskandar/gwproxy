@@ -439,6 +439,33 @@ else
 	print_supp "no" "${l}";
 fi;
 
+# ------ Check for getrandom() ------
+#
+# glibc 2.25+ and Bionic (API 28+) declare it in <sys/random.h>, but not every
+# libc does -- Termux on Android is the case that prompted this -- and an
+# undeclared call is a hard compile error. dns_cache.c falls back to a
+# time/pid/address seed when this is absent.
+cat > $tmp_c << EOF
+#include <sys/random.h>
+int main(void)
+{
+	unsigned long long s;
+	return getrandom(&s, sizeof(s), 0) == (long)sizeof(s) ? 0 : 1;
+}
+EOF
+#
+# -Werror=implicit-function-declaration matters: without it a missing
+# declaration is only a warning, the call still links against a libc that
+# happens to export the symbol, and the probe answers "yes" on precisely the
+# systems it exists to catch.
+l="Do we have getrandom()?";
+if compile_cc "-Werror=implicit-function-declaration" "" "getrandom()"; then
+	add_config "CONFIG_HAVE_GETRANDOM";
+	print_supp "yes" "${l}";
+else
+	print_supp "no" "${l}";
+fi;
+
 add_make_var "CC" "${cc}";
 add_make_var "CXX" "${cxx}";
 add_make_var "CFLAGS" "$(echo "${CFLAGS} ${USER_CFLAGS}" | awk '{$1=$1};1')";
