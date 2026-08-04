@@ -38,6 +38,17 @@ struct gwp_iou_tls;
 struct gwp_iou_udp;
 struct gwp_acl;
 
+/*
+ * Which address family outgoing (target) connections may use. IPv4/IPv6 force
+ * DNS to resolve that family only and refuse a literal target of the other one;
+ * ANY leaves the choice to DNS and --prefer-ipv6.
+ */
+enum {
+	GWP_OUT_FAMILY_ANY	= 0,
+	GWP_OUT_FAMILY_IPV4	= 1,
+	GWP_OUT_FAMILY_IPV6	= 2,
+};
+
 struct gwp_cfg {
 	const char	*event_loop;
 	const char	*bind;
@@ -46,6 +57,7 @@ struct gwp_cfg {
 	bool		as_http;
 	bool		udp_associate;	/* allow SOCKS5 UDP ASSOCIATE (default on) */
 	bool		prefer_ipv6;
+	uint8_t		outgoing_family;/* enum GWP_OUT_FAMILY_* */
 	bool		use_raw_dns;
 	int		protocol_timeout;
 	const char	*auth_file;
@@ -753,6 +765,12 @@ int gwp_conn_close_attempts(struct gwp_conn_pair *gcp);
 bool gwp_ctx_acl_client_allowed(struct gwp_ctx *ctx,
 				const struct gwp_sockaddr *client,
 				enum gwp_acl_proto proto);
+/*
+ * True when @a may be dialled under --outgoing-family. v4-mapped aware, so a
+ * ::ffff:a.b.c.d target from the UDP relay counts as IPv4.
+ */
+bool gwp_ctx_outgoing_family_ok(const struct gwp_ctx *ctx,
+				const struct gwp_sockaddr *a);
 int gwp_get_orig_dst(int fd, const struct gwp_sockaddr *client,
 		     struct gwp_sockaddr *dst);
 const char *ip_to_str(const struct gwp_sockaddr *gs);

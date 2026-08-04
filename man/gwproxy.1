@@ -456,6 +456,68 @@ queried first \(em A, falling back to AAAA, or the reverse with
 Default:
 .BR 0 .
 .TP
+.BR \-\-outgoing\-family=\fIany|ipv4|ipv6\fR
+Restrict outgoing (target) connections to one address family. Unlike
+.BR \-\-prefer\-ipv6 ,
+which only reorders candidates, this is a hard restriction with two effects:
+proxy DNS resolves that family only, and a literal target of the other family
+is refused before any socket is created \(em SOCKS5 reply
+.B 0x08
+.RB ( "address type not supported" ),
+HTTP
+.BR 502 .
+Relayed UDP datagrams to a target of the wrong family are dropped. Default:
+.BR any .
+.IP
+The restriction is enforced where the outgoing socket is created, which is
+after the ACL has run, so a
+.B \-j DNAT
+rule that rewrites a destination into the forbidden family is caught as well.
+It also covers the hop to an
+.BR \-\-upstream\-proxy ,
+so an upstream whose own address is of the forbidden family is rejected at
+startup rather than failing on every connection. Likewise
+.B \-\-prefer\-ipv6=1
+with
+.BR \-\-outgoing\-family=ipv4 ,
+and a
+.B \-\-bind\-source
+of the forbidden family, are refused at startup as contradictions.
+.IP
+.B Pitfalls.
+This controls what
+.I this
+proxy dials; it is not a guarantee that no IPv6 is used end to end.
+.RS
+.IP \(bu 2
+With
+.B \-\-upstream\-proxy=socks5h://
+or
+.BR http:// ,
+the hostname is handed to the upstream and that proxy resolves it. gwproxy
+never sees the address, so the upstream may well connect over IPv6. Only the
+hop to the upstream itself is restricted. With
+.B socks5://
+the name is resolved locally, so the restriction does apply.
+.IP \(bu 2
+A domain target in a relayed UDP datagram is dropped for unrelated reasons
+(no per\-datagram DNS), so the family restriction never sees it.
+.IP \(bu 2
+It does not touch the listener. Use
+.B \-\-bind\-ipv6\-only
+to control which families may reach the proxy; the two are independent.
+.IP \(bu 2
+A name with only AAAA records becomes unresolvable under
+.BR ipv4 ,
+and the client is told the host could not be reached. That is the point, but
+it turns a working destination into a failing one, so expect it.
+.IP \(bu 2
+NAT64/DNS64 networks synthesise AAAA for IPv4\-only destinations.
+.B ipv4
+there refuses the synthesised address and leaves no route to the destination
+at all.
+.RE
+.TP
 .BR \-L ", " \-\-dns\-cache\-secs=\fIsec\fR
 Cache proxy DNS answers for this many seconds.
 .B 0

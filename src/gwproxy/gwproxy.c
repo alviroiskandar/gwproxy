@@ -50,6 +50,7 @@
  * short-option string builder below. */
 enum {
 	OPT_ACL_ALLOW_ALL = 0x100,
+	OPT_OUTGOING_FAMILY,
 	OPT_DNS_CACHE_MAX_ENTRIES,
 };
 
@@ -66,6 +67,7 @@ static const struct option long_opts[] = {
 	{ "auth-file",		required_argument,	NULL,	'A' },
 	{ "acl-file",		required_argument,	NULL,	'a' },
 	{ "acl-allow-all",	no_argument,		NULL,	OPT_ACL_ALLOW_ALL },
+	{ "outgoing-family",	required_argument,	NULL,	OPT_OUTGOING_FAMILY },
 	{ "dns-cache-secs",	required_argument,	NULL,	'L' },
 	{ "dns-cache-max-entries", required_argument,	NULL,	OPT_DNS_CACHE_MAX_ENTRIES },
 	{ "nr-workers",		required_argument,	NULL,	'w' },
@@ -107,6 +109,7 @@ static const struct gwp_cfg default_opts = {
 	.as_http		= false,
 	.udp_associate		= true,
 	.prefer_ipv6		= false,
+	.outgoing_family	= GWP_OUT_FAMILY_ANY,
 	.use_raw_dns		= false,
 	.protocol_timeout	= 10,
 	.auth_file		= NULL,
@@ -136,6 +139,8 @@ static const struct gwp_cfg default_opts = {
 	.as_transparent		= false
 };
 
+static uint32_t cfg_dns_restyp(const struct gwp_cfg *cfg);
+
 __cold
 static void show_help(const char *app)
 {
@@ -150,6 +155,8 @@ static void show_help(const char *app)
 	printf("  -H, --as-http=0|1               Run as an HTTP proxy (default: %d)\n", default_opts.as_http);
 	printf("  -U, --udp-associate=0|1         Allow SOCKS5 UDP ASSOCIATE; 0 rejects it with REP 0x07 (default: %d)\n", default_opts.udp_associate);
 	printf("  -Q, --prefer-ipv6=0|1           Prefer IPv6 for proxy DNS queries (default: %d)\n", default_opts.prefer_ipv6);
+	printf("      --outgoing-family=fam       Restrict outgoing connections to one family: any|ipv4|ipv6 (default: any)\n");
+	printf("                                  Resolves that family only; a literal target of the other one is refused\n");
 	printf("  -o, --protocol-timeout=sec      Timeout for protocol handshake process (default: %d)\n", default_opts.protocol_timeout);
 	printf("  -A, --auth-file=file            File with username:password credentials for SOCKS5 and HTTP auth (default: no auth)\n");
 	printf("  -a, --acl-file=file             iptables-style ACL rule file for target/client filtering\n");
@@ -268,6 +275,16 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 			break;
 		case 'a':
 			cfg->acl_file = optarg;
+			break;
+		case OPT_OUTGOING_FAMILY:
+			if (!strcmp(optarg, "any"))
+				cfg->outgoing_family = GWP_OUT_FAMILY_ANY;
+			else if (!strcmp(optarg, "ipv4"))
+				cfg->outgoing_family = GWP_OUT_FAMILY_IPV4;
+			else if (!strcmp(optarg, "ipv6"))
+				cfg->outgoing_family = GWP_OUT_FAMILY_IPV6;
+			else
+				goto einval_outfam;
 			break;
 		case OPT_ACL_ALLOW_ALL:
 			cfg->acl_allow_all = true;
@@ -397,6 +414,16 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 		goto einval;
 	}
 
+	/*
+	 * --prefer-ipv6 asks for a family that --outgoing-family forbids. Take
+	 * it as a mistake rather than silently letting the hard restriction win
+	 * -- an operator who wrote both is describing two different intents.
+	 */
+	if (cfg->prefer_ipv6 && cfg->outgoing_family == GWP_OUT_FAMILY_IPV4) {
+		fprintf(stderr, ERR_WRAP "Error: --prefer-ipv6=1 contradicts --outgoing-family=ipv4.\n" ERR_WRAP);
+		goto einval;
+	}
+
 	if (cfg->target_buf_size <= 1) {
 		fprintf(stderr, ERR_WRAP "Error: --target-buf-size must be greater than 1.\n" ERR_WRAP);
 		goto einval;
@@ -420,6 +447,10 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 	}
 
 	return 0;
+
+einval_outfam:
+	fprintf(stderr, ERR_WRAP "Error: --outgoing-family must be any, ipv4 or ipv6.\n" ERR_WRAP);
+	goto einval;
 
 einval:
 	fprintf(stderr, "\n");
@@ -523,9 +554,7 @@ static int gwp_raw_dns_resolve(struct gwp_wrk *w,
 		goto out_err;
 	}
 
-	gdp->restyp = w->ctx->cfg.prefer_ipv6 ?
-		GWP_DNS_RESTYP_PREFER_IPV6 :
-		GWP_DNS_RESTYP_PREFER_IPV4;
+	gdp->restyp = cfg_dns_restyp(&w->ctx->cfg);
 
 	gdp->port = (uint16_t)atoi(port);
 	gdp->buf_len = sizeof(gdp->buf);
@@ -1403,6 +1432,24 @@ static void gwp_ctx_free_socks5(struct gwp_ctx *ctx)
 	pr_dbg(&ctx->lh, "SOCKS5 context freed");
 }
 
+/*
+ * The DNS resolution type implied by the configuration. --outgoing-family wins
+ * over --prefer-ipv6: the former is a hard restriction, the latter only a
+ * preference, and the two are rejected together at startup anyway.
+ */
+static uint32_t cfg_dns_restyp(const struct gwp_cfg *cfg)
+{
+	switch (cfg->outgoing_family) {
+	case GWP_OUT_FAMILY_IPV4:
+		return GWP_DNS_RESTYP_IPV4_ONLY;
+	case GWP_OUT_FAMILY_IPV6:
+		return GWP_DNS_RESTYP_IPV6_ONLY;
+	default:
+		return cfg->prefer_ipv6 ? GWP_DNS_RESTYP_PREFER_IPV6 :
+					  GWP_DNS_RESTYP_PREFER_IPV4;
+	}
+}
+
 static int gwp_ctx_init_dns(struct gwp_ctx *ctx)
 {
 	struct gwp_cfg *cfg = &ctx->cfg;
@@ -1410,7 +1457,7 @@ static int gwp_ctx_init_dns(struct gwp_ctx *ctx)
 		.cache_expiry = cfg->dns_cache_secs,
 		.max_entries = cfg->dns_cache_max_entries > 0 ?
 			       (uint32_t)cfg->dns_cache_max_entries : 0,
-		.restyp = cfg->prefer_ipv6 ? GWP_DNS_RESTYP_PREFER_IPV6 : 0,
+		.restyp = cfg_dns_restyp(cfg),
 		.nr_workers = cfg->nr_dns_workers
 	};
 	int r;
@@ -1718,6 +1765,16 @@ static int gwp_ctx_init(struct gwp_ctx *ctx)
 		goto out_free_log;
 
 	r = gwp_ctx_init_bind_def(ctx);
+	if (!r && ctx->bind_def.have_src &&
+	    !gwp_ctx_outgoing_family_ok(ctx, &ctx->bind_def.src)) {
+		/*
+		 * A source of the family we are forbidden to dial can never
+		 * apply: apply_conn_bind() would skip it on every connection.
+		 */
+		pr_err(&ctx->lh, "--bind-source %s is not allowed by --outgoing-family",
+		       ip_to_str(&ctx->bind_def.src));
+		r = -EAFNOSUPPORT;
+	}
 	if (r < 0)
 		goto out_free_log;
 
@@ -1732,6 +1789,17 @@ static int gwp_ctx_init(struct gwp_ctx *ctx)
 		if (ctx->upstream.use_tls) {
 			pr_err(&ctx->lh, "An https:// (TLS) upstream proxy is not supported yet; use http:// or socks5[h]://");
 			r = -ENOTSUP;
+			goto out_free_log;
+		}
+		/*
+		 * The upstream proxy is itself an outgoing connection, so it is
+		 * subject to --outgoing-family. Catching it here turns what
+		 * would be an every-connection failure into one startup error.
+		 */
+		if (!gwp_ctx_outgoing_family_ok(ctx, &ctx->upstream.addr)) {
+			pr_err(&ctx->lh, "--upstream-proxy address %s is not allowed by --outgoing-family",
+			       ip_to_str(&ctx->upstream.addr));
+			r = -EAFNOSUPPORT;
 			goto out_free_log;
 		}
 		pr_info(&ctx->lh, "Routing outgoing connections via upstream %s proxy %s (%s DNS)",
@@ -2190,6 +2258,18 @@ int gwp_create_sock_target(struct gwp_wrk *w, struct gwp_sockaddr *addr,
 	socklen_t len;
 	int fd, r;
 
+	/*
+	 * --outgoing-family. This is the one choke point every outgoing TCP
+	 * socket passes through, and it sits after the ACL has run, so a
+	 * "-j DNAT" rewrite into the forbidden family is caught here too.
+	 * -EAFNOSUPPORT reaches the client as SOCKS5 REP 0x08 / HTTP 502.
+	 */
+	if (!gwp_ctx_outgoing_family_ok(w->ctx, addr)) {
+		pr_info(&w->ctx->lh,
+			"--outgoing-family refuses target %s", ip_to_str(addr));
+		return -EAFNOSUPPORT;
+	}
+
 	fd = __sys_socket(addr->sa.sa_family, t, 0);
 	if (unlikely(fd < 0))
 		return fd;
@@ -2314,6 +2394,8 @@ static int socks5_translate_err(int err)
 		return GWP_SOCKS5_REP_CONN_REFUSED;
 	case -ETIMEDOUT:
 		return GWP_SOCKS5_REP_TTL_EXPIRED;
+	case -EAFNOSUPPORT:
+		return GWP_SOCKS5_REP_ATYP_NOT_SUPPORTED;
 	default:
 		return GWP_SOCKS5_REP_FAILURE;
 	}
@@ -2820,6 +2902,29 @@ static void sockaddr_canon_ip(const struct gwp_sockaddr *a, bool *is_v4,
 }
 
 /*
+ * True when @a may be dialled under --outgoing-family.
+ *
+ * The comparison must be v4-mapped aware: the SOCKS5 UDP relay hands targets
+ * over as ::ffff:a.b.c.d on its dual-stack socket, so a bare
+ * sa_family == AF_INET6 test would refuse ordinary IPv4 traffic.
+ */
+bool gwp_ctx_outgoing_family_ok(const struct gwp_ctx *ctx,
+				const struct gwp_sockaddr *a)
+{
+	const uint8_t *ip;
+	bool is_v4;
+
+	if (ctx->cfg.outgoing_family == GWP_OUT_FAMILY_ANY)
+		return true;
+
+	sockaddr_canon_ip(a, &is_v4, &ip);
+	if (ctx->cfg.outgoing_family == GWP_OUT_FAMILY_IPV4)
+		return is_v4;
+	return !is_v4;
+}
+
+
+/*
  * Compare two addresses by IP only (not port), treating an IPv4 address and its
  * IPv4-mapped IPv6 form as equal. The UDP relay socket is dual-stack, so a
  * datagram's source is always AF_INET6 (v4-mapped for an IPv4 peer) while the
@@ -2885,6 +2990,12 @@ enum gwp_udp_act gwp_udp_relay_classify(struct gwp_wrk *w,
 			return GWP_UDP_DROP;
 		if (gwp_socks5_addr_to_sockaddr(&dst, &tsa, &tslen))
 			return GWP_UDP_DROP;	/* domain target: unsupported */
+		/*
+		 * --outgoing-family. tsa is v4-mapped for an IPv4 target on this
+		 * dual-stack relay socket, which the predicate accounts for.
+		 */
+		if (!gwp_ctx_outgoing_family_ok(w->ctx, &tsa))
+			return GWP_UDP_DROP;	/* wrong family for this proxy */
 		if (!gwp_ctx_acl_output_allowed(w->ctx, &gcp->udp_peer, &tsa,
 						gcp_req_user(gcp),
 						GWP_ACL_PROTO_UDP))
