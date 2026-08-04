@@ -51,6 +51,7 @@
 enum {
 	OPT_ACL_ALLOW_ALL = 0x100,
 	OPT_OUTGOING_FAMILY,
+	OPT_BIND_IPV6_ONLY,
 	OPT_DNS_CACHE_MAX_ENTRIES,
 };
 
@@ -68,6 +69,7 @@ static const struct option long_opts[] = {
 	{ "acl-file",		required_argument,	NULL,	'a' },
 	{ "acl-allow-all",	no_argument,		NULL,	OPT_ACL_ALLOW_ALL },
 	{ "outgoing-family",	required_argument,	NULL,	OPT_OUTGOING_FAMILY },
+	{ "bind-ipv6-only",	required_argument,	NULL,	OPT_BIND_IPV6_ONLY },
 	{ "dns-cache-secs",	required_argument,	NULL,	'L' },
 	{ "dns-cache-max-entries", required_argument,	NULL,	OPT_DNS_CACHE_MAX_ENTRIES },
 	{ "nr-workers",		required_argument,	NULL,	'w' },
@@ -110,6 +112,7 @@ static const struct gwp_cfg default_opts = {
 	.udp_associate		= true,
 	.prefer_ipv6		= false,
 	.outgoing_family	= GWP_OUT_FAMILY_ANY,
+	.bind_ipv6_only		= false,
 	.use_raw_dns		= false,
 	.protocol_timeout	= 10,
 	.auth_file		= NULL,
@@ -139,6 +142,7 @@ static const struct gwp_cfg default_opts = {
 	.as_transparent		= false
 };
 
+static int setskopt_int(int fd, int level, int optname, int val);
 static uint32_t cfg_dns_restyp(const struct gwp_cfg *cfg);
 
 __cold
@@ -157,6 +161,7 @@ static void show_help(const char *app)
 	printf("  -Q, --prefer-ipv6=0|1           Prefer IPv6 for proxy DNS queries (default: %d)\n", default_opts.prefer_ipv6);
 	printf("      --outgoing-family=fam       Restrict outgoing connections to one family: any|ipv4|ipv6 (default: any)\n");
 	printf("                                  Resolves that family only; a literal target of the other one is refused\n");
+	printf("      --bind-ipv6-only=0|1        Set IPV6_V6ONLY on the listener, so an IPv6 bind refuses IPv4 (default: 0)\n");
 	printf("  -o, --protocol-timeout=sec      Timeout for protocol handshake process (default: %d)\n", default_opts.protocol_timeout);
 	printf("  -A, --auth-file=file            File with username:password credentials for SOCKS5 and HTTP auth (default: no auth)\n");
 	printf("  -a, --acl-file=file             iptables-style ACL rule file for target/client filtering\n");
@@ -285,6 +290,9 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 				cfg->outgoing_family = GWP_OUT_FAMILY_IPV6;
 			else
 				goto einval_outfam;
+			break;
+		case OPT_BIND_IPV6_ONLY:
+			cfg->bind_ipv6_only = !!atoi(optarg);
 			break;
 		case OPT_ACL_ALLOW_ALL:
 			cfg->acl_allow_all = true;
@@ -687,6 +695,28 @@ static int gwp_ctx_init_thread_sock(struct gwp_wrk *w,
 	v = 1;
 	__sys_setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &v, sizeof(v));
 	__sys_setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &v, sizeof(v));
+
+	/*
+	 * --bind-ipv6-only. Set unconditionally on an IPv6 listener rather than
+	 * only when asked, so the behaviour does not depend on the host's
+	 * net.ipv6.bindv6only sysctl: a wildcard [::] bind accepts IPv4 clients
+	 * as ::ffff:a.b.c.d by default, and refuses them when this is on.
+	 *
+	 * This is the LISTENER only. The SOCKS5 UDP relay socket deliberately
+	 * clears IPV6_V6ONLY (see gwp_socks5_udp_associate_setup) because a
+	 * single-family bind cannot egress the other family; applying this
+	 * there would break UDP ASSOCIATE to IPv4 targets.
+	 */
+	if (ba->sa.sa_family == AF_INET6) {
+		int v6only = cfg->bind_ipv6_only ? 1 : 0;
+
+		r = setskopt_int(fd, IPPROTO_IPV6, IPV6_V6ONLY, v6only);
+		if (r < 0) {
+			pr_err(&w->ctx->lh, "Failed to set IPV6_V6ONLY=%d: %s",
+			       v6only, strerror(-r));
+			goto out_close;
+		}
+	}
 
 	r = __sys_bind(fd, (struct sockaddr *)ba, slen);
 	if (r < 0) {
