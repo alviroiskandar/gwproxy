@@ -58,6 +58,7 @@ struct gwp_cfg {
 	bool		udp_associate;	/* allow SOCKS5 UDP ASSOCIATE (default on) */
 	bool		prefer_ipv6;
 	uint8_t		outgoing_family;/* enum GWP_OUT_FAMILY_* */
+	bool		bind_ipv6_only;	/* IPV6_V6ONLY on the listener */
 	bool		use_raw_dns;
 	int		protocol_timeout;
 	const char	*auth_file;

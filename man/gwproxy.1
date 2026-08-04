@@ -518,6 +518,31 @@ there refuses the synthesised address and leaves no route to the destination
 at all.
 .RE
 .TP
+.BR \-\-bind\-ipv6\-only=\fI0|1\fR
+Set
+.B IPV6_V6ONLY
+on the listening socket. With the default
+.BR 0 ,
+a wildcard
+.B [::]
+bind also accepts IPv4 clients, which appear as
+.RI ::ffff: a.b.c.d
+(an ACL
+.B \-s 10.0.0.0/8
+still matches such a client, since addresses are compared in their canonical
+form). With
+.BR 1 ,
+those connections are refused and only IPv6 clients can reach the proxy.
+.IP
+The value is applied explicitly in both directions rather than only when the
+option is given, so behaviour does not depend on the host's
+.B net.ipv6.bindv6only
+sysctl. It has no effect when
+.B \-\-bind
+names an IPv4 address. It applies to the listener only: the SOCKS5 UDP relay
+socket stays dual\-stack on purpose, because a single\-family bind cannot
+egress the other family, so UDP ASSOCIATE to IPv4 targets keeps working.
+.TP
 .BR \-L ", " \-\-dns\-cache\-secs=\fIsec\fR
 Cache proxy DNS answers for this many seconds.
 .B 0

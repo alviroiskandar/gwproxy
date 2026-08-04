@@ -52,7 +52,8 @@ Features
     single match rather than repeating the same condition twice.
   - Address-family control: --outgoing-family=any|ipv4|ipv6 restricts what
     the proxy dials (DNS resolves that family only; a literal target of the
-    other family is refused with SOCKS5 0x08 / HTTP 502),.
+    other family is refused with SOCKS5 0x08 / HTTP 502), and
+    --bind-ipv6-only decides whether a [::] bind also accepts IPv4 clients.
     Note --outgoing-family cannot reach past an upstream proxy that resolves
     the name itself (socks5h:// and http://).
   - Two event loops: epoll (default) and io_uring (optional, enabled at
