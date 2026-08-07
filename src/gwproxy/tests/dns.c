@@ -23,6 +23,7 @@
 
 struct req_template {
 	const char *domain, *service;
+	bool needs_ipv6;	/* requires a resolvable IPv6, see has_ipv6() */
 };
 
 /*
@@ -33,23 +34,26 @@ struct req_template {
  * regression in gwp_dns_queue(). Repeating a handful of local names keeps the
  * many-requests shape (queue, workers, eventfd, refcounts, cache inserts) that
  * this test is actually about, and covers both address families.
+ *
+ * The entries marked needs_ipv6 are requested only where the host can serve
+ * them; /etc/hosts is not enough on its own. See has_ipv6().
  */
 static const struct req_template req_template[] = {
-	{ "localhost",		"80" },
-	{ "127.0.0.1",		"80" },
-	{ "::1",		"443" },
-	{ "ip6-localhost",	"443" },
-	{ "localhost",		"443" },
-	{ "127.0.0.1",		"443" },
-	{ "::1",		"80" },
-	{ "ip6-localhost",	"80" },
-	{ "localhost",		"8080" },
-	{ "127.0.0.1",		"8080" },
-	{ "::1",		"8080" },
-	{ "ip6-localhost",	"8080" },
-	{ "localhost",		"9090" },
-	{ "127.0.0.1",		"9090" },
-	{ "::1",		"9090" },
+	{ "localhost",		"80",	false },
+	{ "127.0.0.1",		"80",	false },
+	{ "::1",		"443",	true },
+	{ "ip6-localhost",	"443",	false },
+	{ "localhost",		"443",	false },
+	{ "127.0.0.1",		"443",	false },
+	{ "::1",		"80",	true },
+	{ "ip6-localhost",	"80",	false },
+	{ "localhost",		"8080",	false },
+	{ "127.0.0.1",		"8080",	false },
+	{ "::1",		"8080",	true },
+	{ "ip6-localhost",	"8080",	false },
+	{ "localhost",		"9090",	false },
+	{ "127.0.0.1",		"9090",	false },
+	{ "::1",		"9090",	true },
 };
 
 static int poll_all_in(struct pollfd *pfd, int n, int timeout)
@@ -79,28 +83,73 @@ static int poll_all_in(struct pollfd *pfd, int n, int timeout)
 	}
 }
 
+/*
+ * Can this host resolve an IPv6 name at all, using the flags the resolver
+ * itself uses?
+ *
+ * gwp_dns_queue() resolves with AI_ADDRCONFIG (prep_hints() in dns.c), and
+ * glibc only enables AF_INET6 lookups when a NON-LOOPBACK IPv6 address is
+ * configured -- "::1/128 scope host" on lo does not count. So on a v4-only
+ * host, and in most containers, even the literal "::1" fails with
+ * EAI_ADDRFAMILY, which the resolver reports as -EHOSTUNREACH. That is the
+ * resolver behaving correctly, not a regression, so the IPv6 names are
+ * requested only where they can succeed. Probing beats parsing /etc/hosts or
+ * poking at interfaces: it asks exactly the question the code under test asks.
+ */
+static bool has_ipv6(void)
+{
+	struct addrinfo hints, *res = NULL;
+	int r;
+
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+	hints.ai_flags = AI_ADDRCONFIG;
+	r = getaddrinfo("::1", "80", &hints, &res);
+	if (res)
+		freeaddrinfo(res);
+
+	return r == 0;
+}
+
 static void test_basic_dns_multiple_requests(void)
 {
 	struct gwp_dns_cfg cfg = { .nr_workers = 1 };
 	struct gwp_dns_entry *earr[ARRAY_SIZE(req_template)];
 	struct pollfd pfd[ARRAY_SIZE(req_template)];
+	bool v6 = has_ipv6();
 	struct gwp_dns_ctx *ctx;
-	int i, n;
+	int i, n, skipped = 0;
 	int r;
 
 	r = gwp_dns_ctx_init(&ctx, &cfg);
 	assert(!r);
 	assert(ctx != NULL);
 
-	n = (int)ARRAY_SIZE(req_template);
-	for (i = 0; i < n; i++) {
+	n = 0;
+	for (i = 0; i < (int)ARRAY_SIZE(req_template); i++) {
 		const struct req_template *rt = &req_template[i];
-		earr[i] = gwp_dns_queue(ctx, rt->domain, rt->service);
-		assert(earr[i]);
-		assert(earr[i]->ev_fd >= 0);
-		pfd[i].fd = earr[i]->ev_fd;
-		pfd[i].events = POLLIN;
+
+		if (rt->needs_ipv6 && !v6) {
+			skipped++;
+			continue;
+		}
+		earr[n] = gwp_dns_queue(ctx, rt->domain, rt->service);
+		assert(earr[n]);
+		assert(earr[n]->ev_fd >= 0);
+		pfd[n].fd = earr[n]->ev_fd;
+		pfd[n].events = POLLIN;
+		n++;
 	}
+	assert(n > 0);
+
+	/*
+	 * Say so rather than quietly running a smaller test: a reader who sees
+	 * a pass here must not conclude that IPv6 resolution was covered.
+	 */
+	if (skipped)
+		printf("dns: no non-loopback IPv6 on this host, skipped %d of %zu requests\n",
+		       skipped, ARRAY_SIZE(req_template));
 
 	r = poll_all_in(pfd, n, 5000);
 	assert(!r);
