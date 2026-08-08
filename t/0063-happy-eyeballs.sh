@@ -21,13 +21,43 @@ require curl
 require python3
 require unshare
 
-# Re-exec: everything below the marker runs inside the namespace.
+# Nothing in this test needs privilege, but "sudo make test" hands it some
+# anyway, and that breaks the namespace: "unshare -r" maps exactly ONE uid,
+# the caller's. Run normally the caller owns this tree, so the sources stay
+# readable inside. Run as root the mapping is 0->0, the tree's owner is left
+# unmapped and reads back as "nobody", and an 0700 $HOME anywhere above the
+# tree then denies the inner root -- capabilities inside a user namespace
+# apply only to inodes whose owner is mapped into it, so CAP_DAC_OVERRIDE does
+# not help and no container capability can. (Skipping the user namespace and
+# taking a plain "unshare -m" instead would need CAP_SYS_ADMIN, which the
+# containers this runs in do not have.)
+#
+# So when handed root, give it back: run the body as the uid owning the tree,
+# which is exactly what a plain "make test" does.
+#
+# Re-exec: everything below the marker runs inside the namespace. The drop
+# below has to stay in this branch -- inside, "id -u" is the MAPPED root, and
+# a chown to the outer uid fails with EINVAL because that uid has no mapping
+# there.
 if [ "${1:-}" != "--inner" ]; then
-	unshare -rm --map-root-user true 2>/dev/null \
+	DROP=""
+	if [ "$(id -u)" = 0 ]; then
+		drop_uid="${SUDO_UID:-$(stat -c %u "$ROOT")}"
+		drop_gid="${SUDO_GID:-$(stat -c %g "$ROOT")}"
+		if [ "$drop_uid" != 0 ]; then
+			require setpriv
+			DROP="setpriv --reuid=$drop_uid --regid=$drop_gid --clear-groups"
+			# $WORK is mktemp'd 0700 as root; the body writes here.
+			chown -R "$drop_uid:$drop_gid" "$WORK" \
+				|| fail "cannot chown $WORK to $drop_uid:$drop_gid"
+		fi
+	fi
+
+	$DROP unshare -rm --map-root-user true 2>/dev/null \
 		|| skip "no user+mount namespaces (unshare -rm) available"
 	out="$WORK/inner.out"
 	# Detached: a backgrounded proxy holding the pipe would wedge the read.
-	setsid unshare -rm --map-root-user "$0" --inner "$WORK" \
+	setsid $DROP unshare -rm --map-root-user "$0" --inner "$WORK" \
 		</dev/null >"$out" 2>&1 &
 	for i in $(seq 1 60); do
 		grep -q '^INNER-DONE' "$out" 2>/dev/null && break
