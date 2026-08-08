@@ -115,6 +115,21 @@ ns_drop_setup()
 	chown -R "$uid:$gid" "$WORK" || fail "cannot chown $WORK to $uid:$gid"
 }
 
+# ns_inner_work <dir>: adopt the outer half's work directory, <dir>.
+#
+# A test that re-execs itself into a namespace sources this file again on the
+# way in, so the inner half has already been given a work directory of its own
+# by the mktemp above -- and it is about to stop using it, in favour of the one
+# the outer half passed down. It also replaces the EXIT trap, so lib.sh's
+# _cleanup never runs there to remove it. Left alone that orphans one empty
+# directory per run, on the host's real /tmp: neither "unshare -rn" nor the
+# "unshare -rm" that bind-mounts only /etc/hosts hides it.
+ns_inner_work()
+{
+	rm -rf "$WORK"
+	WORK="$1"
+}
+
 # Print a free TCP port that is bindable on the IPv4/IPv6 dual stack, so it is
 # also free for a plain 127.0.0.1 or [::1] bind.
 pick_port()
