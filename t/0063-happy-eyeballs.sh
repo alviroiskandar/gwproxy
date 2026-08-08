@@ -43,7 +43,7 @@ if [ "${1:-}" != "--inner" ]; then
 fi
 
 # ---------------------------------------------------------------- inner ----
-WORK="$2"
+ns_inner_work "$2"
 GWPROXY="${GWPROXY:-$ROOT/gwproxy}"
 rc=1
 
