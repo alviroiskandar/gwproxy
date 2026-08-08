@@ -81,6 +81,40 @@ require_opt()
 # misleading "gwproxy did not listen"; say so up front.
 require ss
 
+# ns_drop_setup: prepare to enter a user namespace, setting NS_DROP to a
+# command prefix to run "unshare -r..." under ("" when already unprivileged).
+#
+# "unshare -r" maps exactly ONE uid into the new namespace: the caller's. Run
+# the ordinary way the caller owns this tree, so uid_map reads "0 <uid> 1" and
+# the sources stay readable inside. Run under "sudo make test" the caller is
+# root, uid_map reads "0 0 1", and the uid owning the tree is left unmapped --
+# it reads back as "nobody", and an 0700 home directory anywhere above the
+# checkout then refuses even the inner root.
+#
+# No capability fixes that: capabilities inside a user namespace apply only to
+# inodes whose owner is mapped into it, so CAP_DAC_OVERRIDE has no authority
+# over a file owned by an unmapped uid. (Skipping the user namespace needs
+# CAP_SYS_ADMIN, which the containers these run in do not have.)
+#
+# None of the namespace tests need privilege, so when handed root they give it
+# back: run as the uid owning the tree, reproducing the unprivileged mapping.
+ns_drop_setup()
+{
+	local uid gid
+
+	NS_DROP=""
+	[ "$(id -u)" = 0 ] || return 0
+
+	uid="${SUDO_UID:-$(stat -c %u "$ROOT")}"
+	gid="${SUDO_GID:-$(stat -c %g "$ROOT")}"
+	[ "$uid" != 0 ] || return 0
+
+	require setpriv
+	NS_DROP="setpriv --reuid=$uid --regid=$gid --clear-groups"
+	# $WORK is mktemp'd 0700 as root; the namespace body writes there.
+	chown -R "$uid:$gid" "$WORK" || fail "cannot chown $WORK to $uid:$gid"
+}
+
 # Print a free TCP port that is bindable on the IPv4/IPv6 dual stack, so it is
 # also free for a plain 127.0.0.1 or [::1] bind.
 pick_port()
