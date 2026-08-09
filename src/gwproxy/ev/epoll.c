@@ -118,8 +118,21 @@ static int handle_ev_raw_dns_query(struct gwp_wrk *w)
 	int r;
 
 	ret = __sys_recv(res->udp_fd, buf, sizeof(buf), 0);
-	if (unlikely(ret < 0))
-		return (int)ret;
+	if (unlikely(ret < 0)) {
+		/*
+		 * Nothing that arrives on this socket may take the worker
+		 * down with it. The descriptor is connected, so an ICMP port
+		 * unreachable from a DNS server that is down -- or simply not
+		 * listening where we were told -- is reported here as
+		 * -ECONNREFUSED, and returning it broke the event loop and
+		 * killed every connection the worker was carrying. The
+		 * pending queries time out on their own.
+		 */
+		if (ret != -EAGAIN && ret != -EINTR)
+			pr_err(&ctx->lh, "DNS socket recv failed: %s",
+			       strerror((int)-ret));
+		return 0;
+	}
 
 	len = (uint16_t)ret;
 	ret = gwp_dns_res_fetch_gcp_by_payload(res, buf, len, &gcp);
