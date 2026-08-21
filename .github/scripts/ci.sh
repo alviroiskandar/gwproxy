@@ -41,6 +41,12 @@ TOPDIR="$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)"
 # apt.llvm.org release installed when a matrix row asks for the "clang"
 # package. Bumping this here (not in the YAML) keeps older commits pinned to
 # the clang they were tested with.
+#
+# It is tied to the runner's distribution, which is pinned in the YAML rather
+# than here: apt.llvm.org does not carry the same releases for every codename,
+# and 23 is one of the ones it publishes for noble and not for jammy. So
+# changing runs-on can invalidate this line without touching it. Check
+# https://apt.llvm.org/<codename>/dists/ when moving either.
 CLANG_VERSION="23"
 
 # Extra Debian packages needed by the --use-openssl and --use-pcre variants.
