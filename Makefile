@@ -132,7 +132,29 @@ ifeq ($(CONFIG_IO_URING),y)
 $(LIBURING_DIR)/Makefile:
 	git submodule update --init --recursive;
 
-$(LIBURING_TARGET): $(LIBURING_DIR)/Makefile
+#
+# liburing keeps its own configuration, in config-host.mak, and it outlives
+# ours: "make clean" here only descends into the submodule while
+# CONFIG_IO_URING is still set, and a caller that removes config.make first --
+# .github/scripts/ci.sh does, deliberately -- leaves both that file and
+# liburing.a behind. Only the sanitized branch below ever wrote the submodule's
+# configuration, and nothing put it back afterwards: once a tree had built with
+# --sanitize, every later build reused an instrumented liburing, and the first
+# one without --sanitize failed to link against it with a few thousand
+# undefined __asan_*/__ubsan_* symbols.
+#
+# So depend on config.make, which is rewritten whenever this tree is
+# reconfigured, and start from a clean submodule each time. liburing's own
+# clean removes config-host.mak and its Makefile regenerates it with defaults,
+# so the unsanitized case needs nothing here -- it just must not inherit the
+# old one.
+#
+# The cost is rebuilding liburing on every reconfigure. It is a small library,
+# and the alternative is a build whose correctness depends on the order the
+# variants happened to run in.
+#
+$(LIBURING_TARGET): $(LIBURING_DIR)/Makefile config.make
+	@$(MAKE) -C $(LIBURING_DIR) clean
 ifeq ($(CONFIG_SANITIZE),y)
 	cd $(LIBURING_DIR) && ./configure --enable-sanitizer;
 endif
