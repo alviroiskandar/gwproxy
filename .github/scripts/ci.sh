@@ -290,6 +290,18 @@ cmd_build()
 		return 0
 	fi
 
+	# The raw DNS resolver. It needs no extra library, so the only reason
+	# it sits below the x86_64 guard rather than beside the io_uring rows
+	# is that this is where "make test" runs, and t/0027 -- the only thing
+	# that exercises the response parser -- has to execute to be worth
+	# anything. Widening it to the cross rows would add the endianness
+	# coverage that a packet parser wants; nobody has checked it builds
+	# there yet, and a matrix row that cannot compile is worse than one
+	# that is missing.
+	build_variant "new-dns-resolver" 1 "${run_tests}" \
+		"--cc=${cc}" --use-new-dns-resolver \
+		${san[@]+"${san[@]}"}
+
 	build_variant "openssl" 1 "${run_tests}" \
 		"--cc=${cc}" --use-openssl \
 		${san[@]+"${san[@]}"}
