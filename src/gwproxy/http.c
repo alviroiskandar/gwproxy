@@ -23,6 +23,15 @@ struct gwp_http_conn {
 	struct gwnet_http_req_hdr	req_hdr;
 
 	/*
+	 * Bytes of request header consumed so far, summed across every call.
+	 * The caller hands us only what it has and advances its buffer by what
+	 * we took, so a header that spans several reads is parsed in pieces
+	 * and ctx_hdr.off describes the last piece alone -- never the whole
+	 * header. Sizing anything from that is wrong; use this.
+	 */
+	size_t				hdr_len;
+
+	/*
 	 * True for a forwarding request (absolute-form target, e.g.
 	 * "GET http://host/path") as opposed to a CONNECT tunnel.
 	 */
@@ -369,11 +378,12 @@ int gwp_http_conn_process(struct gwp_http_conn *hc, struct gwp_auth *auth,
 	hc->ctx_hdr.off = 0;
 	r = gwnet_http_req_hdr_parse(&hc->ctx_hdr, req);
 	*in_len = hc->ctx_hdr.off;
+	hc->hdr_len += hc->ctx_hdr.off;
 	if (r < 0)
 		return (r == -EAGAIN) ? GWP_HTTP_NEED_MORE : GWP_HTTP_ERR;
 
 	/* Header complete. */
-	hdr_len = hc->ctx_hdr.off;
+	hdr_len = hc->hdr_len;
 
 	/*
 	 * "Basic" proxy authentication (shared with SOCKS5) applies to CONNECT
