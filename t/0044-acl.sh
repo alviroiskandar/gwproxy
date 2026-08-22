@@ -445,6 +445,36 @@ for loop in epoll io_uring; do
 		"http://127.0.0.1:$hp/payload.bin" -o /dev/null \
 		|| fail "$loop TCP wrongly blocked by a -p udp INPUT rule"
 	kill "$GWP_PID" 2>/dev/null
+
+	# -m statistic --mode nth. The unit tests cover the arithmetic; what
+	# this proves is that the module is wired through the real binary --
+	# parsed at startup, evaluated per connection, and enforced.
+	#
+	# A literal IP target on purpose: a name could resolve to several
+	# candidate addresses, and the OUTPUT chain runs once per candidate, so
+	# the count would not be one per connection.
+	printf -- '%s\n' \
+		'-A OUTPUT --dports 9 -m statistic --mode nth --every 2 -j REJECT' \
+		'-P OUTPUT ACCEPT' >"$WORK/nth.acl"
+	np="$(pick_port)"
+	gwp_start "127.0.0.1:$np" --as-socks5=1 --event-loop="$loop" \
+		--acl-file="$WORK/nth.acl"
+	rejected=0
+	for i in 1 2 3 4 5 6 7 8; do
+		rep="$(socks5_connect_rep "$np" 127.0.0.1 9)"
+		[ "$rep" = 2 ] && rejected=$((rejected + 1))
+	done
+	[ "$rejected" = 4 ] || \
+		fail "$loop -m statistic --every 2 rejected $rejected of 8 (want 4)"
+
+	# The same proxy, a port the rule does not match: never rejected, and
+	# those connections must not consume the counter either.
+	for i in 1 2 3 4; do
+		rep="$(socks5_connect_rep "$np" 127.0.0.1 "$hp")"
+		[ "$rep" = 0 ] || \
+			fail "$loop -m statistic leaked onto an unmatched port (REP $rep)"
+	done
+	kill "$GWP_PID" 2>/dev/null
 done
 
 pass

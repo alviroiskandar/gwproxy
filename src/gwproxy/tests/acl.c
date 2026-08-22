@@ -598,6 +598,28 @@ static noinline void test_parse_errors(void)
 		"-A OUTPUT -j ACCEPT --accept\n",		    /* --accept on ACCEPT */
 		"-A OUTPUT -j REJECT --accept\n",		    /* --accept on REJECT */
 		"-A OUTPUT -j DNAT --to 1.2.3.4 --accept\n",	    /* DNAT already terminal */
+		/* -m statistic */
+		"-A OUTPUT -m statistic -j ACCEPT\n",		    /* module, no options */
+		"-A OUTPUT -m statistic --mode nth -j ACCEPT\n",   /* --mode w/o --every */
+		"-A OUTPUT -m statistic --every 2 -j ACCEPT\n",    /* --every w/o --mode */
+		"-A OUTPUT --mode nth --every 2 -j ACCEPT\n",	    /* options w/o -m */
+		"-A OUTPUT -m statistic --mode random --probability 0.5 -j ACCEPT\n", /* unsupported mode */
+		"-A OUTPUT -m statistic --mode nth --every 0 -j ACCEPT\n",  /* --every 0 */
+		"-A OUTPUT -m statistic --mode nth --every 2 --packet 2 -j ACCEPT\n", /* packet >= every */
+		"-A OUTPUT -m statistic --mode nth --every 2 --packet 9 -j ACCEPT\n", /* packet >= every */
+		"-A OUTPUT -m statistic --mode nth --every 2 --every 3 -j ACCEPT\n",  /* dup --every */
+		"-A OUTPUT -m statistic --mode nth --mode nth --every 2 -j ACCEPT\n", /* dup --mode */
+		"-A OUTPUT -m statistic --mode nth --every 2 --packet 0 --packet 1 -j ACCEPT\n", /* dup --packet */
+		"-A OUTPUT -m statistic --mode nth --every nope -j ACCEPT\n",	      /* bad --every */
+		"-A OUTPUT --packet 0 -j ACCEPT\n",		    /* --packet w/o -m */
+		/*
+		 * Only --every takes the "!". The other two must refuse it
+		 * rather than pass it along to the option that follows: the
+		 * second line here would otherwise parse as "! -d", the exact
+		 * inverse of the rule as written.
+		 */
+		"-A OUTPUT -m statistic ! --mode nth --every 2 -j ACCEPT\n",	      /* negated --mode */
+		"-A OUTPUT -m statistic --mode nth --every 2 ! --packet 0 -d 10.0.0.0/8 -j REJECT\n", /* negated --packet */
 		"-A OUTPUT -j MARK --set-mark 5 --accept --accept\n", /* dup --accept */
 		"-A OUTPUT -j MARK --set-mark 5 ! --accept\n",	    /* negated --accept */
 		"-A OUTPUT -d 1.2.3.4 --accept\n",		    /* --accept w/o -j */
@@ -706,6 +728,170 @@ static noinline void test_domain_only_target_criteria(void)
 	gwp_acl_destroy(a);
 }
 
+/*
+ * -m statistic --mode nth: one evaluation in --every is selected, the one at
+ * --packet. The counter lives on the rule, so these walk a fixed number of
+ * evaluations and count how many were selected rather than probing one.
+ */
+static void test_statistic_nth(void)
+{
+	struct gwp_acl *a = NULL;
+	struct gwp_sockaddr t = sa4("1.2.3.4", 443);
+	int i, hits;
+
+	/* Every 3rd, default offset 0: exactly one third, and it leads. */
+	assert(!gwp_acl_parse_str(&a,
+		"-A OUTPUT -m statistic --mode nth --every 3 -j REJECT\n"
+		"-P OUTPUT ACCEPT\n"));
+	for (i = 0, hits = 0; i < 30; i++)
+		if (out(a, &t, NULL, 443, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT)
+			hits++;
+	assert(hits == 10);
+	gwp_acl_destroy(a);
+
+	/* Offset selects which of the three; still one in three. */
+	a = NULL;
+	assert(!gwp_acl_parse_str(&a,
+		"-A OUTPUT -m statistic --mode nth --every 3 --packet 2 -j REJECT\n"
+		"-P OUTPUT ACCEPT\n"));
+	for (i = 0, hits = 0; i < 30; i++) {
+		enum gwp_acl_verdict v = out(a, &t, NULL, 443,
+					     GWP_ACL_PROTO_TCP);
+		/* The 3rd of each group, i.e. i % 3 == 2. */
+		assert((v == GWP_ACL_REJECT) == (i % 3 == 2));
+		if (v == GWP_ACL_REJECT)
+			hits++;
+	}
+	assert(hits == 10);
+	gwp_acl_destroy(a);
+
+	/* --every 1 selects everything; the degenerate but legal case. */
+	a = NULL;
+	assert(!gwp_acl_parse_str(&a,
+		"-A OUTPUT -m statistic --mode nth --every 1 -j REJECT\n"
+		"-P OUTPUT ACCEPT\n"));
+	for (i = 0; i < 5; i++)
+		assert(out(a, &t, NULL, 443, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+	gwp_acl_destroy(a);
+
+	/* Negated: the complement, two in three. */
+	a = NULL;
+	assert(!gwp_acl_parse_str(&a,
+		"-A OUTPUT -m statistic --mode nth ! --every 3 -j REJECT\n"
+		"-P OUTPUT ACCEPT\n"));
+	for (i = 0, hits = 0; i < 30; i++)
+		if (out(a, &t, NULL, 443, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT)
+			hits++;
+	assert(hits == 20);
+	gwp_acl_destroy(a);
+}
+
+/*
+ * The counter must only advance for connections the rest of the rule already
+ * matched, or the split is taken against the wrong population. Two ports share
+ * one nth rule here: if the non-matching port were counted, the matching port
+ * would not see a clean 1-in-2.
+ */
+static void test_statistic_counts_only_matches(void)
+{
+	struct gwp_acl *a = NULL;
+	struct gwp_sockaddr t = sa4("1.2.3.4", 0);
+	int i, hits = 0;
+
+	assert(!gwp_acl_parse_str(&a,
+		"-A OUTPUT --dports 443 -m statistic --mode nth --every 2 -j REJECT\n"
+		"-P OUTPUT ACCEPT\n"));
+	for (i = 0; i < 20; i++) {
+		/* Interleave a port the rule does not match. */
+		assert(out(a, &t, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
+		if (out(a, &t, NULL, 443, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT)
+			hits++;
+	}
+	assert(hits == 10);
+	gwp_acl_destroy(a);
+}
+
+/*
+ * The point of the module: split traffic evenly over several rules.
+ *
+ * Each rule counts its OWN evaluations, and a rule is only evaluated for the
+ * connections earlier rules passed on -- so three rules all saying --every 3
+ * do NOT give thirds. Rule 2 would only ever see the 2/3 that rule 1 declined,
+ * and take a third of those.
+ *
+ * The iptables idiom applies unchanged: count down. 1-in-3, then 1-in-2 of the
+ * remainder, then everything left.
+ */
+static void test_statistic_load_balance(void)
+{
+	struct gwp_acl *a = NULL;
+	struct gwp_sockaddr t = sa4("1.2.3.4", 443);
+	int i, seen[3] = { 0, 0, 0 };
+
+	assert(!gwp_acl_parse_str(&a,
+		"-A OUTPUT -m statistic --mode nth --every 3 -j BIND --to-source 10.0.0.1 --accept\n"
+		"-A OUTPUT -m statistic --mode nth --every 2 -j BIND --to-source 10.0.0.2 --accept\n"
+		"-A OUTPUT -j BIND --to-source 10.0.0.3 --accept\n"
+		"-P OUTPUT REJECT\n"));
+	for (i = 0; i < 30; i++) {
+		struct gwp_acl_req req = {
+			.target = &t, .dport = 443, .proto = GWP_ACL_PROTO_TCP,
+		};
+		char ip[INET_ADDRSTRLEN];
+
+		assert(gwp_acl_eval_output(a, &req) == GWP_ACL_ACCEPT);
+		assert(req.bind.set && req.bind.have_src);
+		assert(inet_ntop(AF_INET, &req.bind.src.i4.sin_addr, ip,
+				 sizeof(ip)));
+		assert(!strncmp(ip, "10.0.0.", 7));
+		seen[ip[7] - '1']++;
+	}
+	assert(seen[0] == 10);
+	assert(seen[1] == 10);
+	assert(seen[2] == 10);
+	gwp_acl_destroy(a);
+}
+
+/*
+ * And the trap, pinned so nobody "fixes" the idiom above into the obvious
+ * wrong thing: equal --every values do not split equally. Rule 1 takes a third
+ * and rule 2 takes a third of the remaining two thirds.
+ */
+static void test_statistic_equal_every_is_uneven(void)
+{
+	struct gwp_acl *a = NULL;
+	struct gwp_sockaddr t = sa4("1.2.3.4", 443);
+	int i, first = 0, second = 0, rest = 0;
+
+	assert(!gwp_acl_parse_str(&a,
+		"-A OUTPUT -m statistic --mode nth --every 3 -j BIND --to-source 10.0.0.1 --accept\n"
+		"-A OUTPUT -m statistic --mode nth --every 3 -j BIND --to-source 10.0.0.2 --accept\n"
+		"-A OUTPUT -j BIND --to-source 10.0.0.3 --accept\n"
+		"-P OUTPUT REJECT\n"));
+	for (i = 0; i < 18; i++) {
+		struct gwp_acl_req req = {
+			.target = &t, .dport = 443, .proto = GWP_ACL_PROTO_TCP,
+		};
+		char ip[INET_ADDRSTRLEN];
+
+		assert(gwp_acl_eval_output(a, &req) == GWP_ACL_ACCEPT);
+		assert(inet_ntop(AF_INET, &req.bind.src.i4.sin_addr, ip,
+				 sizeof(ip)));
+		if (ip[7] == '1')
+			first++;
+		else if (ip[7] == '2')
+			second++;
+		else
+			rest++;
+	}
+	/* 18 -> 6 to the first, 4 to the second (a third of 12), 8 left. */
+	assert(first == 6);
+	assert(second == 4);
+	assert(rest == 8);
+	gwp_acl_destroy(a);
+}
+
+
 static void run_tests(void)
 {
 	size_t i;
@@ -725,6 +911,10 @@ static void run_tests(void)
 		test_bind();
 		test_dnat();
 		test_comments_and_default_policy();
+		test_statistic_nth();
+		test_statistic_counts_only_matches();
+		test_statistic_load_balance();
+		test_statistic_equal_every_is_uneven();
 	}
 	printf("All tests passed!\n");
 }
