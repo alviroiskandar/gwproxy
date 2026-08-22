@@ -14,6 +14,7 @@
 #include <string.h>
 #include <strings.h>
 #include <errno.h>
+#include <stdatomic.h>
 
 #ifdef CONFIG_PCRE
 #include <pcre2.h>
@@ -97,6 +98,18 @@ struct gwp_acl_rule {
 	} user;
 	struct gwp_acl_ports	sports, dports;
 	struct gwp_acl_cidr	src, dst;
+	/*
+	 * -m statistic --mode nth: match one evaluation in @st_every, the one
+	 * at offset @st_packet. @st_count is the running counter and is the
+	 * only mutable state a rule carries -- see statistic_match().
+	 *
+	 * uint32_t, not a wider type, deliberately: an 8-byte _Atomic is not
+	 * lock-free on the 32-bit targets this cross-builds for, and GCC then
+	 * emits __atomic_*_8 calls that do not link.
+	 */
+	_Atomic(uint32_t)	st_count;
+	uint32_t		st_every;
+	uint32_t		st_packet;
 	/* -j action payload; the live member is selected by @action. */
 	union {
 		struct gwp_acl_dnat	dnat;	 /* GWP_ACL_ACT_DNAT (--to) */
@@ -109,6 +122,7 @@ struct gwp_acl_rule {
 	bool			neg_src : 1, neg_dst : 1, neg_domain : 1,
 				neg_proto : 1, neg_sports : 1, neg_dports : 1;
 	bool			has_user : 1, neg_user : 1;
+	bool			has_statistic : 1, neg_statistic : 1;
 	bool			domain_is_re : 1;	/* --domain-regexp */
 	bool			user_is_re : 1;		/* --user-regexp */
 	/*
@@ -664,6 +678,9 @@ static int parse_rule(struct gwp_acl_ruleset *rs, char **tok, int n)
 	struct gwp_acl_rule *r;
 	enum gwp_acl_chain chain;
 	bool neg = false, m_domain = false, m_user = false, have_jump = false;
+	/* -m statistic: the module, and each of its options, seen separately. */
+	bool m_stat = false, have_mode = false, have_every = false;
+	bool have_packet = false;
 	/* At most one -j action payload group may be present (they share a union). */
 	bool have_to = false, have_setmark = false;
 	bool have_src = false, have_iface = false;
@@ -717,6 +734,8 @@ static int parse_rule(struct gwp_acl_ruleset *rs, char **tok, int n)
 				if (chain != GWP_ACL_OUTPUT)
 					goto out;	/* -m user is OUTPUT-only */
 				m_user = true;
+			} else if (!strcmp(v, "statistic")) {
+				m_stat = true;
 			} else {
 				goto out;
 			}
@@ -780,6 +799,42 @@ static int parse_rule(struct gwp_acl_ruleset *rs, char **tok, int n)
 			ret = -ENOSYS;
 			goto out;
 #endif
+		} else if (!strcmp(o, "--mode")) {
+			v = next_val(tok, n, &i);
+			/*
+			 * Neither --mode nor --packet is negatable, and both
+			 * "continue" past the neg reset at the foot of the
+			 * loop. Were they to accept a "!" it would not stop
+			 * there: it would slide onto the option after them and
+			 * silently invert a criterion written plainly.
+			 */
+			if (!m_stat || !v || have_mode || neg)
+				goto out;
+			/*
+			 * Only nth for now. "random" is the other iptables mode
+			 * and would need --probability; rejecting it by name
+			 * keeps the door open without pretending to implement
+			 * it -- a rule asking for it fails loudly at startup
+			 * rather than silently behaving like nth.
+			 */
+			if (strcmp(v, "nth"))
+				goto out;
+			have_mode = true;
+			continue;	/* --mode selects, it does not match */
+		} else if (!strcmp(o, "--every")) {
+			v = next_val(tok, n, &i);
+			if (!m_stat || !v || have_every ||
+			    parse_u32(v, &r->st_every) || r->st_every < 1)
+				goto out;
+			have_every = true;
+			r->neg_statistic = neg;
+		} else if (!strcmp(o, "--packet")) {
+			v = next_val(tok, n, &i);
+			if (!m_stat || !v || have_packet || neg ||
+			    parse_u32(v, &r->st_packet))
+				goto out;
+			have_packet = true;
+			continue;	/* offset only; --every carries the negation */
 		} else if (eq(o, "-p", "--protocol")) {
 			v = next_val(tok, n, &i);
 			if (!v || r->has_proto)
@@ -889,6 +944,23 @@ static int parse_rule(struct gwp_acl_ruleset *rs, char **tok, int n)
 		goto out;
 	if (m_user && !r->has_user)
 		goto out;
+
+	/*
+	 * Same rule for -m statistic: without both --mode and --every it would
+	 * be a no-op that matches everything. --packet on its own is likewise
+	 * meaningless, and a --packet at or beyond --every can never come up,
+	 * so the rule would be dead -- both are far more likely to be typos
+	 * than intent.
+	 */
+	if (m_stat != (have_mode && have_every))
+		goto out;
+	if (have_packet && !m_stat)
+		goto out;
+	if (m_stat) {
+		if (r->st_packet >= r->st_every)
+			goto out;
+		r->has_statistic = true;
+	}
 
 	/*
 	 * Exactly the action's own payload group may be present. The cross-group
@@ -1181,7 +1253,36 @@ static bool user_match(const struct gwp_acl_rule *r, const char *user)
 	return r->user.str && !strcmp(user, r->user.str);
 }
 
-static bool rule_matches(const struct gwp_acl_rule *r,
+/*
+ * -m statistic --mode nth: match one evaluation in @st_every, the one whose
+ * index modulo @st_every equals @st_packet.
+ *
+ * fetch_add rather than a read-modify-write loop, so concurrent workers each
+ * take a distinct ticket and the split stays exact under load instead of
+ * degrading into "whoever raced". Relaxed ordering: the counter is not
+ * synchronising anything, it only has to be handed out without duplicates.
+ *
+ * The rule is shared and evaluated under the ACL's read lock, so this is the
+ * one place a rule is written to; @st_count being atomic is what makes that
+ * safe without promoting the lock.
+ *
+ * Note the counter counts EVALUATIONS, not connections. A target with several
+ * candidate addresses is evaluated once per candidate (Happy Eyeballs), so a
+ * split across such targets is by attempt rather than by connection.
+ *
+ * Only ever call this behind a @has_statistic test: @st_every is 0 on a rule
+ * that does not use the module, and crit_ok() evaluates its arguments eagerly,
+ * so an unguarded call divides by zero on every other rule in the file.
+ */
+static bool statistic_match(struct gwp_acl_rule *r)
+{
+	uint32_t n;
+
+	n = atomic_fetch_add_explicit(&r->st_count, 1, memory_order_relaxed);
+	return (n % r->st_every) == r->st_packet;
+}
+
+static bool rule_matches(struct gwp_acl_rule *r,
 			 const struct gwp_acl_req *q)
 {
 	/*
@@ -1206,7 +1307,20 @@ static bool rule_matches(const struct gwp_acl_rule *r,
 	       crit_ok(r->has_sports, ports_match(&r->sports, q->sport),
 		       r->neg_sports) &&
 	       crit_ok(r->has_dports, ports_match(&r->dports, q->dport),
-		       r->neg_dports);
+		       r->neg_dports) &&
+	       /*
+		* LAST, and it has to stay last. Every criterion above is a pure
+		* predicate; this one advances the rule's counter, so a rule
+		* must only consume a slot once everything else about it has
+		* matched -- otherwise "-d 10.0.0.0/8 -m statistic ..." would
+		* count the connections it does not select and the split would
+		* be against the wrong population. The && chain short-circuits,
+		* which is what enforces that; crit_ok() itself evaluates its
+		* @matched argument eagerly, so ordering is the only guard.
+		*/
+	       crit_ok(r->has_statistic,
+		       r->has_statistic && statistic_match(r),
+		       r->neg_statistic);
 }
 
 /* Read a sockaddr's port (host byte order) regardless of family. */
@@ -1262,11 +1376,11 @@ static void apply_dnat(struct gwp_acl_req *req, const struct gwp_acl_dnat *d)
  * Walk @head, returning the first terminal verdict. DNAT rewrites @req->dnat;
  * MARK is a composable modifier that records @req->mark and keeps matching.
  */
-static enum gwp_acl_verdict eval_chain(const struct gwp_acl_rule *head,
+static enum gwp_acl_verdict eval_chain(struct gwp_acl_rule *head,
 				       enum gwp_acl_verdict policy,
 				       struct gwp_acl_req *req)
 {
-	const struct gwp_acl_rule *r;
+	struct gwp_acl_rule *r;
 
 	for (r = head; r; r = r->next) {
 		if (!rule_matches(r, req))
