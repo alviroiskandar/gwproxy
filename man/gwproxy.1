@@ -393,6 +393,71 @@ The
 option, like
 .BR \-\-domain\-regexp ,
 requires a PCRE2 build.
+.IP
+.BR "\-m statistic \-\-mode nth \-\-every" " " \fIn\fR " [" \-\-packet " " \fIp\fR ]
+matches one evaluation in every
+.IR n ,
+the one whose index modulo
+.I n
+equals
+.I p
+(default 0), and is how several rules are made to share traffic between them.
+.I p
+must be less than
+.IR n .
+Only
+.B nth
+mode exists so far;
+.B random
+is rejected rather than approximated. The match may be negated
+.RB ( "! \-\-every" ),
+which selects the other
+.IR n \-1
+in
+.IR n .
+The negation belongs to
+.B \-\-every
+alone: a
+.B !
+before
+.B \-\-mode
+or
+.B \-\-packet
+is rejected rather than passed on to the option after it.
+The match composes with every other criterion \(em the counter advances only
+for connections the rest of the rule already matched, so
+.B "\-d 10.0.0.0/8 \-m statistic \-\-mode nth \-\-every 2"
+splits that prefix's traffic and leaves everything else alone.
+.IP
+Splitting
+.I k
+ways needs descending counts, not
+.I k
+equal ones: a rule is only consulted for what the rules above it passed on. For
+an even three-way split write
+.BR "\-\-every 3" ,
+then
+.BR "\-\-every 2" ,
+then no statistic match at all:
+.IP
+.EX
+\-A OUTPUT \-m statistic \-\-mode nth \-\-every 3 \-j BIND \-\-to\-source 10.0.0.1 \-\-accept
+\-A OUTPUT \-m statistic \-\-mode nth \-\-every 2 \-j BIND \-\-to\-source 10.0.0.2 \-\-accept
+\-A OUTPUT \-j BIND \-\-to\-source 10.0.0.3 \-\-accept
+.EE
+.IP
+Three rules all saying
+.B "\-\-every 3"
+would instead give 1/3, 2/9 and 4/9, because the second only ever sees the two
+thirds the first declined.
+.IP
+Two properties worth knowing. The counter counts evaluations rather than
+connections, and the
+.B OUTPUT
+chain runs once per candidate address, so a target that resolves to several
+addresses is counted more than once \(em pin the split to literal addresses, or
+accept that it is per attempt. And the counters live in the rules, so reloading
+the ACL file restarts every split from zero.
 .TP
 .B \-\-acl\-allow\-all
 Do not apply the built\-in default ACL; allow all targets (the behaviour before
