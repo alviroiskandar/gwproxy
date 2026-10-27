@@ -1447,14 +1447,16 @@ static bool rule_matches(struct gwp_acl_rule *r,
 			 const struct gwp_acl_req *q)
 {
 	/*
-	 * Target-dependent criteria (-d, --dports) cannot be evaluated for a
-	 * domain-only request (socks5h remote-DNS: no resolved IP, @dport unset).
-	 * Such a rule matches NEITHER polarity -- otherwise a negated
-	 * "! -d"/"! --dports" would flip the unknown into a match and fail open
-	 * (e.g. an allow-by-exclusion rule bypassing an internal-range REJECT).
-	 * -m domain / -m user still evaluate here (domain/user are known).
+	 * -d cannot be evaluated for a domain-only request (remote-DNS
+	 * upstream: no resolved IP), and neither can --dports when the port is
+	 * unknown too. Such a rule matches NEITHER polarity -- otherwise a
+	 * negated "! -d"/"! --dports" would flip the unknown into a match and
+	 * fail open (e.g. an allow-by-exclusion rule bypassing an
+	 * internal-range REJECT). The requested port is known, though, so
+	 * --dports is evaluated against it; -m domain / -m user evaluate here
+	 * as well.
 	 */
-	if (!q->target && (r->has_dst || r->has_dports))
+	if (!q->target && (r->has_dst || (r->has_dports && !q->dport)))
 		return false;
 
 	/*

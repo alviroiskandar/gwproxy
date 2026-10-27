@@ -1256,6 +1256,14 @@ static const char gwp_acl_default_rules[] =
 	"-A OUTPUT -d fe80::/10 -j REJECT\n"
 	"-A OUTPUT -d fec0::/10 -j REJECT\n"
 	"-A OUTPUT -d ff00::/8 -j REJECT\n"
+	/*
+	 * With a remote-DNS upstream the name is resolved over there, so the
+	 * address rules above never see where "localhost" leads.
+	 */
+	"-A OUTPUT -m domain --domain localhost -j REJECT\n"
+#ifdef CONFIG_PCRE
+	"-A OUTPUT -m domain --domain-regexp \\.localhost$ -j REJECT\n"
+#endif
 	"-P OUTPUT ACCEPT\n";
 
 /*
@@ -1364,7 +1372,7 @@ static void acl_out_req(struct gwp_acl_req *req,
  */
 static enum gwp_acl_verdict acl_out(struct gwp_ctx *ctx,
 				    const struct gwp_sockaddr *client,
-				    struct gwp_sockaddr *target,
+				    struct gwp_sockaddr *target, uint16_t dport,
 				    const char *domain, const char *user,
 				    struct gwp_acl_memo *memo,
 				    struct gwp_conn_sockopt *so_out,
@@ -1388,6 +1396,8 @@ static enum gwp_acl_verdict acl_out(struct gwp_ctx *ctx,
 		return GWP_ACL_ACCEPT;
 
 	acl_out_req(&req, client, have_ip ? target : NULL, domain, user, proto);
+	if (!have_ip)
+		req.dport = dport;
 	req.memo = memo;
 	v = gwp_acl_eval_output(ctx->acl, &req);
 	if (v != GWP_ACL_ACCEPT)
@@ -1428,7 +1438,7 @@ bool gwp_ctx_acl_output_dnat(struct gwp_ctx *ctx,
 			     struct gwp_conn_sockopt *so,
 			     enum gwp_acl_proto proto)
 {
-	return acl_out(ctx, client, target, NULL, NULL, NULL, so, NULL,
+	return acl_out(ctx, client, target, 0, NULL, NULL, NULL, so, NULL,
 		       proto) == GWP_ACL_ACCEPT;
 }
 
@@ -1478,6 +1488,7 @@ static bool udp_target_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 
 bool gwp_ctx_acl_target_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp)
 {
+	uint16_t dport = 0;
 	bool dnat = false;
 	enum gwp_acl_verdict v;
 
@@ -1486,8 +1497,12 @@ bool gwp_ctx_acl_target_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp)
 	 * user more than once; gwp_conn_set_candidates() resets the memo for
 	 * each new list.
 	 */
-	v = acl_out(ctx, &gcp->client_addr, &gcp->target_addr, gcp->req_domain,
-		    gcp_req_user(gcp), gcp->nr_cand > 1 ? &gcp->acl_memo : NULL,
+	/* A domain-only request still has the port it asked for. */
+	if (gcp->up_dst.ver == GWP_SOCKS5_ATYP_DOMAIN)
+		dport = ntohs(gcp->up_dst.port);
+	v = acl_out(ctx, &gcp->client_addr, &gcp->target_addr, dport,
+		    gcp->req_domain, gcp_req_user(gcp),
+		    gcp->nr_cand > 1 ? &gcp->acl_memo : NULL,
 		    &gcp->acl_sockopt, &dnat, GWP_ACL_PROTO_TCP);
 	if (v != GWP_ACL_ACCEPT)
 		return false;
@@ -2916,6 +2931,27 @@ void gwp_conn_set_single_candidate(struct gwp_conn_pair *gcp,
 	gwp_conn_set_candidates(gcp, addr, 1);
 }
 
+/*
+ * Parse @host as an IP literal, IPv6 or any form inet_aton() accepts (which
+ * includes "2130706433" and "127.1", spellings a resolver takes as numbers
+ * too), into @sa with @port. Returns false for a real name.
+ */
+static bool req_host_ip(const char *host, uint16_t port, struct gwp_sockaddr *sa)
+{
+	memset(sa, 0, sizeof(*sa));
+	if (inet_pton(AF_INET6, host, &sa->i6.sin6_addr) == 1) {
+		sa->i6.sin6_family = AF_INET6;
+		sa->i6.sin6_port = htons(port);
+		return true;
+	}
+	if (inet_aton(host, &sa->i4.sin_addr)) {
+		sa->i4.sin_family = AF_INET;
+		sa->i4.sin_port = htons(port);
+		return true;
+	}
+	return false;
+}
+
 static int prepare_target_addr_domain(struct gwp_wrk *w,
 				      struct gwp_conn_pair *gcp,
 				      char *host, uint16_t port)
@@ -2949,8 +2985,20 @@ static int prepare_target_addr_domain(struct gwp_wrk *w,
 	 * proxy. up_dst carries the domain and we're ready to connect.
 	 */
 	if (ctx->upstream.enabled && ctx->upstream.remote_dns) {
+		struct gwp_sockaddr sa;
+
 		if (!port)
 			return -EINVAL;
+		/*
+		 * An address in disguise ("127.0.0.1", "::1", or a legacy form
+		 * such as "2130706433") is the target itself: take it as one,
+		 * so -d rules see it, and the upstream is asked for that
+		 * address rather than a name it would only parse back.
+		 */
+		if (req_host_ip(host, port, &sa)) {
+			gwp_conn_set_single_candidate(gcp, &sa);
+			return 0;
+		}
 		return upstream_dst_from_domain(host, port, &gcp->up_dst);
 	}
 

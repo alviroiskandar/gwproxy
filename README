@@ -53,7 +53,11 @@ Features
     "-m statistic --mode nth --every N" match selects one connection in
     every N, which combines with any other criterion and lets a set of
     rules share traffic between them -- see gwproxy(1) for the descending
-    --every counts an even split needs.
+    --every counts an even split needs. With an upstream proxy that
+    resolves the name itself (socks5h:// and http://), -d rules only see
+    targets given as IP literals, however they are spelled: what a name
+    resolves to over there is beyond them, so filter such names with
+    "-m domain" rules (the built-in default ACL refuses "localhost").
   - Address-family control: --outgoing-family=any|ipv4|ipv6 restricts what
     the proxy dials (DNS resolves that family only; a literal target of the
     other family is refused with SOCKS5 0x08 / HTTP 502), and
