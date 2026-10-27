@@ -1102,6 +1102,32 @@ static int read_file(const char *path, char **out)
  * ------------------------------------------------------------------------
  */
 
+/*
+ * Every worker takes the read lock per evaluation, and the only writer is the
+ * reload, which runs on worker 0's event loop. glibc's default rwlock prefers
+ * readers: a waiting writer does not hold off new ones, so while the other
+ * workers keep overlapping their evaluations (a busy proxy with a large rule
+ * file) the reload never gets in, and worker 0 with every connection it owns
+ * stalls behind it. Prefer the writer instead. The non-recursive kind is
+ * required for that and is safe here: no reader takes the lock twice.
+ */
+static int acl_lock_init(pthread_rwlock_t *lock)
+{
+	pthread_rwlockattr_t attr;
+	int r;
+
+	r = pthread_rwlockattr_init(&attr);
+	if (r)
+		return r;
+#ifdef __GLIBC__
+	pthread_rwlockattr_setkind_np(&attr,
+				      PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+#endif
+	r = pthread_rwlock_init(lock, &attr);
+	pthread_rwlockattr_destroy(&attr);
+	return r;
+}
+
 int gwp_acl_parse_str(struct gwp_acl **out, const char *text)
 {
 	struct gwp_acl *acl;
@@ -1111,7 +1137,7 @@ int gwp_acl_parse_str(struct gwp_acl **out, const char *text)
 	if (!acl)
 		return -ENOMEM;
 
-	r = pthread_rwlock_init(&acl->lock, NULL);
+	r = acl_lock_init(&acl->lock);
 	if (r) {
 		free(acl);
 		return -r;
@@ -1160,7 +1186,7 @@ int gwp_acl_create(struct gwp_acl **out, const char *path)
 
 int gwp_acl_reload(struct gwp_acl *acl)
 {
-	struct gwp_acl_ruleset rs;
+	struct gwp_acl_ruleset rs, old;
 	char *text;
 	int r;
 
@@ -1176,8 +1202,14 @@ int gwp_acl_reload(struct gwp_acl *acl)
 	if (r)
 		return r;			/* keep the old rules */
 
+	/*
+	 * Only swap under the lock. Freeing the old rules (every pcre2 code
+	 * and port array) can take a millisecond for a large file, and every
+	 * evaluation on every worker waits while the write lock is held, so
+	 * that is done after unlocking, on the copy taken here.
+	 */
 	pthread_rwlock_wrlock(&acl->lock);
-	ruleset_free(&acl->rs);
+	old = acl->rs;
 	acl->rs = rs;
 	/* The tail pointers in @rs point at @rs's stack head slots when a chain
 	 * is empty; re-anchor them to the live struct. */
@@ -1186,6 +1218,8 @@ int gwp_acl_reload(struct gwp_acl *acl)
 	if (!acl->rs.out_head)
 		acl->rs.out_tail = &acl->rs.out_head;
 	pthread_rwlock_unlock(&acl->lock);
+
+	ruleset_free(&old);
 	return 0;
 }
 

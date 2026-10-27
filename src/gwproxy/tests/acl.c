@@ -16,6 +16,9 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdatomic.h>
 
 static struct gwp_sockaddr sa4(const char *ip, uint16_t port)
 {
@@ -891,6 +894,98 @@ static void test_statistic_equal_every_is_uneven(void)
 	gwp_acl_destroy(a);
 }
 
+/*
+ * Write @text to a new temporary file and return its malloc'd path, for the
+ * tests that need gwp_acl_create()/gwp_acl_reload() on a real file.
+ */
+static char *write_tmp_rules(const char *text)
+{
+	const char *dir = getenv("TMPDIR");
+	char *path;
+	size_t len = strlen(text);
+	int fd;
+
+	if (!dir || !*dir)
+		dir = "/tmp";
+	assert(asprintf(&path, "%s/gwp-acl-test.XXXXXX", dir) > 0);
+	fd = mkstemp(path);
+	assert(fd >= 0);
+	assert(write(fd, text, len) == (ssize_t)len);
+	close(fd);
+	return path;
+}
+
+struct reload_reader {
+	struct gwp_acl	*acl;
+	atomic_bool	*stop;
+};
+
+static void *reload_reader_fn(void *arg)
+{
+	struct reload_reader *rr = arg;
+	struct gwp_sockaddr t = sa4("93.184.216.34", 443);
+
+	while (!atomic_load_explicit(rr->stop, memory_order_relaxed))
+		out(rr->acl, &t, NULL, 443, GWP_ACL_PROTO_TCP);
+	return NULL;
+}
+
+static void reload_watchdog(int sig)
+{
+	static const char msg[] =
+		"test_reload_under_readers: reload starved by readers\n";
+
+	(void)sig;
+	if (write(STDERR_FILENO, msg, sizeof(msg) - 1) < 0)
+		_exit(1);
+	_exit(1);
+}
+
+/*
+ * A reload must get the write lock while other threads keep evaluating with
+ * overlapping read sections, as busy workers do. With a reader-preferring
+ * lock it waited for a gap that never came; the watchdog turns that hang
+ * into a failure.
+ */
+static void test_reload_under_readers(void)
+{
+	struct reload_reader rr;
+	pthread_t thr[16];
+	atomic_bool stop = false;
+	struct gwp_sockaddr t = sa4("10.1.2.3", 80);
+	struct gwp_acl *a;
+	long nr_cpu = sysconf(_SC_NPROCESSORS_ONLN);
+	size_t nr, i;
+	char *path;
+
+	nr = nr_cpu > 2 ? (size_t)nr_cpu - 1 : 2;
+	if (nr > 16)
+		nr = 16;
+
+	path = write_tmp_rules(DEFAULT_RULES);
+	assert(!gwp_acl_create(&a, path));
+	rr.acl = a;
+	rr.stop = &stop;
+	for (i = 0; i < nr; i++)
+		assert(!pthread_create(&thr[i], NULL, reload_reader_fn, &rr));
+
+	signal(SIGALRM, reload_watchdog);
+	alarm(20);
+	for (i = 0; i < 50; i++)
+		assert(!gwp_acl_reload(a));
+	alarm(0);
+	signal(SIGALRM, SIG_DFL);
+
+	atomic_store(&stop, true);
+	for (i = 0; i < nr; i++)
+		pthread_join(thr[i], NULL);
+
+	/* The reloaded rules are the same file, so the verdicts are too. */
+	assert(out(a, &t, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+	gwp_acl_destroy(a);
+	unlink(path);
+	free(path);
+}
 
 static void run_tests(void)
 {
@@ -898,6 +993,7 @@ static void run_tests(void)
 
 	/* Negative cases print the offending line to stderr; run them once. */
 	test_parse_errors();
+	test_reload_under_readers();
 
 	for (i = 0; i < 200; i++) {
 		test_default_ruleset();
