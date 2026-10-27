@@ -58,6 +58,7 @@
 #define DNS_QR(flags)		(((flags) >> DNS_QR_BIT) & 0x1)
 #define DNS_OPCODE(flags)	(((flags) >> DNS_OPCODE_BIT) & 0xF)
 #define DNS_RCODE(flags)	((flags) & 0xF)
+#define DNS_TC(flags)		(((flags) >> DNS_TC_BIT) & 0x1)
 #define DNS_IS_COMPRESSED(mask) ((mask) & DNS_COMPRESSION_BIT)
 
 /* Flag construction macros for little-endian machine */
@@ -68,6 +69,12 @@
 #define DOMAIN_NAME_LIMIT 255
 #define UDP_MSG_LIMIT 512
 
+/*
+ * The UDP payload size advertised with EDNS0, and so the most a reply can
+ * carry: 1232 avoids IP fragmentation on any path (DNS Flag Day 2020).
+ */
+#define DNS_EDNS_UDP_SIZE 1232
+
 typedef enum {
 	OPCODE_QUERY	= 0,	// Standard query (QUERY)
 } gwdns_op;
@@ -76,6 +83,7 @@ typedef enum {
 	TYPE_A		= 1,	// IPv4 host address
 	TYPE_CNAME	= 5,	// the canonical name for an alias
 	TYPE_AAAA	= 28,	// IPv6 host address
+	TYPE_OPT	= 41,	// EDNS0 pseudo-record (RFC 6891)
 } gwdns_type;
 
 typedef enum {
@@ -139,6 +147,7 @@ ssize_t gwdns_build_query(uint16_t txid, const char *name, int family, uint8_t *
  * -EINVAL	the content of in buffer is not valid.
  * -ENODATA	the packet didn't contain any answers.
  * -EPROTO	the DNS server can't understand your question
+ * -EMSGSIZE	the server truncated the answer (TC)
  *
  * @param txid		transaction id of question
  * @param port		port to put in the addresses (host byte order)

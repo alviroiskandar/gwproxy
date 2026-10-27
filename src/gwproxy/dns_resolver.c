@@ -343,7 +343,7 @@ void gwp_dns_res_drop_query(struct gwp_dns_resolver *res,
 }
 
 int gwp_dns_res_fetch_gcp_by_payload(struct gwp_dns_resolver *res,
-				     const uint8_t buf[UDP_MSG_LIMIT],
+				     const uint8_t buf[DNS_EDNS_UDP_SIZE],
 				     uint16_t len,
 				     struct gwp_conn_pair **gcp_p)
 {
@@ -365,7 +365,7 @@ int gwp_dns_res_fetch_gcp_by_payload(struct gwp_dns_resolver *res,
 
 int gwp_dns_res_complete_query(struct gwp_dns_resolver *res,
 				struct gwp_dns_packet *gdp,
-				uint8_t buf[UDP_MSG_LIMIT],
+				uint8_t buf[DNS_EDNS_UDP_SIZE],
 				uint16_t len,
 				struct gwp_sockaddr *addrs, uint8_t cap,
 				uint8_t *nr_addrs)
@@ -399,6 +399,14 @@ int gwp_dns_res_complete_query(struct gwp_dns_resolver *res,
 	 */
 	if (r == -EAGAIN)
 		r = -EBADMSG;
+
+	/*
+	 * A truncated answer would need a retry over TCP, which this
+	 * resolver does not do. Asking for the other family over UDP is no
+	 * answer to it either: fail the lookup.
+	 */
+	if (r == -EMSGSIZE)
+		gdp->__in_fallback_attempt = false;
 
 	if (gdp->__in_fallback_attempt) {
 		int tmp = gwp_dns_res_prep_query(res, gdp);

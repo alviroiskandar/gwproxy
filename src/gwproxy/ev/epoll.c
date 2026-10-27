@@ -182,7 +182,7 @@ static int handle_ev_raw_dns_query(struct gwp_wrk *w)
 {
 	struct gwp_dns_resolver *res = &w->dns->resolvers[0];
 	struct gwp_ctx *ctx = w->ctx;
-	uint8_t buf[UDP_MSG_LIMIT];
+	uint8_t buf[DNS_EDNS_UDP_SIZE];
 	ssize_t ret;
 	int i, r;
 

@@ -154,6 +154,13 @@ int gwdns_parse_query(uint16_t txid, uint16_t port, const uint8_t *in,
 	if (DNS_RCODE(raw_flags))
 		return -EPROTO;
 
+	/*
+	 * TC: the server cut the answer to fit. What is left may end on a
+	 * record boundary and look complete, so never use it.
+	 */
+	if (DNS_TC(raw_flags))
+		return -EMSGSIZE;
+
 	ancount = ntohs(hdr.ancount);
 	if (!ancount)
 		return -ENODATA;
@@ -281,6 +288,7 @@ static ssize_t construct_question(gwdns_question_part *question)
 	DNS_SET_RD(hdr->flags, true);
 	hdr->flags = htons(hdr->flags);
 	hdr->qdcount = htons(1);
+	hdr->arcount = htons(1);	/* the OPT record below */
 
 	/*
 	* pkt.body is interpreted as question section
@@ -297,6 +305,28 @@ static ssize_t construct_question(gwdns_question_part *question)
 	bw += 2;
 	memcpy(&pkt.body[bw], &qclass, 2);
 	bw += 2;
+
+	/*
+	 * EDNS0 OPT record (RFC 6891): root owner name, TYPE 41, CLASS is
+	 * the UDP payload size we accept, TTL (extended RCODE, version,
+	 * flags) and RDLENGTH zero. Without it a server cuts any answer
+	 * over 512 bytes and sets TC.
+	 */
+	if ((size_t)bw + 11 > sizeof(pkt.body))
+		return -ENAMETOOLONG;
+	{
+		static const uint8_t opt[11] = {
+			0x00,				/* NAME: root */
+			0x00, TYPE_OPT,			/* TYPE */
+			DNS_EDNS_UDP_SIZE >> 8,		/* CLASS: size */
+			DNS_EDNS_UDP_SIZE & 0xff,
+			0x00, 0x00, 0x00, 0x00,		/* TTL */
+			0x00, 0x00,			/* RDLENGTH */
+		};
+
+		memcpy(&pkt.body[bw], opt, sizeof(opt));
+		bw += sizeof(opt);
+	}
 
 	required_len = sizeof(pkt.hdr) + bw;
 	if (question->dst_len < required_len)

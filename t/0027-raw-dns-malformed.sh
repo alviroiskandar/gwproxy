@@ -19,9 +19,10 @@
 #   cname-jump        a CNAME whose RDLENGTH walks the cursor past the buffer;
 #   rdata-truncated   an AAAA claiming 16 bytes of RDATA that stops after one;
 #   field-truncated   an answer that stops inside its TTL;
+#   tc-set            a complete-looking answer with the TC (truncated) bit;
 #   question-label    a question label length of 0xC0, which strides 193 bytes.
 #
-# The last four must be refused, not parsed: the client gets a failure reply
+# The last five must be refused, not parsed: the client gets a failure reply
 # (a non-zero REP) and the failure stays inside that one request.
 # It must also stay within one query per address family. The resolver used to
 # send the same query again on every unusable answer, as fast as the server
@@ -74,7 +75,7 @@ except Exception:
 for loop in epoll; do
 
 	for mode in good uncompressed-name cname-jump rdata-truncated \
-		    field-truncated question-label; do
+		    field-truncated tc-set question-label; do
 		dp="$(pick_port)"
 		rm -f "$WORK/nr_queries"
 		python3 "$SERVERS_DIR/dns_malformed.py" "$mode" "$dp" \
