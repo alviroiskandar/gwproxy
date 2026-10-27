@@ -50,19 +50,28 @@ enum {
 	GWNET_HTTP_METHOD_CONNECT	= 9,
 };
 
+/*
+ * One stored field. @key and @val share a single allocation, owned through
+ * @key; @val follows the key's NUL. Their lengths are kept so a lookup or a
+ * merge does not have to strlen() them.
+ */
 struct gwnet_http_hdr_field {
 	char	*key;
 	char	*val;
+	size_t	klen;
+	size_t	vlen;
 };
 
 struct gwnet_http_hdr_fields {
 	struct gwnet_http_hdr_field	*ff;
 	size_t				nr;
+	size_t				cap;
 };
 
 struct gwnet_http_req_hdr {
 	uint8_t		method;
 	uint8_t		version;
+	/* One allocation, owned through @path; @uri and @qs point into it. */
 	char		*path;
 	char		*uri;
 	char		*qs;

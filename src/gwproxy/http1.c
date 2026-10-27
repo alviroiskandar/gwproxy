@@ -98,60 +98,61 @@ static inline int is_alpha(int c)
  */
 static bool is_field_allowed_to_be_duplicate(const char *key, size_t n)
 {
-	static const char *comma_separated_list_headers[] = {
+#define LH(s)	{ s, sizeof(s) - 1 }
+	static const struct {
+		const char	*name;
+		size_t		len;
+	} comma_separated_list_headers[] = {
 		/* RFC 7231, Section 5.3.2 */
-		"Accept",
+		LH("Accept"),
 		/* RFC 7231, Section 5.3.3 */
-		"Accept-Charset",
+		LH("Accept-Charset"),
 		/* RFC 7231, Section 5.3.4 */
-		"Accept-Encoding",
+		LH("Accept-Encoding"),
 		/* RFC 7231, Section 5.3.5 */
-		"Accept-Language",
+		LH("Accept-Language"),
 		/* RFC 7233, Section 2.3 */
-		"Accept-Ranges",
+		LH("Accept-Ranges"),
 		/* RFC 7231, Section 7.4.1 */
-		"Allow",
+		LH("Allow"),
 		/* RFC 7234, Section 5.2 */
-		"Cache-Control",
+		LH("Cache-Control"),
 		/* RFC 7230, Section 6.1 */
-		"Connection",
+		LH("Connection"),
 		/* RFC 7232, Section 3.1 */
-		"If-Match",
+		LH("If-Match"),
 		/* RFC 7232, Section 3.2 */
-		"If-None-Match",
+		LH("If-None-Match"),
 		/* RFC 7233, Section 3.1 */
-		"Range",
+		LH("Range"),
 		/* RFC 7234, Section 5.4 */
-		"Pragma",
+		LH("Pragma"),
 		/* RFC 7235, Section 4.3 */
-		"Proxy-Authenticate",
+		LH("Proxy-Authenticate"),
 		/* RFC 7230, Section 4.3 */
-		"TE",
+		LH("TE"),
 		/* RFC 7230, Section 4.4 */
-		"Trailer",
+		LH("Trailer"),
 		/* RFC 7230, Section 3.3.1 */
-		"Transfer-Encoding",
+		LH("Transfer-Encoding"),
 		/* RFC 7230, Section 6.7 */
-		"Upgrade",
+		LH("Upgrade"),
 		/* RFC 7231, Section 7.1.4 */
-		"Vary",
+		LH("Vary"),
 		/* RFC 7230, Section 5.7.1 */
-		"Via",
+		LH("Via"),
 		/* RFC 7234, Section 5.5 */
-		"Warning",
+		LH("Warning"),
 		/* RFC 7235, Section 4.1 */
-		"WWW-Authenticate",
-
-		NULL
+		LH("WWW-Authenticate"),
 	};
+#undef LH
+	size_t i;
 
-	const char **p;
-
-	for (p = comma_separated_list_headers; *p; p++) {
-		const char *hdr = *p;
-		size_t hdr_len = strlen(hdr);
-
-		if (n == hdr_len && !strncasecmp(key, hdr, n))
+	for (i = 0; i < sizeof(comma_separated_list_headers) /
+			 sizeof(comma_separated_list_headers[0]); i++) {
+		if (n == comma_separated_list_headers[i].len &&
+		    !strncasecmp(key, comma_separated_list_headers[i].name, n))
 			return true;
 	}
 
@@ -409,40 +410,27 @@ static int parse_hdr_req_first_line(struct gwnet_http_hdr_pctx *ctx,
 	if (ctx->tot_len + off >= ctx->max_len)
 		return -E2BIG;
 
-	hdr->path = malloc(path_len + 1);
+	/* path, uri and qs, each NUL-terminated, in one allocation. */
+	hdr->path = malloc((size_t)path_len + uri_len + qs_len + 3);
 	if (unlikely(!hdr->path))
 		return -ENOMEM;
 
-	hdr->uri = malloc(uri_len + 1);
-	if (unlikely(!hdr->uri))
-		goto free_path;
-
+	memcpy(hdr->path, path, path_len);
+	hdr->path[path_len] = '\0';
+	hdr->uri = hdr->path + path_len + 1;
+	memcpy(hdr->uri, uri, uri_len);
+	hdr->uri[uri_len] = '\0';
 	if (qs_len) {
-		hdr->qs = malloc(qs_len + 1);
-		if (unlikely(!hdr->qs))
-			goto free_uri;
+		hdr->qs = hdr->uri + uri_len + 1;
 		memcpy(hdr->qs, qs, qs_len);
 		hdr->qs[qs_len] = '\0';
 	}
-
-	memcpy(hdr->path, path, path_len);
-	hdr->path[path_len] = '\0';
-	memcpy(hdr->uri, uri, uri_len);
-	hdr->uri[uri_len] = '\0';
 
 	hdr->method = method_code;
 	hdr->version = version_code;
 	ctx->off += off;
 	ctx->tot_len += off;
 	return 0;
-
-free_uri:
-	free(hdr->uri);
-	hdr->uri = NULL;
-free_path:
-	free(hdr->path);
-	hdr->path = NULL;
-	return -ENOMEM;
 }
 
 /*
@@ -924,8 +912,6 @@ void gwnet_http_req_hdr_free(struct gwnet_http_req_hdr *hdr)
 		return;
 
 	free(hdr->path);
-	free(hdr->uri);
-	free(hdr->qs);
 	gwnet_http_hdr_fields_free(&hdr->fields);
 	memset(hdr, 0, sizeof(*hdr));
 }
@@ -952,10 +938,8 @@ void gwnet_http_hdr_fields_free(struct gwnet_http_hdr_fields *ff)
 	if (!ff)
 		return;
 
-	for (i = 0; i < ff->nr; i++) {
+	for (i = 0; i < ff->nr; i++)
 		free(ff->ff[i].key);
-		free(ff->ff[i].val);
-	}
 
 	free(ff->ff);
 	memset(ff, 0, sizeof(*ff));
@@ -967,14 +951,47 @@ static ssize_t find_hdr_field_idx(const struct gwnet_http_hdr_fields *ff,
 	size_t i;
 
 	for (i = 0; i < ff->nr; i++) {
-		struct gwnet_http_hdr_field *f = &ff->ff[i];
-		if (!strncasecmp(f->key, k, klen)) {
-			if (strlen(f->key) == klen)
-				return i;
-		}
+		const struct gwnet_http_hdr_field *f = &ff->ff[i];
+
+		if (f->klen == klen && !strncasecmp(f->key, k, klen))
+			return i;
 	}
 
 	return -ENOENT;
+}
+
+/* Store @k/@v as a new field, growing the array geometrically. */
+static int add_new_field(struct gwnet_http_hdr_fields *ff, const char *k,
+			 size_t klen, const char *v, size_t vlen)
+{
+	struct gwnet_http_hdr_field *f;
+	char *kv;
+
+	if (ff->nr == ff->cap) {
+		size_t cap = ff->cap ? ff->cap * 2 : 16;
+
+		f = realloc(ff->ff, cap * sizeof(*f));
+		if (!f)
+			return -ENOMEM;
+		ff->ff = f;
+		ff->cap = cap;
+	}
+
+	kv = malloc(klen + vlen + 2);
+	if (!kv)
+		return -ENOMEM;
+
+	memcpy(kv, k, klen);
+	kv[klen] = '\0';
+	memcpy(kv + klen + 1, v, vlen);
+	kv[klen + 1 + vlen] = '\0';
+
+	f = &ff->ff[ff->nr++];
+	f->key = kv;
+	f->val = kv + klen + 1;
+	f->klen = klen;
+	f->vlen = vlen;
+	return 0;
 }
 
 __hot
@@ -984,42 +1001,11 @@ int gwnet_http_hdr_fields_addl(struct gwnet_http_hdr_fields *ff,
 {
 	ssize_t idx = find_hdr_field_idx(ff, k, klen);
 	struct gwnet_http_hdr_field *f;
-	size_t cur_len, new_val_len;
-	char *new_val;
+	size_t cur_len;
+	char *kv;
 
-	if (idx < 0) {
-		struct gwnet_http_hdr_field *new_fields;
-		size_t new_size;
-		char *kc, *vc;
-
-		kc = malloc(klen + 1);
-		if (!kc)
-			return -ENOMEM;
-
-		vc = malloc(vlen + 1);
-		if (!vc) {
-			free(kc);
-			return -ENOMEM;
-		}
-
-		new_size = (ff->nr + 1) * sizeof(*ff->ff);
-		new_fields = realloc(ff->ff, new_size);
-		if (!new_fields) {
-			free(kc);
-			free(vc);
-			return -ENOMEM;
-		}
-
-		memcpy(kc, k, klen);
-		memcpy(vc, v, vlen);
-		kc[klen] = '\0';
-		vc[vlen] = '\0';
-		ff->ff = new_fields;
-		f = &ff->ff[ff->nr++];
-		f->key = kc;
-		f->val = vc;
-		return 0;
-	}
+	if (idx < 0)
+		return add_new_field(ff, k, klen, v, vlen);
 
 	/*
 	 * A field that may appear only once is not stored a second time: the
@@ -1032,22 +1018,22 @@ int gwnet_http_hdr_fields_addl(struct gwnet_http_hdr_fields *ff,
 	if (!vlen)
 		return 0;
 
-	cur_len = strlen(f->val);
-	new_val_len = cur_len + vlen + 3;
-	new_val = realloc(f->val, new_val_len);
-	if (!new_val)
+	/* Append ", @v" (or just @v to an empty value); key and value move
+	 * together. */
+	cur_len = f->vlen;
+	kv = realloc(f->key, f->klen + 1 + cur_len + 2 + vlen + 1);
+	if (!kv)
 		return -ENOMEM;
 
-	if (!cur_len) {
-		memcpy(new_val, v, vlen);
-		new_val[vlen] = '\0';
-	} else {
-		memcpy(&new_val[cur_len], ", ", 2);
-		memcpy(&new_val[cur_len + 2], v, vlen);
-		new_val[cur_len + 2 + vlen] = '\0';
+	f->key = kv;
+	f->val = kv + f->klen + 1;
+	if (cur_len) {
+		memcpy(&f->val[cur_len], ", ", 2);
+		cur_len += 2;
 	}
-
-	f->val = new_val;
+	memcpy(&f->val[cur_len], v, vlen);
+	f->vlen = cur_len + vlen;
+	f->val[f->vlen] = '\0';
 	return 0;
 }
 
