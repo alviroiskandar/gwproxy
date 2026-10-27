@@ -483,6 +483,80 @@ static void test_res_interim(void)
 	PRTEST_OK();
 }
 
+/*
+ * The response rewrite checks every field against the Connection options, so
+ * both are bounded: at most 256 field lines and 32 distinct options, past
+ * which the response is refused (the caller answers 502). Repeated options
+ * count once, and the options may come from several Connection lines,
+ * before or after the fields they name.
+ */
+static void test_res_limits(void)
+{
+	static char in[40000], out[40000];
+	struct gwp_http_conn *hc = gwp_http_conn_alloc();
+	size_t n, out_len;
+	int i;
+
+	assert(hc);
+
+	/* 256 field lines: fine. 257: refused. */
+	n = (size_t)sprintf(in, "HTTP/1.1 200 OK\r\n");
+	for (i = 0; i < 256; i++)
+		n += (size_t)sprintf(in + n, "X-%d: v\r\n", i);
+	sprintf(in + n, "\r\n");
+	assert(!gwp_http_fwd_res_init(hc, sizeof(in)));
+	assert(gwp_http_fwd_res_input(hc, in, strlen(in), false, out,
+				      sizeof(out), &out_len) == 0);
+	assert(gwp_http_fwd_res_state(hc) == GWP_HTTP_RES_BODY);
+	sprintf(in + n, "X-x: v\r\n\r\n");
+	assert(!gwp_http_fwd_res_init(hc, sizeof(in)));
+	assert(gwp_http_fwd_res_input(hc, in, strlen(in), false, out,
+				      sizeof(out), &out_len) == -E2BIG);
+
+	/* 32 distinct options over two lines, each repeated: fine. */
+	n = (size_t)sprintf(in, "HTTP/1.1 200 OK\r\nX-0: drop\r\n"
+			    "Connection: ");
+	for (i = 0; i < 16; i++)
+		n += (size_t)sprintf(in + n, "x-%d, X-%d ,", i, i);
+	n += (size_t)sprintf(in + n, "\r\nKeep: me\r\nConnection: ");
+	for (i = 16; i < 32; i++)
+		n += (size_t)sprintf(in + n, ",, X-%d,x-%d", i, i);
+	n += (size_t)sprintf(in + n, "\r\nX-31: drop\r\n");
+	sprintf(in + n, "\r\n");
+	assert(!gwp_http_fwd_res_init(hc, sizeof(in)));
+	assert(gwp_http_fwd_res_input(hc, in, strlen(in), false, out,
+				      sizeof(out), &out_len) == 0);
+	{
+		static const char want[] =
+			"HTTP/1.1 200 OK\r\nKeep: me\r\n"
+			"Connection: close\r\nProxy-Connection: close\r\n"
+			"\r\n";
+
+		assert(out_len == strlen(want) && !memcmp(out, want, out_len));
+	}
+
+	/* A 33rd distinct option: refused. */
+	sprintf(in + n, "Connection: X-32\r\n\r\n");
+	assert(!gwp_http_fwd_res_init(hc, sizeof(in)));
+	assert(gwp_http_fwd_res_input(hc, in, strlen(in), false, out,
+				      sizeof(out), &out_len) == -E2BIG);
+
+	/* A long list of one repeated option is one option. */
+	n = (size_t)sprintf(in, "HTTP/1.1 200 OK\r\nConnection: a");
+	for (i = 0; i < 5000; i++)
+		n += (size_t)sprintf(in + n, ",a");
+	sprintf(in + n, "\r\nA: x\r\nB: y\r\n\r\n");
+	assert(!gwp_http_fwd_res_init(hc, sizeof(in)));
+	assert(gwp_http_fwd_res_input(hc, in, strlen(in), false, out,
+				      sizeof(out), &out_len) == 0);
+	assert(out_len == strlen("HTTP/1.1 200 OK\r\nB: y\r\n"
+				 "Connection: close\r\n"
+				 "Proxy-Connection: close\r\n\r\n"));
+
+	gwp_http_conn_free(hc);
+	PRTEST_OK();
+}
+
 static void test_res_reject(void)
 {
 	static const char *const bad[] = {
@@ -752,6 +826,7 @@ int main(void)
 		test_res_rewrite();
 		test_res_interim();
 		test_res_reject();
+		test_res_limits();
 		test_need_more();
 		test_errors();
 		test_duplicate_field();

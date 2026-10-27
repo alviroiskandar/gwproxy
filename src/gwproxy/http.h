@@ -127,7 +127,8 @@ size_t gwp_http_fwd_res_pending(const struct gwp_http_conn *hc);
  * @return	0; or, with the state moved to GWP_HTTP_RES_FAILED and nothing
  *		written, a negative error the caller answers with 502:
  *		-EBADMSG (not a valid HTTP/1.x header, a 101, or the origin
- *		closed early), -E2BIG (header too large), -EACCES (the origin
+ *		closed early), -E2BIG (header too large, or more than 256
+ *		field lines or 32 Connection options), -EACCES (the origin
  *		answered 407), -ENOMEM.
  */
 int gwp_http_fwd_res_input(struct gwp_http_conn *hc, const void *in,

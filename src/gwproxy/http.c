@@ -244,6 +244,76 @@ static bool conn_lists(const char *conn, const char *name)
 }
 
 /*
+ * Most distinct connection-options accepted in a message's Connection
+ * header(s). Real messages name one or two; the limit keeps checking every
+ * other field against them cheap.
+ */
+#define CONN_MAX_TOKENS		32
+
+/* A connection-option: @len bytes at @p, not NUL-terminated. */
+struct conn_tok {
+	const char	*p;
+	size_t		len;
+};
+
+/*
+ * Add the connection-options of the Connection value at @v (@len bytes) to
+ * the @nr already in @toks, skipping empty list elements and options already
+ * there (case-insensitively). Returns the new count, or -E2BIG if that would
+ * take more than CONN_MAX_TOKENS.
+ */
+static int conn_tokenise(const char *v, size_t len, struct conn_tok *toks,
+			 int nr)
+{
+	const char *p = v, *end = v + len;
+
+	while (p < end) {
+		const char *e;
+		size_t tlen;
+		int i;
+
+		while (p < end && (*p == ',' || *p == ' ' || *p == '\t'))
+			p++;
+		if (p == end)
+			break;
+		e = memchr(p, ',', (size_t)(end - p));
+		if (!e)
+			e = end;
+		tlen = (size_t)(e - p);
+		while (tlen > 0 && (p[tlen - 1] == ' ' || p[tlen - 1] == '\t'))
+			tlen--;
+
+		for (i = 0; i < nr; i++) {
+			if (toks[i].len == tlen &&
+			    !strncasecmp(toks[i].p, p, tlen))
+				break;
+		}
+		if (i == nr) {
+			if (nr >= CONN_MAX_TOKENS)
+				return -E2BIG;
+			toks[nr].p = p;
+			toks[nr].len = tlen;
+			nr++;
+		}
+		p = e;
+	}
+	return nr;
+}
+
+/* Whether the field name @k (@klen bytes) is one of the @nr options. */
+static bool conn_toks_have(const struct conn_tok *toks, int nr, const char *k,
+			   size_t klen)
+{
+	int i;
+
+	for (i = 0; i < nr; i++) {
+		if (toks[i].len == klen && !strncasecmp(toks[i].p, k, klen))
+			return true;
+	}
+	return false;
+}
+
+/*
  * Rebuild the request in origin-form into hc->fwd_req: the absolute-form
  * request-target is replaced by @path, hop-by-hop / connection-specific
  * headers are dropped and "Connection: close" is appended (this proxy handles
@@ -528,14 +598,20 @@ int gwp_http_conn_process(struct gwp_http_conn *hc, struct gwp_auth *auth,
  */
 static bool is_res_hop_by_hop(const char *k, size_t klen)
 {
-	static const char *const hbh[] = {
-		"Connection", "Proxy-Connection", "Keep-Alive", "Upgrade",
-		"TE", "Proxy-Authenticate", "Proxy-Authentication-Info",
+#define HBH(s)	{ s, sizeof(s) - 1 }
+	static const struct {
+		const char	*name;
+		size_t		len;
+	} hbh[] = {
+		HBH("Connection"), HBH("Proxy-Connection"), HBH("Keep-Alive"),
+		HBH("Upgrade"), HBH("TE"), HBH("Proxy-Authenticate"),
+		HBH("Proxy-Authentication-Info"),
 	};
+#undef HBH
 	size_t i;
 
 	for (i = 0; i < sizeof(hbh) / sizeof(hbh[0]); i++) {
-		if (strlen(hbh[i]) == klen && !strncasecmp(k, hbh[i], klen))
+		if (hbh[i].len == klen && !strncasecmp(k, hbh[i].name, klen))
 			return true;
 	}
 	return false;
@@ -744,24 +820,32 @@ int gwp_http_fwd_req_body(struct gwp_http_conn *hc, const void *in,
 }
 
 /*
- * Return the length of the line at @p (at most @len bytes, which always
- * include its LF) excluding the line terminator, which is LF or CRLF.
+ * Return the line after the one at @p, which ends before @end; *@n is set to
+ * the length of the line at @p without its terminator (LF or CRLF).
  */
-static size_t line_len(const char *p, size_t len)
+static const char *next_line(const char *p, const char *end, size_t *n)
 {
-	const char *lf = memchr(p, '\n', len);
-	size_t n = (size_t)(lf - p);
+	const char *lf = memchr(p, '\n', (size_t)(end - p));
 
-	if (n && p[n - 1] == '\r')
-		n--;
-	return n;
+	*n = (size_t)(lf - p);
+	if (*n && p[*n - 1] == '\r')
+		(*n)--;
+	return lf + 1;
 }
 
-/* The line after the one at @p; the header ending at @end has one. */
-static const char *next_line(const char *p, const char *end)
-{
-	return (const char *)memchr(p, '\n', (size_t)(end - p)) + 1;
-}
+/*
+ * Most field lines accepted in one response header. Ordinary responses have
+ * a few dozen; without a limit the work per header grows with the size of
+ * the hold-back buffer (-T).
+ */
+#define RES_MAX_FIELDS		256
+
+/* Where a field line sits in the header: offset, length and name length. */
+struct res_line {
+	uint32_t	off;
+	uint32_t	len;
+	uint32_t	klen;
+};
 
 /*
  * Rewrite one complete response header (@len bytes, ending with its blank
@@ -770,20 +854,22 @@ static const char *next_line(const char *p, const char *end)
  * told that the connection closes after it. *@code is set to the status code.
  *
  * Returns the length written, -EBADMSG for a header that is not valid
- * HTTP/1.x, or -E2BIG if @out is too small.
+ * HTTP/1.x, or -E2BIG if @out is too small or the header has more than
+ * RES_MAX_FIELDS field lines or CONN_MAX_TOKENS connection-options.
  */
 static ssize_t rewrite_res_hdr(const char *hdr, size_t len, char *out,
 			       size_t out_cap, int *code)
 {
 	static const char cls[] = "Connection: close\r\n"
 				  "Proxy-Connection: close\r\n";
+	struct res_line lines[RES_MAX_FIELDS];
+	struct conn_tok toks[CONN_MAX_TOKENS];
 	const char *p = hdr, *end = hdr + len, *q;
-	char *conn = NULL;
-	size_t n, o = 0, conn_len = 0, i;
-	ssize_t ret = -EBADMSG;
+	int nr_toks = 0, nr_lines = 0, l;
+	size_t n, o, i;
 
 	/* Status line: HTTP/1.x SP 3DIGIT [ SP reason-phrase ] */
-	n = line_len(p, (size_t)(end - p));
+	q = next_line(p, end, &n);
 	if (n < 12 || memcmp(p, "HTTP/1.", 7) || (p[7] != '0' && p[7] != '1') ||
 	    p[8] != ' ' || p[9] < '1' || p[9] > '5' || p[10] < '0' ||
 	    p[10] > '9' || p[11] < '0' || p[11] > '9' ||
@@ -799,77 +885,68 @@ static ssize_t rewrite_res_hdr(const char *hdr, size_t len, char *out,
 	memcpy(out, p, n);
 	memcpy(out + n, "\r\n", 2);
 	o = n + 2;
-	p = next_line(p, end);
 
 	/*
-	 * Validate the field lines and gather every Connection value into one
-	 * list first: a field may be named by a Connection line that comes
-	 * after it.
+	 * Validate the field lines, note where each one is and collect the
+	 * connection-options first: a field may be named by a Connection line
+	 * that comes after it.
 	 */
-	conn = malloc(len + 1);
-	if (!conn)
-		return -ENOMEM;
-	for (q = p; ; ) {
+	for (p = q; ; p = q) {
 		const char *colon, *v;
 
-		n = line_len(q, (size_t)(end - q));
+		q = next_line(p, end, &n);
 		if (!n)
 			break;
+		if (nr_lines == RES_MAX_FIELDS)
+			return -E2BIG;
 		/* obs-fold (RFC 9112 Section 5.2) is refused, not unfolded. */
-		colon = memchr(q, ':', n);
-		if (!colon || colon == q)
-			goto out;
-		for (v = q; v < colon; v++) {
-			if (!is_tchar(*v))
-				goto out;
-		}
-		for (v = colon + 1; v < q + n; v++) {
-			if (!is_field_char(*v))
-				goto out;
-		}
-		if (colon - q == 10 && !strncasecmp(q, "Connection", 10)) {
-			conn[conn_len++] = ',';
-			memcpy(conn + conn_len, colon + 1, n - 11);
-			conn_len += n - 11;
-		}
-		q = next_line(q, end);
-	}
-	conn[conn_len] = '\0';
-
-	for (;;) {
-		const char *colon;
-		size_t klen;
-
-		n = line_len(p, (size_t)(end - p));
-		if (!n)
-			break;
 		colon = memchr(p, ':', n);
-		klen = (size_t)(colon - p);
-		if (!is_res_hop_by_hop(p, klen) &&
-		    (is_framing_field(p, klen) || !conn_listsl(conn, p, klen))) {
-			if (o + n + 2 > out_cap) {
-				ret = -E2BIG;
-				goto out;
-			}
-			memcpy(out + o, p, n);
-			memcpy(out + o + n, "\r\n", 2);
-			o += n + 2;
+		if (!colon || colon == p)
+			return -EBADMSG;
+		for (v = p; v < colon; v++) {
+			if (!is_tchar(*v))
+				return -EBADMSG;
 		}
-		p = next_line(p, end);
+		for (v = colon + 1; v < p + n; v++) {
+			if (!is_field_char(*v))
+				return -EBADMSG;
+		}
+		lines[nr_lines].off = (uint32_t)(p - hdr);
+		lines[nr_lines].len = (uint32_t)n;
+		lines[nr_lines].klen = (uint32_t)(colon - p);
+		nr_lines++;
+		if (colon - p == 10 && !strncasecmp(p, "Connection", 10)) {
+			nr_toks = conn_tokenise(colon + 1, n - 11, toks,
+						nr_toks);
+			if (nr_toks < 0)
+				return nr_toks;
+		}
+	}
+
+	for (l = 0; l < nr_lines; l++) {
+		const char *k = hdr + lines[l].off;
+		size_t klen = lines[l].klen;
+
+		n = lines[l].len;
+		if (is_res_hop_by_hop(k, klen))
+			continue;
+		if (!is_framing_field(k, klen) &&
+		    conn_toks_have(toks, nr_toks, k, klen))
+			continue;
+		if (o + n + 2 > out_cap)
+			return -E2BIG;
+		memcpy(out + o, k, n);
+		memcpy(out + o + n, "\r\n", 2);
+		o += n + 2;
 	}
 
 	/* An interim response says nothing about the connection. */
 	n = (*code >= 200) ? sizeof(cls) - 1 : 0;
-	if (o + n + 2 > out_cap) {
-		ret = -E2BIG;
-		goto out;
-	}
+	if (o + n + 2 > out_cap)
+		return -E2BIG;
 	memcpy(out + o, cls, n);
 	memcpy(out + o + n, "\r\n", 2);
-	ret = (ssize_t)(o + n + 2);
-out:
-	free(conn);
-	return ret;
+	return (ssize_t)(o + n + 2);
 }
 
 /*
