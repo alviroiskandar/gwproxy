@@ -101,11 +101,9 @@ static int chk_handle_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	return arm_poll_for_dns_query(w, gcp);
 }
 
-static int prep_and_send_socks5_rep_connect(struct gwp_wrk *w,
-					    struct gwp_conn_pair *gcp,
-					    int err);
-
 static int handle_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
+static int free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
+static ssize_t __do_send(struct gwp_conn *src, struct gwp_conn *dst);
 
 static int handle_ev_raw_dns_query(struct gwp_wrk *w)
 {
@@ -141,10 +139,12 @@ static int handle_ev_raw_dns_query(struct gwp_wrk *w)
 
 	ret = gwp_dns_res_complete_query(res, gcp->gdp, buf, len,
 					 &gcp->target_addr);
-	if (ret == -EAGAIN)
-		return send_dns_payload(res, gcp);
-
-	if (likely(!ret)) {
+	if (ret == -EAGAIN) {
+		/* Retry with the fallback record type. */
+		ret = send_dns_payload(res, gcp);
+		if (likely(!ret))
+			return 0;
+	} else if (likely(!ret)) {
 		pr_dbg(&ctx->lh, "Resolved DNS query for %s to %s (gcp_idx=%u)",
 			gcp->gdp->host, ip_to_str(&gcp->target_addr), gcp->idx);
 		/*
@@ -153,13 +153,39 @@ static int handle_ev_raw_dns_query(struct gwp_wrk *w)
 		 */
 		gwp_conn_set_single_candidate(gcp, &gcp->target_addr);
 		r = handle_connect(w, gcp);
-	} else {
-		if (gcp->conn_state == CONN_STATE_SOCKS5_DNS_QUERY)
-			r = prep_and_send_socks5_rep_connect(w, gcp, (int)ret);
-		else
-			r = -EIO;
+		goto out;
 	}
-	return r;
+
+	/*
+	 * The name did not resolve, so the origin is unreachable: answer
+	 * in whatever protocol the client speaks (SOCKS5 REP, or HTTP 502)
+	 * and close, as the getaddrinfo path does.
+	 */
+	r = gwp_conn_fail_reply(w, gcp, (int)ret);
+	if (!r && gcp->target.len) {
+		ssize_t sr = __do_send(&gcp->target, &gcp->client);
+
+		if (unlikely(sr < 0))
+			r = (int)sr;
+	}
+	if (!r)
+		r = (int)ret;
+
+out:
+	/*
+	 * Whatever failed here belongs to this one connection. The event
+	 * is tagged EV_BIT_RAW_DNS_QUERY, not with a pair bit, so
+	 * handle_event() would not free the pair; it would hand the error
+	 * to the worker loop instead, which exits and stops every worker.
+	 * One request resolving to an ACL-denied address took the whole
+	 * proxy down that way. Any reply due to the client has been sent
+	 * by now; tear the pair down here (which also drops its resolver
+	 * slot) and let only a failure to do that reach the loop.
+	 */
+	if (unlikely(r))
+		return free_conn_pair(w, gcp);
+
+	return 0;
 }
 #else
 static int register_dns_to_epoll(struct gwp_wrk __unused *w)
