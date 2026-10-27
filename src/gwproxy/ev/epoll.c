@@ -599,7 +599,6 @@ static int __handle_ev_accept(struct gwp_wrk *w)
 	}
 
 	gcp->client_addr = addr;
-	gwp_setup_cli_sock_options(w, fd);
 	gcp->client.fd = fd;
 	pr_dbg(&ctx->lh, "New connection from %s (fd=%d)",
 		ip_to_str(&gcp->client_addr), fd);
