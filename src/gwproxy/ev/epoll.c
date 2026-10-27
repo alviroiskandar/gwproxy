@@ -1586,6 +1586,39 @@ static int handle_ev_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	return forward_progress(w, gcp);
 }
 
+/*
+ * A client event while the upstream proxy handshake runs. The handshake owns
+ * the target socket and gcp->target until the tunnel is up, so all there is to
+ * do is take in what the client sends; upstream_finish() flushes it to the
+ * target. Going through the forwarding path instead armed EPOLLOUT on the
+ * client for whatever sat in gcp->target, sent a partial upstream reply to the
+ * client, and shut the target's write side on a client half-close.
+ */
+static int handle_ev_client_upstream_hs(struct gwp_wrk *w,
+					struct gwp_conn_pair *gcp,
+					struct epoll_event *ev)
+{
+	struct epoll_event cev;
+	int r;
+
+	if (ev->events & (EPOLLIN | EPOLLHUP)) {
+		r = do_splice(w, gcp, &gcp->client, &gcp->target, true, false);
+		if (r)
+			return r;
+	}
+
+	/* Both directions gone: nothing left to tunnel for. */
+	if ((ev->events & EPOLLHUP) && gcp->client.rd_eof)
+		return -ECONNRESET;
+
+	if (!adj_epl_in(&gcp->client))
+		return 0;
+
+	cev.events = gcp->client.ep_mask;
+	cev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_CLIENT;
+	return __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_MOD, gcp->client.fd, &cev);
+}
+
 __hot
 static int handle_ev_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			    struct epoll_event *ev)
@@ -1596,6 +1629,9 @@ static int handle_ev_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		pr_err(&w->ctx->lh, "EPOLLERR on client connection event");
 		return -ECONNRESET;
 	}
+
+	if (in_upstream_hs(gcp))
+		return handle_ev_client_upstream_hs(w, gcp, ev);
 
 	if (ev->events & (EPOLLIN | EPOLLHUP)) {
 		r = do_splice(w, gcp, &gcp->client, &gcp->target, true,
