@@ -1206,20 +1206,12 @@ void gwp_acl_destroy(struct gwp_acl *acl)
  */
 
 /*
- * A single match criterion. @present is the rule's has_* flag; @matched is
- * whether the value matched; @negate is the rule's neg_* flag. The criterion is
- * satisfied when it is absent, or present with (matched XOR negated). Adding a
- * new criterion to rule_matches() is then a one-liner.
- *
- * @matched is computed by the caller and so is evaluated even when @present is
- * false: it must be side-effect-free and safe to compute for a rule that does
- * not set the criterion (e.g. guard a pointer deref on the rule field, not just
- * the query field).
+ * A single match criterion fails the rule when it is present and its match
+ * result equals its negation flag (a present criterion is satisfied by
+ * matched XOR negated). Only evaluated behind the rule's has_* flag, so a
+ * criterion the rule does not use costs one bit test.
  */
-static bool crit_ok(bool present, bool matched, bool negate)
-{
-	return !present || (matched != negate);
-}
+#define CRIT_FAILS(r, has, neg, matched) ((r)->has && ((matched) == (r)->neg))
 
 /*
  * True if rule @r's -m domain criterion matches the requested hostname @dom
@@ -1271,8 +1263,7 @@ static bool user_match(const struct gwp_acl_rule *r, const char *user)
  * split across such targets is by attempt rather than by connection.
  *
  * Only ever call this behind a @has_statistic test: @st_every is 0 on a rule
- * that does not use the module, and crit_ok() evaluates its arguments eagerly,
- * so an unguarded call divides by zero on every other rule in the file.
+ * that does not use the module, so an unguarded call divides by zero.
  */
 static bool statistic_match(struct gwp_acl_rule *r)
 {
@@ -1288,39 +1279,47 @@ static bool rule_matches(struct gwp_acl_rule *r,
 	/*
 	 * Target-dependent criteria (-d, --dports) cannot be evaluated for a
 	 * domain-only request (socks5h remote-DNS: no resolved IP, @dport unset).
-	 * Such a rule matches NEITHER polarity -- otherwise crit_ok would let a
-	 * negated "! -d"/"! --dports" flip the unknown into a match and fail open
+	 * Such a rule matches NEITHER polarity -- otherwise a negated
+	 * "! -d"/"! --dports" would flip the unknown into a match and fail open
 	 * (e.g. an allow-by-exclusion rule bypassing an internal-range REJECT).
 	 * -m domain / -m user still evaluate here (domain/user are known).
 	 */
 	if (!q->target && (r->has_dst || r->has_dports))
 		return false;
 
-	return crit_ok(r->has_src,
-		       q->client && cidr_match(&r->src, q->client), r->neg_src) &&
-	       crit_ok(r->has_dst,
-		       q->target && cidr_match(&r->dst, q->target), r->neg_dst) &&
-	       crit_ok(r->has_domain, domain_match(r, q->domain),
-		       r->neg_domain) &&
-	       crit_ok(r->has_user, user_match(r, q->user), r->neg_user) &&
-	       crit_ok(r->has_proto, q->proto == r->proto, r->neg_proto) &&
-	       crit_ok(r->has_sports, ports_match(&r->sports, q->sport),
-		       r->neg_sports) &&
-	       crit_ok(r->has_dports, ports_match(&r->dports, q->dport),
-		       r->neg_dports) &&
-	       /*
-		* LAST, and it has to stay last. Every criterion above is a pure
-		* predicate; this one advances the rule's counter, so a rule
-		* must only consume a slot once everything else about it has
-		* matched -- otherwise "-d 10.0.0.0/8 -m statistic ..." would
-		* count the connections it does not select and the split would
-		* be against the wrong population. The && chain short-circuits,
-		* which is what enforces that; crit_ok() itself evaluates its
-		* @matched argument eagerly, so ordering is the only guard.
-		*/
-	       crit_ok(r->has_statistic,
-		       r->has_statistic && statistic_match(r),
-		       r->neg_statistic);
+	/*
+	 * Cheapest test first: a rule is rejected by its first failing
+	 * criterion, and every criterion below the statistic is a pure
+	 * predicate, so the order changes the cost and never the result.
+	 */
+	if (CRIT_FAILS(r, has_proto, neg_proto, q->proto == r->proto))
+		return false;
+	if (CRIT_FAILS(r, has_dports, neg_dports,
+		       ports_match(&r->dports, q->dport)))
+		return false;
+	if (CRIT_FAILS(r, has_sports, neg_sports,
+		       ports_match(&r->sports, q->sport)))
+		return false;
+	if (CRIT_FAILS(r, has_dst, neg_dst,
+		       q->target && cidr_match(&r->dst, q->target)))
+		return false;
+	if (CRIT_FAILS(r, has_src, neg_src,
+		       q->client && cidr_match(&r->src, q->client)))
+		return false;
+	if (CRIT_FAILS(r, has_user, neg_user, user_match(r, q->user)))
+		return false;
+	if (CRIT_FAILS(r, has_domain, neg_domain, domain_match(r, q->domain)))
+		return false;
+
+	/*
+	 * LAST, and it has to stay last. Every criterion above is a pure
+	 * predicate; this one advances the rule's counter, so a rule must only
+	 * consume a slot once everything else about it has matched --
+	 * otherwise "-d 10.0.0.0/8 -m statistic ..." would count the
+	 * connections it does not select and the split would be against the
+	 * wrong population.
+	 */
+	return !CRIT_FAILS(r, has_statistic, neg_statistic, statistic_match(r));
 }
 
 /* Read a sockaddr's port (host byte order) regardless of family. */
