@@ -25,15 +25,32 @@
 #include <gwproxy/dns_cache.h>
 #include <arpa/inet.h>
 
-#ifndef container_of
-#define container_of(ptr, type, member) \
-	((type *)((char *)(ptr) - offsetof(type, member)))
-#endif
+struct gwp_dns_cache_entry {
+	/**
+	 * Super compact domain name and IP address list.
+	 *
+	 * - name_len: length of the domain name (including null terminator).
+	 * - nr_i4: number of IPv4 addresses.
+	 * - nr_i6: number of IPv6 addresses.
+	 * - block: flexible array member that contains:
+	 *     - The first name_len octets are the domain name.
+	 *     - The next nr_i4 * 4 octets are IPv4 addresses.
+	 *     - The next nr_i6 * 16 octets are IPv6 addresses.
+	 */
+	uint8_t		name_len;
+	uint8_t		nr_i4;
+	uint8_t		nr_i6;
+	uint8_t		block[];
+};
 
+/*
+ * Entries are only ever reached under the cache lock: a hit copies the
+ * addresses out before unlocking, so an entry has no other owner than the
+ * table and is freed as soon as it is unlinked.
+ */
 struct dns_cache_entry {
 	struct dns_cache_entry		*next;
 	time_t				expired_at;
-	_Atomic(int)			ref_cnt;
 	struct gwp_dns_cache_entry	e;
 };
 
@@ -186,17 +203,7 @@ static int dns_map_init(struct dns_hash_map *map, size_t nr_buckets,
 
 static void put_dns_entry(struct dns_cache_entry *e)
 {
-	int x = atomic_fetch_sub(&e->ref_cnt, 1);
-	assert(x > 0);
-	if (x == 1)
-		free(e);
-}
-
-static void get_dns_entry(struct dns_cache_entry *e)
-{
-	int x = atomic_fetch_add(&e->ref_cnt, 1);
-	assert(x >= 0);
-	(void)x;
+	free(e);
 }
 
 static void dns_map_free(struct dns_hash_map *map)
@@ -300,7 +307,6 @@ static int alloc_dns_entry(struct dns_cache_entry **ep, const char *key,
 	de->e.name_len = name_len;
 	de->e.nr_i4 = nr_i4;
 	de->e.nr_i6 = nr_i6;
-	atomic_init(&de->ref_cnt, 1);
 	memcpy(de->e.block, key, name_len);
 	extract_i4i6(de, ai);
 	*ep = de;
@@ -337,7 +343,7 @@ static int dns_map_insert(struct dns_hash_map *map, const char *key,
 		 * Case 1. Best case, no collision!
 		 */
 		if (map->max_entries && map->nr_entries >= map->max_entries) {
-			free(de);	/* fresh, unshared alloc (ref_cnt == 1) */
+			free(de);	/* fresh, not linked anywhere yet */
 			return -ENOSPC;
 		}
 		map->table[idx] = de;
@@ -436,7 +442,7 @@ static int dns_map_insert(struct dns_hash_map *map, const char *key,
 	 * just not cached) rather than growing without limit.
 	 */
 	if (map->max_entries && map->nr_entries >= map->max_entries) {
-		free(de);	/* fresh, unshared alloc (ref_cnt == 1) */
+		free(de);	/* fresh, not linked anywhere yet */
 		return -ENOSPC;
 	}
 	map->nr_entries++;
@@ -449,8 +455,22 @@ static int dns_map_insert(struct dns_hash_map *map, const char *key,
 	return 0;
 }
 
-static int dns_map_lookup_and_get(struct dns_hash_map *map, const char *key,
-				  struct dns_cache_entry **ep)
+static void copy_addrs(const struct gwp_dns_cache_entry *e,
+		       struct gwp_dns_cache_addrs *out)
+{
+	const uint8_t *i4b = &e->block[e->name_len];
+	const uint8_t *i6b = &i4b[e->nr_i4 * 4];
+
+	out->nr_i4 = e->nr_i4 < GWP_DNS_CACHE_MAX_ADDRS ?
+		     e->nr_i4 : GWP_DNS_CACHE_MAX_ADDRS;
+	out->nr_i6 = e->nr_i6 < GWP_DNS_CACHE_MAX_ADDRS ?
+		     e->nr_i6 : GWP_DNS_CACHE_MAX_ADDRS;
+	memcpy(out->i4, i4b, (size_t)out->nr_i4 * 4);
+	memcpy(out->i6, i6b, (size_t)out->nr_i6 * 16);
+}
+
+static int dns_map_lookup(struct dns_hash_map *map, const char *key,
+			  struct gwp_dns_cache_addrs *out)
 {
 	struct dns_cache_entry *cur;
 	time_t now = time(NULL);
@@ -472,8 +492,7 @@ static int dns_map_lookup_and_get(struct dns_hash_map *map, const char *key,
 			if (cur->expired_at <= now)
 				return -ETIMEDOUT;
 
-			get_dns_entry(cur);
-			*ep = cur;
+			copy_addrs(&cur->e, out);
 			return 0;
 		}
 		cur = cur->next;
@@ -559,27 +578,18 @@ static void throttled_housekeep(struct gwp_dns_cache *cache)
 	gwp_dns_cache_housekeep(cache);
 }
 
-int gwp_dns_cache_getent(struct gwp_dns_cache *cache, const char *key,
-			 struct gwp_dns_cache_entry **ep)
+int gwp_dns_cache_lookup_addrs(struct gwp_dns_cache *cache, const char *key,
+			       struct gwp_dns_cache_addrs *out)
 {
-	struct dns_cache_entry *de = NULL;
 	int r;
 
 	pthread_rwlock_rdlock(&cache->lock);
-	r = dns_map_lookup_and_get(&cache->map, key, &de);
+	r = dns_map_lookup(&cache->map, key, out);
 	pthread_rwlock_unlock(&cache->lock);
-	if (de)
-		*ep = &de->e;
-	else if (r == -ETIMEDOUT)
+	if (r == -ETIMEDOUT)
 		throttled_housekeep(cache);
 
 	return r;
-}
-
-void gwp_dns_cache_putent(struct gwp_dns_cache_entry *e)
-{
-	if (e)
-		put_dns_entry(container_of(e, struct dns_cache_entry, e));
 }
 
 static void dns_map_scan_and_remove_expired(struct dns_hash_map *map)

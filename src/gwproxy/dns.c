@@ -606,77 +606,12 @@ out_err:
 	return r;
 }
 
-static bool fetch_i4(struct gwp_dns_cache_entry *e, struct gwp_sockaddr *addr,
-		     uint16_t port)
-{
-	uint8_t *b = gwp_dns_cache_entget_i4(e);
-	if (!b)
-		return false;
-
-	memset(addr, 0, sizeof(*addr));
-	addr->i4.sin_family = AF_INET;
-	addr->i4.sin_port = htons(port);
-	memcpy(&addr->i4.sin_addr, b, 4);
-	return true;
-}
-
-static bool fetch_i6(struct gwp_dns_cache_entry *e, struct gwp_sockaddr *addr,
-		     uint16_t port)
-{
-	uint8_t *b = gwp_dns_cache_entget_i6(e);
-	if (!b)
-		return false;
-
-	memset(addr, 0, sizeof(*addr));
-	addr->i6.sin6_family = AF_INET6;
-	addr->i6.sin6_port = htons(port);
-	memcpy(&addr->i6.sin6_addr, b, 16);
-	return true;
-}
-
-static int fetch_addr(struct gwp_dns_cache_entry *e, struct gwp_sockaddr *addr,
-		      uint16_t port, uint32_t restyp)
-{
-	if (restyp == GWP_DNS_RESTYP_IPV4_ONLY) {
-		if (!fetch_i4(e, addr, port))
-			return -EHOSTUNREACH;
-	} else if (restyp == GWP_DNS_RESTYP_IPV6_ONLY) {
-		if (!fetch_i6(e, addr, port))
-			return -EHOSTUNREACH;
-	} else if (restyp == GWP_DNS_RESTYP_PREFER_IPV6) {
-		if (!fetch_i6(e, addr, port)) {
-			if (!fetch_i4(e, addr, port))
-				return -EHOSTUNREACH;
-		}
-	} else if (restyp == GWP_DNS_RESTYP_PREFER_IPV4 ||
-		   restyp == GWP_DNS_RESTYP_DEFAULT) {
-		if (!fetch_i4(e, addr, port)) {
-			if (!fetch_i6(e, addr, port))
-				return -EHOSTUNREACH;
-		}
-	} else {
-		return -EINVAL;
-	}
-
-	return 0;
-}
-
 int gwp_dns_cache_lookup(struct gwp_dns_ctx *ctx, const char *name,
 			 const char *service, struct gwp_sockaddr *addr)
 {
-	struct gwp_dns_cache_entry *e;
-	int r;
+	uint8_t nr;
 
-	if (!ctx->cache)
-		return -ENOSYS;
-
-	r = gwp_dns_cache_getent(ctx->cache, name, &e);
-	if (r)
-		return r;
-
-	r = fetch_addr(e, addr, service ? atoi(service) : 0, ctx->cfg.restyp);
-	gwp_dns_cache_putent(e);
-	return r;
+	return gwp_dns_cache_lookup_list(ctx, name, service, addr, 1, &nr);
 }
 
 /* Size the bucket array from the entry cap for a ~1.0 load factor, clamped to
@@ -692,33 +627,33 @@ static uint32_t cache_bucket_count(uint32_t max_entries)
 	return n;
 }
 
-static void fetch_i4_at(struct gwp_dns_cache_entry *e, uint8_t idx,
-			struct gwp_sockaddr *addr, uint16_t port)
-{
-	uint8_t *b = gwp_dns_cache_entget_i4(e) + ((size_t)idx * 4u);
+/* A hit must be able to fill a whole list from one family. */
+_Static_assert(GWP_DNS_CACHE_MAX_ADDRS >= GWP_DNS_MAX_ADDRS,
+	       "the cache hands back fewer addresses than a lookup returns");
 
+static void fill_i4(struct gwp_sockaddr *addr, const struct in_addr *a,
+		    uint16_t port)
+{
 	memset(addr, 0, sizeof(*addr));
 	addr->i4.sin_family = AF_INET;
 	addr->i4.sin_port = htons(port);
-	memcpy(&addr->i4.sin_addr, b, 4);
+	addr->i4.sin_addr = *a;
 }
 
-static void fetch_i6_at(struct gwp_dns_cache_entry *e, uint8_t idx,
-			struct gwp_sockaddr *addr, uint16_t port)
+static void fill_i6(struct gwp_sockaddr *addr, const struct in6_addr *a,
+		    uint16_t port)
 {
-	uint8_t *b = gwp_dns_cache_entget_i6(e) + ((size_t)idx * 16u);
-
 	memset(addr, 0, sizeof(*addr));
 	addr->i6.sin6_family = AF_INET6;
 	addr->i6.sin6_port = htons(port);
-	memcpy(&addr->i6.sin6_addr, b, 16);
+	addr->i6.sin6_addr = *a;
 }
 
 int gwp_dns_cache_lookup_list(struct gwp_dns_ctx *ctx, const char *name,
 			      const char *service, struct gwp_sockaddr *addrs,
 			      uint8_t cap, uint8_t *nr_addrs)
 {
-	struct gwp_dns_cache_entry *e;
+	struct gwp_dns_cache_addrs ca;
 	uint8_t nr_v4, nr_v6, n = 0, i;
 	uint32_t rt = ctx->cfg.restyp;
 	bool v6_first;
@@ -732,13 +667,13 @@ int gwp_dns_cache_lookup_list(struct gwp_dns_ctx *ctx, const char *name,
 	if (cap > GWP_DNS_MAX_ADDRS)
 		cap = GWP_DNS_MAX_ADDRS;
 
-	r = gwp_dns_cache_getent(ctx->cache, name, &e);
+	r = gwp_dns_cache_lookup_addrs(ctx->cache, name, &ca);
 	if (r)
 		return r;
 
 	port = service ? (uint16_t)atoi(service) : 0;
-	nr_v4 = (rt == GWP_DNS_RESTYP_IPV6_ONLY) ? 0 : e->nr_i4;
-	nr_v6 = (rt == GWP_DNS_RESTYP_IPV4_ONLY) ? 0 : e->nr_i6;
+	nr_v4 = (rt == GWP_DNS_RESTYP_IPV6_ONLY) ? 0 : ca.nr_i4;
+	nr_v6 = (rt == GWP_DNS_RESTYP_IPV4_ONLY) ? 0 : ca.nr_i6;
 
 	/* Same interleave and the same leading family as collect_addr_list(). */
 	v6_first = (rt == GWP_DNS_RESTYP_PREFER_IPV6);
@@ -746,18 +681,17 @@ int gwp_dns_cache_lookup_list(struct gwp_dns_ctx *ctx, const char *name,
 	for (i = 0; n < cap && (i < nr_v4 || i < nr_v6); i++) {
 		if (v6_first) {
 			if (i < nr_v6)
-				fetch_i6_at(e, i, &addrs[n++], port);
+				fill_i6(&addrs[n++], &ca.i6[i], port);
 			if (i < nr_v4 && n < cap)
-				fetch_i4_at(e, i, &addrs[n++], port);
+				fill_i4(&addrs[n++], &ca.i4[i], port);
 		} else {
 			if (i < nr_v4)
-				fetch_i4_at(e, i, &addrs[n++], port);
+				fill_i4(&addrs[n++], &ca.i4[i], port);
 			if (i < nr_v6 && n < cap)
-				fetch_i6_at(e, i, &addrs[n++], port);
+				fill_i6(&addrs[n++], &ca.i6[i], port);
 		}
 	}
 
-	gwp_dns_cache_putent(e);
 	*nr_addrs = n;
 	return n ? 0 : -EHOSTUNREACH;
 }

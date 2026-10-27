@@ -221,7 +221,7 @@ static void fill_ai_v4(struct addrinfo *ai, struct sockaddr_in *sa)
 static void test_dns_cache_cap(void)
 {
 	struct gwp_dns_cache *cache = NULL;
-	struct gwp_dns_cache_entry *e;
+	struct gwp_dns_cache_addrs ca;
 	struct sockaddr_in sa;
 	struct addrinfo ai;
 	char key[32];
@@ -242,13 +242,12 @@ static void test_dns_cache_cap(void)
 	/* A fifth distinct key is refused and not cached. */
 	r = gwp_dns_cache_insert(cache, "host4.example", &ai, time(NULL) + 100);
 	assert(r == -ENOSPC);
-	r = gwp_dns_cache_getent(cache, "host4.example", &e);
+	r = gwp_dns_cache_lookup_addrs(cache, "host4.example", &ca);
 	assert(r == -ENOENT);
 
 	/* Existing keys remain; replacing one (same key) is allowed when full. */
-	r = gwp_dns_cache_getent(cache, "host0.example", &e);
+	r = gwp_dns_cache_lookup_addrs(cache, "host0.example", &ca);
 	assert(!r);
-	gwp_dns_cache_putent(e);
 	r = gwp_dns_cache_insert(cache, "host0.example", &ai, time(NULL) + 100);
 	assert(!r);
 
@@ -259,7 +258,7 @@ static void test_dns_cache_cap(void)
 static void test_dns_cache_case(void)
 {
 	struct gwp_dns_cache *cache = NULL;
-	struct gwp_dns_cache_entry *e;
+	struct gwp_dns_cache_addrs ca;
 	struct sockaddr_in sa;
 	struct addrinfo ai;
 	int r;
@@ -270,32 +269,30 @@ static void test_dns_cache_case(void)
 
 	r = gwp_dns_cache_insert(cache, "MixedCase.Example", &ai, time(NULL) + 100);
 	assert(!r);
-	r = gwp_dns_cache_getent(cache, "mixedcase.example", &e);
+	r = gwp_dns_cache_lookup_addrs(cache, "mixedcase.example", &ca);
 	assert(!r);
-	gwp_dns_cache_putent(e);
-	r = gwp_dns_cache_getent(cache, "MIXEDCASE.EXAMPLE", &e);
+	r = gwp_dns_cache_lookup_addrs(cache, "MIXEDCASE.EXAMPLE", &ca);
 	assert(!r);
-	gwp_dns_cache_putent(e);
 
 	/* A differently-cased insert replaces, not duplicates, the same key. */
 	r = gwp_dns_cache_insert(cache, "MIXEDCASE.example", &ai, time(NULL) + 100);
 	assert(!r);
-	r = gwp_dns_cache_getent(cache, "mixedcase.example", &e);
+	r = gwp_dns_cache_lookup_addrs(cache, "mixedcase.example", &ca);
 	assert(!r);
-	gwp_dns_cache_putent(e);
 
 	gwp_dns_cache_free(cache);
 }
 
 /*
- * An already-expired entry is not returned, and a reference obtained before a
- * same-key replace stays valid until released (the documented guarantee; run
- * under ASan this also checks there is no use-after-free).
+ * An already-expired entry is not returned, and a same-key replace is what the
+ * next lookup sees. A hit copies the addresses out under the lock, so there is
+ * no reference to outlive the replaced entry (run under ASan this also checks
+ * there is no use-after-free).
  */
-static void test_dns_cache_expiry_refcount(void)
+static void test_dns_cache_expiry_replace(void)
 {
-	struct gwp_dns_cache_entry *e, *e2;
 	struct gwp_dns_cache *cache = NULL;
+	struct gwp_dns_cache_addrs ca;
 	struct sockaddr_in sa;
 	struct addrinfo ai;
 	int r;
@@ -307,21 +304,22 @@ static void test_dns_cache_expiry_refcount(void)
 	/* Expired-on-insert: lookup reports a miss, not the stale entry. */
 	r = gwp_dns_cache_insert(cache, "old.example", &ai, time(NULL) - 1);
 	assert(!r);
-	r = gwp_dns_cache_getent(cache, "old.example", &e);
+	r = gwp_dns_cache_lookup_addrs(cache, "old.example", &ca);
 	assert(r == -ETIMEDOUT || r == -ENOENT);
 
-	/* A held reference survives a same-key replace. */
 	r = gwp_dns_cache_insert(cache, "live.example", &ai, time(NULL) + 100);
 	assert(!r);
-	r = gwp_dns_cache_getent(cache, "live.example", &e);	/* ref held */
+	r = gwp_dns_cache_lookup_addrs(cache, "live.example", &ca);
 	assert(!r);
+	assert(ca.nr_i4 == 1 && ca.nr_i6 == 0);
+	assert(ca.i4[0].s_addr == htonl(0x7f000001));
+
+	sa.sin_addr.s_addr = htonl(0x7f000002);
 	r = gwp_dns_cache_insert(cache, "live.example", &ai, time(NULL) + 100);
-	assert(!r);						/* replaced */
-	assert(e->name_len > 0);				/* stale ref still readable */
-	r = gwp_dns_cache_getent(cache, "live.example", &e2);	/* fresh entry */
 	assert(!r);
-	gwp_dns_cache_putent(e2);
-	gwp_dns_cache_putent(e);				/* frees the old entry */
+	r = gwp_dns_cache_lookup_addrs(cache, "live.example", &ca);
+	assert(!r);
+	assert(ca.nr_i4 == 1 && ca.i4[0].s_addr == htonl(0x7f000002));
 
 	gwp_dns_cache_free(cache);
 }
@@ -407,7 +405,7 @@ int main(void)
 	test_dns_cache();
 	test_dns_cache_cap();
 	test_dns_cache_case();
-	test_dns_cache_expiry_refcount();
+	test_dns_cache_expiry_replace();
 	test_addr_list();
 	printf("All tests passed.\n");
 	return 0;
