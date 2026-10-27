@@ -691,8 +691,8 @@ static int gwp_ctx_init_thread_sock(struct gwp_wrk *w,
 
 	fd = __sys_socket(r, type, 0);
 	if (fd < 0) {
-		pr_err(&w->ctx->lh, "Failed to create socket: %s", strerror(-r));
-		return r;
+		pr_err(&w->ctx->lh, "Failed to create socket: %s", strerror(-fd));
+		return fd;
 	}
 
 	v = 1;
