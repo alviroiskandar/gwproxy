@@ -797,11 +797,16 @@ static inline void gwp_conn_buf_advance(struct gwp_conn *conn, size_t len)
 		memmove(conn->buf, conn->buf + len, conn->len);
 }
 
+/*
+ * Debug, not info: at the default level every connection already logs
+ * "Target socket connected" (fds, both addresses) and "Closing connection
+ * pair" (idx, fds, both addresses), so this line only repeated them.
+ */
 static inline
 void log_conn_pair_created(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_ctx *ctx = w->ctx;
-	pr_info(&ctx->lh, "New connection pair created (idx=%u, cfd=%d, tfd=%d, ca=%s, ta=%s)",
+	pr_dbg(&ctx->lh, "New connection pair created (idx=%u, cfd=%d, tfd=%d, ca=%s, ta=%s)",
 		gcp->idx, gcp->client.fd, gcp->target.fd,
 		ip_to_str(&gcp->client_addr), ip_to_str(&gcp->target_addr));
 }
