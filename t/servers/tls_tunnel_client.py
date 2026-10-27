@@ -11,6 +11,11 @@
 #       Check that the tunnel echoes, let a second client fail its TLS
 #       handshake on the same proxy, then check that the tunnel still echoes.
 #       A failed handshake must not affect any other session.
+#   noread <pid> <max_kib>
+#       The origin sends without pause while this client never reads. Watch
+#       the proxy's resident memory (VmRSS of <pid>) for a few seconds and
+#       fail if it grows by more than <max_kib> KiB: the proxy must stop
+#       reading from the origin once the client stops reading.
 #   slowread <nbytes>
 #       The origin sends <nbytes> bytes and closes. This client waits a
 #       while before it starts reading, then must get all <nbytes> bytes and
@@ -40,6 +45,16 @@ def echo_origin(lsock):
     while True:
         c, _ = lsock.accept()
         threading.Thread(target=serve, args=(c,), daemon=True).start()
+
+
+def blast_origin(lsock):
+    c, _ = lsock.accept()
+    chunk = b"y" * 65536
+    try:
+        while True:
+            c.sendall(chunk)
+    except OSError:
+        pass
 
 
 def sized_origin(nbytes):
@@ -127,6 +142,30 @@ def scen_isolation(pport):
             % (got,))
 
 
+def vmrss_kib(pid):
+    with open("/proc/%d/status" % pid) as f:
+        for line in f:
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1])
+    die("no VmRSS for pid %d" % pid)
+
+
+def scen_noread(pport, pid, max_kib):
+    oport = start_origin(blast_origin)
+    a = tunnel(pport, oport)
+    # Let the socket buffers on both legs fill before taking the baseline.
+    time.sleep(0.5)
+    base = vmrss_kib(pid)
+    peak = base
+    for _ in range(15):
+        time.sleep(0.2)
+        peak = max(peak, vmrss_kib(pid))
+    if peak - base > max_kib:
+        die("proxy RSS grew from %d KiB to %d KiB with a client that does "
+            "not read" % (base, peak))
+    a.close()
+
+
 def scen_slowread(pport, nbytes):
     oport = start_origin(sized_origin(nbytes))
     a = tunnel(pport, oport)
@@ -149,6 +188,8 @@ def main():
     pport = int(sys.argv[2])
     if scen == "isolation":
         scen_isolation(pport)
+    elif scen == "noread":
+        scen_noread(pport, int(sys.argv[3]), int(sys.argv[4]))
     elif scen == "slowread":
         scen_slowread(pport, int(sys.argv[3]))
     else:

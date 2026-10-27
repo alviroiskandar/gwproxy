@@ -6,6 +6,10 @@
 # The proxy must keep the ciphertext the client has not taken yet and shut
 # the client's write side only after all of it (and the close_notify) has
 # gone out, so the client gets every byte and a clean end of stream.
+#
+# A TLS client that does not read at all, behind an origin that never stops
+# sending. The proxy must stop reading from the origin instead of queueing
+# ever more ciphertext for the client: its memory must stay flat.
 # Exercised on every event loop.
 
 . "$(dirname "$0")/lib.sh"
@@ -29,6 +33,10 @@ for loop in epoll io_uring; do
 	timeout 60 python3 "$SERVERS_DIR/tls_tunnel_client.py" slowread \
 		"$pp" 8000000 \
 		|| fail "[$loop] slow TLS client did not get the whole response"
+	# RSS may grow by at most 8 MiB while the client does not read.
+	timeout 60 python3 "$SERVERS_DIR/tls_tunnel_client.py" noread \
+		"$pp" "$GWP_PID" 8192 \
+		|| fail "[$loop] proxy memory grew with a TLS client that does not read"
 	kill "$GWP_PID" 2>/dev/null
 done
 

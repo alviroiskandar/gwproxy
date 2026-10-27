@@ -842,21 +842,35 @@ static ssize_t do_recv_tls(struct gwp_conn *src)
 }
 
 /*
- * TLS send: encrypt as much of src->buf as the engine will take, then flush the
- * resulting ciphertext to dst->fd, consuming only what the socket accepts (a
- * memory BIO cannot push read bytes back). Unflushed ciphertext stays queued in
- * the BIO; adj_epl_out() keeps EPOLLOUT armed on a TLS peer while bytes remain.
+ * TLS send: encrypt src->buf into the send BIO and flush the ciphertext to
+ * dst->fd, consuming only what the socket accepts (a memory BIO cannot push
+ * read bytes back). Unflushed ciphertext stays queued in the BIO;
+ * adj_epl_out() keeps EPOLLOUT armed on a TLS peer while bytes remain.
+ *
+ * The memory BIO takes any amount, so encrypt only while less than one source
+ * buffer of ciphertext is queued. Past that the plaintext stays in src->buf,
+ * whose full buffer stops adj_epl_in() reading from the source, and the BIO
+ * stays bounded when the peer does not read.
+ *
  * Returns the number of ciphertext bytes flushed, or <0 on a fatal error.
  */
 static ssize_t do_send_tls(struct gwp_conn *src, struct gwp_conn *dst)
 {
 	size_t sent = 0, plen;
 	const void *p;
+	bool capped;
 	ssize_t n;
 	int sr;
 
+again:
+	capped = false;
 	while (src->len) {
 		size_t consumed = 0;
+
+		if (gwp_ssl_bio_pending(dst->tls) >= src->cap) {
+			capped = true;
+			break;
+		}
 
 		sr = gwp_ssl_write(dst->tls, src->buf, src->len, &consumed);
 		if (sr == GWP_SSL_OK) {
@@ -876,15 +890,19 @@ static ssize_t do_send_tls(struct gwp_conn *src, struct gwp_conn *dst)
 			gwp_ssl_bio_consume(dst->tls, (size_t)n);
 			sent += (size_t)n;
 			if ((size_t)n < plen)
-				break;	/* socket full */
+				return (ssize_t)sent;	/* socket full */
 		} else if (n == -EAGAIN || n == -EINTR) {
-			break;
+			return (ssize_t)sent;
 		} else if (n == 0) {
 			return -ECONNRESET;
 		} else {
 			return n;
 		}
 	}
+
+	/* The BIO drained with plaintext held back by the cap: go on. */
+	if (capped)
+		goto again;
 
 	return (ssize_t)sent;
 }
