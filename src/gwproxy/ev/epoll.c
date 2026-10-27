@@ -1485,9 +1485,16 @@ static int handle_ev_target_attempt(struct gwp_wrk *w,
  * sent has been flushed to the peer, shut the peer's write side so it sees the
  * FIN. When both directions have been shut, the pair is fully drained and is
  * torn down without dropping any buffered data.
+ *
+ * @hup, if not NULL, is a side whose fd hung up after its read side was
+ * drained (see handle_ev_hup()); it stops being monitored here unless the pair
+ * is torn down anyway.
  */
-static int forward_progress(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+static int forward_progress(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			    struct gwp_conn *hup)
 {
+	bool shut_client = false, shut_target = false, done;
+
 	if (gcp->target.rd_eof && gcp->target.len == 0 && !gcp->client.wr_shut) {
 #ifdef CONFIG_HTTPS
 		/* Best-effort close_notify before closing the write side. */
@@ -1496,34 +1503,51 @@ static int forward_progress(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 			tls_flush_hs(&gcp->client);
 		}
 #endif
-		__sys_shutdown(gcp->client.fd, SHUT_WR);
+		shut_client = true;
 		gcp->client.wr_shut = true;
 	}
 
 	if (gcp->client.rd_eof && gcp->client.len == 0 && !gcp->target.wr_shut) {
-		__sys_shutdown(gcp->target.fd, SHUT_WR);
+		shut_target = true;
 		gcp->target.wr_shut = true;
 	}
 
-	if (gcp->client.wr_shut && gcp->target.wr_shut)
+	/*
+	 * Once both directions are done the pair is torn down, and closing
+	 * its sockets sends the FINs. A shutdown() right before that close()
+	 * only costs a syscall, provided nothing is left unread on the
+	 * socket: close() answers unread data with an RST instead of a FIN,
+	 * so a socket whose read side has not reached EOF still gets the
+	 * explicit shutdown(). Likewise a hung-up fd needs no EPOLL_CTL_DEL
+	 * when close() is about to remove it.
+	 */
+	done = gcp->client.wr_shut && gcp->target.wr_shut;
+	if (shut_client && !(done && gcp->client.rd_eof))
+		__sys_shutdown(gcp->client.fd, SHUT_WR);
+	if (shut_target && !(done && gcp->target.rd_eof))
+		__sys_shutdown(gcp->target.fd, SHUT_WR);
+	if (done)
 		return -ECONNRESET;
+
+	if (hup && hup->ep_mask) {
+		__sys_epoll_ctl(w->ep_fd, EPOLL_CTL_DEL, hup->fd, NULL);
+		hup->ep_mask = 0;
+	}
 
 	return adjust_epl_mask(w, gcp);
 }
 
 /*
  * @c's fd hung up (EPOLLHUP) and its read side has already been drained to
- * EOF. No further I/O is possible on it, so mark its write side shut and stop
- * monitoring it (EPOLLHUP is level-triggered and would otherwise wake us in a
- * loop); forward_progress() then finishes the pair once the peer is flushed.
+ * EOF. No further I/O is possible on it, so mark its write side shut; it must
+ * also stop being monitored (EPOLLHUP is level-triggered and would otherwise
+ * wake us in a loop), which forward_progress() does unless the pair is done.
+ * Returns @c for forward_progress().
  */
-static void handle_ev_hup(struct gwp_wrk *w, struct gwp_conn *c)
+static struct gwp_conn *handle_ev_hup(struct gwp_conn *c)
 {
 	c->wr_shut = true;
-	if (c->ep_mask) {
-		__sys_epoll_ctl(w->ep_fd, EPOLL_CTL_DEL, c->fd, NULL);
-		c->ep_mask = 0;
-	}
+	return c;
 }
 
 __hot
@@ -1591,6 +1615,7 @@ static int handle_ev_target_conn_err(struct gwp_wrk *w,
 static int handle_ev_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			    struct epoll_event *ev)
 {
+	struct gwp_conn *hup = NULL;
 	int r;
 
 	if (unlikely(ev->events & EPOLLERR)) {
@@ -1628,9 +1653,9 @@ static int handle_ev_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	}
 
 	if ((ev->events & EPOLLHUP) && gcp->target.rd_eof)
-		handle_ev_hup(w, &gcp->target);
+		hup = handle_ev_hup(&gcp->target);
 
-	return forward_progress(w, gcp);
+	return forward_progress(w, gcp, hup);
 }
 
 /*
@@ -1670,6 +1695,7 @@ __hot
 static int handle_ev_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			    struct epoll_event *ev)
 {
+	struct gwp_conn *hup = NULL;
 	int r;
 
 	if (unlikely(ev->events & EPOLLERR)) {
@@ -1694,9 +1720,9 @@ static int handle_ev_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	}
 
 	if ((ev->events & EPOLLHUP) && gcp->client.rd_eof)
-		handle_ev_hup(w, &gcp->client);
+		hup = handle_ev_hup(&gcp->client);
 
-	return forward_progress(w, gcp);
+	return forward_progress(w, gcp, hup);
 }
 
 __hot
