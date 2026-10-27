@@ -25,6 +25,13 @@
 #       then, without closing, wait for the origin to confirm it got them
 #       all. Whatever the proxy decrypted it must also deliver, even when the
 #       client has nothing more to send.
+#   splitrec
+#       Send the CONNECT request as three TLS records in a single TCP send,
+#       so they reach the proxy together, and expect the 200 reply. Then do
+#       it again with the first tunnel bytes as a fourth record in the same
+#       send, and expect them echoed back. A proxy that waits for the
+#       socket while its TLS engine still holds whole records never
+#       answers.
 #
 # Exits 0 on success, 1 on failure (with a message on stderr).
 
@@ -227,6 +234,79 @@ def scen_upload(pport, nbytes):
         die("origin reported %r, want %r" % (rep, want))
 
 
+class RecordClient:
+    """TLS over memory BIOs, so several records can go out in one send."""
+
+    def __init__(self, pport):
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        self.inc, self.out = ssl.MemoryBIO(), ssl.MemoryBIO()
+        self.o = ctx.wrap_bio(self.inc, self.out)
+        self.s = socket.create_connection(("127.0.0.1", pport), timeout=5)
+        while True:
+            try:
+                self.o.do_handshake()
+                break
+            except ssl.SSLWantReadError:
+                self.flush()
+                self.fill()
+        self.flush()
+
+    def flush(self):
+        if self.out.pending:
+            self.s.sendall(self.out.read())
+
+    def fill(self):
+        try:
+            d = self.s.recv(65536)
+        except socket.timeout:
+            die("timed out waiting for the proxy")
+        if not d:
+            die("proxy closed the connection")
+        self.inc.write(d)
+
+    def send_records(self, recs):
+        for r in recs:
+            self.o.write(r)
+        self.flush()
+
+    def recv_until(self, pred):
+        got = b""
+        while not pred(got):
+            try:
+                got += self.o.read(65536)
+            except ssl.SSLWantReadError:
+                self.fill()
+        return got
+
+
+def scen_splitrec(pport):
+    oport = start_origin(echo_origin)
+    req = [b"CONNECT 127.0.0.1:%d HTTP/1.1\r\n" % oport, b"Host: x\r\n",
+           b"\r\n"]
+
+    c = RecordClient(pport)
+    c.send_records(req)
+    rep = c.recv_until(lambda g: b"\r\n\r\n" in g)
+    if b" 200 " not in rep.split(b"\r\n")[0]:
+        die("CONNECT in three records refused: %r" % rep)
+    c.send_records([b"ping1"])
+    got = c.recv_until(lambda g: len(g) >= 5)
+    if got != b"ping1":
+        die("tunnel after a split CONNECT echoed %r" % got)
+
+    c = RecordClient(pport)
+    c.send_records(req + [b"ping2"])
+    got = c.recv_until(lambda g: b"\r\n\r\n" in g and
+                       len(g.split(b"\r\n\r\n", 1)[1]) >= 5)
+    rep, data = got.split(b"\r\n\r\n", 1)
+    if b" 200 " not in rep.split(b"\r\n")[0]:
+        die("pipelined CONNECT refused: %r" % rep)
+    if data != b"ping2":
+        die("bytes pipelined after the CONNECT came back as %r" % data)
+
+
 def main():
     scen = sys.argv[1]
     pport = int(sys.argv[2])
@@ -238,6 +318,8 @@ def main():
         scen_slowread(pport, int(sys.argv[3]))
     elif scen == "upload":
         scen_upload(pport, int(sys.argv[3]))
+    elif scen == "splitrec":
+        scen_splitrec(pport)
     else:
         die("unknown scenario %s" % scen)
 

@@ -812,30 +812,51 @@ static int tls_forward_pump(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	return 0;
 }
 
-/* Decrypt a freshly received ciphertext chunk and run the protocol on it. */
+/*
+ * Decrypt what the engine holds into client.buf and run the protocol on it.
+ * One gwp_ssl_read() yields at most one record, and records that arrived
+ * together are all off the socket already: take every one of them now, as a
+ * plaintext recv of the same segment would, since no completion will come
+ * for them later.
+ */
 static int tls_prot_pump(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_conn *c = &gcp->client;
-	size_t space = c->cap - c->len, got = 0;
+	uint32_t from = c->len;
+	size_t got;
 	int sr;
 
-	if (!space) {
-		/* Buffer full mid-handshake: let the protocol drain it. */
-		return process_client_prot(w, gcp);
+	while (c->len < c->cap) {
+		got = 0;
+		sr = gwp_ssl_read(c->tls, c->buf + c->len, c->cap - c->len,
+				  &got);
+		if (sr == GWP_SSL_ERROR)
+			return -EIO;
+		/* Need more ciphertext, or the client sent close_notify. */
+		if (!got)
+			break;
+		c->len += (uint32_t)got;
 	}
 
-	sr = gwp_ssl_read(c->tls, c->buf + c->len, space, &got);
-	if (sr == GWP_SSL_ERROR)
-		return -EIO;
-	if (sr == GWP_SSL_OK && got == 0)	/* client sent close_notify */
+	/* Nothing new, and room for more: wait for the client. */
+	if (c->len == from && c->len < c->cap)
 		return prep_recv_client_prot(w, gcp);
 
-	/* Need more ciphertext to complete a record. */
-	if (got == 0)
-		return prep_recv_client_prot(w, gcp);
-
-	c->len += (uint32_t)got;
 	return process_client_prot(w, gcp);
+}
+
+/*
+ * Whether the protocol should be fed from the engine rather than the socket:
+ * it still holds records, client.buf has room for them, and no reply is on
+ * its way to the client, which a second pass could overwrite.
+ */
+static bool tls_prot_more(struct gwp_conn_pair *gcp)
+{
+	struct gwp_conn *c = &gcp->client;
+	struct gwp_iou_tls *t = gcp->tls_io;
+
+	return client_is_tls(gcp) && c->len < c->cap &&
+	       t->tx_sent >= t->tx_len && gwp_ssl_rx_more(c->tls);
 }
 
 /* Handshake done: switch to the plaintext protocol path on the decrypted stream. */
@@ -1430,6 +1451,13 @@ static int finish_target_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	 */
 	if (!http_fwd && gcp->client.len) {
 		prep_send_target(w, gcp);
+#ifdef CONFIG_HTTPS
+	} else if (!http_fwd && client_is_tls(gcp)) {
+		/* The engine may hold more of it; tunnel that first. */
+		r = tls_forward_pump(w, gcp);
+		if (r)
+			return r;
+#endif
 	} else if (!http_fwd) {
 		r = prep_recv_client(w, gcp);
 		if (r)
@@ -2136,8 +2164,13 @@ static int chk_prot_result(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int r)
 		return arm_udp_relay(w, gcp);
 
 	/* Handshake incomplete; read more from the client. */
-	if (r == 0 || r == -EAGAIN)
+	if (r == 0 || r == -EAGAIN) {
+#ifdef CONFIG_HTTPS
+		if (tls_prot_more(gcp))
+			return tls_prot_pump(w, gcp);
+#endif
 		return prep_recv_client_prot(w, gcp);
+	}
 
 	return r;
 }
