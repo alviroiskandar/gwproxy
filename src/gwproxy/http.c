@@ -32,6 +32,15 @@ struct gwp_http_conn {
 	size_t				hdr_len;
 
 	/*
+	 * How much of the not-yet-consumed request bytes has been searched for
+	 * a line end without finding one. The parser only takes complete
+	 * lines, so it is run again only once a new line end has arrived;
+	 * otherwise a long line received in small pieces would be parsed from
+	 * its start on every read, at a cost quadratic in its length.
+	 */
+	size_t				scan;
+
+	/*
 	 * True for a forwarding request (absolute-form target, e.g.
 	 * "GET http://host/path") as opposed to a CONNECT tunnel.
 	 */
@@ -68,6 +77,9 @@ struct gwp_http_conn {
 	size_t				res_scan;
 };
 
+/* Longest request header accepted, in bytes. */
+#define REQ_HDR_MAX		16384
+
 struct gwp_http_conn *gwp_http_conn_alloc(void)
 {
 	struct gwp_http_conn *hc = calloc(1, sizeof(*hc));
@@ -79,6 +91,7 @@ struct gwp_http_conn *gwp_http_conn_alloc(void)
 		free(hc);
 		return NULL;
 	}
+	hc->ctx_hdr.max_len = REQ_HDR_MAX;
 
 	return hc;
 }
@@ -528,17 +541,40 @@ int gwp_http_conn_process(struct gwp_http_conn *hc, struct gwp_auth *auth,
 			  const char **req_p, size_t *req_len_p)
 {
 	struct gwnet_http_req_hdr *req = &hc->req_hdr;
-	size_t hdr_len;
+	size_t hdr_len, len = *in_len, used;
+	const char *p = in;
 	int r;
 
+	/*
+	 * Nothing to do until a line is complete: only the bytes not searched
+	 * yet are looked at. Past the length limit the parser runs anyway, to
+	 * refuse the header.
+	 */
+	if (hc->scan > len)
+		hc->scan = 0;
+	if (hc->hdr_len + len <= REQ_HDR_MAX &&
+	    !memchr(p + hc->scan, '\n', len - hc->scan)) {
+		hc->scan = len;
+		*in_len = 0;
+		return GWP_HTTP_NEED_MORE;
+	}
+
 	hc->ctx_hdr.buf = in;
-	hc->ctx_hdr.len = *in_len;
+	hc->ctx_hdr.len = len;
 	hc->ctx_hdr.off = 0;
 	r = gwnet_http_req_hdr_parse(&hc->ctx_hdr, req);
-	*in_len = hc->ctx_hdr.off;
-	hc->hdr_len += hc->ctx_hdr.off;
-	if (r == -EAGAIN)
+	used = hc->ctx_hdr.off;
+	*in_len = used;
+	hc->hdr_len += used;
+	if (r == -EAGAIN) {
+		/*
+		 * Every complete line has been taken; what is left is the
+		 * start of the next one. Should the parser ever leave a line
+		 * end behind, search from the start again so it is not missed.
+		 */
+		hc->scan = memchr(p + used, '\n', len - used) ? 0 : len - used;
 		return GWP_HTTP_NEED_MORE;
+	}
 	/*
 	 * A repeated field that may appear only once (Host, Content-Length,
 	 * ...) is a well-formed line in an unacceptable request; say so

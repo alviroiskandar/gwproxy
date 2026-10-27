@@ -666,6 +666,108 @@ static void test_need_more(void)
 	PRTEST_OK();
 }
 
+/*
+ * Feed @req to a new connection @step bytes at a time, keeping unconsumed
+ * bytes buffered the way gwp_handle_conn_state_http() does. Returns the
+ * result; *@tail is set to how many bytes were left unconsumed, and the
+ * rewritten request (if any) is copied to @fwd.
+ */
+static int feed_steps(const char *req, size_t len, size_t step, char *fwd,
+		      size_t *fwd_len, char *hp, size_t *tail)
+{
+	static char buf[32768];
+	struct gwp_http_conn *hc = gwp_http_conn_alloc();
+	size_t have = 0, pos = 0, in, rl = 0;
+	int r = GWP_HTTP_NEED_MORE;
+	const char *rq = NULL;
+	char *h, *p;
+
+	assert(hc);
+	while (r == GWP_HTTP_NEED_MORE && pos < len) {
+		size_t n = (len - pos < step) ? len - pos : step;
+
+		memcpy(buf + have, req + pos, n);
+		have += n;
+		pos += n;
+		in = have;
+		r = gwp_http_conn_process(hc, NULL, buf, &in, &h, &p, &rq, &rl);
+		assert(in <= have);
+		have -= in;
+		memmove(buf, buf + in, have);
+	}
+	*fwd_len = 0;
+	if (r == GWP_HTTP_FORWARD) {
+		memcpy(fwd, rq, rl);
+		*fwd_len = rl;
+	}
+	if (r == GWP_HTTP_FORWARD || r == GWP_HTTP_CONNECT)
+		sprintf(hp, "%s|%s", h, p);
+	else
+		hp[0] = '\0';
+	*tail = have + (len - pos);
+	gwp_http_conn_free(hc);
+	return r;
+}
+
+/*
+ * The parser is only re-run once a line end has arrived, so whatever the
+ * size of the reads the outcome must be exactly that of one read: the same
+ * result, target, rewritten request and leftover body bytes.
+ */
+static void test_incremental(void)
+{
+	static char longline[17000], longfield[17000];
+	const char *reqs[] = {
+		"GET http://example.com:8080/a/b?q=1 HTTP/1.1\r\n"
+		"Host: example.com\r\nUser-Agent: x\r\n"
+		"Accept: a\r\nAccept: b\r\nContent-Length: 4\r\n\r\nbody",
+		"CONNECT example.com:443 HTTP/1.1\nHost: x\n\nearly",
+		"GET http://example.com/ HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n",
+		"GET http://example.com/ HTTP/1.1\r\nX : bad\r\n\r\n",
+		"WAT / HTTP/1.1\r\n\r\n",
+		longline,
+		longfield,
+	};
+	static char fwd1[40000], fwd2[40000];
+	char hp1[300], hp2[300];
+	size_t i, s, n, l1, l2, t1, t2;
+	static const size_t steps[] = { 1, 2, 3, 7, 64, 1000 };
+	int r1, r2;
+
+	/* A request line, and then a field, past the 16 KiB limit. */
+	n = (size_t)sprintf(longline, "GET http://example.com/");
+	memset(longline + n, 'a', 16500);
+	sprintf(longline + n + 16500, " HTTP/1.1\r\n\r\n");
+	n = (size_t)sprintf(longfield, "GET http://example.com/ HTTP/1.1\r\n"
+			    "X: ");
+	memset(longfield + n, 'a', 16500);
+	sprintf(longfield + n + 16500, "\r\n\r\n");
+
+	for (i = 0; i < sizeof(reqs) / sizeof(reqs[0]); i++) {
+		size_t len = strlen(reqs[i]);
+
+		r1 = feed_steps(reqs[i], len, len, fwd1, &l1, hp1, &t1);
+		for (s = 0; s < sizeof(steps) / sizeof(steps[0]); s++) {
+			r2 = feed_steps(reqs[i], len, steps[s], fwd2, &l2,
+					hp2, &t2);
+			assert(r1 == r2);
+			if (r1 == GWP_HTTP_ERR || r1 == GWP_HTTP_BAD_REQUEST ||
+			    r1 == GWP_HTTP_TOO_LARGE)
+				continue;
+			assert(t1 == t2);
+			assert(!strcmp(hp1, hp2));
+			assert(l1 == l2 && !memcmp(fwd1, fwd2, l1));
+		}
+	}
+	assert(feed_steps(reqs[0], strlen(reqs[0]), 1, fwd1, &l1, hp1, &t1) ==
+	       GWP_HTTP_FORWARD && t1 == 4);
+	assert(feed_steps(longline, strlen(longline), 1, fwd1, &l1, hp1,
+			  &t1) == GWP_HTTP_TOO_LARGE);
+	assert(feed_steps(longfield, strlen(longfield), 3, fwd1, &l1, hp1,
+			  &t1) == GWP_HTTP_TOO_LARGE);
+	PRTEST_OK();
+}
+
 static void test_errors(void)
 {
 	static const char https[] =	/* unsupported scheme (no TLS) */
@@ -874,6 +976,9 @@ int main(void)
 		test_header_limits();
 		test_auth();
 	}
+
+	/* Byte-by-byte feeding of 17 KiB headers: once is enough. */
+	test_incremental();
 
 	printf("All tests passed!\n");
 	return 0;
