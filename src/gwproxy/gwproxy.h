@@ -17,6 +17,7 @@
 #include <gwproxy/acl.h>
 #include <gwproxy/log.h>
 #include <assert.h>
+#include <stdatomic.h>
 #ifdef CONFIG_IO_URING
 #include <liburing.h>
 #endif
@@ -644,7 +645,12 @@ enum {
 };
 
 struct gwp_ctx {
-	volatile bool			stop;
+	/*
+	 * Set from the signal handler and from any worker that exits, read by
+	 * every worker loop: an atomic, which volatile is not. Lock-free, so it
+	 * is also safe to store from a signal handler.
+	 */
+	_Atomic(bool)			stop;
 	uint8_t				ev_used;
 	struct log_handle		lh;
 	struct gwp_wrk			*workers;
