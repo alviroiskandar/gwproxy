@@ -56,12 +56,16 @@ static void put_all_entries(struct gwp_dns_entry *head)
 	}
 }
 
-static void copy_ai_addr(struct gwp_sockaddr *gs, const struct addrinfo *ai)
+static void copy_ai_addr(struct gwp_sockaddr *gs, const struct addrinfo *ai,
+			 uint16_t port)
 {
-	if (ai->ai_family == AF_INET)
+	if (ai->ai_family == AF_INET) {
 		gs->i4 = *(struct sockaddr_in *)ai->ai_addr;
-	else
+		gs->i4.sin_port = htons(port);
+	} else {
 		gs->i6 = *(struct sockaddr_in6 *)ai->ai_addr;
+		gs->i6.sin6_port = htons(port);
+	}
 }
 
 /*
@@ -78,10 +82,12 @@ static void copy_ai_addr(struct gwp_sockaddr *gs, const struct addrinfo *ai)
  * @out[0] is the address the old single-shot selection would have returned, so
  * callers that only look at the first entry keep their existing behaviour.
  *
+ * The names are resolved without a service, so @port is filled in here.
+ *
  * Returns the number of addresses written.
  */
 static uint8_t collect_addr_list(struct addrinfo *res, struct gwp_sockaddr *out,
-				 uint8_t cap, uint32_t rt)
+				 uint8_t cap, uint32_t rt, uint16_t port)
 {
 	const struct addrinfo *v4[GWP_DNS_MAX_ADDRS];
 	const struct addrinfo *v6[GWP_DNS_MAX_ADDRS];
@@ -120,9 +126,9 @@ static uint8_t collect_addr_list(struct addrinfo *res, struct gwp_sockaddr *out,
 			     : (i < nr_v6 ? v6[i] : NULL);
 
 		if (a)
-			copy_ai_addr(&out[n++], a);
+			copy_ai_addr(&out[n++], a, port);
 		if (b && n < cap)
-			copy_ai_addr(&out[n++], b);
+			copy_ai_addr(&out[n++], b, port);
 	}
 
 	return n;
@@ -154,7 +160,7 @@ static void try_pass_result_to_cache(struct gwp_dns_ctx *ctx, const char *name,
 }
 
 int gwp_dns_resolve(struct gwp_dns_ctx *ctx, const char *name,
-		    const char *service, struct gwp_sockaddr *addrs,
+		    uint16_t port, struct gwp_sockaddr *addrs,
 		    uint8_t cap, uint8_t *nr_addrs, uint32_t restyp)
 {
 	struct addrinfo *res = NULL, hints;
@@ -162,11 +168,11 @@ int gwp_dns_resolve(struct gwp_dns_ctx *ctx, const char *name,
 	int r;
 
 	prep_hints(&hints, restyp);
-	r = getaddrinfo(name, service, &hints, &res);
+	r = getaddrinfo(name, NULL, &hints, &res);
 	if (r)
 		return -EHOSTUNREACH;
 
-	n = collect_addr_list(res, addrs, cap, restyp);
+	n = collect_addr_list(res, addrs, cap, restyp, port);
 	if (n)
 		try_pass_result_to_cache(ctx, name, res);
 
@@ -293,7 +299,7 @@ static int dbq_add_entry(struct dns_batch_query *dbq, struct gwp_dns_entry *e)
 	de->e = e;
 	memset(&de->cb, 0, sizeof(de->cb));
 	de->cb.ar_name = e->name;
-	de->cb.ar_service = e->service;
+	de->cb.ar_service = NULL;
 	de->cb.ar_request = &dbq->hints;
 	de->cb.ar_result = NULL;
 	dbq->nr_entries++;
@@ -371,7 +377,7 @@ static void dispatch_batch_result(int r, struct gwp_dns_ctx *ctx,
 			e->res = -EHOSTUNREACH;
 		} else if (!(e->nr_addrs = collect_addr_list(ai, e->addrs,
 							     GWP_DNS_MAX_ADDRS,
-							     restyp))) {
+							     restyp, e->port))) {
 			e->res = -EHOSTUNREACH;
 		} else {
 			e->res = 0;
@@ -485,7 +491,7 @@ static void process_queue_entry_single(struct gwp_dns_ctx *ctx)
 		goto out;
 	}
 
-	e->res = gwp_dns_resolve(ctx, e->name, e->service, e->addrs,
+	e->res = gwp_dns_resolve(ctx, e->name, e->port, e->addrs,
 				 GWP_DNS_MAX_ADDRS, &e->nr_addrs,
 				 ctx->cfg.restyp);
 	eventfd_write(e->ev_fd, 1);
@@ -607,11 +613,11 @@ out_err:
 }
 
 int gwp_dns_cache_lookup(struct gwp_dns_ctx *ctx, const char *name,
-			 const char *service, struct gwp_sockaddr *addr)
+			 uint16_t port, struct gwp_sockaddr *addr)
 {
 	uint8_t nr;
 
-	return gwp_dns_cache_lookup_list(ctx, name, service, addr, 1, &nr);
+	return gwp_dns_cache_lookup_list(ctx, name, port, addr, 1, &nr);
 }
 
 /* Size the bucket array from the entry cap for a ~1.0 load factor, clamped to
@@ -650,14 +656,13 @@ static void fill_i6(struct gwp_sockaddr *addr, const struct in6_addr *a,
 }
 
 int gwp_dns_cache_lookup_list(struct gwp_dns_ctx *ctx, const char *name,
-			      const char *service, struct gwp_sockaddr *addrs,
+			      uint16_t port, struct gwp_sockaddr *addrs,
 			      uint8_t cap, uint8_t *nr_addrs)
 {
 	struct gwp_dns_cache_addrs ca;
 	uint8_t nr_v4, nr_v6, n = 0, i;
 	uint32_t rt = ctx->cfg.restyp;
 	bool v6_first;
-	uint16_t port;
 	int r;
 
 	if (!ctx->cache)
@@ -671,7 +676,6 @@ int gwp_dns_cache_lookup_list(struct gwp_dns_ctx *ctx, const char *name,
 	if (r)
 		return r;
 
-	port = service ? (uint16_t)atoi(service) : 0;
 	nr_v4 = (rt == GWP_DNS_RESTYP_IPV6_ONLY) ? 0 : ca.nr_i4;
 	nr_v6 = (rt == GWP_DNS_RESTYP_IPV4_ONLY) ? 0 : ca.nr_i6;
 
@@ -827,10 +831,9 @@ static void push_queue(struct gwp_dns_ctx *ctx, struct gwp_dns_entry *e)
 }
 
 struct gwp_dns_entry *gwp_dns_queue(struct gwp_dns_ctx *ctx,
-				    const char *name, const char *service)
+				    const char *name, uint16_t port)
 {
 	struct gwp_dns_entry *e;
-	size_t nl, sl;
 
 	e = malloc(sizeof(*e));
 	if (!e)
@@ -840,25 +843,11 @@ struct gwp_dns_entry *gwp_dns_queue(struct gwp_dns_ctx *ctx,
 	if (e->ev_fd < 0)
 		goto out_free_e;
 
-	/*
-	 * Merge name and service into a single allocated string to
-	 * avoid multiple allocations.
-	 *
-	 * The format is: "<name>\0<service>\0" where both name and
-	 * service are null-terminated strings.
-	 */
-	nl = strlen(name);
-	sl = service ? strlen(service) : 0;
-	e->name = malloc(nl + 1 + sl + 1);
+	e->name = strdup(name);
 	if (!e->name)
 		goto out_close_ev_fd;
 
-	e->service = e->name + nl + 1;
-	memcpy(e->name, name, nl + 1);
-	if (service)
-		memcpy(e->service, service, sl + 1);
-	else
-		e->service[0] = '\0';
+	e->port = port;
 
 	atomic_init(&e->refcnt, 2);
 	e->res = 0;

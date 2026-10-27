@@ -2201,15 +2201,15 @@ static void log_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	struct gwp_ctx *ctx = w->ctx;
 
 	if (gde->res) {
-		pr_dbg(&ctx->lh, "DNS query failed: %s:%s (res=%d; idx=%u; cfd=%d; tfd=%d; ca=%s)",
-			gde->name, gde->service, gde->res,
+		pr_dbg(&ctx->lh, "DNS query failed: %s:%hu (res=%d; idx=%u; cfd=%d; tfd=%d; ca=%s)",
+			gde->name, gde->port, gde->res,
 			gcp->idx, gcp->client.fd, gcp->target.fd,
 			ip_to_str(&gcp->client_addr));
 		return;
 	}
 
-	pr_dbg(&ctx->lh, "DNS query resolved: %s:%s -> %s (res=%d; idx=%u; cfd=%d; tfd=%d; ca=%s)",
-		gde->name, gde->service, ip_to_str(&gde->addrs[0]), gde->res,
+	pr_dbg(&ctx->lh, "DNS query resolved: %s:%hu -> %s (res=%d; idx=%u; cfd=%d; tfd=%d; ca=%s)",
+		gde->name, gde->port, ip_to_str(&gde->addrs[0]), gde->res,
 		gcp->idx, gcp->client.fd, gcp->target.fd,
 		ip_to_str(&gcp->client_addr));
 }

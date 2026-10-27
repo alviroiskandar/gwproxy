@@ -22,7 +22,8 @@
 #endif
 
 struct req_template {
-	const char *domain, *service;
+	const char *domain;
+	uint16_t port;
 	bool needs_ipv6;	/* requires a resolvable IPv6, see has_ipv6() */
 };
 
@@ -42,21 +43,21 @@ struct req_template {
  * them; /etc/hosts is not enough on its own. See has_ipv6().
  */
 static const struct req_template req_template[] = {
-	{ "localhost",		"80",	false },
-	{ "127.0.0.1",		"80",	false },
-	{ "::1",		"443",	true },
-	{ "localhost",		"1080",	false },
-	{ "localhost",		"443",	false },
-	{ "127.0.0.1",		"443",	false },
-	{ "::1",		"80",	true },
-	{ "localhost",		"3128",	false },
-	{ "localhost",		"8080",	false },
-	{ "127.0.0.1",		"8080",	false },
-	{ "::1",		"8080",	true },
-	{ "localhost",		"8443",	false },
-	{ "localhost",		"9090",	false },
-	{ "127.0.0.1",		"9090",	false },
-	{ "::1",		"9090",	true },
+	{ "localhost",		80,	false },
+	{ "127.0.0.1",		80,	false },
+	{ "::1",		443,	true },
+	{ "localhost",		1080,	false },
+	{ "localhost",		443,	false },
+	{ "127.0.0.1",		443,	false },
+	{ "::1",		80,	true },
+	{ "localhost",		3128,	false },
+	{ "localhost",		8080,	false },
+	{ "127.0.0.1",		8080,	false },
+	{ "::1",		8080,	true },
+	{ "localhost",		8443,	false },
+	{ "localhost",		9090,	false },
+	{ "127.0.0.1",		9090,	false },
+	{ "::1",		9090,	true },
 };
 
 static int poll_all_in(struct pollfd *pfd, int n, int timeout)
@@ -119,6 +120,7 @@ static void test_basic_dns_multiple_requests(void)
 {
 	struct gwp_dns_cfg cfg = { .nr_workers = 1 };
 	struct gwp_dns_entry *earr[ARRAY_SIZE(req_template)];
+	uint16_t ports[ARRAY_SIZE(req_template)];
 	struct pollfd pfd[ARRAY_SIZE(req_template)];
 	bool v6 = has_ipv6();
 	struct gwp_dns_ctx *ctx;
@@ -137,7 +139,8 @@ static void test_basic_dns_multiple_requests(void)
 			skipped++;
 			continue;
 		}
-		earr[n] = gwp_dns_queue(ctx, rt->domain, rt->service);
+		earr[n] = gwp_dns_queue(ctx, rt->domain, rt->port);
+		ports[n] = rt->port;
 		assert(earr[n]);
 		assert(earr[n]->ev_fd >= 0);
 		pfd[n].fd = earr[n]->ev_fd;
@@ -161,6 +164,8 @@ static void test_basic_dns_multiple_requests(void)
 		assert(earr[i]->res == 0);
 		r = earr[i]->addrs[0].sa.sa_family;
 		assert(r == AF_INET || r == AF_INET6);
+		/* sin_port and sin6_port share an offset. */
+		assert(earr[i]->addrs[0].i4.sin_port == htons(ports[i]));
 	}
 
 	for (i = 0; i < n; i++)
@@ -181,7 +186,7 @@ static void test_dns_cache(void)
 	assert(!r);
 	assert(ctx != NULL);
 
-	e = gwp_dns_queue(ctx, "localhost", "80");
+	e = gwp_dns_queue(ctx, "localhost", 80);
 	assert(e != NULL);
 	assert(e->ev_fd >= 0);
 	pfd.fd = e->ev_fd;
@@ -193,11 +198,13 @@ static void test_dns_cache(void)
 	assert(r == AF_INET || r == AF_INET6);
 	gwp_dns_entry_put(e);
 
-	r = gwp_dns_cache_lookup(ctx, "localhost", "80", &addr);
+	r = gwp_dns_cache_lookup(ctx, "localhost", 8080, &addr);
 	assert(!r);
 	r = addr.sa.sa_family;
 	assert(r == AF_INET || r == AF_INET6);
-	r = gwp_dns_cache_lookup(ctx, "aaaa.com", "80", &addr);
+	/* A hit carries the port asked for, not the one first resolved. */
+	assert(addr.i4.sin_port == htons(8080));
+	r = gwp_dns_cache_lookup(ctx, "aaaa.com", 80, &addr);
 	assert(r == -ENOENT);
 	gwp_dns_ctx_free(ctx);
 }
@@ -371,7 +378,7 @@ static void test_addr_list(void)
 	r = gwp_dns_ctx_init(&ctx, &cfg);
 	assert(!r);
 
-	e = gwp_dns_queue(ctx, "localhost", "80");
+	e = gwp_dns_queue(ctx, "localhost", 80);
 	assert(e != NULL);
 	pfd.fd = e->ev_fd;
 	pfd.events = POLLIN;
@@ -410,17 +417,17 @@ static void test_addr_list(void)
 	gwp_dns_entry_put(e);
 
 	/* The cache stores every record; its list must match the resolver's. */
-	r = gwp_dns_cache_lookup_list(ctx, "localhost", "80", list,
+	r = gwp_dns_cache_lookup_list(ctx, "localhost", 80, list,
 				      GWP_DNS_MAX_ADDRS, &nr);
 	assert(!r);
 	assert(nr >= 1);
 
 	/* ... and its first address must equal the single-address lookup. */
-	r = gwp_dns_cache_lookup(ctx, "localhost", "80", &one);
+	r = gwp_dns_cache_lookup(ctx, "localhost", 80, &one);
 	assert(!r);
 	assert(one.sa.sa_family == list[0].sa.sa_family);
 
-	r = gwp_dns_cache_lookup_list(ctx, "aaaa.com", "80", list,
+	r = gwp_dns_cache_lookup_list(ctx, "aaaa.com", 80, list,
 				      GWP_DNS_MAX_ADDRS, &nr);
 	assert(r == -ENOENT);
 

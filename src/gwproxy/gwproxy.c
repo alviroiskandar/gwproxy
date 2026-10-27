@@ -545,8 +545,7 @@ static void gwp_free_dns_packet(struct gwp_conn_pair *gcp)
 
 static int gwp_raw_dns_resolve(struct gwp_wrk *w,
 			       struct gwp_conn_pair *gcp,
-			       const char *host,
-			       const char *port)
+			       const char *host, uint16_t port)
 {
 	struct gwp_dns_resolver *res;
 	struct gwp_dns_packet *gdp;
@@ -568,7 +567,7 @@ static int gwp_raw_dns_resolve(struct gwp_wrk *w,
 
 	gdp->restyp = cfg_dns_restyp(&w->ctx->cfg);
 
-	gdp->port = (uint16_t)atoi(port);
+	gdp->port = port;
 	gdp->buf_len = sizeof(gdp->buf);
 	gdp->gcp = gcp;
 	r = gwp_dns_res_prep_query(res, gdp);
@@ -594,7 +593,7 @@ static void gwp_ctx_free_raw_dns(struct gwp_wrk __unused *w)
 static int gwp_raw_dns_resolve(struct gwp_wrk __unused *w,
 			       struct gwp_conn_pair __unused *gcp,
 			       const char __unused *host,
-			       const char __unused *port)
+			       uint16_t __unused port)
 {
 	return -ENOSYS;
 }
@@ -2611,14 +2610,14 @@ int gwp_acl_reject_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 }
 
 static int queue_dns_resolution(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
-				const char *host, const char *port)
+				const char *host, uint16_t port)
 {
 	struct gwp_dns_ctx *dns = w->ctx->dns;
 	struct gwp_dns_entry *gde;
 
 	gde = gwp_dns_queue(dns, host, port);
 	if (unlikely(!gde)) {
-		pr_err(&w->ctx->lh, "Failed to allocate DNS entry for %s:%s", host, port);
+		pr_err(&w->ctx->lh, "Failed to allocate DNS entry for %s:%hu", host, port);
 		return -ENOMEM;
 	}
 
@@ -2806,7 +2805,7 @@ void gwp_conn_set_single_candidate(struct gwp_conn_pair *gcp,
 
 static int prepare_target_addr_domain(struct gwp_wrk *w,
 				      struct gwp_conn_pair *gcp,
-				      const char *host, const char *port)
+				      const char *host, uint16_t port)
 {
 	struct gwp_ctx *ctx = w->ctx;
 	struct gwp_cfg *cfg = &ctx->cfg;
@@ -2820,19 +2819,9 @@ static int prepare_target_addr_domain(struct gwp_wrk *w,
 	 * proxy. up_dst carries the domain and we're ready to connect.
 	 */
 	if (ctx->upstream.enabled && ctx->upstream.remote_dns) {
-		/*
-		 * Strict: atoi() stops at the first non-digit and reports the
-		 * prefix, so a port carrying trailing junk was silently
-		 * accepted. Unlike the resolving paths below, nothing else
-		 * validates this string before it becomes the upstream's
-		 * destination port.
-		 */
-		char *endp;
-		unsigned long p = strtoul(port, &endp, 10);
-
-		if (endp == port || *endp || !p || p > 65535)
+		if (!port)
 			return -EINVAL;
-		return upstream_dst_from_domain(host, (uint16_t)p, &gcp->up_dst);
+		return upstream_dst_from_domain(host, port, &gcp->up_dst);
 	}
 
 	if (cfg->use_raw_dns) {
@@ -2845,7 +2834,7 @@ static int prepare_target_addr_domain(struct gwp_wrk *w,
 					      GWP_MAX_CONN_CAND, &nr);
 		if (!r) {
 			gwp_conn_set_candidates(gcp, addrs, nr);
-			pr_dbg(&ctx->lh, "Found %s:%s in DNS cache %s (%u addr)",
+			pr_dbg(&ctx->lh, "Found %s:%hu in DNS cache %s (%u addr)",
 				host, port, ip_to_str(&gcp->target_addr), nr);
 			return 0;
 		}
@@ -2858,16 +2847,11 @@ static int socks5_prepare_target_addr_domain(struct gwp_wrk *w,
 					     struct gwp_conn_pair *gcp)
 {
 	struct gwp_socks5_addr *dst;
-	const char *host;
-	char portstr[6];
-	uint16_t port;
 	int r;
 
 	dst = &gcp->s5_conn->dst_addr;
-	port = ntohs(dst->port);
-	host = dst->domain.str;
-	snprintf(portstr, sizeof(portstr), "%hu", port);
-	r = prepare_target_addr_domain(w, gcp, host, portstr);
+	r = prepare_target_addr_domain(w, gcp, dst->domain.str,
+				       ntohs(dst->port));
 	if (r == -EINPROGRESS)
 		gcp->conn_state = CONN_STATE_SOCKS5_DNS_QUERY;
 
@@ -3421,11 +3405,44 @@ static int http_inject_forward_request(struct gwp_conn_pair *gcp,
 	return 0;
 }
 
+/*
+ * A port as an HTTP authority carries it: decimal digits only, no sign, no
+ * service name, at most 65535.
+ */
+static int parse_port(const char *s, uint16_t *port)
+{
+	uint32_t v = 0;
+
+	if (!*s)
+		return -EINVAL;
+
+	for (; *s; s++) {
+		if (*s < '0' || *s > '9')
+			return -EINVAL;
+		v = v * 10 + (uint32_t)(*s - '0');
+		if (v > 65535)
+			return -EINVAL;
+	}
+
+	*port = (uint16_t)v;
+	return 0;
+}
+
 /* Resolve and connect to @host:@port, setting the HTTP connect/DNS state. */
 static int http_connect_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			       const char *host, const char *port)
 {
-	int r = prepare_target_addr_domain(w, gcp, host, port);
+	uint16_t p;
+	int r;
+
+	/*
+	 * The resolver takes the port as a number; a port that is not one
+	 * used to reach getaddrinfo() and come back as a 502.
+	 */
+	if (parse_port(port, &p))
+		return http_reject_bad_request(gcp);
+
+	r = prepare_target_addr_domain(w, gcp, host, p);
 
 	if (r == -EINPROGRESS)
 		gcp->conn_state = CONN_STATE_HTTP_DNS_QUERY;

@@ -23,7 +23,7 @@ struct gwp_dns_wrk;
 
 struct gwp_dns_entry {
 	char			*name;
-	char			*service;
+	uint16_t		port;	/* host byte order */
 	_Atomic(int)		refcnt;
 	int			res;
 	int			ev_fd;
@@ -88,11 +88,11 @@ void gwp_dns_ctx_free(struct gwp_dns_ctx *ctx);
  *
  * @param ctx		Pointer to the DNS context.
  * @param name		Name to resolve.
- * @param service 	Service to resolve in port number ascii format.
+ * @param port 		Port to put in the resolved addresses (host byte order).
  * @return		Pointer to a gwp_dns_entry on success, NULL on failure.
  */
 struct gwp_dns_entry *gwp_dns_queue(struct gwp_dns_ctx *ctx,
-				    const char *name, const char *service);
+				    const char *name, uint16_t port);
 
 /**
  * Release a DNS entry. This function decrements the reference count of the
@@ -111,7 +111,7 @@ bool gwp_dns_entry_put(struct gwp_dns_entry *entry);
  *
  * @param ctx		Pointer to the DNS context.
  * @param name		Pointer to the name to look up.
- * @param service	Pointer to the service to look up.
+ * @param port		Port to put in the address (host byte order).
  * @param addr		Pointer to the sockaddr structure to fill in.
  * @return		0 on success, negative error code on failure.
  *
@@ -121,7 +121,7 @@ bool gwp_dns_entry_put(struct gwp_dns_entry *entry);
  * -EINVAL: Invalid parameters.
  */
 int gwp_dns_cache_lookup(struct gwp_dns_ctx *ctx, const char *name,
-			 const char *service, struct gwp_sockaddr *addr);
+			 uint16_t port, struct gwp_sockaddr *addr);
 
 /*
  * As gwp_dns_cache_lookup(), but returns up to @cap addresses in the order they
@@ -130,17 +130,17 @@ int gwp_dns_cache_lookup(struct gwp_dns_ctx *ctx, const char *name,
  * reads the same entry -- no extra lookup cost.
  */
 int gwp_dns_cache_lookup_list(struct gwp_dns_ctx *ctx, const char *name,
-			      const char *service, struct gwp_sockaddr *addrs,
+			      uint16_t port, struct gwp_sockaddr *addrs,
 			      uint8_t cap, uint8_t *nr_addrs);
 
 
 /*
- * Resolve @name/@service into up to @cap addresses, written to @addrs in the
+ * Resolve @name into up to @cap addresses with port @port, written to @addrs in the
  * order they should be tried (see struct gwp_dns_entry). *@nr_addrs receives
  * the count. Returns 0 on success, or -EHOSTUNREACH when nothing resolved.
  */
 int gwp_dns_resolve(struct gwp_dns_ctx *ctx, const char *name,
-		    const char *service, struct gwp_sockaddr *addrs,
+		    uint16_t port, struct gwp_sockaddr *addrs,
 		    uint8_t cap, uint8_t *nr_addrs, uint32_t restyp);
 
 #endif /* #ifndef GWP_DNS_H */
