@@ -78,7 +78,6 @@ struct gwp_cfg {
 	int		target_buf_size;
 	int		client_buf_size;
 	bool		tcp_nodelay;
-	bool		tcp_quickack;
 	bool		tcp_keepalive;
 	int		tcp_keepidle;
 	int		tcp_keepintvl;

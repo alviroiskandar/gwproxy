@@ -126,7 +126,6 @@ static const struct gwp_cfg default_opts = {
 	.target_buf_size	= 65536,
 	.client_buf_size	= 65536,
 	.tcp_nodelay		= 1,
-	.tcp_quickack		= 1,
 	.tcp_keepalive		= 1,
 	.tcp_keepidle		= 60,
 	.tcp_keepintvl		= 10,
@@ -177,7 +176,6 @@ static void show_help(const char *app)
 	printf("  -T, --target-buf-size=nr        Target buffer size in bytes (default: %d)\n", default_opts.target_buf_size);
 	printf("  -C, --client-buf-size=nr        Client buffer size in bytes (default: %d)\n", default_opts.client_buf_size);
 	printf("  -d, --tcp-nodelay=0|1           Enable/disable TCP_NODELAY (default: %d)\n", default_opts.tcp_nodelay);
-	printf("  -K, --tcp-quickack=0|1          Enable/disable TCP_QUICKACK (default: %d)\n", default_opts.tcp_quickack);
 	printf("  -k, --tcp-keepalive=0|1         Enable/disable TCP_KEEPALIVE (default: %d)\n", default_opts.tcp_keepalive);
 	printf("  -i, --tcp-keepidle=sec          TCP_KEEPIDLE in seconds (default: %d)\n", default_opts.tcp_keepidle);
 	printf("  -l, --tcp-keepintvl=sec         TCP_KEEPINTVL in seconds (default: %d)\n", default_opts.tcp_keepintvl);
@@ -325,7 +323,13 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 			cfg->tcp_nodelay = !!atoi(optarg);
 			break;
 		case 'K':
-			cfg->tcp_quickack = !!atoi(optarg);
+			/*
+			 * --tcp-quickack never did anything: no TCP_QUICKACK was
+			 * ever set, and a one-shot set would not stick anyway,
+			 * since the kernel leaves quickack mode on its own.
+			 * Accepted so existing command lines still start.
+			 */
+			fprintf(stderr, "Warning: --tcp-quickack has no effect and is ignored\n");
 			break;
 		case 'k':
 			cfg->tcp_keepalive = !!atoi(optarg);

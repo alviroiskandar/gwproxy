@@ -793,10 +793,10 @@ on connections. Default:
 .BR 1 .
 .TP
 .BR \-K ", " \-\-tcp\-quickack=\fI0|1\fR
-Enable
-.B TCP_QUICKACK
-on connections. Default:
-.BR 1 .
+Obsolete and ignored, with a warning. It never set
+.BR TCP_QUICKACK ,
+which the kernel clears again by itself, so it cannot be set once per
+connection. It is still accepted so that existing command lines start.
 .TP
 .BR \-k ", " \-\-tcp\-keepalive=\fI0|1\fR
 Enable
