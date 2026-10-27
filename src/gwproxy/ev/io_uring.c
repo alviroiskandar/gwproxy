@@ -31,14 +31,13 @@
 
 #ifdef CONFIG_HTTPS
 /*
- * Per-connection ciphertext scratch for a TLS client. The io_uring recv/send
- * are asynchronous, so the wire buffers must persist for the whole operation
- * (unlike epoll, which decrypts synchronously into a stack buffer). @rx is
- * where the kernel deposits ciphertext to be fed to the read BIO; @tx holds
- * ciphertext pulled from the write BIO that is being sent, with @tx_sent..@tx_len
- * the not-yet-written tail. Both hold a whole TLS record, header and cipher
- * overhead included, so a full record goes out in one send and comes in with
- * one recv.
+ * Per-connection ciphertext scratch for a TLS client. The io_uring send is
+ * asynchronous, so its buffer must persist for the whole operation: @tx holds
+ * ciphertext pulled from the write BIO that is being sent, with
+ * @tx_sent..@tx_len the not-yet-written tail. It holds a whole TLS record,
+ * header and cipher overhead included, so a full record goes out in one send.
+ * Received ciphertext needs no scratch: it lands in the engine's own input
+ * queue (see __prep_recv_client()).
  */
 #define GWP_TLS_CIPHER_CAP GWP_SSL_RECORD_MAX
 
@@ -46,7 +45,6 @@ struct gwp_iou_tls {
 	uint32_t	tx_len;		/* ciphertext bytes queued in @tx  */
 	uint32_t	tx_sent;	/* of those, already written       */
 	bool		closing;	/* close_notify queued             */
-	unsigned char	rx[GWP_TLS_CIPHER_CAP];
 	unsigned char	tx[GWP_TLS_CIPHER_CAP];
 };
 
@@ -420,8 +418,8 @@ static struct io_uring_sqe *prep_recv_target(struct gwp_wrk *w,
 	return s;
 }
 
-static struct io_uring_sqe *prep_recv_client(struct gwp_wrk *w,
-					     struct gwp_conn_pair *gcp)
+static int __prep_recv_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			      uint64_t ev_bit)
 {
 	size_t len = gcp->client.cap - gcp->client.len;
 	char *buf = gcp->client.buf + gcp->client.len;
@@ -430,25 +428,32 @@ static struct io_uring_sqe *prep_recv_client(struct gwp_wrk *w,
 
 #ifdef CONFIG_HTTPS
 	/*
-	 * A TLS client receives ciphertext into the connection's rx scratch;
-	 * the completion handler decrypts it into client.buf. (During the
-	 * handshake this path is not used; see prep_tls_detect().)
+	 * A TLS client receives ciphertext straight into the engine's input
+	 * queue, with room for at least one whole record; the completion
+	 * commits it and decrypts into client.buf. The space stays put until
+	 * that commit (see gwp_ssl_rx_space()).
 	 */
 	if (client_is_tls(gcp)) {
-		buf = (char *)gcp->tls_io->rx;
-		len = sizeof(gcp->tls_io->rx);
+		buf = gwp_ssl_rx_space(gcp->client.tls, GWP_SSL_RECORD_MAX, &len);
+		if (unlikely(!buf))
+			return -ENOMEM;
 	}
 #endif
 
 	s = get_sqe_nofail(w);
 	io_uring_prep_recv(s, fd, buf, len, MSG_NOSIGNAL);
 	io_uring_sqe_set_data(s, gcp);
-	s->user_data |= EV_BIT_IOU_CLIENT_RECV;
+	s->user_data |= ev_bit;
 	get_gcp_io(gcp, s);
 	pr_dbg(&w->ctx->lh,
 		"Prepared recv for client fd=%d, len=%zu, buf=%p, ref_cnt=%d",
 		fd, len, buf, gcp->ref_cnt);
-	return s;
+	return 0;
+}
+
+static int prep_recv_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	return __prep_recv_client(w, gcp, EV_BIT_IOU_CLIENT_RECV);
 }
 
 static struct io_uring_sqe *prep_send_target(struct gwp_wrk *w,
@@ -701,13 +706,9 @@ static void shutdown_gcp(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	gcp->flags |= GWP_CONN_FLAG_IS_CANCEL;
 }
 
-static struct io_uring_sqe *prep_recv_client_prot(struct gwp_wrk *w,
-						  struct gwp_conn_pair *gcp)
+static int prep_recv_client_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
-	struct io_uring_sqe *s = prep_recv_client(w, gcp);
-	s->user_data &= ~EV_BIT_ALL;
-	s->user_data |= EV_BIT_IOU_CLIENT_PROT;
-	return s;
+	return __prep_recv_client(w, gcp, EV_BIT_IOU_CLIENT_PROT);
 }
 
 #ifdef CONFIG_HTTPS
@@ -716,26 +717,14 @@ static struct io_uring_sqe *prep_recv_client_prot(struct gwp_wrk *w,
  * HTTPS proxy: client-side TLS termination on the io_uring loop.
  *
  * Only the client wire speaks TLS; the target side stays plaintext. Ciphertext
- * is shuttled through the connection's gwp_iou_tls scratch (rx/tx), because an
- * async recv/send must own a stable buffer for the whole operation (epoll
- * decrypts synchronously into a stack buffer instead). Once the handshake
- * completes, the connection runs the normal SOCKS5/HTTP logic on the decrypted
- * client.buf, exactly like the plaintext path. TLS is auto-detected from the
+ * is received straight into the engine's input queue and sent from the
+ * connection's gwp_iou_tls scratch, because an async send must own a stable
+ * buffer for the whole operation. Once the handshake completes, the
+ * connection runs the normal SOCKS5/HTTP logic on the decrypted client.buf,
+ * exactly like the plaintext path. TLS is auto-detected from the
  * client's first byte so plaintext clients keep working on the same port.
  * ------------------------------------------------------------------------
  */
-
-static void prep_recv_client_cipher(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
-				    uint64_t ev_bit)
-{
-	struct gwp_iou_tls *t = gcp->tls_io;
-	struct io_uring_sqe *s = get_sqe_nofail(w);
-
-	io_uring_prep_recv(s, gcp->client.fd, t->rx, sizeof(t->rx), MSG_NOSIGNAL);
-	io_uring_sqe_set_data(s, gcp);
-	s->user_data |= ev_bit;
-	get_gcp_io(gcp, s);
-}
 
 static void prep_send_client_cipher(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				    uint64_t ev_bit)
@@ -817,10 +806,9 @@ static int tls_forward_pump(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 			return sr;
 	}
 
-	if (c->len)
-		prep_send_target(w, gcp);
-	else
-		prep_recv_client(w, gcp);
+	if (!c->len)
+		return prep_recv_client(w, gcp);
+	prep_send_target(w, gcp);
 	return 0;
 }
 
@@ -839,16 +827,12 @@ static int tls_prot_pump(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	sr = gwp_ssl_read(c->tls, c->buf + c->len, space, &got);
 	if (sr == GWP_SSL_ERROR)
 		return -EIO;
-	if (sr == GWP_SSL_OK && got == 0) {	/* client sent close_notify */
-		prep_recv_client_prot(w, gcp);
-		return 0;
-	}
+	if (sr == GWP_SSL_OK && got == 0)	/* client sent close_notify */
+		return prep_recv_client_prot(w, gcp);
 
-	if (got == 0) {
-		/* Need more ciphertext to complete a record. */
-		prep_recv_client_prot(w, gcp);
-		return 0;
-	}
+	/* Need more ciphertext to complete a record. */
+	if (got == 0)
+		return prep_recv_client_prot(w, gcp);
 
 	c->len += (uint32_t)got;
 	return process_client_prot(w, gcp);
@@ -894,8 +878,7 @@ static int tls_hs_step(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	if (hs == GWP_SSL_OK)
 		return tls_hs_finish(w, gcp);
 
-	prep_recv_client_cipher(w, gcp, EV_BIT_IOU_TLS_HS_RECV);
-	return 0;
+	return __prep_recv_client(w, gcp, EV_BIT_IOU_TLS_HS_RECV);
 }
 
 static int handle_ev_tls_hs_recv(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
@@ -904,18 +887,15 @@ static int handle_ev_tls_hs_recv(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	int r = cqe->res;
 
 	if (r < 0) {
-		if (r == -EAGAIN || r == -EINTR) {
-			prep_recv_client_cipher(w, gcp, EV_BIT_IOU_TLS_HS_RECV);
-			return 0;
-		}
+		if (r == -EAGAIN || r == -EINTR)
+			return __prep_recv_client(w, gcp,
+						  EV_BIT_IOU_TLS_HS_RECV);
 		return r;
 	}
 	if (r == 0)
 		return -ECONNRESET;	/* peer closed mid-handshake */
 
-	if (gwp_ssl_bio_write(gcp->client.tls, gcp->tls_io->rx, (size_t)r) < 0)
-		return -EIO;
-
+	gwp_ssl_rx_commit(gcp->client.tls, (size_t)r);
 	return tls_hs_step(w, gcp);
 }
 
@@ -974,11 +954,10 @@ static int handle_ev_tls_detect(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	if ((unsigned char)gcp->client.buf[0] != 0x16) {
 		/* Plaintext client: proceed as usual, peeked byte still queued. */
 		gcp->conn_state = CONN_STATE_PROT;
-		prep_recv_client_prot(w, gcp);
-		return 0;
+		return prep_recv_client_prot(w, gcp);
 	}
 
-	/* Only the header needs zeroing; rx/tx are scratch. */
+	/* Only the header needs zeroing; tx is scratch. */
 	gcp->tls_io = malloc(sizeof(*gcp->tls_io));
 	if (unlikely(!gcp->tls_io))
 		return -ENOMEM;
@@ -991,8 +970,7 @@ static int handle_ev_tls_detect(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		return -ENOMEM;
 
 	gcp->conn_state = CONN_STATE_TLS_HANDSHAKE;
-	prep_recv_client_cipher(w, gcp, EV_BIT_IOU_TLS_HS_RECV);
-	return 0;
+	return __prep_recv_client(w, gcp, EV_BIT_IOU_TLS_HS_RECV);
 }
 #endif /* CONFIG_HTTPS */
 
@@ -1318,10 +1296,9 @@ static int upstream_iou_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	 * request in client.buf, which the origin must receive. The send
 	 * completion arms the next client recv.
 	 */
-	if (gcp->client.len)
-		prep_send_target(w, gcp);
-	else
-		prep_recv_client(w, gcp);
+	if (!gcp->client.len)
+		return prep_recv_client(w, gcp);
+	prep_send_target(w, gcp);
 	return 0;
 }
 
@@ -1446,8 +1423,11 @@ static int finish_target_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	 * armed only once it has drained (handle_ev_target_send()). Arming it
 	 * here would race with that send on client.buf.
 	 */
-	if (!http_fwd)
-		prep_recv_client(w, gcp);
+	if (!http_fwd) {
+		r = prep_recv_client(w, gcp);
+		if (r)
+			return r;
+	}
 
 	/*
 	 * SOCKS5/HTTP: write the connect reply into target.buf and flush it to
@@ -1668,10 +1648,8 @@ static int handle_ev_client_recv(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	uint32_t from;
 
 	if (r < 0) {
-		if (r == -EAGAIN || r == -EINTR) {
-			prep_recv_client(w, gcp);
-			return 0;
-		}
+		if (r == -EAGAIN || r == -EINTR)
+			return prep_recv_client(w, gcp);
 		return r;
 	}
 
@@ -1681,9 +1659,7 @@ static int handle_ev_client_recv(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			gcp->client.rd_eof = true;
 			return iou_forward_progress(w, gcp);
 		}
-		if (gwp_ssl_bio_write(gcp->client.tls, gcp->tls_io->rx,
-				      (size_t)r) < 0)
-			return -EIO;
+		gwp_ssl_rx_commit(gcp->client.tls, (size_t)r);
 		return tls_forward_pump(w, gcp);
 	}
 #endif
@@ -1707,10 +1683,9 @@ static int handle_ev_client_recv(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	}
 
 	/* An HTTP forwarding filter may have dropped all of it. */
-	if (gcp->client.len)
-		prep_send_target(w, gcp);
-	else
-		prep_recv_client(w, gcp);
+	if (!gcp->client.len)
+		return prep_recv_client(w, gcp);
+	prep_send_target(w, gcp);
 	return 0;
 }
 
@@ -1834,8 +1809,7 @@ static int handle_ev_target_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		return tls_forward_pump(w, gcp);
 #endif
 
-	prep_recv_client(w, gcp);
-	return 0;
+	return prep_recv_client(w, gcp);
 }
 
 /*
@@ -2110,6 +2084,8 @@ static int handle_ev_udp_tx(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
  */
 static int arm_udp_relay(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
+	int r;
+
 	gcp->udp_iou = calloc(1, sizeof(*gcp->udp_iou));
 	if (unlikely(!gcp->udp_iou))
 		return -ENOMEM;
@@ -2124,7 +2100,9 @@ static int arm_udp_relay(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		prep_timer_del_target(w, gcp);
 	}
 
-	prep_recv_client_prot(w, gcp);
+	r = prep_recv_client_prot(w, gcp);
+	if (r)
+		return r;
 	prep_udp_recv(w, gcp);
 	return 0;
 }
@@ -2150,11 +2128,9 @@ static int chk_prot_result(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int r)
 	if (r == 0 && ct == CONN_STATE_SOCKS5_UDP_ASSOCIATE)
 		return arm_udp_relay(w, gcp);
 
-	if (r == 0 || r == -EAGAIN) {
-		/* Handshake incomplete; read more from the client. */
-		prep_recv_client_prot(w, gcp);
-		return 0;
-	}
+	/* Handshake incomplete; read more from the client. */
+	if (r == 0 || r == -EAGAIN)
+		return prep_recv_client_prot(w, gcp);
 
 	return r;
 }
@@ -2189,12 +2165,10 @@ static int handle_ev_client_prot(struct gwp_wrk *w,
 {
 	int r = handle_sock_ret(cqe->res);
 
-	if (r < 0) {
+	if (r < 0)
 		return r;
-	} else if (!r) {
-		prep_recv_client_prot(w, gcp);
-		return 0;
-	}
+	else if (!r)
+		return prep_recv_client_prot(w, gcp);
 
 	/*
 	 * Once the UDP association is up the TCP control connection is idle and
@@ -2203,16 +2177,13 @@ static int handle_ev_client_prot(struct gwp_wrk *w,
 	 */
 	if (gcp->conn_state == CONN_STATE_SOCKS5_UDP_ASSOCIATE) {
 		gcp->client.len = 0;
-		prep_recv_client_prot(w, gcp);
-		return 0;
+		return prep_recv_client_prot(w, gcp);
 	}
 
 #ifdef CONFIG_HTTPS
 	if (client_is_tls(gcp)) {
 		/* Decrypt the ciphertext chunk, then run the protocol on it. */
-		if (gwp_ssl_bio_write(gcp->client.tls, gcp->tls_io->rx,
-				      (size_t)r) < 0)
-			return -EIO;
+		gwp_ssl_rx_commit(gcp->client.tls, (size_t)r);
 		return tls_prot_pump(w, gcp);
 	}
 #endif
