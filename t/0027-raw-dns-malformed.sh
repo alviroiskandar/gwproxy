@@ -18,9 +18,10 @@
 #                     it used to hit an assert, and must now resolve;
 #   cname-jump        a CNAME whose RDLENGTH walks the cursor past the buffer;
 #   rdata-truncated   an AAAA claiming 16 bytes of RDATA that stops after one;
+#   field-truncated   an answer that stops inside its TTL;
 #   question-label    a question label length of 0xC0, which strides 193 bytes.
 #
-# The last three must be refused, not parsed -- the client sees nothing and
+# The last four must be refused, not parsed -- the client sees nothing and
 # gives up, which is the point: the failure stays inside that one request.
 #
 # The port matters as much as the payload here. --dns-server used to drop the
@@ -69,7 +70,8 @@ except Exception:
 # io_uring hides the difference.
 for loop in epoll; do
 
-	for mode in good uncompressed-name cname-jump rdata-truncated question-label; do
+	for mode in good uncompressed-name cname-jump rdata-truncated \
+		    field-truncated question-label; do
 		dp="$(pick_port)"
 		python3 "$SERVERS_DIR/dns_malformed.py" "$mode" "$dp" 2>/dev/null &
 		dns_pid=$!

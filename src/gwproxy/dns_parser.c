@@ -202,7 +202,14 @@ static int serialize_answ(uint16_t txid, uint8_t *in, size_t in_len, gwdns_answ_
 			}
 			idx = (size_t)ret;
 		}
-		if (idx >= in_len) {
+
+		/*
+		 * TYPE, CLASS, TTL and RDLENGTH: ten bytes, all of which
+		 * must be there before any is read. Checking for one byte
+		 * per field let a reply cut inside one read up to three
+		 * bytes past the end of the buffer.
+		 */
+		if (idx > in_len || in_len - idx < 10) {
 			ret = -EAGAIN;
 			free(item);
 			goto exit_free;
@@ -211,27 +218,12 @@ static int serialize_answ(uint16_t txid, uint8_t *in, size_t in_len, gwdns_answ_
 		memcpy(&item->rr_type, &in[idx], 2);
 		item->rr_type = ntohs(item->rr_type);
 		idx += 2; // TYPE
-		if (idx >= in_len) {
-			ret = -EAGAIN;
-			free(item);
-			goto exit_free;
-		}
 		memcpy(&item->rr_class, &in[idx], 2);
 		item->rr_class = ntohs(item->rr_class);
 		idx += 2; // CLASS
-		if (idx >= in_len) {
-			ret = -EAGAIN;
-			free(item);
-			goto exit_free;
-		}
 		memcpy(&item->ttl, &in[idx], 4);
 		item->ttl = be32toh(item->ttl);
 		idx += 4; // TTL
-		if (idx >= in_len) {
-			ret = -EAGAIN;
-			free(item);
-			goto exit_free;
-		}
 
 		memcpy(&rdlength, &in[idx], sizeof(rdlength));
 		rdlength = ntohs(rdlength);

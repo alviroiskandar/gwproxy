@@ -52,6 +52,12 @@ while True:
         rr = b"\xc0\x0c" + struct.pack("!HHIH", 28, 1, 60, 16) + b"\x01"
         resp = txid + struct.pack("!HHHHH", 0x8180, 1, 1, 0, 0) + question + rr
 
+    elif mode == "field-truncated":
+        # The reply ends two bytes into the answer's TTL, so the TTL and
+        # RDLENGTH reads run off the end of what arrived.
+        rr = b"\xc0\x0c" + struct.pack("!HH", 1, 1) + b"\x00\x00"
+        resp = txid + struct.pack("!HHHHH", 0x8180, 1, 1, 0, 0) + question + rr
+
     elif mode == "question-label":
         # Echo a question whose second label length is 0xC0 (192): the question
         # walker has no notion of compression and strides 193 bytes forward.
