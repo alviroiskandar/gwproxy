@@ -841,11 +841,17 @@ static bool adj_epl_in(struct gwp_conn *src)
 	return false;
 }
 
+/*
+ * Bring both fds' registrations in line with the pair's buffers. @force_target
+ * re-registers the target even when its mask is unchanged, for a target fd that
+ * is still registered under another tag (see adopt_winning_attempt()).
+ */
 __hot
-static int adjust_epl_mask(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+static int __adjust_epl_mask(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			     bool force_target)
 {
 	bool client_need_ctl = false;
-	bool target_need_ctl = false;
+	bool target_need_ctl = force_target;
 	struct epoll_event ev;
 	int r;
 
@@ -878,6 +884,11 @@ static int adjust_epl_mask(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	}
 
 	return 0;
+}
+
+static int adjust_epl_mask(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	return __adjust_epl_mask(w, gcp, false);
 }
 
 #ifdef CONFIG_HTTPS
@@ -1167,6 +1178,14 @@ static int upstream_arm(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 {
 	struct epoll_event ev;
 
+	/*
+	 * Nothing to tell the kernel if the mask is what it already has. A
+	 * target just adopted from an attempt has ep_mask 0, which no caller
+	 * passes, so it is always re-registered under its proper tag.
+	 */
+	if (gcp->target.ep_mask == mask)
+		return 0;
+
 	gcp->target.ep_mask = mask;
 	ev.events = mask;
 	ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_TARGET;
@@ -1185,10 +1204,13 @@ static int upstream_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		gcp->timer_fd = -1;
 	}
 
+	/*
+	 * target.ep_mask is left as upstream_arm() registered it, so that
+	 * adjust_epl_mask() below changes only what actually differs.
+	 */
 	gcp->up_tx = false;
 	gcp->is_target_alive = true;
 	gcp->conn_state = CONN_STATE_FORWARDING;
-	gcp->target.ep_mask = EPOLLOUT | EPOLLIN | EPOLLRDHUP;
 
 	r = gwp_http_fwd_begin(w, gcp);
 	if (unlikely(r))
@@ -1215,13 +1237,34 @@ static int upstream_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	return adjust_epl_mask(w, gcp);
 }
 
-/* Begin the upstream-proxy handshake and arm the first request send. */
+/*
+ * Send the request the handshake has just queued. It is tried at once rather
+ * than after another EPOLLOUT: the socket has just connected or answered, so
+ * it almost always takes the whole request, and then the reply is all there is
+ * to wait for.
+ */
+static int upstream_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	ssize_t sr;
+
+	sr = __do_send(&gcp->target, &gcp->target);
+	if (unlikely(sr < 0))
+		return (int)sr;
+
+	if (gcp->target.len)
+		return upstream_arm(w, gcp, EPOLLOUT | EPOLLRDHUP);
+
+	gcp->up_tx = false;
+	return upstream_arm(w, gcp, EPOLLIN | EPOLLRDHUP);
+}
+
+/* Begin the upstream-proxy handshake and send its first request. */
 static int upstream_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	int r = gwp_upstream_hs_start(w, gcp);
 
 	if (r == GWP_UPSTREAM_IO_SEND)
-		return upstream_arm(w, gcp, EPOLLOUT | EPOLLRDHUP);
+		return upstream_send(w, gcp);
 	return r;	/* negative errno */
 }
 
@@ -1266,7 +1309,7 @@ static int handle_ev_upstream(struct gwp_wrk *w,
 	r = gwp_upstream_hs_on_reply(w, gcp, &notify);
 	switch (r) {
 	case GWP_UPSTREAM_IO_SEND:
-		return upstream_arm(w, gcp, EPOLLOUT | EPOLLRDHUP);
+		return upstream_send(w, gcp);
 	case GWP_UPSTREAM_IO_RECV:
 		if (ev->events & (EPOLLRDHUP | EPOLLHUP))
 			return -ECONNRESET;
@@ -1279,14 +1322,20 @@ static int handle_ev_upstream(struct gwp_wrk *w,
 }
 
 /*
- * An attempt won the race. Adopt its socket as the pair's target, drop every
- * other attempt and the attempt timer, and re-register the fd under the normal
- * target tag so the rest of the loop sees an ordinary connected target.
+ * An attempt won the race. Adopt its socket as the pair's target and drop every
+ * other attempt and the attempt timer.
+ *
+ * The fd is left registered under its attempt tag. The caller,
+ * handle_ev_target_conn_result(), re-registers it under the normal target tag
+ * with the mask it actually needs next, through upstream_arm() or
+ * __adjust_epl_mask(); doing it here as well cost a second EPOLL_CTL_MOD right
+ * behind the first. ep_mask 0 records that the kernel does not hold a target
+ * registration for it yet. Should the caller fail before that, the attempt
+ * tag finds the slot empty and the pair is torn down anyway.
  */
 static int adopt_winning_attempt(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				 uint8_t slot)
 {
-	struct epoll_event ev;
 	int fd = gcp->attempt_fd[slot];
 	int closed, r;
 
@@ -1303,11 +1352,8 @@ static int adopt_winning_attempt(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	}
 
 	gcp->target.fd = fd;
-	gcp->target.ep_mask = EPOLLOUT | EPOLLIN | EPOLLRDHUP;
-
-	ev.events = gcp->target.ep_mask;
-	ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_TARGET;
-	return __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_MOD, fd, &ev);
+	gcp->target.ep_mask = 0;
+	return 0;
 }
 
 __hot
@@ -1361,7 +1407,8 @@ static int handle_ev_target_conn_result(struct gwp_wrk *w,
 			return (int)sr;
 	}
 
-	return adjust_epl_mask(w, gcp);
+	/* Forced: the target may still carry its attempt tag. */
+	return __adjust_epl_mask(w, gcp, true);
 }
 
 /*
