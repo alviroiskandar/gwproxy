@@ -134,19 +134,45 @@ struct gwp_acl_rule {
 	bool			then_accept : 1;
 	uint8_t			proto : 1;	/* enum gwp_acl_proto */
 	uint8_t			action : 3;	/* enum gwp_acl_action */
+	/*
+	 * Slot of this rule's -m domain/-m user result in a struct
+	 * gwp_acl_memo, or ACL_NO_MEMO (INPUT rules, rules without those
+	 * criteria, and OUTPUT rules past the memo's capacity).
+	 */
+	uint8_t			memo_idx;
 };
+
+#define ACL_NO_MEMO	0xff
 
 struct gwp_acl_ruleset {
 	struct gwp_acl_rule	*in_head, **in_tail;
 	struct gwp_acl_rule	*out_head, **out_tail;
 	enum gwp_acl_verdict	in_policy, out_policy;
+	/* OUTPUT has a -m statistic rule: its verdicts must not be cached. */
+	bool			out_has_stat;
+	/* memo_idx slots handed out to OUTPUT rules so far. */
+	uint8_t			out_nr_memo;
 };
 
 struct gwp_acl {
 	struct gwp_acl_ruleset	rs;
 	char			*path;
 	pthread_rwlock_t	lock;
+	/* Bumped by every successful reload; see gwp_acl_generation(). */
+	_Atomic(uint32_t)	gen;
+	/*
+	 * ACL_SUM_* summary of @rs, published with it: an empty chain's
+	 * verdict is its policy, and the evaluators answer that from here
+	 * without taking the lock (the built-in default ACL has no INPUT
+	 * rules, so that is every accepted connection).
+	 */
+	_Atomic(uint8_t)	sum;
 };
+
+#define ACL_SUM_IN_EMPTY	(1u << 0)
+#define ACL_SUM_OUT_EMPTY	(1u << 1)
+#define ACL_SUM_IN_REJECT	(1u << 2)
+#define ACL_SUM_OUT_REJECT	(1u << 3)
 
 #define ACL_MAX_TOKENS	32
 
@@ -158,11 +184,30 @@ struct gwp_acl {
  *
  * Patterns are matched raw/unanchored -- the user writes ^...$ if they want a
  * full-string match. Matching runs against attacker-influenced hostnames and
- * usernames, so a shared match context caps the work (match + backtracking
- * depth limits) to keep a pathological pattern from becoming a ReDoS.
+ * usernames, so a shared match context caps the work to keep a pathological
+ * pattern from becoming a ReDoS. The match limit bounds both the interpreter
+ * and JIT-compiled code. The depth limit only bounds the interpreter: JIT
+ * ignores it (pcre2api(3)), and a JIT match is bounded instead by JIT's own
+ * default 32 KiB machine stack, whose exhaustion fails the match like any
+ * other limit does. Every pattern is JIT-compiled when JIT is available, so
+ * in practice that stack, not the depth limit, is the recursion bound.
  */
 static pthread_once_t g_regex_once = PTHREAD_ONCE_INIT;
 static pcre2_match_context *g_regex_mctx;
+
+/*
+ * Match data is scratch space for one pcre2_match() call. Keep one per thread
+ * instead of a malloc/free pair per match (about a third of the cost of a
+ * simple JIT match); the key's destructor frees it when the thread exits.
+ */
+static pthread_key_t g_regex_md_key;
+static bool g_regex_md_key_ok;
+static __thread pcre2_match_data *t_regex_md;
+
+static void regex_md_free(void *md)
+{
+	pcre2_match_data_free(md);
+}
 
 static void regex_ctx_init(void)
 {
@@ -171,9 +216,14 @@ static void regex_ctx_init(void)
 		pcre2_set_match_limit(g_regex_mctx, 100000);
 		pcre2_set_depth_limit(g_regex_mctx, 1000);
 	}
+	g_regex_md_key_ok = !pthread_key_create(&g_regex_md_key, regex_md_free);
 }
 
-/* Compile @pat, JIT-compiling it when supported. Returns NULL on error. */
+/*
+ * Compile @pat, JIT-compiling it when supported. Returns NULL on error,
+ * including when the limit-carrying match context could not be allocated:
+ * matching would fall back to PCRE2's far larger default limits.
+ */
 static pcre2_code *regex_compile(const char *pat, bool caseless)
 {
 	uint32_t opts = caseless ? PCRE2_CASELESS : 0;
@@ -182,12 +232,32 @@ static pcre2_code *regex_compile(const char *pat, bool caseless)
 	int errcode;
 
 	pthread_once(&g_regex_once, regex_ctx_init);
+	if (!g_regex_mctx)
+		return NULL;
 	re = pcre2_compile((PCRE2_SPTR)pat, PCRE2_ZERO_TERMINATED, opts,
 			   &errcode, &erroff, NULL);
 	if (!re)
 		return NULL;
 	pcre2_jit_compile(re, PCRE2_JIT_COMPLETE);	/* best effort */
 	return re;
+}
+
+/* This thread's match data, created on first use; NULL on OOM. */
+static pcre2_match_data *regex_md(void)
+{
+	pcre2_match_data *md = t_regex_md;
+
+	if (md)
+		return md;
+	md = pcre2_match_data_create(1, NULL);
+	if (!md)
+		return NULL;
+	if (!g_regex_md_key_ok || pthread_setspecific(g_regex_md_key, md)) {
+		/* Nothing would free it at thread exit; do not cache it. */
+		return md;
+	}
+	t_regex_md = md;
+	return md;
 }
 
 /*
@@ -202,12 +272,13 @@ static bool regex_match(const pcre2_code *re, const char *subj)
 
 	if (!subj)
 		return false;
-	md = pcre2_match_data_create(1, NULL);
+	md = regex_md();
 	if (!md)
 		return false;
 	rc = pcre2_match(re, (PCRE2_SPTR)subj, PCRE2_ZERO_TERMINATED, 0, 0,
 			 md, g_regex_mctx);
-	pcre2_match_data_free(md);
+	if (md != t_regex_md)
+		pcre2_match_data_free(md);
 	return rc >= 0;
 }
 #endif /* CONFIG_PCRE */
@@ -510,6 +581,8 @@ static void ruleset_init(struct gwp_acl_ruleset *rs)
 	rs->out_tail = &rs->out_head;
 	rs->in_policy = GWP_ACL_ACCEPT;
 	rs->out_policy = GWP_ACL_ACCEPT;
+	rs->out_has_stat = false;
+	rs->out_nr_memo = 0;
 }
 
 static void ruleset_free(struct gwp_acl_ruleset *rs)
@@ -1001,12 +1074,18 @@ static int parse_rule(struct gwp_acl_ruleset *rs, char **tok, int n)
 		break;
 	}
 
+	r->memo_idx = ACL_NO_MEMO;
 	if (chain == GWP_ACL_INPUT) {
 		*rs->in_tail = r;
 		rs->in_tail = &r->next;
 	} else {
 		*rs->out_tail = r;
 		rs->out_tail = &r->next;
+		if (r->has_statistic)
+			rs->out_has_stat = true;
+		if ((r->has_domain || r->has_user) &&
+		    rs->out_nr_memo < GWP_ACL_MEMO_RULES)
+			r->memo_idx = rs->out_nr_memo++;
 	}
 	return 0;
 
@@ -1102,6 +1181,47 @@ static int read_file(const char *path, char **out)
  * ------------------------------------------------------------------------
  */
 
+static uint8_t ruleset_summary(const struct gwp_acl_ruleset *rs)
+{
+	uint8_t sum = 0;
+
+	if (!rs->in_head)
+		sum |= ACL_SUM_IN_EMPTY;
+	if (!rs->out_head)
+		sum |= ACL_SUM_OUT_EMPTY;
+	if (rs->in_policy == GWP_ACL_REJECT)
+		sum |= ACL_SUM_IN_REJECT;
+	if (rs->out_policy == GWP_ACL_REJECT)
+		sum |= ACL_SUM_OUT_REJECT;
+	return sum;
+}
+
+/*
+ * Every worker takes the read lock per evaluation, and the only writer is the
+ * reload, which runs on worker 0's event loop. glibc's default rwlock prefers
+ * readers: a waiting writer does not hold off new ones, so while the other
+ * workers keep overlapping their evaluations (a busy proxy with a large rule
+ * file) the reload never gets in, and worker 0 with every connection it owns
+ * stalls behind it. Prefer the writer instead. The non-recursive kind is
+ * required for that and is safe here: no reader takes the lock twice.
+ */
+static int acl_lock_init(pthread_rwlock_t *lock)
+{
+	pthread_rwlockattr_t attr;
+	int r;
+
+	r = pthread_rwlockattr_init(&attr);
+	if (r)
+		return r;
+#ifdef __GLIBC__
+	pthread_rwlockattr_setkind_np(&attr,
+				      PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+#endif
+	r = pthread_rwlock_init(lock, &attr);
+	pthread_rwlockattr_destroy(&attr);
+	return r;
+}
+
 int gwp_acl_parse_str(struct gwp_acl **out, const char *text)
 {
 	struct gwp_acl *acl;
@@ -1111,7 +1231,7 @@ int gwp_acl_parse_str(struct gwp_acl **out, const char *text)
 	if (!acl)
 		return -ENOMEM;
 
-	r = pthread_rwlock_init(&acl->lock, NULL);
+	r = acl_lock_init(&acl->lock);
 	if (r) {
 		free(acl);
 		return -r;
@@ -1123,6 +1243,7 @@ int gwp_acl_parse_str(struct gwp_acl **out, const char *text)
 		free(acl);
 		return r;
 	}
+	atomic_init(&acl->sum, ruleset_summary(&acl->rs));
 
 	*out = acl;
 	return 0;
@@ -1160,7 +1281,7 @@ int gwp_acl_create(struct gwp_acl **out, const char *path)
 
 int gwp_acl_reload(struct gwp_acl *acl)
 {
-	struct gwp_acl_ruleset rs;
+	struct gwp_acl_ruleset rs, old;
 	char *text;
 	int r;
 
@@ -1176,9 +1297,26 @@ int gwp_acl_reload(struct gwp_acl *acl)
 	if (r)
 		return r;			/* keep the old rules */
 
+	/*
+	 * Only swap under the lock. Freeing the old rules (every pcre2 code
+	 * and port array) can take a millisecond for a large file, and every
+	 * evaluation on every worker waits while the write lock is held, so
+	 * that is done after unlocking, on the copy taken here.
+	 */
 	pthread_rwlock_wrlock(&acl->lock);
-	ruleset_free(&acl->rs);
+	old = acl->rs;
 	acl->rs = rs;
+	/*
+	 * Summary before generation: a lock-free reader loads the generation
+	 * first, so one that sees the new generation also sees the new
+	 * summary, and a verdict is never tagged newer than its rules.
+	 */
+	atomic_store_explicit(&acl->sum, ruleset_summary(&rs),
+			      memory_order_release);
+	atomic_store_explicit(&acl->gen,
+			      atomic_load_explicit(&acl->gen,
+						   memory_order_relaxed) + 1,
+			      memory_order_release);
 	/* The tail pointers in @rs point at @rs's stack head slots when a chain
 	 * is empty; re-anchor them to the live struct. */
 	if (!acl->rs.in_head)
@@ -1186,6 +1324,8 @@ int gwp_acl_reload(struct gwp_acl *acl)
 	if (!acl->rs.out_head)
 		acl->rs.out_tail = &acl->rs.out_head;
 	pthread_rwlock_unlock(&acl->lock);
+
+	ruleset_free(&old);
 	return 0;
 }
 
@@ -1206,20 +1346,12 @@ void gwp_acl_destroy(struct gwp_acl *acl)
  */
 
 /*
- * A single match criterion. @present is the rule's has_* flag; @matched is
- * whether the value matched; @negate is the rule's neg_* flag. The criterion is
- * satisfied when it is absent, or present with (matched XOR negated). Adding a
- * new criterion to rule_matches() is then a one-liner.
- *
- * @matched is computed by the caller and so is evaluated even when @present is
- * false: it must be side-effect-free and safe to compute for a rule that does
- * not set the criterion (e.g. guard a pointer deref on the rule field, not just
- * the query field).
+ * A single match criterion fails the rule when it is present and its match
+ * result equals its negation flag (a present criterion is satisfied by
+ * matched XOR negated). Only evaluated behind the rule's has_* flag, so a
+ * criterion the rule does not use costs one bit test.
  */
-static bool crit_ok(bool present, bool matched, bool negate)
-{
-	return !present || (matched != negate);
-}
+#define CRIT_FAILS(r, has, neg, matched) ((r)->has && ((matched) == (r)->neg))
 
 /*
  * True if rule @r's -m domain criterion matches the requested hostname @dom
@@ -1271,8 +1403,7 @@ static bool user_match(const struct gwp_acl_rule *r, const char *user)
  * split across such targets is by attempt rather than by connection.
  *
  * Only ever call this behind a @has_statistic test: @st_every is 0 on a rule
- * that does not use the module, and crit_ok() evaluates its arguments eagerly,
- * so an unguarded call divides by zero on every other rule in the file.
+ * that does not use the module, so an unguarded call divides by zero.
  */
 static bool statistic_match(struct gwp_acl_rule *r)
 {
@@ -1282,45 +1413,81 @@ static bool statistic_match(struct gwp_acl_rule *r)
 	return (n % r->st_every) == r->st_packet;
 }
 
+/*
+ * The -m user and -m domain criteria of @r. They depend only on the request's
+ * username and domain, which stay the same across a connection's candidate
+ * addresses, so with a memo in @q each rule's result is computed for the
+ * first candidate and reused for the rest.
+ */
+static bool name_crit_ok(const struct gwp_acl_rule *r,
+			 const struct gwp_acl_req *q)
+{
+	struct gwp_acl_memo *m = q->memo;
+	uint64_t bit = 0;
+	bool ok;
+
+	if (m && r->memo_idx != ACL_NO_MEMO) {
+		bit = 1ull << r->memo_idx;
+		if (m->known & bit)
+			return m->ok & bit;
+	}
+
+	ok = !CRIT_FAILS(r, has_user, neg_user, user_match(r, q->user)) &&
+	     !CRIT_FAILS(r, has_domain, neg_domain, domain_match(r, q->domain));
+
+	if (bit) {
+		m->known |= bit;
+		if (ok)
+			m->ok |= bit;
+	}
+	return ok;
+}
+
 static bool rule_matches(struct gwp_acl_rule *r,
 			 const struct gwp_acl_req *q)
 {
 	/*
 	 * Target-dependent criteria (-d, --dports) cannot be evaluated for a
 	 * domain-only request (socks5h remote-DNS: no resolved IP, @dport unset).
-	 * Such a rule matches NEITHER polarity -- otherwise crit_ok would let a
-	 * negated "! -d"/"! --dports" flip the unknown into a match and fail open
+	 * Such a rule matches NEITHER polarity -- otherwise a negated
+	 * "! -d"/"! --dports" would flip the unknown into a match and fail open
 	 * (e.g. an allow-by-exclusion rule bypassing an internal-range REJECT).
 	 * -m domain / -m user still evaluate here (domain/user are known).
 	 */
 	if (!q->target && (r->has_dst || r->has_dports))
 		return false;
 
-	return crit_ok(r->has_src,
-		       q->client && cidr_match(&r->src, q->client), r->neg_src) &&
-	       crit_ok(r->has_dst,
-		       q->target && cidr_match(&r->dst, q->target), r->neg_dst) &&
-	       crit_ok(r->has_domain, domain_match(r, q->domain),
-		       r->neg_domain) &&
-	       crit_ok(r->has_user, user_match(r, q->user), r->neg_user) &&
-	       crit_ok(r->has_proto, q->proto == r->proto, r->neg_proto) &&
-	       crit_ok(r->has_sports, ports_match(&r->sports, q->sport),
-		       r->neg_sports) &&
-	       crit_ok(r->has_dports, ports_match(&r->dports, q->dport),
-		       r->neg_dports) &&
-	       /*
-		* LAST, and it has to stay last. Every criterion above is a pure
-		* predicate; this one advances the rule's counter, so a rule
-		* must only consume a slot once everything else about it has
-		* matched -- otherwise "-d 10.0.0.0/8 -m statistic ..." would
-		* count the connections it does not select and the split would
-		* be against the wrong population. The && chain short-circuits,
-		* which is what enforces that; crit_ok() itself evaluates its
-		* @matched argument eagerly, so ordering is the only guard.
-		*/
-	       crit_ok(r->has_statistic,
-		       r->has_statistic && statistic_match(r),
-		       r->neg_statistic);
+	/*
+	 * Cheapest test first: a rule is rejected by its first failing
+	 * criterion, and every criterion below the statistic is a pure
+	 * predicate, so the order changes the cost and never the result.
+	 */
+	if (CRIT_FAILS(r, has_proto, neg_proto, q->proto == r->proto))
+		return false;
+	if (CRIT_FAILS(r, has_dports, neg_dports,
+		       ports_match(&r->dports, q->dport)))
+		return false;
+	if (CRIT_FAILS(r, has_sports, neg_sports,
+		       ports_match(&r->sports, q->sport)))
+		return false;
+	if (CRIT_FAILS(r, has_dst, neg_dst,
+		       q->target && cidr_match(&r->dst, q->target)))
+		return false;
+	if (CRIT_FAILS(r, has_src, neg_src,
+		       q->client && cidr_match(&r->src, q->client)))
+		return false;
+	if ((r->has_user || r->has_domain) && !name_crit_ok(r, q))
+		return false;
+
+	/*
+	 * LAST, and it has to stay last. Every criterion above is a pure
+	 * predicate; this one advances the rule's counter, so a rule must only
+	 * consume a slot once everything else about it has matched --
+	 * otherwise "-d 10.0.0.0/8 -m statistic ..." would count the
+	 * connections it does not select and the split would be against the
+	 * wrong population.
+	 */
+	return !CRIT_FAILS(r, has_statistic, neg_statistic, statistic_match(r));
 }
 
 /* Read a sockaddr's port (host byte order) regardless of family. */
@@ -1426,26 +1593,60 @@ enum gwp_acl_verdict gwp_acl_eval_output(struct gwp_acl *acl,
 					 struct gwp_acl_req *req)
 {
 	enum gwp_acl_verdict verdict;
+	uint32_t gen;
+	uint8_t sum;
 
 	req->dnat_applied = false;
 	req->mark_set = false;
 	req->bind.set = false;
+	req->gen = 0;
+	req->cacheable = true;
 	if (!acl)
 		return GWP_ACL_ACCEPT;
 
+	gen = gwp_acl_generation(acl);
+	sum = atomic_load_explicit(&acl->sum, memory_order_acquire);
+	if (sum & ACL_SUM_OUT_EMPTY) {
+		req->gen = gen;
+		return (sum & ACL_SUM_OUT_REJECT) ? GWP_ACL_REJECT
+						  : GWP_ACL_ACCEPT;
+	}
+
 	pthread_rwlock_rdlock(&acl->lock);
+	req->gen = atomic_load_explicit(&acl->gen, memory_order_relaxed);
+	req->cacheable = !acl->rs.out_has_stat;
+	/* Memo slots are only meaningful for the ruleset that filled them. */
+	if (req->memo && (!req->memo->valid || req->memo->gen != req->gen)) {
+		req->memo->valid = true;
+		req->memo->gen = req->gen;
+		req->memo->known = 0;
+		req->memo->ok = 0;
+	}
 	verdict = eval_chain(acl->rs.out_head, acl->rs.out_policy, req);
 	pthread_rwlock_unlock(&acl->lock);
 	return verdict;
+}
+
+uint32_t gwp_acl_generation(struct gwp_acl *acl)
+{
+	if (!acl)
+		return 0;
+	return atomic_load_explicit(&acl->gen, memory_order_acquire);
 }
 
 enum gwp_acl_verdict gwp_acl_eval_input(struct gwp_acl *acl,
 					struct gwp_acl_req *req)
 {
 	enum gwp_acl_verdict verdict;
+	uint8_t sum;
 
 	if (!acl)
 		return GWP_ACL_ACCEPT;
+
+	sum = atomic_load_explicit(&acl->sum, memory_order_acquire);
+	if (sum & ACL_SUM_IN_EMPTY)
+		return (sum & ACL_SUM_IN_REJECT) ? GWP_ACL_REJECT
+						 : GWP_ACL_ACCEPT;
 
 	pthread_rwlock_rdlock(&acl->lock);
 	verdict = eval_chain(acl->rs.in_head, acl->rs.in_policy, req);

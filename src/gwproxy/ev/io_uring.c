@@ -21,7 +21,6 @@
 #include <string.h>
 #include <assert.h>
 #include <limits.h>
-#include <sys/inotify.h>
 #include <liburing.h>
 #include <poll.h>
 #ifdef CONFIG_HTTPS
@@ -2249,57 +2248,32 @@ static int handle_ev_dns_query(struct gwp_wrk *w, void *udata)
 	return do_prep_connect(w, gcp);
 }
 
-static void prep_auth_reload(struct gwp_wrk *w)
+static void prep_reload_files(struct gwp_wrk *w)
 {
-	static const size_t l = sizeof(struct inotify_event) + NAME_MAX + 1;
 	struct gwp_ctx *ctx = w->ctx;
 	struct io_uring_sqe *s;
 
-	assert(ctx->auth);
 	s = get_sqe_nofail(w);
-	io_uring_prep_read(s, ctx->ino_fd, ctx->ino_buf, l, 0);
-	s->user_data = EV_BIT_IOU_SOCKS5_AUTH_FILE;
+	io_uring_prep_read(s, ctx->ino_fd, ctx->ino_buf, GWP_INO_BUF_SIZE, 0);
+	s->user_data = EV_BIT_IOU_RELOAD_FILES;
 }
 
-static int handle_ev_auth_file(struct gwp_wrk *w, int res)
+/*
+ * One read takes every record queued so far (the buffer has room for a
+ * burst), and each file it names is reloaded once however many records name
+ * it. The re-armed read is only submitted after this returns, so the buffer
+ * is not overwritten while it is parsed.
+ */
+static int handle_ev_reload_files(struct gwp_wrk *w, int res)
 {
 	struct gwp_ctx *ctx = w->ctx;
 
-	prep_auth_reload(w);
-	if (res <= 0 || !gwp_inotify_event_matches(ctx->ino_buf, (size_t)res,
-						   ctx->cfg.auth_file))
+	prep_reload_files(w);
+	if (res <= 0)
 		return 0;
 
-	gwp_auth_reload(ctx->auth);
-	pr_info(&ctx->lh, "Reloaded authentication file");
-	return 0;
-}
-
-static void prep_acl_reload(struct gwp_wrk *w)
-{
-	static const size_t l = sizeof(struct inotify_event) + NAME_MAX + 1;
-	struct gwp_ctx *ctx = w->ctx;
-	struct io_uring_sqe *s;
-
-	assert(ctx->acl);
-	s = get_sqe_nofail(w);
-	io_uring_prep_read(s, ctx->acl_ino_fd, ctx->acl_ino_buf, l, 0);
-	s->user_data = EV_BIT_IOU_ACL_FILE;
-}
-
-static int handle_ev_acl_file(struct gwp_wrk *w, int res)
-{
-	struct gwp_ctx *ctx = w->ctx;
-
-	prep_acl_reload(w);
-	if (res <= 0 || !gwp_inotify_event_matches(ctx->acl_ino_buf, (size_t)res,
-						   ctx->cfg.acl_file))
-		return 0;
-
-	if (gwp_acl_reload(ctx->acl))
-		pr_warn(&ctx->lh, "Failed to reload ACL file; keeping current rules");
-	else
-		pr_info(&ctx->lh, "Reloaded ACL file");
+	gwp_ctx_reload_files(ctx, gwp_reload_events(ctx, ctx->ino_buf,
+						     (size_t)res));
 	return 0;
 }
 
@@ -2416,12 +2390,9 @@ static int handle_event(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 		pr_dbg(&ctx->lh, "Handling upstream SOCKS5 handshake event: %d", cqe->res);
 		r = handle_ev_upstream_s5(w, udata, cqe);
 		break;
-	case EV_BIT_IOU_SOCKS5_AUTH_FILE:
-		pr_dbg(&ctx->lh, "Handling SOCKS5 auth file reload event: %d", cqe->res);
-		return handle_ev_auth_file(w, cqe->res);
-	case EV_BIT_IOU_ACL_FILE:
-		pr_dbg(&ctx->lh, "Handling ACL file reload event: %d", cqe->res);
-		return handle_ev_acl_file(w, cqe->res);
+	case EV_BIT_IOU_RELOAD_FILES:
+		pr_dbg(&ctx->lh, "Handling auth/ACL file reload event: %d", cqe->res);
+		return handle_ev_reload_files(w, cqe->res);
 	case EV_BIT_IOU_TARGET_CANCEL:
 		gcp = udata;
 		pr_dbg(&ctx->lh, "Handling target cancel event: %d", cqe->res);
@@ -2530,10 +2501,7 @@ int gwp_ctx_thread_entry_io_uring(struct gwp_wrk *w)
 	pr_info(&ctx->lh, "Worker %u started (io_uring)", w->idx);
 
 	if (w->idx == 0 && ctx->ino_fd >= 0)
-		prep_auth_reload(w);
-
-	if (w->idx == 0 && ctx->acl_ino_fd >= 0)
-		prep_acl_reload(w);
+		prep_reload_files(w);
 
 	io_uring_set_iowait(&w->iou->ring, false);
 	arm_stop_poll(w);

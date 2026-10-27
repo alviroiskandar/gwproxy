@@ -16,7 +16,6 @@
 #include <string.h>
 #include <assert.h>
 #include <limits.h>
-#include <sys/inotify.h>
 #ifdef CONFIG_HTTPS
 #include <gwproxy/ssl.h>
 #endif
@@ -272,16 +271,8 @@ int gwp_ctx_init_thread_epoll(struct gwp_wrk *w)
 
 	if (w->idx == 0 && (ctx->ino_fd >= 0)) {
 		ev.events = EPOLLIN;
-		ev.data.u64 = EV_BIT_SOCKS5_AUTH_FILE;
+		ev.data.u64 = EV_BIT_RELOAD_FILES;
 		r = __sys_epoll_ctl(ep_fd, EPOLL_CTL_ADD, ctx->ino_fd, &ev);
-		if (unlikely(r))
-			goto out_free_events;
-	}
-
-	if (w->idx == 0 && (ctx->acl_ino_fd >= 0)) {
-		ev.events = EPOLLIN;
-		ev.data.u64 = EV_BIT_ACL_FILE;
-		r = __sys_epoll_ctl(ep_fd, EPOLL_CTL_ADD, ctx->acl_ino_fd, &ev);
 		if (unlikely(r))
 			goto out_free_events;
 	}
@@ -2255,57 +2246,36 @@ static int handle_ev_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	return r;
 }
 
-static int handle_ev_auth_file(struct gwp_wrk *w)
+/*
+ * Drain the reload watch, then reload each file it named once: an editor
+ * save or a deploy script often fires several records in a row, and each
+ * would otherwise cost a full re-read and re-parse. The drain is bounded so a
+ * directory under constant churn cannot hold worker 0 here.
+ */
+static int handle_ev_reload_files(struct gwp_wrk *w)
 {
-	static const size_t l = sizeof(struct inotify_event) + NAME_MAX + 1;
-	ssize_t r;
-
-	assert(w->ctx->auth);
-
-	r = __sys_read(w->ctx->ino_fd, w->ctx->ino_buf, l);
-	if (unlikely(r < 0)) {
-		if (r == -EINTR || r == -EAGAIN)
-			return 0;
-
-		pr_err(&w->ctx->lh, "Failed to read inotify event: %s", strerror((int)-r));
-		return (int)r;
-	}
-
-	if (!gwp_inotify_event_matches(w->ctx->ino_buf, (size_t)r,
-				       w->ctx->cfg.auth_file))
-		return 0;
-
-	gwp_auth_reload(w->ctx->auth);
-	pr_info(&w->ctx->lh, "Reloaded authentication file");
-	return 0;
-}
-
-static int handle_ev_acl_file(struct gwp_wrk *w)
-{
-	static const size_t l = sizeof(struct inotify_event) + NAME_MAX + 1;
 	struct gwp_ctx *ctx = w->ctx;
+	unsigned flags = 0;
 	ssize_t r;
+	int i;
 
-	assert(ctx->acl);
-
-	r = __sys_read(ctx->acl_ino_fd, ctx->acl_ino_buf, l);
-	if (unlikely(r < 0)) {
-		if (r == -EINTR || r == -EAGAIN)
-			return 0;
-
-		pr_err(&ctx->lh, "Failed to read ACL inotify event: %s",
-			strerror((int)-r));
-		return (int)r;
+	for (i = 0; i < 16; i++) {
+		r = __sys_read(ctx->ino_fd, ctx->ino_buf, GWP_INO_BUF_SIZE);
+		if (r < 0) {
+			if (r == -EINTR)
+				continue;
+			if (r == -EAGAIN)
+				break;
+			pr_err(&ctx->lh, "Failed to read inotify event: %s",
+				strerror((int)-r));
+			return (int)r;
+		}
+		if (!r)
+			break;
+		flags |= gwp_reload_events(ctx, ctx->ino_buf, (size_t)r);
 	}
 
-	if (!gwp_inotify_event_matches(ctx->acl_ino_buf, (size_t)r,
-				       ctx->cfg.acl_file))
-		return 0;
-
-	if (gwp_acl_reload(ctx->acl))
-		pr_warn(&ctx->lh, "Failed to reload ACL file; keeping current rules");
-	else
-		pr_info(&ctx->lh, "Reloaded ACL file");
+	gwp_ctx_reload_files(ctx, flags);
 	return 0;
 }
 
@@ -2826,11 +2796,8 @@ static int handle_event(struct gwp_wrk *w, struct epoll_event *ev)
 	case EV_BIT_DNS_QUERY:
 		r = handle_ev_dns_query(w, udata);
 		break;
-	case EV_BIT_SOCKS5_AUTH_FILE:
-		r = handle_ev_auth_file(w);
-		break;
-	case EV_BIT_ACL_FILE:
-		r = handle_ev_acl_file(w);
+	case EV_BIT_RELOAD_FILES:
+		r = handle_ev_reload_files(w);
 		break;
 	case EV_BIT_RAW_DNS_QUERY:
 		r = handle_ev_raw_dns_query(w);

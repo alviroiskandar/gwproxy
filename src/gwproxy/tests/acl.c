@@ -16,6 +16,9 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdatomic.h>
 
 static struct gwp_sockaddr sa4(const char *ip, uint16_t port)
 {
@@ -891,6 +894,269 @@ static void test_statistic_equal_every_is_uneven(void)
 	gwp_acl_destroy(a);
 }
 
+/*
+ * Write @text to a new temporary file and return its malloc'd path, for the
+ * tests that need gwp_acl_create()/gwp_acl_reload() on a real file.
+ */
+static char *write_tmp_rules(const char *text)
+{
+	const char *dir = getenv("TMPDIR");
+	char *path;
+	size_t len = strlen(text);
+	int fd;
+
+	if (!dir || !*dir)
+		dir = "/tmp";
+	assert(asprintf(&path, "%s/gwp-acl-test.XXXXXX", dir) > 0);
+	fd = mkstemp(path);
+	assert(fd >= 0);
+	assert(write(fd, text, len) == (ssize_t)len);
+	close(fd);
+	return path;
+}
+
+struct reload_reader {
+	struct gwp_acl	*acl;
+	atomic_bool	*stop;
+};
+
+static void *reload_reader_fn(void *arg)
+{
+	struct reload_reader *rr = arg;
+	struct gwp_sockaddr t = sa4("93.184.216.34", 443);
+
+	while (!atomic_load_explicit(rr->stop, memory_order_relaxed))
+		out(rr->acl, &t, NULL, 443, GWP_ACL_PROTO_TCP);
+	return NULL;
+}
+
+static void reload_watchdog(int sig)
+{
+	static const char msg[] =
+		"test_reload_under_readers: reload starved by readers\n";
+
+	(void)sig;
+	if (write(STDERR_FILENO, msg, sizeof(msg) - 1) < 0)
+		_exit(1);
+	_exit(1);
+}
+
+/*
+ * A reload must get the write lock while other threads keep evaluating with
+ * overlapping read sections, as busy workers do. With a reader-preferring
+ * lock it waited for a gap that never came; the watchdog turns that hang
+ * into a failure.
+ */
+static void test_reload_under_readers(void)
+{
+	struct reload_reader rr;
+	pthread_t thr[16];
+	atomic_bool stop = false;
+	struct gwp_sockaddr t = sa4("10.1.2.3", 80);
+	struct gwp_acl *a;
+	long nr_cpu = sysconf(_SC_NPROCESSORS_ONLN);
+	size_t nr, i;
+	char *path;
+
+	nr = nr_cpu > 2 ? (size_t)nr_cpu - 1 : 2;
+	if (nr > 16)
+		nr = 16;
+
+	path = write_tmp_rules(DEFAULT_RULES);
+	assert(!gwp_acl_create(&a, path));
+	rr.acl = a;
+	rr.stop = &stop;
+	for (i = 0; i < nr; i++)
+		assert(!pthread_create(&thr[i], NULL, reload_reader_fn, &rr));
+
+	signal(SIGALRM, reload_watchdog);
+	alarm(20);
+	for (i = 0; i < 50; i++)
+		assert(!gwp_acl_reload(a));
+	alarm(0);
+	signal(SIGALRM, SIG_DFL);
+
+	atomic_store(&stop, true);
+	for (i = 0; i < nr; i++)
+		pthread_join(thr[i], NULL);
+
+	/* The reloaded rules are the same file, so the verdicts are too. */
+	assert(out(a, &t, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+	gwp_acl_destroy(a);
+	unlink(path);
+	free(path);
+}
+
+/*
+ * Callers cache OUTPUT verdicts keyed on the ruleset generation: it must move
+ * on every successful reload and only then, and a chain with a -m statistic
+ * rule must mark its verdicts uncacheable.
+ */
+static void test_generation(void)
+{
+	struct gwp_sockaddr t = sa4("93.184.216.34", 53);
+	struct gwp_acl_req req = {
+		.target = &t, .dport = 53, .proto = GWP_ACL_PROTO_UDP,
+	};
+	struct gwp_acl *a;
+	uint32_t g0;
+	char *path;
+	int fd;
+
+	assert(gwp_acl_generation(NULL) == 0);
+	path = write_tmp_rules("-A OUTPUT --dports 53 -j REJECT\n");
+	assert(!gwp_acl_create(&a, path));
+	g0 = gwp_acl_generation(a);
+	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_REJECT);
+	assert(req.gen == g0 && req.cacheable);
+
+	/* A good reload moves the generation and the verdict with it. */
+	fd = open(path, O_WRONLY | O_TRUNC);
+	assert(fd >= 0);
+	assert(write(fd, "-P OUTPUT REJECT\n-A OUTPUT --dports 53 -j ACCEPT\n",
+		     49) == 49);
+	close(fd);
+	assert(!gwp_acl_reload(a));
+	assert(gwp_acl_generation(a) != g0);
+	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_ACCEPT);
+	assert(req.gen == gwp_acl_generation(a) && req.cacheable);
+	g0 = req.gen;
+
+	/* A failed reload keeps both the rules and the generation. */
+	fd = open(path, O_WRONLY | O_TRUNC);
+	assert(fd >= 0);
+	assert(write(fd, "-A OUTPUT -j BOGUS\n", 19) == 19);
+	close(fd);
+	assert(gwp_acl_reload(a) < 0);
+	assert(gwp_acl_generation(a) == g0);
+
+	/* A statistic rule anywhere in OUTPUT makes verdicts uncacheable. */
+	fd = open(path, O_WRONLY | O_TRUNC);
+	assert(fd >= 0);
+	assert(write(fd, "-A OUTPUT --dports 80 -m statistic --mode nth --every 2 -j REJECT\n",
+		     66) == 66);
+	close(fd);
+	assert(!gwp_acl_reload(a));
+	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_ACCEPT);
+	assert(!req.cacheable);
+
+	gwp_acl_destroy(a);
+	unlink(path);
+	free(path);
+}
+
+static enum gwp_acl_verdict out_memo(struct gwp_acl *a, struct gwp_acl_memo *m,
+				     const char *dom, const char *ip,
+				     uint16_t port)
+{
+	struct gwp_sockaddr t = sa4(ip, port);
+	struct gwp_acl_req req = {
+		.target = &t, .domain = dom, .memo = m, .dport = port,
+		.proto = GWP_ACL_PROTO_TCP,
+	};
+
+	return gwp_acl_eval_output(a, &req);
+}
+
+/*
+ * The -m domain/-m user memo shared by a connection's candidate addresses:
+ * verdicts are the same as without it, the address-dependent criteria are
+ * still evaluated per candidate, rules past its capacity still match, and
+ * a reset is what makes a new domain take effect.
+ */
+static void test_memo(void)
+{
+	static const char rules[] =
+		"-A OUTPUT -m domain --domain bad.example --dports 80 -j REJECT\n"
+		"-A OUTPUT -m domain --domain bad.example --dports 25 -j REJECT\n"
+		"-A OUTPUT -m domain ! --domain bad.example --dports 26 -j REJECT\n";
+	struct gwp_acl_memo m = { 0 };
+	char *big, *p;
+	struct gwp_acl *a;
+	int i;
+
+	assert(!gwp_acl_parse_str(&a, rules));
+	for (i = 0; i < 2; i++) {
+		struct gwp_acl_memo *mp = i ? &m : NULL;
+
+		assert(out_memo(a, mp, "bad.example", "8.8.8.8", 80) == GWP_ACL_REJECT);
+		assert(out_memo(a, mp, "bad.example", "8.8.8.8", 443) == GWP_ACL_ACCEPT);
+		assert(out_memo(a, mp, "bad.example", "8.8.8.8", 25) == GWP_ACL_REJECT);
+		assert(out_memo(a, mp, "bad.example", "8.8.8.8", 26) == GWP_ACL_ACCEPT);
+	}
+	/* Proof the memo is used: without a reset, a new domain is not seen. */
+	assert(out_memo(a, &m, "good.example", "8.8.4.4", 80) == GWP_ACL_REJECT);
+	gwp_acl_memo_reset(&m);
+	assert(out_memo(a, &m, "good.example", "8.8.4.4", 80) == GWP_ACL_ACCEPT);
+	assert(out_memo(a, &m, "good.example", "8.8.8.8", 26) == GWP_ACL_REJECT);
+	gwp_acl_destroy(a);
+
+	/* More name rules than memo slots: the rest is evaluated each time. */
+	big = malloc(100 * 64);
+	assert(big);
+	p = big;
+	for (i = 0; i < GWP_ACL_MEMO_RULES + 6; i++)
+		p += sprintf(p, "-A OUTPUT -m domain --domain h%d.example -j REJECT\n", i);
+	assert(!gwp_acl_parse_str(&a, big));
+	free(big);
+	memset(&m, 0, sizeof(m));
+	for (i = 0; i < 3; i++) {
+		assert(out_memo(a, &m, "h69.example", "8.8.8.8", 80) == GWP_ACL_REJECT);
+		assert(out_memo(a, &m, "h69.example", "8.8.4.4", 80) == GWP_ACL_REJECT);
+	}
+	gwp_acl_memo_reset(&m);
+	assert(out_memo(a, &m, "h70.example", "8.8.8.8", 80) == GWP_ACL_ACCEPT);
+	gwp_acl_destroy(a);
+}
+
+/*
+ * An empty chain is answered from a summary published with the rules,
+ * without the lock: it must follow both the policy and every reload.
+ */
+static void test_empty_chain_policy(void)
+{
+	static const char *const files[] = {
+		"-P INPUT REJECT\n",
+		"-P OUTPUT REJECT\n-A INPUT -s 10.0.0.0/8 -j REJECT\n",
+		"-A OUTPUT --dports 80 -j REJECT\n",
+		"",
+	};
+	/* in(10.1.1.1), in(192.0.2.1), out(:80), out(:443) per file */
+	static const enum gwp_acl_verdict want[][4] = {
+		{ GWP_ACL_REJECT, GWP_ACL_REJECT, GWP_ACL_ACCEPT, GWP_ACL_ACCEPT },
+		{ GWP_ACL_REJECT, GWP_ACL_ACCEPT, GWP_ACL_REJECT, GWP_ACL_REJECT },
+		{ GWP_ACL_ACCEPT, GWP_ACL_ACCEPT, GWP_ACL_REJECT, GWP_ACL_ACCEPT },
+		{ GWP_ACL_ACCEPT, GWP_ACL_ACCEPT, GWP_ACL_ACCEPT, GWP_ACL_ACCEPT },
+	};
+	struct gwp_sockaddr c1 = sa4("10.1.1.1", 1234);
+	struct gwp_sockaddr c2 = sa4("192.0.2.1", 1234);
+	struct gwp_sockaddr t = sa4("93.184.216.34", 80);
+	struct gwp_acl *a;
+	char *path;
+	size_t i;
+	int fd;
+
+	path = write_tmp_rules(files[0]);
+	assert(!gwp_acl_create(&a, path));
+	for (i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+		if (i) {
+			size_t len = strlen(files[i]);
+
+			fd = open(path, O_WRONLY | O_TRUNC);
+			assert(fd >= 0);
+			assert(write(fd, files[i], len) == (ssize_t)len);
+			close(fd);
+			assert(!gwp_acl_reload(a));
+		}
+		assert(in(a, &c1, 1234, GWP_ACL_PROTO_TCP) == want[i][0]);
+		assert(in(a, &c2, 1234, GWP_ACL_PROTO_TCP) == want[i][1]);
+		assert(out(a, &t, NULL, 80, GWP_ACL_PROTO_TCP) == want[i][2]);
+		assert(out(a, &t, NULL, 443, GWP_ACL_PROTO_TCP) == want[i][3]);
+	}
+	gwp_acl_destroy(a);
+	unlink(path);
+	free(path);
+}
 
 static void run_tests(void)
 {
@@ -898,6 +1164,9 @@ static void run_tests(void)
 
 	/* Negative cases print the offending line to stderr; run them once. */
 	test_parse_errors();
+	test_reload_under_readers();
+	test_generation();
+	test_empty_chain_policy();
 
 	for (i = 0; i < 200; i++) {
 		test_default_ruleset();
@@ -910,6 +1179,7 @@ static void run_tests(void)
 		test_mark();
 		test_bind();
 		test_dnat();
+		test_memo();
 		test_comments_and_default_policy();
 		test_statistic_nth();
 		test_statistic_counts_only_matches();

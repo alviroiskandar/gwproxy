@@ -1060,6 +1060,54 @@ static void test_auth(void)
 	PRTEST_OK();
 }
 
+/*
+ * The credential store indexes entries by username: every entry of a large
+ * file must still be found, a duplicate username accepts each of its
+ * passwords, and a line without ':' is a user with an empty password.
+ */
+static void test_auth_store(void)
+{
+	char cred_file[] = "/tmp/gwp_http_auth.XXXXXX";
+	struct gwp_auth *auth = NULL;
+	char u[32], p[32], *data;
+	size_t len = 0, cap = 64 * 1024;
+	ssize_t w;
+	int i;
+
+	data = malloc(cap);
+	assert(data);
+	for (i = 0; i < 2000; i++)
+		len += (size_t)snprintf(data + len, cap - len, "u%d:p%d\n", i, i);
+	len += (size_t)snprintf(data + len, cap - len,
+				"dup:one\ndup:two\nnopass\nempty:\n");
+	w = write_temp_file(cred_file, data, len);
+	assert(w == (ssize_t)len);
+	free(data);
+	assert(!gwp_auth_create(&auth, cred_file));
+
+	for (i = 0; i < 2000; i++) {
+		snprintf(u, sizeof(u), "u%d", i);
+		snprintf(p, sizeof(p), "p%d", i);
+		assert(gwp_auth_check(auth, u, strlen(u), p, strlen(p)));
+		snprintf(p, sizeof(p), "p%d", i + 1);
+		assert(!gwp_auth_check(auth, u, strlen(u), p, strlen(p)));
+	}
+	assert(!gwp_auth_check(auth, "u2000", 5, "p2000", 5));
+	assert(!gwp_auth_check(auth, "u1", 2, "p10", 3));
+	assert(!gwp_auth_check(auth, "u10", 3, "p1", 2));
+	assert(gwp_auth_check(auth, "dup", 3, "one", 3));
+	assert(gwp_auth_check(auth, "dup", 3, "two", 3));
+	assert(!gwp_auth_check(auth, "dup", 3, "three", 5));
+	assert(gwp_auth_check(auth, "nopass", 6, NULL, 0));
+	assert(!gwp_auth_check(auth, "nopass", 6, "x", 1));
+	assert(gwp_auth_check(auth, "empty", 5, "", 0));
+	assert(!gwp_auth_check(auth, "", 0, "", 0));
+
+	gwp_auth_destroy(auth);
+	unlink(cred_file);
+	PRTEST_OK();
+}
+
 int main(void)
 {
 	size_t i;
@@ -1088,6 +1136,7 @@ int main(void)
 
 	/* Byte-by-byte feeding of 17 KiB headers: once is enough. */
 	test_incremental();
+	test_auth_store();
 
 	printf("All tests passed!\n");
 	return 0;

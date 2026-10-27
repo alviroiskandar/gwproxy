@@ -1022,7 +1022,7 @@ static const char *path_basename(const char *path)
  * fires again. Watching the directory for IN_CLOSE_WRITE (in-place writes) and
  * IN_MOVED_TO (rename-into-place) catches both update styles; handlers narrow
  * the reported events down to the file's basename with
- * gwp_inotify_event_matches(). Returns the watch descriptor or -errno.
+ * gwp_reload_events(). Returns the watch descriptor or -errno.
  */
 static int add_reload_watch(int ino_fd, const char *path)
 {
@@ -1048,14 +1048,24 @@ static int add_reload_watch(int ino_fd, const char *path)
 	return (r < 0) ? -errno : r;
 }
 
-/*
- * True when a drained inotify buffer names the basename of `path`. The reload
- * watches sit on the parent directory (see add_reload_watch), so handlers call
- * this to reload only for their own file and ignore unrelated directory churn.
- */
-bool gwp_inotify_event_matches(const void *buf, size_t len, const char *path)
+/* True when inotify record @e names the basename of @path (NULL: never). */
+static bool inotify_names(const struct inotify_event *e, const char *path)
 {
-	const char *base = path_basename(path);
+	return path && e->len && !strcmp(e->name, path_basename(path));
+}
+
+/*
+ * Classify a drained inotify buffer into the GWP_RELOAD_* files it names. The
+ * watches sit on the parent directories (see add_reload_watch), so records for
+ * unrelated directory churn are ignored, and a burst of records for the same
+ * file still yields a single reload.
+ */
+unsigned gwp_reload_events(const struct gwp_ctx *ctx, const void *buf,
+			   size_t len)
+{
+	const char *auth = ctx->auth ? ctx->cfg.auth_file : NULL;
+	const char *acl = ctx->acl_watched ? ctx->cfg.acl_file : NULL;
+	unsigned flags = 0;
 	size_t off = 0;
 
 	while (off + sizeof(struct inotify_event) <= len) {
@@ -1065,26 +1075,115 @@ bool gwp_inotify_event_matches(const void *buf, size_t len, const char *path)
 
 		/*
 		 * The kernel dropped events (queue overflow, delivered as a
-		 * nameless wd=-1 record). Our file's change may have been among
-		 * the lost ones, so force a reload rather than miss it.
+		 * nameless wd=-1 record). A watched file's change may have been
+		 * among the lost ones, so force a reload rather than miss it.
 		 */
 		if (e->mask & IN_Q_OVERFLOW)
-			return true;
+			return GWP_RELOAD_AUTH | GWP_RELOAD_ACL;
 
 		if (off + rec > len)
 			break;
-		if (e->len && !strcmp(e->name, base))
-			return true;
+		if (inotify_names(e, auth))
+			flags |= GWP_RELOAD_AUTH;
+		if (inotify_names(e, acl))
+			flags |= GWP_RELOAD_ACL;
 		off += rec;
 	}
-	return false;
+	return flags;
+}
+
+/* Reload the files named by @flags (GWP_RELOAD_*), logging the outcome. */
+void gwp_ctx_reload_files(struct gwp_ctx *ctx, unsigned flags)
+{
+	if ((flags & GWP_RELOAD_AUTH) && ctx->auth) {
+		if (gwp_auth_reload(ctx->auth))
+			pr_warn(&ctx->lh, "Failed to reload authentication file; keeping current credentials");
+		else
+			pr_info(&ctx->lh, "Reloaded authentication file");
+	}
+	if ((flags & GWP_RELOAD_ACL) && ctx->acl_watched) {
+		if (gwp_acl_reload(ctx->acl))
+			pr_warn(&ctx->lh, "Failed to reload ACL file; keeping current rules");
+		else
+			pr_info(&ctx->lh, "Reloaded ACL file");
+	}
 }
 
 /*
- * Load the shared credential store from the auth file (if configured) and set
- * up an inotify watch so it is hot-reloaded on change. The store is shared by
- * the SOCKS5 and HTTP CONNECT front-ends. Leaves ctx->auth NULL (and the
- * inotify fields disabled) when no auth file is configured.
+ * One inotify instance watches both the auth file and the ACL file, so when
+ * they share a directory each event is read once, not once per store. Worker 0
+ * polls it. Leaves ino_fd at -1 when neither file is configured.
+ */
+static int gwp_ctx_init_reload(struct gwp_ctx *ctx)
+{
+	struct gwp_cfg *cfg = &ctx->cfg;
+	int r;
+
+	ctx->ino_fd = -1;
+	ctx->ino_buf = NULL;
+	if (!ctx->auth && !ctx->acl_watched)
+		return 0;
+
+	r = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+	if (r < 0) {
+		r = -errno;
+		pr_err(&ctx->lh, "Failed to initialize inotify: %s", strerror(-r));
+		return r;
+	}
+	ctx->ino_fd = r;
+	pr_dbg(&ctx->lh, "Inotify file descriptor initialized (fd=%d)", r);
+
+	if (ctx->auth) {
+		r = add_reload_watch(ctx->ino_fd, cfg->auth_file);
+		if (r < 0) {
+			pr_err(&ctx->lh, "Failed to add inotify watch for '%s': %s",
+				cfg->auth_file, strerror(-r));
+			goto out_err;
+		}
+		pr_dbg(&ctx->lh, "Inotify watch added for '%s' (wd=%d)",
+			cfg->auth_file, r);
+	}
+
+	if (ctx->acl_watched) {
+		r = add_reload_watch(ctx->ino_fd, cfg->acl_file);
+		if (r < 0) {
+			pr_err(&ctx->lh, "Failed to add inotify watch for '%s': %s",
+				cfg->acl_file, strerror(-r));
+			goto out_err;
+		}
+		pr_dbg(&ctx->lh, "Inotify watch added for '%s' (wd=%d)",
+			cfg->acl_file, r);
+	}
+
+	ctx->ino_buf = malloc(GWP_INO_BUF_SIZE);
+	if (!ctx->ino_buf) {
+		pr_err(&ctx->lh, "Failed to allocate inotify buffer: %s", strerror(ENOMEM));
+		r = -ENOMEM;
+		goto out_err;
+	}
+	return 0;
+
+out_err:
+	__sys_close(ctx->ino_fd);
+	ctx->ino_fd = -1;
+	return r;
+}
+
+static void gwp_ctx_free_reload(struct gwp_ctx *ctx)
+{
+	free(ctx->ino_buf);
+	ctx->ino_buf = NULL;
+	if (ctx->ino_fd >= 0) {
+		__sys_close(ctx->ino_fd);
+		ctx->ino_fd = -1;
+	}
+}
+
+/*
+ * Load the shared credential store from the auth file (if configured). The
+ * store is shared by the SOCKS5 and HTTP CONNECT front-ends and hot-reloaded
+ * through gwp_ctx_init_reload()'s watch. Leaves ctx->auth NULL when no auth
+ * file is configured.
  */
 static int gwp_ctx_init_auth(struct gwp_ctx *ctx)
 {
@@ -1092,8 +1191,6 @@ static int gwp_ctx_init_auth(struct gwp_ctx *ctx)
 	int r;
 
 	ctx->auth = NULL;
-	ctx->ino_fd = -1;
-	ctx->ino_buf = NULL;
 
 	if (!cfg->auth_file || !*cfg->auth_file) {
 		pr_dbg(&ctx->lh, "Authentication disabled (no auth file)");
@@ -1104,59 +1201,14 @@ static int gwp_ctx_init_auth(struct gwp_ctx *ctx)
 	if (r < 0) {
 		pr_err(&ctx->lh, "Failed to load auth file '%s': %s",
 			cfg->auth_file, strerror(-r));
+		ctx->auth = NULL;
 		return r;
 	}
-
-	r = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
-	if (r < 0) {
-		pr_err(&ctx->lh, "Failed to initialize inotify: %s", strerror(-r));
-		goto out_err;
-	}
-
-	pr_dbg(&ctx->lh, "Inotify file descriptor initialized (fd=%d)", r);
-
-	ctx->ino_fd = r;
-	r = add_reload_watch(ctx->ino_fd, cfg->auth_file);
-	if (r < 0) {
-		pr_err(&ctx->lh, "Failed to add inotify watch: %s", strerror(-r));
-		goto out_err;
-	}
-
-	pr_dbg(&ctx->lh, "Inotify watch added for '%s' (wd=%d)", cfg->auth_file, r);
-
-	ctx->ino_buf = malloc(sizeof(struct inotify_event) + NAME_MAX + 1);
-	if (!ctx->ino_buf) {
-		pr_err(&ctx->lh, "Failed to allocate inotify buffer: %s", strerror(ENOMEM));
-		r = -ENOMEM;
-		goto out_err;
-	}
-
 	return 0;
-
-out_err:
-	if (ctx->ino_fd >= 0) {
-		__sys_close(ctx->ino_fd);
-		ctx->ino_fd = -1;
-	}
-	gwp_auth_destroy(ctx->auth);
-	ctx->auth = NULL;
-	return r;
 }
 
 static void gwp_ctx_free_auth(struct gwp_ctx *ctx)
 {
-	if (ctx->ino_buf) {
-		free(ctx->ino_buf);
-		ctx->ino_buf = NULL;
-		pr_dbg(&ctx->lh, "Inotify buffer freed");
-	}
-
-	if (ctx->ino_fd >= 0) {
-		__sys_close(ctx->ino_fd);
-		ctx->ino_fd = -1;
-		pr_dbg(&ctx->lh, "Inotify file descriptor closed");
-	}
-
 	gwp_auth_destroy(ctx->auth);
 	ctx->auth = NULL;
 }
@@ -1207,12 +1259,12 @@ static const char gwp_acl_default_rules[] =
 	"-P OUTPUT ACCEPT\n";
 
 /*
- * Load the ACL rule file (--acl-file) and watch it for changes so it is
- * hot-reloaded, mirroring the auth store. Unlike auth (prot-only), the ACL is
- * global to every proxy mode, so this is initialised from gwp_ctx_init()
+ * Load the ACL rule file (--acl-file); gwp_ctx_init_reload() then watches it
+ * so it is hot-reloaded, like the auth store. Unlike auth (prot-only), the ACL
+ * is global to every proxy mode, so this is initialised from gwp_ctx_init()
  * regardless of SOCKS5/HTTP/transparent/plain forwarding. With no file it
- * applies the built-in default ACL, unless --acl-allow-all leaves it disabled
- * (NULL, watch fd -1).
+ * applies the built-in default ACL (not watched), unless --acl-allow-all
+ * leaves it disabled (NULL).
  */
 static int gwp_ctx_init_acl(struct gwp_ctx *ctx)
 {
@@ -1220,8 +1272,7 @@ static int gwp_ctx_init_acl(struct gwp_ctx *ctx)
 	int r;
 
 	ctx->acl = NULL;
-	ctx->acl_ino_fd = -1;
-	ctx->acl_ino_buf = NULL;
+	ctx->acl_watched = false;
 
 	if (!cfg->acl_file || !*cfg->acl_file) {
 		if (cfg->acl_allow_all) {
@@ -1249,52 +1300,16 @@ static int gwp_ctx_init_acl(struct gwp_ctx *ctx)
 		return r;
 	}
 
-	r = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
-	if (r < 0) {
-		pr_err(&ctx->lh, "Failed to initialize ACL inotify: %s",
-			strerror(-r));
-		goto out_err;
-	}
-	ctx->acl_ino_fd = r;
-
-	r = add_reload_watch(ctx->acl_ino_fd, cfg->acl_file);
-	if (r < 0) {
-		pr_err(&ctx->lh, "Failed to add ACL inotify watch: %s",
-			strerror(-r));
-		goto out_err;
-	}
-
-	ctx->acl_ino_buf = malloc(sizeof(struct inotify_event) + NAME_MAX + 1);
-	if (!ctx->acl_ino_buf) {
-		r = -ENOMEM;
-		goto out_err;
-	}
-
+	ctx->acl_watched = true;
 	pr_info(&ctx->lh, "Loaded ACL file '%s'", cfg->acl_file);
 	return 0;
-
-out_err:
-	if (ctx->acl_ino_fd >= 0) {
-		__sys_close(ctx->acl_ino_fd);
-		ctx->acl_ino_fd = -1;
-	}
-	gwp_acl_destroy(ctx->acl);
-	ctx->acl = NULL;
-	return r;
 }
 
 static void gwp_ctx_free_acl(struct gwp_ctx *ctx)
 {
-	if (ctx->acl_ino_buf) {
-		free(ctx->acl_ino_buf);
-		ctx->acl_ino_buf = NULL;
-	}
-	if (ctx->acl_ino_fd >= 0) {
-		__sys_close(ctx->acl_ino_fd);
-		ctx->acl_ino_fd = -1;
-	}
 	gwp_acl_destroy(ctx->acl);
 	ctx->acl = NULL;
+	ctx->acl_watched = false;
 }
 
 /*
@@ -1315,21 +1330,46 @@ static int upstream_dst_from_sockaddr(const struct gwp_sockaddr *sa,
 				      struct gwp_socks5_addr *out);
 
 /*
+ * Fill the inputs of an OUTPUT request for @target (NULL when only a domain is
+ * known) from @client, with the optional requested @domain / @user. Only the
+ * inputs: gwp_acl_eval_output() resets the output flags itself, and the
+ * output payloads are only read behind those flags, so zeroing the whole
+ * request first would be done twice.
+ */
+static void acl_out_req(struct gwp_acl_req *req,
+			const struct gwp_sockaddr *client,
+			const struct gwp_sockaddr *target,
+			const char *domain, const char *user,
+			enum gwp_acl_proto proto)
+{
+	req->memo = NULL;
+	req->client = client;
+	req->target = target;
+	req->domain = domain;
+	req->user = user;
+	req->proto = proto;
+	req->dport = target ? sa_port_h(target) : 0;
+	req->sport = client ? sa_port_h(client) : 0;
+}
+
+/*
  * Evaluate the ACL OUTPUT chain for a connection to @target from @client (with
  * an optional requested @domain / @user). Returns the verdict; allows (with no
- * eval) when there is no ACL, or nothing to match on. When @do_dnat is set and a
- * matching -j DNAT rule produced a concrete address, the rewritten destination
- * is written back to *@target (for the direct connection and, via the caller,
- * the upstream) and *@dnat_out (when non-NULL) is set true. Composable -j MARK /
- * -j BIND modifiers are surfaced in *@so_out.
+ * eval) when there is no ACL, or nothing to match on. When a matching -j DNAT
+ * rule produced a concrete address, the rewritten destination is written back
+ * to *@target (for the direct connection and, via the caller, the upstream)
+ * and *@dnat_out (when non-NULL) is set true. Composable -j MARK / -j BIND
+ * modifiers are surfaced in *@so_out. @memo (may be NULL) carries the
+ * -m domain/-m user results between evaluations of the same request.
  */
 static enum gwp_acl_verdict acl_out(struct gwp_ctx *ctx,
 				    const struct gwp_sockaddr *client,
 				    struct gwp_sockaddr *target,
 				    const char *domain, const char *user,
+				    struct gwp_acl_memo *memo,
 				    struct gwp_conn_sockopt *so_out,
 				    bool *dnat_out,
-				    enum gwp_acl_proto proto, bool do_dnat)
+				    enum gwp_acl_proto proto)
 {
 	int fam = target ? target->sa.sa_family : 0;
 	bool have_ip = (fam == AF_INET || fam == AF_INET6);
@@ -1347,15 +1387,8 @@ static enum gwp_acl_verdict acl_out(struct gwp_ctx *ctx,
 	if (!have_ip && !domain)
 		return GWP_ACL_ACCEPT;
 
-	memset(&req, 0, sizeof(req));
-	req.client = client;
-	req.target = have_ip ? target : NULL;
-	req.domain = domain;
-	req.user = user;
-	req.proto = proto;
-	req.dport = have_ip ? sa_port_h(target) : 0;
-	req.sport = client ? sa_port_h(client) : 0;
-
+	acl_out_req(&req, client, have_ip ? target : NULL, domain, user, proto);
+	req.memo = memo;
 	v = gwp_acl_eval_output(ctx->acl, &req);
 	if (v != GWP_ACL_ACCEPT)
 		return v;
@@ -1366,7 +1399,7 @@ static enum gwp_acl_verdict acl_out(struct gwp_ctx *ctx,
 	 * caller, the upstream destination. A port-only DNAT with no base IP
 	 * (e.g. a socks5h domain request) yields no address and is skipped.
 	 */
-	if (do_dnat && req.dnat_applied && req.dnat.sa.sa_family) {
+	if (req.dnat_applied && req.dnat.sa.sa_family) {
 		if (have_ip)
 			pr_info(&ctx->lh, "ACL DNAT %s -> %s",
 				ip_to_str(target), ip_to_str(&req.dnat));
@@ -1387,18 +1420,6 @@ static enum gwp_acl_verdict acl_out(struct gwp_ctx *ctx,
 	return v;
 }
 
-/* Verdict only (no DNAT), for the UDP relay's per-datagram target. */
-bool gwp_ctx_acl_output_allowed(struct gwp_ctx *ctx,
-				const struct gwp_sockaddr *client,
-				const struct gwp_sockaddr *target,
-				const char *user, enum gwp_acl_proto proto)
-{
-	struct gwp_sockaddr tmp = *target;
-
-	return acl_out(ctx, client, &tmp, NULL, user, NULL, NULL, proto,
-		       false) == GWP_ACL_ACCEPT;
-}
-
 /* Verdict + DNAT rewrite of *@target, for the accept-time plain/transparent
  * forwarding path (which has no gwp_conn_pair yet, hence no username). */
 bool gwp_ctx_acl_output_dnat(struct gwp_ctx *ctx,
@@ -1407,8 +1428,8 @@ bool gwp_ctx_acl_output_dnat(struct gwp_ctx *ctx,
 			     struct gwp_conn_sockopt *so,
 			     enum gwp_acl_proto proto)
 {
-	return acl_out(ctx, client, target, NULL, NULL, so, NULL, proto,
-		       true) == GWP_ACL_ACCEPT;
+	return acl_out(ctx, client, target, NULL, NULL, NULL, so, NULL,
+		       proto) == GWP_ACL_ACCEPT;
 }
 
 /* The authenticated username for an ACL "-m user" match, or NULL when the
@@ -1422,14 +1443,52 @@ static const char *gcp_req_user(const struct gwp_conn_pair *gcp)
 	return NULL;
 }
 
+/*
+ * OUTPUT verdict for a UDP ASSOCIATE datagram to @target. Only the verdict
+ * applies to UDP (no DNAT, MARK or BIND), and every input but the target is
+ * fixed for the association (pinned peer, username), so the last target's
+ * verdict is reused while the target and the ruleset generation stay the
+ * same: a client streaming to one peer costs one evaluation, not one per
+ * datagram. A chain with a -m statistic rule is evaluated every time, as its
+ * answer changes per evaluation.
+ */
+static bool udp_target_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
+			       const struct gwp_sockaddr *target)
+{
+	struct gwp_udp_acl_cache *c = &gcp->udp_acl;
+	struct gwp_acl_req req;
+	bool ok;
+
+	if (!ctx->acl)
+		return true;
+	if (c->valid && c->gen == gwp_acl_generation(ctx->acl) &&
+	    gwp_sockaddr_eq(&c->dst, target))
+		return c->ok;
+
+	acl_out_req(&req, &gcp->udp_peer, target, NULL, gcp_req_user(gcp),
+		    GWP_ACL_PROTO_UDP);
+	ok = gwp_acl_eval_output(ctx->acl, &req) == GWP_ACL_ACCEPT;
+
+	c->valid = req.cacheable;
+	c->gen = req.gen;
+	c->dst = *target;
+	c->ok = ok;
+	return ok;
+}
+
 bool gwp_ctx_acl_target_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp)
 {
 	bool dnat = false;
 	enum gwp_acl_verdict v;
 
+	/*
+	 * Only a walk over several candidates evaluates the same domain and
+	 * user more than once; gwp_conn_set_candidates() resets the memo for
+	 * each new list.
+	 */
 	v = acl_out(ctx, &gcp->client_addr, &gcp->target_addr, gcp->req_domain,
-		    gcp_req_user(gcp), &gcp->acl_sockopt, &dnat,
-		    GWP_ACL_PROTO_TCP, true);
+		    gcp_req_user(gcp), gcp->nr_cand > 1 ? &gcp->acl_memo : NULL,
+		    &gcp->acl_sockopt, &dnat, GWP_ACL_PROTO_TCP);
 	if (v != GWP_ACL_ACCEPT)
 		return false;
 
@@ -1593,8 +1652,6 @@ static int gwp_ctx_init_prot(struct gwp_ctx *ctx)
 
 	ctx->socks5 = NULL;
 	ctx->auth = NULL;
-	ctx->ino_fd = -1;
-	ctx->ino_buf = NULL;
 
 	/*
 	 * SOCKS5 and HTTP may run together on the same port: the connection
@@ -1935,9 +1992,13 @@ static int gwp_ctx_init(struct gwp_ctx *ctx)
 	if (r < 0)
 		goto out_free_prot;
 
-	r = gwp_ctx_init_dns(ctx);
+	r = gwp_ctx_init_reload(ctx);
 	if (r < 0)
 		goto out_free_acl;
+
+	r = gwp_ctx_init_dns(ctx);
+	if (r < 0)
+		goto out_free_reload;
 
 	r = gwp_ctx_init_threads(ctx);
 	if (r < 0) {
@@ -1949,6 +2010,8 @@ static int gwp_ctx_init(struct gwp_ctx *ctx)
 
 out_free_dns:
 	gwp_ctx_free_dns(ctx);
+out_free_reload:
+	gwp_ctx_free_reload(ctx);
 out_free_acl:
 	gwp_ctx_free_acl(ctx);
 out_free_prot:
@@ -1973,6 +2036,7 @@ static void gwp_ctx_free(struct gwp_ctx *ctx)
 	gwp_ctx_stop(ctx);
 	gwp_ctx_free_threads(ctx);
 	gwp_ctx_free_dns(ctx);
+	gwp_ctx_free_reload(ctx);
 	gwp_ctx_free_acl(ctx);
 	gwp_ctx_free_prot(ctx);
 	gwp_ctx_free_tls(ctx);
@@ -2789,6 +2853,7 @@ void gwp_conn_set_candidates(struct gwp_conn_pair *gcp,
 	memcpy(gcp->cand, addrs, (size_t)nr * sizeof(*addrs));
 	gcp->nr_cand = nr;
 	gcp->next_cand = 0;
+	gwp_acl_memo_reset(&gcp->acl_memo);
 
 	/*
 	 * Keep target_addr meaningful for callers that read it before the
@@ -3104,9 +3169,7 @@ enum gwp_udp_act gwp_udp_relay_classify(struct gwp_wrk *w,
 		 */
 		if (!gwp_ctx_outgoing_family_ok(w->ctx, &tsa))
 			return GWP_UDP_DROP;	/* wrong family for this proxy */
-		if (!gwp_ctx_acl_output_allowed(w->ctx, &gcp->udp_peer, &tsa,
-						gcp_req_user(gcp),
-						GWP_ACL_PROTO_UDP))
+		if (!udp_target_allowed(w->ctx, gcp, &tsa))
 			return GWP_UDP_DROP;	/* ACL denied this datagram */
 		out->buf = base + hdr_len;
 		out->len = n - hdr_len;
