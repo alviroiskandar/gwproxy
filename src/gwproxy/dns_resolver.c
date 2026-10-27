@@ -191,9 +191,27 @@ static int init_udp_sock(struct gwp_dns_resolver *gdr, const char *srv_addr)
 {
 	static const int type = SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC;
 	struct gwp_sockaddr addr;
+	bool has_port;
 	int f, r;
 
-	r = convert_str_to_ssaddr(srv_addr, &addr, 53);
+	/*
+	 * convert_str_to_ssaddr() ignores an explicit port in the string when
+	 * a non-zero default_port is passed, so only pass the default when the
+	 * address has no port of its own -- the same dance
+	 * gwp_parse_upstream_socks5() does. Without it "--dns-server" silently
+	 * queried port 53 whatever the user asked for, and since the socket is
+	 * connected, the ICMP unreachable that came back from the port nothing
+	 * was listening on surfaced as -ECONNREFUSED on the next recv.
+	 */
+	if (srv_addr[0] == '[') {
+		const char *rb = strchr(srv_addr, ']');
+
+		has_port = rb && rb[1] == ':';
+	} else {
+		has_port = strchr(srv_addr, ':') != NULL;
+	}
+
+	r = convert_str_to_ssaddr(srv_addr, &addr, has_port ? 0 : 53);
 	if (r)
 		return r;
 

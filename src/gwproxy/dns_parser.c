@@ -38,6 +38,35 @@ static ssize_t construct_qname(uint8_t *dst, size_t dst_len, const char *qname)
 	return total;
 }
 
+/*
+ * Step over a literal (uncompressed) name at @idx, returning the offset just
+ * past its terminating zero, or -EINVAL if it runs off the end. A label that
+ * turns out to be a compression pointer ends the name too, per RFC 1035
+ * Section 4.1.4.
+ */
+static int skip_literal_name(const uint8_t *in, size_t in_len, size_t idx)
+{
+	while (idx < in_len) {
+		uint8_t len = in[idx];
+
+		if (!len)
+			return (int)(idx + 1);
+
+		if (DNS_IS_COMPRESSED((uint16_t)len << 8)) {
+			if (idx + 2 > in_len)
+				return -EINVAL;
+			return (int)(idx + 2);
+		}
+
+		if (len > 63)
+			return -EINVAL;
+
+		idx += (size_t)len + 1;
+	}
+
+	return -EINVAL;
+}
+
 static int calculate_question_len(uint8_t *in, size_t in_len)
 {
 	const uint8_t *p = in;
@@ -45,13 +74,21 @@ static int calculate_question_len(uint8_t *in, size_t in_len)
 
 	tot_len = 0;
 	while (true) {
+		/*
+		 * Bound first, dereference second. The other order read *p
+		 * after the previous iteration had already stepped past the
+		 * end -- a label length byte is up to 255, so one stride was
+		 * enough to leave the buffer, and 0xC0 (what a compression
+		 * pointer's first byte looks like, which this parser does not
+		 * understand) strides 193.
+		 */
+		if (tot_len >= (int)in_len)
+			return -ENOBUFS;
+
 		if (*p == 0x0) {
 			tot_len++;
 			break;
 		}
-
-		if (tot_len >= (int)in_len)
-			return -ENOBUFS;
 
 		advance_len = *p + 1;
 		tot_len += advance_len;
@@ -137,11 +174,34 @@ static int serialize_answ(uint16_t txid, uint8_t *in, size_t in_len, gwdns_answ_
 			goto exit_free;
 		}
 
+		if (idx + sizeof(is_compressed) > in_len) {
+			ret = -EAGAIN;
+			free(item);
+			goto exit_free;
+		}
 		memcpy(&is_compressed, &in[idx], sizeof(is_compressed));
 		is_compressed = ntohs(is_compressed);
 		is_compressed = DNS_IS_COMPRESSED(is_compressed);
-		assert(is_compressed);
-		idx += 2; // NAME
+		if (is_compressed) {
+			idx += 2; // NAME
+		} else {
+			/*
+			 * Compression is an option, not an obligation
+			 * (RFC 1035 Section 4.1.4): a responder may write the
+			 * owner name out in full, and plenty do. A label
+			 * length is 0..63, so its top two bits are always
+			 * clear and this arm is what a literal name takes.
+			 * Asserting here brought the whole proxy down on a
+			 * conforming answer; walking the labels is all it
+			 * ever needed.
+			 */
+			ret = skip_literal_name(in, in_len, idx);
+			if (ret < 0) {
+				free(item);
+				goto exit_free;
+			}
+			idx = (size_t)ret;
+		}
 		if (idx >= in_len) {
 			ret = -EAGAIN;
 			free(item);
@@ -191,6 +251,20 @@ static int serialize_answ(uint16_t txid, uint8_t *in, size_t in_len, gwdns_answ_
 			}
 			break;
 		case TYPE_CNAME:
+			/*
+			 * @rdlength is 16 bits of whatever the responder sent,
+			 * so this is the one arm that moves the cursor by an
+			 * attacker's number. Every other field re-checks the
+			 * bound afterwards; this one jumped straight back to
+			 * the top of the loop, where the first thing read is
+			 * in[idx] -- up to 64 KiB past a 512-byte stack
+			 * buffer.
+			 */
+			if ((size_t)2 + rdlength > in_len - idx) {
+				ret = -EINVAL;
+				free(item);
+				goto exit_free;
+			}
 			idx += 2 + rdlength;
 			free(item);
 			continue;
@@ -217,14 +291,20 @@ static int serialize_answ(uint16_t txid, uint8_t *in, size_t in_len, gwdns_answ_
 			goto exit_free;
 		}
 
-		memcpy(ptr, &in[idx], rdlength);
-		idx += rdlength;
-		if (idx > in_len) {
+		/*
+		 * Check before copying, not after: the old order had already
+		 * read past the end by the time it noticed. An AAAA claims 16
+		 * bytes of RDATA, so a response ending one byte in took 15
+		 * from beyond the buffer.
+		 */
+		if ((size_t)rdlength > in_len - idx) {
 			ret = -EINVAL;
 			free(item);
 			free(ptr);
 			goto exit_free;
 		}
+		memcpy(ptr, &in[idx], rdlength);
+		idx += rdlength;
 
 		item->rdata = ptr;
 		out->rr_answ[out->hdr.ancount] = item;
