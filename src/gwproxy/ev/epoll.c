@@ -2440,7 +2440,7 @@ static int handle_conn_state_socks5(struct gwp_wrk *w, struct gwp_conn_pair *gcp
 static int chk_http(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int r)
 {
 	if (r == -EINPROGRESS && gcp->conn_state == CONN_STATE_HTTP_DNS_QUERY)
-		return arm_poll_for_dns_query(w, gcp);
+		return chk_handle_dns_query(w, gcp);
 
 	if (r == 0 && gcp->conn_state == CONN_STATE_HTTP_CONNECT)
 		return handle_connect(w, gcp);

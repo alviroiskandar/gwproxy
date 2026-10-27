@@ -103,6 +103,28 @@ for loop in epoll; do
 		kill "$dns_pid" 2>/dev/null
 	done
 
+	# The HTTP proxy resolves through the same raw resolver. Its CONNECT
+	# path used to treat the pending raw query as a getaddrinfo() entry
+	# and hand a field of the DNS packet to epoll_ctl() as a descriptor,
+	# so the query was never even sent.
+	dp="$(pick_port)"
+	python3 "$SERVERS_DIR/dns_malformed.py" good "$dp" 2>/dev/null &
+	dns_pid=$!
+	_PIDS+=("$dns_pid")
+	sleep 0.4
+	p="$(pick_port)"
+	gwp_start "127.0.0.1:$p" --as-http=1 --raw-dns=1 \
+		--dns-server="127.0.0.1:$dp" --event-loop="$loop" --nr-workers=1
+	code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 \
+		-p -x "http://127.0.0.1:$p" "http://probe.example.com:$hp/index.html")"
+	[ "$code" = 200 ] || \
+		fail "[$loop] HTTP CONNECT through raw DNS got '$code' (want 200)"
+	kill -0 "$GWP_PID" 2>/dev/null || \
+		fail "[$loop] proxy died on an HTTP CONNECT through raw DNS"
+	kill "$GWP_PID" 2>/dev/null
+	wait "$GWP_PID" 2>/dev/null
+	kill "$dns_pid" 2>/dev/null
+
 	# ...and the case where no response comes back at all. The socket is
 	# connected, so a DNS server that is simply not there answers with an
 	# ICMP port unreachable, which surfaces as -ECONNREFUSED on recv. That
