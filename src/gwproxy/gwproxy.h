@@ -605,10 +605,20 @@ struct gwp_wrk {
 			int			ep_fd;
 			int			ev_fd;
 			struct epoll_event	*events;
+			/*
+			 * Pairs torn down while the current batch of events is
+			 * handled. They are only marked dying then, and freed
+			 * once the batch is done, because a later event in the
+			 * same batch may still point at them.
+			 */
+			struct gwp_conn_pair	**dead;
 			uint16_t		evsz;
+			uint16_t		nr_dead;
+			uint16_t		dead_cap;
 			/*
 			 * If it's true, the worker MUST call epoll_wait() again
-			 * before continue iterating over the events.
+			 * before continue iterating over the events. Only set
+			 * when @dead is full and a pair had to be freed at once.
 			 */
 			bool			ev_need_reload;
 		};
