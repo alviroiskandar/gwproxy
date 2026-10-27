@@ -108,36 +108,16 @@ static int handle_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 static int free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 static ssize_t __do_send(struct gwp_conn *src, struct gwp_conn *dst);
 
-static int handle_ev_raw_dns_query(struct gwp_wrk *w)
+static int handle_raw_dns_reply(struct gwp_wrk *w, uint8_t *buf, uint16_t len)
 {
 	struct gwp_dns_resolver *res = &w->dns->resolvers[0];
 	struct gwp_sockaddr addrs[GWP_MAX_CONN_CAND];
 	struct gwp_conn_pair *gcp = NULL;
 	struct gwp_ctx *ctx = w->ctx;
-	uint8_t buf[UDP_MSG_LIMIT];
 	uint8_t nr = 0;
-	uint16_t len;
 	ssize_t ret;
 	int r;
 
-	ret = __sys_recv(res->udp_fd, buf, sizeof(buf), 0);
-	if (unlikely(ret < 0)) {
-		/*
-		 * Nothing that arrives on this socket may take the worker
-		 * down with it. The descriptor is connected, so an ICMP port
-		 * unreachable from a DNS server that is down -- or simply not
-		 * listening where we were told -- is reported here as
-		 * -ECONNREFUSED, and returning it broke the event loop and
-		 * killed every connection the worker was carrying. The
-		 * pending queries time out on their own.
-		 */
-		if (ret != -EAGAIN && ret != -EINTR)
-			pr_err(&ctx->lh, "DNS socket recv failed: %s",
-			       strerror((int)-ret));
-		return 0;
-	}
-
-	len = (uint16_t)ret;
 	ret = gwp_dns_res_fetch_gcp_by_payload(res, buf, len, &gcp);
 	if (unlikely(ret < 0))
 		return 0;
@@ -187,6 +167,48 @@ out:
 	 */
 	if (unlikely(r))
 		return free_conn_pair(w, gcp);
+
+	return 0;
+}
+/*
+ * Replies read per wakeup, at most: enough to take a burst in one go, few
+ * enough that a flood on this socket cannot starve the worker's other
+ * events. The socket is level-triggered, so whatever is left wakes the
+ * loop again.
+ */
+#define GWP_RAW_DNS_BUDGET	64
+
+static int handle_ev_raw_dns_query(struct gwp_wrk *w)
+{
+	struct gwp_dns_resolver *res = &w->dns->resolvers[0];
+	struct gwp_ctx *ctx = w->ctx;
+	uint8_t buf[UDP_MSG_LIMIT];
+	ssize_t ret;
+	int i, r;
+
+	for (i = 0; i < GWP_RAW_DNS_BUDGET; i++) {
+		ret = __sys_recv(res->udp_fd, buf, sizeof(buf), 0);
+		if (ret < 0) {
+			/*
+			 * Nothing that arrives on this socket may take the
+			 * worker down with it. The descriptor is connected,
+			 * so an ICMP port unreachable from a DNS server that
+			 * is down -- or simply not listening where we were
+			 * told -- is reported here as -ECONNREFUSED, and
+			 * returning it broke the event loop and killed every
+			 * connection the worker was carrying. The pending
+			 * queries time out on their own.
+			 */
+			if (ret != -EAGAIN && ret != -EINTR)
+				pr_err(&ctx->lh, "DNS socket recv failed: %s",
+				       strerror((int)-ret));
+			return 0;
+		}
+
+		r = handle_raw_dns_reply(w, buf, (uint16_t)ret);
+		if (unlikely(r))
+			return r;
+	}
 
 	return 0;
 }
