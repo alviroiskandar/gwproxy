@@ -2785,6 +2785,41 @@ static int upstream_dst_from_hostport(const char *hostport,
  * with socks5h://.
  */
 /*
+ * Whether a client-requested hostname is fit for the ACL, the resolver and an
+ * upstream CONNECT request: an IPv6 literal, or letters, digits, '-' and '_'
+ * in non-empty dot-separated labels (which covers IPv4 literals). Anything
+ * else, CR, LF and ':' in particular, would be pasted verbatim into the
+ * request to an http:// upstream, which then reads a different target than
+ * the one the ACL judged.
+ */
+static bool req_host_valid(const char *host)
+{
+	bool label_start = true;
+	struct in6_addr a6;
+	size_t n = 0;
+
+	if (inet_pton(AF_INET6, host, &a6) == 1)
+		return true;
+
+	for (; host[n]; n++) {
+		unsigned char c = (unsigned char)host[n];
+
+		if (c == '.') {
+			if (label_start)
+				return false;
+			label_start = true;
+			continue;
+		}
+		if (!(c >= 'a' && c <= 'z') && !(c >= 'A' && c <= 'Z') &&
+		    !(c >= '0' && c <= '9') && c != '-' && c != '_')
+			return false;
+		label_start = false;
+	}
+
+	return n > 0 && n <= 255;
+}
+
+/*
  * Format gcp->up_dst as an HTTP authority ("host:port" or "[ipv6]:port") for an
  * upstream CONNECT request. Returns 0 on success, -EINVAL on a bad address.
  */
@@ -2797,6 +2832,9 @@ int gwp_upstream_authority(const struct gwp_socks5_addr *dst, char *buf,
 
 	switch (dst->ver) {
 	case GWP_SOCKS5_ATYP_DOMAIN:
+		/* It goes into a request line: never let it end one early. */
+		if (!req_host_valid(dst->domain.str))
+			return -EINVAL;
 		n = snprintf(buf, cap, "%s:%u", dst->domain.str, port);
 		break;
 	case GWP_SOCKS5_ATYP_IPV4:
@@ -2886,6 +2924,12 @@ static int prepare_target_addr_domain(struct gwp_wrk *w,
 	struct gwp_cfg *cfg = &ctx->cfg;
 	int r;
 
+	if (!req_host_valid(host)) {
+		pr_info(&ctx->lh, "Rejected a malformed target hostname (idx=%u)",
+			gcp->idx);
+		return -EINVAL;
+	}
+
 	/* Remember the requested hostname for ACL "-m domain" matching. */
 	gcp->req_domain = host;
 
@@ -2926,10 +2970,16 @@ static int socks5_prepare_target_addr_domain(struct gwp_wrk *w,
 	int r;
 
 	dst = &gcp->s5_conn->dst_addr;
-	r = prepare_target_addr_domain(w, gcp, dst->domain.str,
-				       ntohs(dst->port));
+	/* A NUL inside the name would cut it short for everyone after us. */
+	if (strlen(dst->domain.str) != dst->domain.len)
+		r = -EINVAL;
+	else
+		r = prepare_target_addr_domain(w, gcp, dst->domain.str,
+					       ntohs(dst->port));
 	if (r == -EINPROGRESS)
 		gcp->conn_state = CONN_STATE_SOCKS5_DNS_QUERY;
+	else if (r == -EINVAL && !gwp_conn_fail_reply(w, gcp, r))
+		return -EBADMSG;	/* the REP 0x01 goes out first */
 
 	return r;
 }
@@ -3517,6 +3567,8 @@ static int http_connect_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		return http_reject_bad_request(gcp);
 
 	r = prepare_target_addr_domain(w, gcp, host, p);
+	if (r == -EINVAL)
+		return http_reject_bad_request(gcp);
 
 	if (r == -EINPROGRESS)
 		gcp->conn_state = CONN_STATE_HTTP_DNS_QUERY;
