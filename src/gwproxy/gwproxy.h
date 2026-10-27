@@ -704,6 +704,8 @@ struct gwp_ctx {
 	 */
 	struct gwp_acl_bind		bind_def;
 	struct gwp_cfg			cfg;
+	/* The locked --pid-file, removed on exit; -1 when there is none. */
+	int				pid_fd;
 	/*
 	 * One inotify instance watching the auth file and the ACL file (their
 	 * parent directories, see add_reload_watch()); -1 when neither is

@@ -45,6 +45,7 @@
 #include <sys/timerfd.h>
 #include <sys/resource.h>
 #include <sys/inotify.h>
+#include <sys/file.h>
 
 /* Long-only options (no short letter): values >= 128 are skipped by the
  * short-option string builder below. */
@@ -632,9 +633,19 @@ static int gwp_ctx_init_log(struct gwp_ctx *ctx)
 	} else if (!*cfg->log_file) {
 		ctx->lh.handle = NULL;
 	} else {
-		ctx->lh.handle = fopen(cfg->log_file, "ab");
+		/*
+		 * Not fopen(): it follows a symlink at the path, so a local
+		 * user who can write to the log directory could have a proxy
+		 * running as root append to any file at all.
+		 */
+		int fd = open(cfg->log_file, O_WRONLY | O_CREAT | O_APPEND |
+			      O_NOFOLLOW | O_CLOEXEC, 0640);
+
+		ctx->lh.handle = fd >= 0 ? fdopen(fd, "ab") : NULL;
 		if (!ctx->lh.handle) {
 			r = -errno;
+			if (fd >= 0)
+				close(fd);
 			pr_err(&ctx->lh, "Failed to open log file '%s': %s",
 				cfg->log_file, strerror(-r));
 		}
@@ -655,25 +666,61 @@ static void gwp_ctx_free_log(struct gwp_ctx *ctx)
 	}
 }
 
+/*
+ * Write our PID to --pid-file. The file is opened without following a
+ * symlink, which fopen("w") did, truncating whatever the link pointed to, and
+ * only truncated once we hold its lock, so a second instance pointed at the
+ * same file leaves the first one's PID alone. The lock is held, and the file
+ * kept, for as long as the proxy runs; gwp_ctx_free_pid_file() removes it.
+ */
 __cold
 static int gwp_ctx_init_pid_file(struct gwp_ctx *ctx)
 {
-	FILE *f;
-	int r;
+	const char *path = ctx->cfg.pid_file;
+	char buf[32];
+	int fd, n, r;
 
-	f = fopen(ctx->cfg.pid_file, "wb");
-	if (!f) {
+	fd = open(path, O_WRONLY | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0644);
+	if (fd < 0) {
 		r = -errno;
-		pr_warn(&ctx->lh, "Failed to open PID file '%s': %s",
-			ctx->cfg.pid_file, strerror(-r));
+		pr_warn(&ctx->lh, "Failed to open PID file '%s': %s", path,
+			strerror(-r));
 		return r;
 	}
 
-	r = getpid();
-	pr_info(&ctx->lh, "Writing PID to '%s' (pid=%d)", ctx->cfg.pid_file, r);
-	fprintf(f, "%d\n", r);
-	fclose(f);
+	if (flock(fd, LOCK_EX | LOCK_NB)) {
+		r = -errno;
+		pr_warn(&ctx->lh, "PID file '%s' is locked by another process; not writing it",
+			path);
+		close(fd);
+		return r;
+	}
+
+	n = snprintf(buf, sizeof(buf), "%d\n", (int)getpid());
+	errno = 0;
+	if (ftruncate(fd, 0) || write(fd, buf, (size_t)n) != n) {
+		r = errno ? -errno : -EIO;
+		pr_warn(&ctx->lh, "Failed to write PID file '%s': %s", path,
+			strerror(-r));
+		close(fd);
+		return r;
+	}
+
+	pr_info(&ctx->lh, "Writing PID to '%s' (pid=%d)", path, (int)getpid());
+	ctx->pid_fd = fd;
 	return 0;
+}
+
+__cold
+static void gwp_ctx_free_pid_file(struct gwp_ctx *ctx)
+{
+	if (ctx->pid_fd < 0)
+		return;
+
+	/* Ours: we hold the lock, so no other instance wrote it since. */
+	unlink(ctx->cfg.pid_file);
+	close(ctx->pid_fd);
+	ctx->pid_fd = -1;
 }
 
 __cold
@@ -1908,6 +1955,7 @@ static int gwp_ctx_init(struct gwp_ctx *ctx)
 {
 	int r;
 
+	ctx->pid_fd = -1;
 	r = gwp_ctx_init_log(ctx);
 	if (r < 0)
 		return r;
@@ -2039,6 +2087,7 @@ out_free_prot:
 out_free_tls:
 	gwp_ctx_free_tls(ctx);
 out_free_log:
+	gwp_ctx_free_pid_file(ctx);
 	gwp_ctx_free_log(ctx);
 	return r;
 }
@@ -2060,6 +2109,7 @@ static void gwp_ctx_free(struct gwp_ctx *ctx)
 	gwp_ctx_free_acl(ctx);
 	gwp_ctx_free_prot(ctx);
 	gwp_ctx_free_tls(ctx);
+	gwp_ctx_free_pid_file(ctx);
 	gwp_ctx_free_log(ctx);
 }
 
