@@ -22,7 +22,6 @@ do {							\
 	assert(!__r);					\
 	assert(*__ctx);					\
 	assert((*__ctx)->auth == NULL);			\
-	assert((*__ctx)->nr_clients == 0);		\
 } while (0)
 
 #define test_socks5_alloc_conn(CTX) ({			\
@@ -116,7 +115,6 @@ static void test_connect_ipv4(void)
 	/* BND.PORT */
 	assert(!memcmp(&out[8], "\xaa\xaa", 2));
 	assert(conn->state == GWP_SOCKS5_ST_FORWARDING);
-	assert(ctx->nr_clients == 1);
 
 	/*
 	 * All good!
@@ -186,7 +184,6 @@ static void test_connect_ipv6(void)
 	/* BND.PORT */
 	assert(!memcmp(&out[20], "\xaa\xaa", 2));
 	assert(conn->state == GWP_SOCKS5_ST_FORWARDING);
-	assert(ctx->nr_clients == 1);
 
 	/*
 	 * All good!
@@ -252,7 +249,6 @@ static int test_connect_domain(void)
 	/* BND.PORT */
 	assert(!memcmp(&out[8], "\xaa\xaa", 2));
 	assert(conn->state == GWP_SOCKS5_ST_FORWARDING);
-	assert(ctx->nr_clients == 1);
 
 	/*
 	 * All good!
@@ -292,13 +288,11 @@ static void test_short_recv(void)
 	assert(!r);
 	assert(ctx);
 	assert(ctx->auth == NULL);
-	assert(ctx->nr_clients == 0);
 
 	conn = gwp_socks5_conn_alloc(ctx);
 	assert(conn);
 	assert(conn->state == GWP_SOCKS5_ST_INIT);
 	assert(conn->ctx == ctx);
-	assert(ctx->nr_clients == 1);
 
 	inb = in;
 	for (i = 0; i < 3; i++) {
@@ -365,7 +359,6 @@ static void test_short_recv(void)
 	/* BND.PORT */
 	assert(!memcmp(&out[8], "\xaa\xaa", 2));
 	assert(conn->state == GWP_SOCKS5_ST_FORWARDING);
-	assert(ctx->nr_clients == 1);
 	gwp_socks5_conn_free(conn);
 	gwp_socks5_ctx_free(ctx);
 }
@@ -430,13 +423,11 @@ static void test_auth_userpass(void)
 	assert(!r);
 	assert(ctx);
 	assert(ctx->auth == auth);
-	assert(ctx->nr_clients == 0);
 
 	conn = gwp_socks5_conn_alloc(ctx);
 	assert(conn);
 	assert(conn->state == GWP_SOCKS5_ST_INIT);
 	assert(conn->ctx == ctx);
-	assert(ctx->nr_clients == 1);
 
 	inb = in;
 	in_len = 4; /* VER, NMETHODS, {USER/PASS} */
@@ -495,7 +486,6 @@ static void test_auth_userpass(void)
 	/* BND.PORT */
 	assert(!memcmp(&out[8], "\x00\x00", 2));
 	assert(conn->state == GWP_SOCKS5_ST_FORWARDING);
-	assert(ctx->nr_clients == 1);
 	gwp_socks5_conn_free(conn);
 	gwp_socks5_ctx_free(ctx);
 	gwp_auth_destroy(auth);
@@ -597,9 +587,7 @@ static void test_offered_methods_no_match(void)
 	/* REP: no acceptable methods */
 	assert(out[1] == 0xff);
 	assert(conn->state == GWP_SOCKS5_ST_ERR);
-	assert(ctx->nr_clients == 1);
 	gwp_socks5_conn_free(conn);
-	assert(ctx->nr_clients == 0);
 	gwp_socks5_ctx_free(ctx);
 }
 
@@ -639,9 +627,7 @@ static void test_err_state_pipelined_byte(void)
 	/* METHOD: no acceptable methods */
 	assert(out[1] == 0xff);
 	assert(conn->state == GWP_SOCKS5_ST_ERR);
-	assert(ctx->nr_clients == 1);
 	gwp_socks5_conn_free(conn);
-	assert(ctx->nr_clients == 0);
 	gwp_socks5_ctx_free(ctx);
 }
 
@@ -666,9 +652,7 @@ static void test_invalid_version(void)
 	assert(in_len == 0);
 	assert(out_len == 0);
 	assert(conn->state == GWP_SOCKS5_ST_ERR);
-	assert(ctx->nr_clients == 1);
 	gwp_socks5_conn_free(conn);
-	assert(ctx->nr_clients == 0);
 	gwp_socks5_ctx_free(ctx);
 }
 
@@ -705,9 +689,7 @@ static void test_invalid_connect_addr_type(void)
 	/* BND.PORT */
 	assert(!memcmp(&out[8], "\x00\x00", 2));
 	assert(conn->state == GWP_SOCKS5_ST_ERR);
-	assert(ctx->nr_clients == 1);
 	gwp_socks5_conn_free(conn);
-	assert(ctx->nr_clients == 0);
 	gwp_socks5_ctx_free(ctx);
 }
 
@@ -746,9 +728,7 @@ static void test_invalid_command(void)
 	/* BND.PORT */
 	assert(!memcmp(&out[8], "\x00\x00", 2));
 	assert(conn->state == GWP_SOCKS5_ST_ERR);
-	assert(ctx->nr_clients == 1);
 	gwp_socks5_conn_free(conn);
-	assert(ctx->nr_clients == 0);
 	gwp_socks5_ctx_free(ctx);
 }
 
@@ -803,9 +783,7 @@ static void test_multi_state_at_once(void)
 	/* BND.PORT */
 	assert(!memcmp(&out[8], "\x00\x00", 2));
 	assert(conn->state == GWP_SOCKS5_ST_FORWARDING);
-	assert(ctx->nr_clients == 1);
 	gwp_socks5_conn_free(conn);
-	assert(ctx->nr_clients == 0);
 	gwp_socks5_ctx_free(ctx);
 }
 
@@ -874,9 +852,7 @@ static void test_enobufs(void)
 		assert(conn->state == GWP_SOCKS5_ST_CMD_CONNECT);
 	}
 
-	assert(ctx->nr_clients == 1);
 	gwp_socks5_conn_free(conn);
-	assert(ctx->nr_clients == 0);
 	gwp_socks5_ctx_free(ctx);
 }
 
@@ -918,13 +894,11 @@ static void test_enobufs_combined_with_multi_state_at_once(void)
 	assert(!r);
 	assert(ctx);
 	assert(ctx->auth == auth);
-	assert(ctx->nr_clients == 0);
 
 	conn = gwp_socks5_conn_alloc(ctx);
 	assert(conn);
 	assert(conn->state == GWP_SOCKS5_ST_INIT);
 	assert(conn->ctx == ctx);
-	assert(ctx->nr_clients == 1);
 
 	for (i = 0; i < 4; i++) {
 		in_len = sizeof(in);
@@ -982,7 +956,6 @@ static void test_enobufs_combined_with_multi_state_at_once(void)
 	/* BND.PORT */
 	assert(!memcmp(&out[8], "\x00\x00", 2));
 	assert(conn->state == GWP_SOCKS5_ST_FORWARDING);
-	assert(ctx->nr_clients == 1);
 	gwp_socks5_conn_free(conn);
 	gwp_socks5_ctx_free(ctx);
 	gwp_auth_destroy(auth);
@@ -1034,7 +1007,6 @@ static void test_udp_associate(void)
 	assert(!memcmp(&out[4], "\x7f\x00\x00\x01", 4));	/* BND.ADDR */
 	assert(!memcmp(&out[8], "\xaa\xaa", 2));		/* BND.PORT */
 	assert(conn->state == GWP_SOCKS5_ST_UDP_ASSOCIATED);
-	assert(ctx->nr_clients == 1);
 
 	gwp_socks5_conn_free(conn);
 	gwp_socks5_ctx_free(ctx);

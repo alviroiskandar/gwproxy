@@ -60,7 +60,6 @@ struct gwp_socks5_conn *gwp_socks5_conn_alloc(struct gwp_socks5_ctx *ctx)
 
 	conn->state = GWP_SOCKS5_ST_INIT;
 	conn->ctx = ctx;
-	atomic_fetch_add(&ctx->nr_clients, 1);
 	return conn;
 }
 
@@ -69,7 +68,6 @@ void gwp_socks5_conn_free(struct gwp_socks5_conn *conn)
 	if (!conn)
 		return;
 
-	atomic_fetch_sub(&conn->ctx->nr_clients, 1);
 	free(conn);
 }
 

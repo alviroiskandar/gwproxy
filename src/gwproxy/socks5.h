@@ -61,7 +61,6 @@ struct gwp_socks5_cfg {
 struct gwp_socks5_ctx {
 	struct gwp_auth		*auth;
 	bool			udp_associate;
-	_Atomic(uint32_t)	nr_clients;
 };
 
 struct gwp_socks5_addr {
