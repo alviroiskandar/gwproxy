@@ -535,6 +535,8 @@ struct gwp_conn_pair {
 	 * target socket is created.
 	 */
 	struct gwp_conn_sockopt	acl_sockopt;
+	/* -m domain/-m user results shared by this candidate list's ACL checks. */
+	struct gwp_acl_memo	acl_memo;
 
 	/*
 	 * Destination requested from the upstream SOCKS5 proxy. Only used

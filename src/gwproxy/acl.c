@@ -134,7 +134,15 @@ struct gwp_acl_rule {
 	bool			then_accept : 1;
 	uint8_t			proto : 1;	/* enum gwp_acl_proto */
 	uint8_t			action : 3;	/* enum gwp_acl_action */
+	/*
+	 * Slot of this rule's -m domain/-m user result in a struct
+	 * gwp_acl_memo, or ACL_NO_MEMO (INPUT rules, rules without those
+	 * criteria, and OUTPUT rules past the memo's capacity).
+	 */
+	uint8_t			memo_idx;
 };
+
+#define ACL_NO_MEMO	0xff
 
 struct gwp_acl_ruleset {
 	struct gwp_acl_rule	*in_head, **in_tail;
@@ -142,6 +150,8 @@ struct gwp_acl_ruleset {
 	enum gwp_acl_verdict	in_policy, out_policy;
 	/* OUTPUT has a -m statistic rule: its verdicts must not be cached. */
 	bool			out_has_stat;
+	/* memo_idx slots handed out to OUTPUT rules so far. */
+	uint8_t			out_nr_memo;
 };
 
 struct gwp_acl {
@@ -560,6 +570,7 @@ static void ruleset_init(struct gwp_acl_ruleset *rs)
 	rs->in_policy = GWP_ACL_ACCEPT;
 	rs->out_policy = GWP_ACL_ACCEPT;
 	rs->out_has_stat = false;
+	rs->out_nr_memo = 0;
 }
 
 static void ruleset_free(struct gwp_acl_ruleset *rs)
@@ -1051,6 +1062,7 @@ static int parse_rule(struct gwp_acl_ruleset *rs, char **tok, int n)
 		break;
 	}
 
+	r->memo_idx = ACL_NO_MEMO;
 	if (chain == GWP_ACL_INPUT) {
 		*rs->in_tail = r;
 		rs->in_tail = &r->next;
@@ -1059,6 +1071,9 @@ static int parse_rule(struct gwp_acl_ruleset *rs, char **tok, int n)
 		rs->out_tail = &r->next;
 		if (r->has_statistic)
 			rs->out_has_stat = true;
+		if ((r->has_domain || r->has_user) &&
+		    rs->out_nr_memo < GWP_ACL_MEMO_RULES)
+			r->memo_idx = rs->out_nr_memo++;
 	}
 	return 0;
 
@@ -1363,6 +1378,36 @@ static bool statistic_match(struct gwp_acl_rule *r)
 	return (n % r->st_every) == r->st_packet;
 }
 
+/*
+ * The -m user and -m domain criteria of @r. They depend only on the request's
+ * username and domain, which stay the same across a connection's candidate
+ * addresses, so with a memo in @q each rule's result is computed for the
+ * first candidate and reused for the rest.
+ */
+static bool name_crit_ok(const struct gwp_acl_rule *r,
+			 const struct gwp_acl_req *q)
+{
+	struct gwp_acl_memo *m = q->memo;
+	uint64_t bit = 0;
+	bool ok;
+
+	if (m && r->memo_idx != ACL_NO_MEMO) {
+		bit = 1ull << r->memo_idx;
+		if (m->known & bit)
+			return m->ok & bit;
+	}
+
+	ok = !CRIT_FAILS(r, has_user, neg_user, user_match(r, q->user)) &&
+	     !CRIT_FAILS(r, has_domain, neg_domain, domain_match(r, q->domain));
+
+	if (bit) {
+		m->known |= bit;
+		if (ok)
+			m->ok |= bit;
+	}
+	return ok;
+}
+
 static bool rule_matches(struct gwp_acl_rule *r,
 			 const struct gwp_acl_req *q)
 {
@@ -1396,9 +1441,7 @@ static bool rule_matches(struct gwp_acl_rule *r,
 	if (CRIT_FAILS(r, has_src, neg_src,
 		       q->client && cidr_match(&r->src, q->client)))
 		return false;
-	if (CRIT_FAILS(r, has_user, neg_user, user_match(r, q->user)))
-		return false;
-	if (CRIT_FAILS(r, has_domain, neg_domain, domain_match(r, q->domain)))
+	if ((r->has_user || r->has_domain) && !name_crit_ok(r, q))
 		return false;
 
 	/*
@@ -1527,6 +1570,13 @@ enum gwp_acl_verdict gwp_acl_eval_output(struct gwp_acl *acl,
 	pthread_rwlock_rdlock(&acl->lock);
 	req->gen = atomic_load_explicit(&acl->gen, memory_order_relaxed);
 	req->cacheable = !acl->rs.out_has_stat;
+	/* Memo slots are only meaningful for the ruleset that filled them. */
+	if (req->memo && (!req->memo->valid || req->memo->gen != req->gen)) {
+		req->memo->valid = true;
+		req->memo->gen = req->gen;
+		req->memo->known = 0;
+		req->memo->ok = 0;
+	}
 	verdict = eval_chain(acl->rs.out_head, acl->rs.out_policy, req);
 	pthread_rwlock_unlock(&acl->lock);
 	return verdict;

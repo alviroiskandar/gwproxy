@@ -1356,12 +1356,14 @@ static void acl_out_req(struct gwp_acl_req *req,
  * rule produced a concrete address, the rewritten destination is written back
  * to *@target (for the direct connection and, via the caller, the upstream)
  * and *@dnat_out (when non-NULL) is set true. Composable -j MARK / -j BIND
- * modifiers are surfaced in *@so_out.
+ * modifiers are surfaced in *@so_out. @memo (may be NULL) carries the
+ * -m domain/-m user results between evaluations of the same request.
  */
 static enum gwp_acl_verdict acl_out(struct gwp_ctx *ctx,
 				    const struct gwp_sockaddr *client,
 				    struct gwp_sockaddr *target,
 				    const char *domain, const char *user,
+				    struct gwp_acl_memo *memo,
 				    struct gwp_conn_sockopt *so_out,
 				    bool *dnat_out,
 				    enum gwp_acl_proto proto)
@@ -1383,6 +1385,7 @@ static enum gwp_acl_verdict acl_out(struct gwp_ctx *ctx,
 		return GWP_ACL_ACCEPT;
 
 	acl_out_req(&req, client, have_ip ? target : NULL, domain, user, proto);
+	req.memo = memo;
 	v = gwp_acl_eval_output(ctx->acl, &req);
 	if (v != GWP_ACL_ACCEPT)
 		return v;
@@ -1422,7 +1425,7 @@ bool gwp_ctx_acl_output_dnat(struct gwp_ctx *ctx,
 			     struct gwp_conn_sockopt *so,
 			     enum gwp_acl_proto proto)
 {
-	return acl_out(ctx, client, target, NULL, NULL, so, NULL,
+	return acl_out(ctx, client, target, NULL, NULL, NULL, so, NULL,
 		       proto) == GWP_ACL_ACCEPT;
 }
 
@@ -1475,9 +1478,14 @@ bool gwp_ctx_acl_target_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp)
 	bool dnat = false;
 	enum gwp_acl_verdict v;
 
+	/*
+	 * Only a walk over several candidates evaluates the same domain and
+	 * user more than once; gwp_conn_set_candidates() resets the memo for
+	 * each new list.
+	 */
 	v = acl_out(ctx, &gcp->client_addr, &gcp->target_addr, gcp->req_domain,
-		    gcp_req_user(gcp), &gcp->acl_sockopt, &dnat,
-		    GWP_ACL_PROTO_TCP);
+		    gcp_req_user(gcp), gcp->nr_cand > 1 ? &gcp->acl_memo : NULL,
+		    &gcp->acl_sockopt, &dnat, GWP_ACL_PROTO_TCP);
 	if (v != GWP_ACL_ACCEPT)
 		return false;
 
@@ -2842,6 +2850,7 @@ void gwp_conn_set_candidates(struct gwp_conn_pair *gcp,
 	memcpy(gcp->cand, addrs, (size_t)nr * sizeof(*addrs));
 	gcp->nr_cand = nr;
 	gcp->next_cand = 0;
+	gwp_acl_memo_reset(&gcp->acl_memo);
 
 	/*
 	 * Keep target_addr meaningful for callers that read it before the

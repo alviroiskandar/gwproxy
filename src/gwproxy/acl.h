@@ -78,6 +78,27 @@ int gwp_acl_reload(struct gwp_acl *acl);
 void gwp_acl_destroy(struct gwp_acl *acl);
 
 /*
+ * Per-connection memo of the address-independent (-m domain / -m user)
+ * results of the first GWP_ACL_MEMO_RULES such OUTPUT rules, so evaluating
+ * the same request against several candidate addresses does that work once.
+ * Owned by one connection; zero-initialise it, and reset it (gwp_acl_memo_reset)
+ * whenever the request's domain or user may change. gwp_acl_eval_output()
+ * discards it by itself when the ruleset is reloaded.
+ */
+#define GWP_ACL_MEMO_RULES	64
+struct gwp_acl_memo {
+	uint64_t	known;	/* bit i: slot i computed */
+	uint64_t	ok;	/* bit i: slot i's criteria hold */
+	uint32_t	gen;	/* ruleset generation of the slots */
+	bool		valid;
+};
+
+static inline void gwp_acl_memo_reset(struct gwp_acl_memo *m)
+{
+	m->valid = false;
+}
+
+/*
  * A single evaluation request, passed by pointer to the eval helpers. Bundling
  * the parameters (and results) in one struct keeps the call sites stable as new
  * match criteria are added -- extend this struct and the matcher, not every
@@ -94,6 +115,7 @@ void gwp_acl_destroy(struct gwp_acl *acl);
  *   @sport   client source port, host byte order (both chains).
  *   @dport   destination port, host byte order (OUTPUT).
  *   @proto   GWP_ACL_PROTO_TCP / _UDP.
+ *   @memo    optional struct gwp_acl_memo (OUTPUT only), or NULL.
  *
  * Outputs (set by gwp_acl_eval_output()):
  *   @dnat_applied  true if a -j DNAT rule matched; @dnat then holds the rewrite.
@@ -117,6 +139,7 @@ struct gwp_acl_req {
 	const struct gwp_sockaddr	*target;
 	const char			*domain;
 	const char			*user;
+	struct gwp_acl_memo		*memo;
 
 	/*
 	 * Outputs. DNAT, MARK and BIND are independent, composable modifiers: a

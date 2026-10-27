@@ -1045,6 +1045,70 @@ static void test_generation(void)
 	free(path);
 }
 
+static enum gwp_acl_verdict out_memo(struct gwp_acl *a, struct gwp_acl_memo *m,
+				     const char *dom, const char *ip,
+				     uint16_t port)
+{
+	struct gwp_sockaddr t = sa4(ip, port);
+	struct gwp_acl_req req = {
+		.target = &t, .domain = dom, .memo = m, .dport = port,
+		.proto = GWP_ACL_PROTO_TCP,
+	};
+
+	return gwp_acl_eval_output(a, &req);
+}
+
+/*
+ * The -m domain/-m user memo shared by a connection's candidate addresses:
+ * verdicts are the same as without it, the address-dependent criteria are
+ * still evaluated per candidate, rules past its capacity still match, and
+ * a reset is what makes a new domain take effect.
+ */
+static void test_memo(void)
+{
+	static const char rules[] =
+		"-A OUTPUT -m domain --domain bad.example --dports 80 -j REJECT\n"
+		"-A OUTPUT -m domain --domain bad.example --dports 25 -j REJECT\n"
+		"-A OUTPUT -m domain ! --domain bad.example --dports 26 -j REJECT\n";
+	struct gwp_acl_memo m = { 0 };
+	char *big, *p;
+	struct gwp_acl *a;
+	int i;
+
+	assert(!gwp_acl_parse_str(&a, rules));
+	for (i = 0; i < 2; i++) {
+		struct gwp_acl_memo *mp = i ? &m : NULL;
+
+		assert(out_memo(a, mp, "bad.example", "8.8.8.8", 80) == GWP_ACL_REJECT);
+		assert(out_memo(a, mp, "bad.example", "8.8.8.8", 443) == GWP_ACL_ACCEPT);
+		assert(out_memo(a, mp, "bad.example", "8.8.8.8", 25) == GWP_ACL_REJECT);
+		assert(out_memo(a, mp, "bad.example", "8.8.8.8", 26) == GWP_ACL_ACCEPT);
+	}
+	/* Proof the memo is used: without a reset, a new domain is not seen. */
+	assert(out_memo(a, &m, "good.example", "8.8.4.4", 80) == GWP_ACL_REJECT);
+	gwp_acl_memo_reset(&m);
+	assert(out_memo(a, &m, "good.example", "8.8.4.4", 80) == GWP_ACL_ACCEPT);
+	assert(out_memo(a, &m, "good.example", "8.8.8.8", 26) == GWP_ACL_REJECT);
+	gwp_acl_destroy(a);
+
+	/* More name rules than memo slots: the rest is evaluated each time. */
+	big = malloc(100 * 64);
+	assert(big);
+	p = big;
+	for (i = 0; i < GWP_ACL_MEMO_RULES + 6; i++)
+		p += sprintf(p, "-A OUTPUT -m domain --domain h%d.example -j REJECT\n", i);
+	assert(!gwp_acl_parse_str(&a, big));
+	free(big);
+	memset(&m, 0, sizeof(m));
+	for (i = 0; i < 3; i++) {
+		assert(out_memo(a, &m, "h69.example", "8.8.8.8", 80) == GWP_ACL_REJECT);
+		assert(out_memo(a, &m, "h69.example", "8.8.4.4", 80) == GWP_ACL_REJECT);
+	}
+	gwp_acl_memo_reset(&m);
+	assert(out_memo(a, &m, "h70.example", "8.8.8.8", 80) == GWP_ACL_ACCEPT);
+	gwp_acl_destroy(a);
+}
+
 static void run_tests(void)
 {
 	size_t i;
@@ -1065,6 +1129,7 @@ static void run_tests(void)
 		test_mark();
 		test_bind();
 		test_dnat();
+		test_memo();
 		test_comments_and_default_policy();
 		test_statistic_nth();
 		test_statistic_counts_only_matches();
