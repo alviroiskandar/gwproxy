@@ -53,6 +53,7 @@ rc=1
 cleanup_inner()
 {
 	echo "INNER-DONE rc=$rc"
+	_release_ports		# lib.sh's _cleanup, which would, is replaced
 	kill 0 2>/dev/null
 }
 trap cleanup_inner EXIT

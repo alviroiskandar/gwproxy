@@ -181,7 +181,12 @@ else
 	# "kill 0" signals exactly this group: the peer namespace holder, the
 	# origin, and any proxy still up. The namespace and its veth die with
 	# the last process in it.
-	cleanup_inner() { echo "INNER-DONE rc=$rc"; kill 0 2>/dev/null; }
+	cleanup_inner()
+	{
+		echo "INNER-DONE rc=$rc"
+		_release_ports		# lib.sh's _cleanup, which would, is replaced
+		kill 0 2>/dev/null
+	}
 	trap cleanup_inner EXIT
 
 	# lib.sh's skip() exits 77, but the outer half only ever sees

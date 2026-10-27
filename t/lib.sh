@@ -33,6 +33,7 @@ _cleanup()
 	# Catch any proxy this test started outside gwp_start (or whose pid we
 	# lost); the runner sweeps again in case we are killed before this runs.
 	gwp_sweep -q
+	_release_ports
 	rm -rf "$WORK"
 }
 # The signal handler must exit rather than fall through: a handler that only
@@ -130,18 +131,89 @@ ns_inner_work()
 	WORK="$1"
 }
 
+# Port reservations, shared by every test running on this host. pick_port()
+# only knows that a port was free when it looked; under `make -jN` (or with
+# several checkouts testing at once) two tests can be handed the same number.
+# gwproxy binds its listener with SO_REUSEPORT, so two tests' proxies can then
+# both bind it and the kernel spreads one test's connections across both --
+# the client talks to the other test's proxy and sees a wrong or "corrupted"
+# payload, while wait_listen() is satisfied by either. Reserving the number
+# with an atomic mkdir closes that: a number is handed to one test at a time.
+#
+# The directory is shared like /tmp (mode 1777) because the privileged tests
+# run the same helpers as root. Each reservation records the test's PID; a
+# test releases its own on exit, and one left by a killed test is reclaimed
+# once that PID is gone.
+_PORT_DIR="${TMPDIR:-/tmp}/gwptest-ports"
+
+# Drop reservations whose test is gone: one killed before its EXIT trap ran,
+# or a half that cleaned up some other way. Without this they would only go
+# away when the same number happened to be probed again.
+_reap_stale_ports()
+{
+	local d owner
+
+	for d in "$_PORT_DIR"/*/; do
+		owner="$(cat "${d}owner" 2>/dev/null)"
+		# No owner yet: being created right now, leave it alone.
+		[ -n "$owner" ] || continue
+		[ -d "/proc/$owner" ] || rm -rf "${d:?}" 2>/dev/null
+	done
+	return 0
+}
+
 # Print a free TCP port that is bindable on the IPv4/IPv6 dual stack, so it is
-# also free for a plain 127.0.0.1 or [::1] bind.
+# also free for a plain 127.0.0.1 or [::1] bind, and reserve it for this test.
 pick_port()
 {
-	python3 - <<-'PY'
-	import socket
-	s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-	s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
-	s.bind(("", 0))
-	print(s.getsockname()[1])
-	s.close()
-	PY
+	local port owner i
+
+	if [ ! -d "$_PORT_DIR" ]; then
+		mkdir -p "$_PORT_DIR" 2>/dev/null && chmod 1777 "$_PORT_DIR" 2>/dev/null
+	fi
+	_reap_stale_ports
+
+	for i in $(seq 1 100); do
+		port="$(python3 - <<-'PY'
+		import socket
+		s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+		s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+		s.bind(("", 0))
+		print(s.getsockname()[1])
+		s.close()
+		PY
+		)"
+		# No usable reservation directory: fall back to the bare probe.
+		if [ ! -w "$_PORT_DIR" ]; then
+			echo "$port"
+			return 0
+		fi
+		if mkdir "$_PORT_DIR/$port" 2>/dev/null; then
+			echo "$$" >"$_PORT_DIR/$port/owner"
+			echo "$port"
+			return 0
+		fi
+		# Reserved already. Reclaim it if its test is gone, then pick
+		# again either way; the probe hands out a fresh port next time.
+		owner="$(cat "$_PORT_DIR/$port/owner" 2>/dev/null)"
+		if [ -n "$owner" ] && [ ! -d "/proc/$owner" ]; then
+			rm -rf "${_PORT_DIR:?}/${port:?}" 2>/dev/null
+		fi
+	done
+	fail "pick_port: could not reserve a free port"
+}
+
+# Release every port this test reserved. pick_port() runs in a command
+# substitution, so the reservations are found by owner, not kept in a list.
+_release_ports()
+{
+	local d
+
+	for d in "$_PORT_DIR"/*/; do
+		[ -f "${d}owner" ] || continue
+		[ "$(cat "${d}owner" 2>/dev/null)" = "$$" ] && rm -rf "${d:?}" 2>/dev/null
+	done
+	return 0
 }
 
 # wait_listen <port> [pid]: wait until something is listening on <port>, or
