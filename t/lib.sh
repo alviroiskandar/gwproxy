@@ -191,6 +191,37 @@ gwp_start()
 	GWP_PID="$pid"
 }
 
+# start_udp_echo <addr>: start the UDP echo server on <addr> (an IPv4 or IPv6
+# literal, "::" for dual-stack) and set UDP_ECHO_PORT to its port.
+#
+# The kernel picks the port (bind to 0) and the server reports it, so there is
+# no window between choosing a number and binding it. pick_port() cannot be
+# used here: it only finds a port free for TCP, and under `make -jN` another
+# test's UDP socket may already hold that number. A readiness check asking ss
+# whether *some* socket has the port is no better, because it is satisfied by
+# that other socket even when this server failed to bind.
+start_udp_echo()
+{
+	local addr="$1" log pid port i
+
+	_UDP_ECHO_N=$((${_UDP_ECHO_N:-0} + 1))
+	log="$WORK/udp_echo.$_UDP_ECHO_N.log"
+	python3 "$SERVERS_DIR/udp_echo.py" "$addr" 0 >"$log" 2>&1 &
+	pid=$!
+	_PIDS+=("$pid")
+	for i in $(seq 1 100); do
+		port="$(sed -n 's/^READY \([0-9][0-9]*\)$/\1/p' "$log")"
+		if [ -n "$port" ]; then
+			UDP_ECHO_PORT="$port"
+			return 0
+		fi
+		kill -0 "$pid" 2>/dev/null || break
+		sleep 0.05
+	done
+	sed 's/^/# udp_echo: /' "$log" >&2
+	fail "UDP echo server on $addr did not start"
+}
+
 # start_httpd <port> <docroot> [http_version]: start the dual-stack test HTTP
 # server serving <docroot>. It is reachable via 127.0.0.1, [::1] or localhost.
 # http_version is "1.0" (closes after each response) or "1.1" (keep-alive).

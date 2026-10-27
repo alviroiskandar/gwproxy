@@ -14,24 +14,10 @@ hp="$(pick_port)"
 make_payload "$WORK/payload.bin" 20000
 start_httpd "$hp" "$WORK" "1.1"
 
-# Wait for a UDP socket to be bound, rather than assuming a fixed delay was
-# long enough -- on a loaded machine it is not, and the failure looks like a
-# relay bug rather than a slow start.
-wait_udp_bound()			# $1=port
-{
-	local i
-	for i in $(seq 1 50); do
-		ss -uanH "sport = :$1" 2>/dev/null | grep -q . && return 0
-		sleep 0.1
-	done
-	fail "UDP server did not bind on $1"
-}
 
 # A UDP echo server for the UDP-relay ACL checks.
-ep="$(pick_port)"
-python3 "$SERVERS_DIR/udp_echo.py" 127.0.0.1 "$ep" >"$WORK/udp_echo.log" 2>&1 &
-_PIDS+=("$!")
-wait_udp_bound "$ep"
+start_udp_echo 127.0.0.1
+ep="$UDP_ECHO_PORT"
 
 # A malformed ACL is rejected at startup (gwproxy exits non-zero, no listener).
 printf -- '-A OUTPUT -j BOGUS\n' >"$WORK/bad.acl"

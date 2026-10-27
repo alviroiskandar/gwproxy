@@ -25,15 +25,8 @@ make_payload "$WORK/payload.bin" 4096
 start_httpd "$hp" "$WORK" "1.1"		# dual-stack [::], like most services
 
 # A dual-stack UDP echo server, reachable via ::1 and 0.0.0.0 alike.
-ep="$(pick_port)"
-python3 "$SERVERS_DIR/udp_echo.py" :: "$ep" >"$WORK/udp_echo.log" 2>&1 &
-_PIDS+=("$!")
-for _ in $(seq 1 50); do
-	ss -uanH "sport = :$ep" 2>/dev/null | grep -q . && break
-	sleep 0.1
-done
-ss -uanH "sport = :$ep" 2>/dev/null | grep -q . \
-	|| fail "UDP echo server did not bind on $ep"
+start_udp_echo ::
+ep="$UDP_ECHO_PORT"
 
 # Start gwproxy with no ACL argument at all. gwp_start would inject
 # --acl-allow-all into such a command line, so launch it directly.

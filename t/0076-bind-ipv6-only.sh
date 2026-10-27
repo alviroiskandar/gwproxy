@@ -67,14 +67,8 @@ for loop in epoll io_uring; do
 	# The UDP relay socket must stay dual-stack: it is bound separately and
 	# is what lets a v6 client reach a v4 target. A regression here would
 	# silently break UDP ASSOCIATE while the TCP cases above stayed green.
-	up="$(pick_port)"
-	python3 "$SERVERS_DIR/udp_echo.py" 127.0.0.1 "$up" \
-		>"$WORK/udp_echo.$up.log" 2>&1 &
-	_PIDS+=("$!")
-	for _ in $(seq 1 50); do
-		ss -lun 2>/dev/null | grep -q ":$up " && break
-		sleep 0.1
-	done
+	start_udp_echo 127.0.0.1
+	up="$UDP_ECHO_PORT"
 
 	p="$(pick_port)"
 	gwp_start "[::]:$p" --as-socks5=1 --event-loop="$loop" \
