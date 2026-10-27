@@ -58,10 +58,11 @@ const char *gwp_http_conn_username(const struct gwp_http_conn *hc);
  * @in		Client bytes to parse.
  * @in_len	In: number of bytes in @in. Out: number of bytes consumed.
  * @host_p	Out (CONNECT/FORWARD): target host, NUL-terminated, owned by @hc
- *		and valid until the next call or gwp_http_conn_free().
+ *		and valid until gwp_http_conn_free().
  * @port_p	Out (CONNECT/FORWARD): target port string, same lifetime.
  * @req_p	Out (FORWARD): the rewritten origin-form request header to send
- *		to the origin, owned by @hc.
+ *		to the origin, owned by @hc and valid until
+ *		gwp_http_conn_drop_req() or gwp_http_conn_free().
  * @req_len_p	Out (FORWARD): length of *@req_p.
  * @return	One of enum gwp_http_result.
  */
@@ -69,6 +70,12 @@ int gwp_http_conn_process(struct gwp_http_conn *hc, struct gwp_auth *auth,
 			  const void *in, size_t *in_len,
 			  char **host_p, char **port_p,
 			  const char **req_p, size_t *req_len_p);
+
+/*
+ * Free the rewritten request returned by gwp_http_conn_process() once the
+ * caller has copied it, rather than keeping it for the connection's life.
+ */
+void gwp_http_conn_drop_req(struct gwp_http_conn *hc);
 
 /**
  * Delimit the body of a forwarding request. Called with each run of client

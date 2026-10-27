@@ -3618,6 +3618,7 @@ int gwp_handle_conn_state_http(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		return http_connect_target(w, gcp, host, port);
 	case GWP_HTTP_FORWARD:
 		r = http_inject_forward_request(gcp, req, req_len);
+		gwp_http_conn_drop_req(gcp->http_conn);
 		if (r == -E2BIG)
 			return http_reject_too_large(gcp);
 		if (r < 0)

@@ -47,9 +47,19 @@ struct gwp_http_conn {
 	 */
 	bool				is_forward;
 
-	/* Rewritten origin-form request header for a forwarding request. */
+	/*
+	 * Rewritten origin-form request header for a forwarding request, kept
+	 * only until the caller has taken it (gwp_http_conn_drop_req()).
+	 */
 	char				*fwd_req;
 	size_t				fwd_req_len;
+
+	/*
+	 * The target's host and port ("host\0port\0"), once classified. They
+	 * outlive the parsed request, which is freed as soon as the request
+	 * has been classified: nothing else in it is needed afterwards.
+	 */
+	char				*target;
 
 	/* Authenticated username (Basic auth), for ACL "-m user" matching. */
 	bool				have_user;
@@ -105,8 +115,16 @@ void gwp_http_conn_free(struct gwp_http_conn *hc)
 	gwnet_http_hdr_pctx_free(&hc->ctx_hdr);
 	gwnet_http_req_hdr_free(&hc->req_hdr);
 	free(hc->fwd_req);
+	free(hc->target);
 	free(hc->res_buf);
 	free(hc);
+}
+
+void gwp_http_conn_drop_req(struct gwp_http_conn *hc)
+{
+	free(hc->fwd_req);
+	hc->fwd_req = NULL;
+	hc->fwd_req_len = 0;
 }
 
 bool gwp_http_conn_is_forward(const struct gwp_http_conn *hc)
@@ -536,13 +554,34 @@ static int classify_forward(struct gwp_http_conn *hc, size_t hdr_len,
 	return GWP_HTTP_FORWARD;
 }
 
+static int classify_req(struct gwp_http_conn *hc, struct gwp_auth *auth,
+			char **host_p, char **port_p, const char **req_p,
+			size_t *req_len_p);
+
+/* Copy the target's host and port into @hc; point @host_p, @port_p there. */
+static int keep_target(struct gwp_http_conn *hc, char **host_p, char **port_p)
+{
+	size_t hl = strlen(*host_p), pl = strlen(*port_p);
+	char *t = malloc(hl + pl + 2);
+
+	if (!t)
+		return -ENOMEM;
+	memcpy(t, *host_p, hl + 1);
+	memcpy(t + hl + 1, *port_p, pl + 1);
+	free(hc->target);
+	hc->target = t;
+	*host_p = t;
+	*port_p = t + hl + 1;
+	return 0;
+}
+
 int gwp_http_conn_process(struct gwp_http_conn *hc, struct gwp_auth *auth,
 			  const void *in, size_t *in_len,
 			  char **host_p, char **port_p,
 			  const char **req_p, size_t *req_len_p)
 {
 	struct gwnet_http_req_hdr *req = &hc->req_hdr;
-	size_t hdr_len, len = *in_len, used;
+	size_t len = *in_len, used;
 	const char *p = in;
 	int r;
 
@@ -588,8 +627,25 @@ int gwp_http_conn_process(struct gwp_http_conn *hc, struct gwp_auth *auth,
 	if (r < 0)
 		return GWP_HTTP_ERR;
 
-	/* Header complete. */
-	hdr_len = hc->hdr_len;
+	/*
+	 * Header complete. Once classified, only the target (copied out), the
+	 * username and the body framing are needed; the parsed request and
+	 * its fields are freed rather than kept for the connection's life.
+	 */
+	r = classify_req(hc, auth, host_p, port_p, req_p, req_len_p);
+	if ((r == GWP_HTTP_CONNECT || r == GWP_HTTP_FORWARD) &&
+	    keep_target(hc, host_p, port_p) < 0)
+		r = GWP_HTTP_ERR;
+	gwnet_http_req_hdr_free(req);
+	return r;
+}
+
+static int classify_req(struct gwp_http_conn *hc, struct gwp_auth *auth,
+			char **host_p, char **port_p, const char **req_p,
+			size_t *req_len_p)
+{
+	struct gwnet_http_req_hdr *req = &hc->req_hdr;
+	size_t hdr_len = hc->hdr_len;
 
 	/*
 	 * "Basic" proxy authentication (shared with SOCKS5) applies to CONNECT
