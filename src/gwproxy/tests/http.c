@@ -230,6 +230,45 @@ static void test_forward_hop_by_hop(void)
 	PRTEST_OK();
 }
 
+static void test_forward_conn_lists_framing(void)
+{
+	/*
+	 * A Connection header naming a framing field (or Host) would make the
+	 * rewrite drop it while the body is still relayed, so the origin would
+	 * read the body as a second request. Such a request is refused with
+	 * 400 rather than rewritten.
+	 */
+	static const char *const bad[] = {
+		("POST http://example.com/a HTTP/1.1\r\n"
+		 "Connection: Content-Length\r\n"
+		 "Content-Length: 4\r\n\r\n"),
+		("POST http://example.com/a HTTP/1.1\r\n"
+		 "Connection: keep-alive, transfer-encoding\r\n"
+		 "Transfer-Encoding: chunked\r\n\r\n"),
+		("GET http://example.com/a HTTP/1.1\r\n"
+		 "Connection: Host\r\n\r\n"),
+	};
+	struct gwp_http_conn *hc;
+	char *host, *port;
+	const char *req = NULL;
+	size_t req_len = 0, i;
+	uint8_t out[128];
+	int r;
+
+	for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+		hc = gwp_http_conn_alloc();
+		assert(hc);
+		r = run(hc, NULL, bad[i], &host, &port, &req, &req_len);
+		assert(r == GWP_HTTP_BAD_REQUEST);
+		gwp_http_conn_free(hc);
+	}
+
+	r = gwp_http_build_bad_request_reply(out, sizeof(out));
+	assert(r > 0 && !strncmp((char *)out, "HTTP/1.1 400 ", 13));
+	assert(gwp_http_build_bad_request_reply(out, 5) == -ENOBUFS);
+	PRTEST_OK();
+}
+
 static void test_need_more(void)
 {
 	/* Request line complete, header fields not yet terminated. */
@@ -360,6 +399,7 @@ int main(void)
 		test_forward_get();
 		test_forward_default_port();
 		test_forward_hop_by_hop();
+		test_forward_conn_lists_framing();
 		test_need_more();
 		test_errors();
 		test_auth();

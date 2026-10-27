@@ -30,6 +30,7 @@ enum gwp_http_result {
 	GWP_HTTP_FORWARD,	/* Forward request; host/port + rewritten req set. */
 	GWP_HTTP_NEED_AUTH,	/* Proxy auth required/failed; reply 407. */
 	GWP_HTTP_ERR,		/* Malformed or unsupported; tear the conn down. */
+	GWP_HTTP_BAD_REQUEST,	/* Well-formed but unacceptable; reply 400. */
 };
 
 /* Allocate/free a per-connection HTTP proxy state. */
@@ -82,6 +83,15 @@ int gwp_http_build_connect_reply(const struct gwp_http_conn *hc, void *out,
  * @return	Number of bytes written to @out, or -ENOBUFS if too small.
  */
 int gwp_http_build_auth_required_reply(void *out, size_t out_cap);
+
+/**
+ * Build a "400 Bad Request" reply, for a request the forwarding proxy refuses
+ * to relay because the origin could frame it differently (see
+ * GWP_HTTP_BAD_REQUEST).
+ *
+ * @return	Number of bytes written to @out, or -ENOBUFS if too small.
+ */
+int gwp_http_build_bad_request_reply(void *out, size_t out_cap);
 
 /**
  * Build a "403 Forbidden" reply (used when an ACL rejects the target).

@@ -244,6 +244,20 @@ static int build_forward_request(struct gwp_http_conn *hc, const char *path,
 	if (!method)
 		return -EINVAL;
 
+	/*
+	 * Fields the Connection header names are dropped below, as RFC 9110
+	 * Section 7.6.1 asks. That must never take the framing fields with
+	 * them: the body follows the header unchanged, so an origin that no
+	 * longer sees Content-Length or Transfer-Encoding reads the body as
+	 * the next request -- a client-chosen request line and Host smuggled
+	 * past the rewrite above. Host is replaced anyway, and listing it is
+	 * just as meaningless. Nothing legitimate does this; refuse it.
+	 */
+	if (conn_lists(conn, "Content-Length") ||
+	    conn_lists(conn, "Transfer-Encoding") ||
+	    conn_lists(conn, "Host"))
+		return -EBADMSG;
+
 	buf = malloc(cap);
 	if (!buf)
 		return -ENOMEM;
@@ -319,8 +333,8 @@ too_big:
 
 /*
  * Classify a fully-parsed forwarding request: rebuild it in origin-form and
- * split the http:// authority into host/port. Returns GWP_HTTP_FORWARD or
- * GWP_HTTP_ERR.
+ * split the http:// authority into host/port. Returns GWP_HTTP_FORWARD,
+ * GWP_HTTP_BAD_REQUEST or GWP_HTTP_ERR.
  */
 static int classify_forward(struct gwp_http_conn *hc, size_t hdr_len,
 			    char **host_p, char **port_p,
@@ -329,6 +343,7 @@ static int classify_forward(struct gwp_http_conn *hc, size_t hdr_len,
 	static char default_port[] = "80";
 	char *uri = hc->req_hdr.uri, *authority, *slash;
 	const char *path;
+	int r;
 
 	/* Only absolute-form http:// URIs are supported (no TLS termination). */
 	if (!uri || strncasecmp(uri, "http://", 7))
@@ -349,8 +364,11 @@ static int classify_forward(struct gwp_http_conn *hc, size_t hdr_len,
 	 * authority is isolated (and the path's leading '/' overwritten) only
 	 * afterwards.
 	 */
-	if (build_forward_request(hc, path, authority,
-				  (size_t)(slash - authority), hdr_len) < 0)
+	r = build_forward_request(hc, path, authority,
+				  (size_t)(slash - authority), hdr_len);
+	if (r == -EBADMSG)
+		return GWP_HTTP_BAD_REQUEST;
+	if (r < 0)
 		return GWP_HTTP_ERR;
 
 	if (*slash == '/')
@@ -432,6 +450,22 @@ int gwp_http_build_auth_required_reply(void *out, size_t out_cap)
 	static const char resp[] =
 		"HTTP/1.1 407 Proxy Authentication Required\r\n"
 		"Proxy-Authenticate: Basic realm=\"gwproxy\"\r\n"
+		"Content-Length: 0\r\n"
+		"Connection: close\r\n"
+		"\r\n";
+	size_t len = sizeof(resp) - 1;
+
+	if (out_cap < len)
+		return -ENOBUFS;
+
+	memcpy(out, resp, len);
+	return (int)len;
+}
+
+int gwp_http_build_bad_request_reply(void *out, size_t out_cap)
+{
+	static const char resp[] =
+		"HTTP/1.1 400 Bad Request\r\n"
 		"Content-Length: 0\r\n"
 		"Connection: close\r\n"
 		"\r\n";

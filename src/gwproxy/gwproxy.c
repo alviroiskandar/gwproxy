@@ -3337,6 +3337,22 @@ static int http_reject_too_large(struct gwp_conn_pair *gcp)
 }
 
 /*
+ * Queue the HTTP 400 reply for a request the forwarding proxy refuses to relay
+ * (GWP_HTTP_BAD_REQUEST). Same mechanism as the 407 above. Returns a negative
+ * error so the caller drops the connection.
+ */
+static int http_reject_bad_request(struct gwp_conn_pair *gcp)
+{
+	int r = gwp_http_build_bad_request_reply(gcp->target.buf + gcp->target.len,
+						 gcp->target.cap - gcp->target.len);
+	if (r < 0)
+		return -ENOBUFS;
+
+	gcp->target.len += (uint32_t)r;
+	return -EBADMSG;
+}
+
+/*
  * Prepend a rewritten origin-form forward request to any request-body bytes
  * already buffered in client.buf, so the forwarding path streams it to the
  * origin.
@@ -3426,6 +3442,9 @@ int gwp_handle_conn_state_http(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		if (r < 0)
 			return r;
 		return http_connect_target(w, gcp, host, port);
+	case GWP_HTTP_BAD_REQUEST:
+		pr_dbg(&ctx->lh, "Refusing HTTP request (fd=%d)", gcp->client.fd);
+		return http_reject_bad_request(gcp);
 	default:	/* GWP_HTTP_ERR */
 		pr_dbg(&ctx->lh, "Invalid HTTP request (fd=%d)", gcp->client.fd);
 		return -EINVAL;
