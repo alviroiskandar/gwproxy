@@ -1620,8 +1620,19 @@ __hot
 static int handle_ev_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_ctx *ctx = w->ctx;
+	uint64_t val;
+	ssize_t r;
 
 	if (gcp->timer_fd < 0)
+		return 0;
+
+	/*
+	 * An expiry reported earlier in this batch may have been discarded
+	 * since, by handle_connect() re-arming the timer for the next phase.
+	 * Only a timerfd that still has an expiry to read has timed out.
+	 */
+	r = __sys_read(gcp->timer_fd, &val, sizeof(val));
+	if (r == -EAGAIN)
 		return 0;
 
 	pr_warn(&ctx->lh, "Connection timeout! (idx=%u, cfd=%d, tfd=%d, ca=%s, ta=%s)",
@@ -1894,28 +1905,24 @@ static int handle_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	int r;
 
-	if (gcp->timer_fd >= 0) {
-		/*
-		 * If we already have a timer fd, close it and use the new
-		 * timer fd instead. There are two timers used in the socks5
-		 * case:
-		 *
-		 *    1. Timer for waiting socks5 auth and command.
-		 *    2. Timer for waiting target connect().
-		 *
-		 * If we've reached this point. Timer no (1) has already
-		 * served its purpose and we can close it.
-		 */
-		__sys_close(gcp->timer_fd);
-		gcp->timer_fd = -1;
-	}
-
 	/*
 	 * The connect timeout bounds the whole operation, across every
 	 * candidate address, so it is armed once here rather than per attempt.
+	 *
+	 * The SOCKS5 and HTTP handshakes ran under the protocol timer, which
+	 * has served its purpose by now. Re-arm that timerfd for the connect
+	 * timeout rather than closing it and creating another: it is already
+	 * registered under the same tag, so this is one timerfd_settime()
+	 * instead of close, timerfd_create, timerfd_settime and EPOLL_CTL_ADD.
+	 * Re-arming also discards an expiry still pending on it, which
+	 * handle_ev_timer() then recognises as stale.
 	 */
 	r = w->ctx->cfg.connect_timeout;
-	if (r > 0) {
+	if (r > 0 && gcp->timer_fd >= 0) {
+		r = gwp_create_timer(gcp->timer_fd, r, 0);
+		if (unlikely(r < 0))
+			return r;
+	} else if (r > 0) {
 		struct epoll_event tev;
 
 		r = gwp_create_timer(-1, r, 0);
@@ -1928,6 +1935,10 @@ static int handle_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, gcp->timer_fd, &tev);
 		if (unlikely(r))
 			return r;
+	} else if (gcp->timer_fd >= 0) {
+		/* No connect timeout: the protocol timer just goes. */
+		__sys_close(gcp->timer_fd);
+		gcp->timer_fd = -1;
 	}
 
 	/*
