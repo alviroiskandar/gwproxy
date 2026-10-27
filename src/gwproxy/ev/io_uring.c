@@ -35,9 +35,11 @@
  * (unlike epoll, which decrypts synchronously into a stack buffer). @rx is
  * where the kernel deposits ciphertext to be fed to the read BIO; @tx holds
  * ciphertext pulled from the write BIO that is being sent, with @tx_sent..@tx_len
- * the not-yet-written tail. TLS records cap at ~16 KiB.
+ * the not-yet-written tail. Both hold a whole TLS record, header and cipher
+ * overhead included, so a full record goes out in one send and comes in with
+ * one recv.
  */
-#define GWP_TLS_CIPHER_CAP 16384u
+#define GWP_TLS_CIPHER_CAP GWP_SSL_RECORD_MAX
 
 struct gwp_iou_tls {
 	uint32_t	tx_len;		/* ciphertext bytes queued in @tx  */
@@ -680,7 +682,7 @@ static void prep_send_client_cipher(struct gwp_wrk *w, struct gwp_conn_pair *gcp
 
 /*
  * Encrypt as much of target.buf as the engine accepts, pull the resulting
- * ciphertext into the tx scratch, and queue it. With a memory write-BIO
+ * ciphertext into the tx scratch, and queue it. With an in-memory write queue
  * SSL_write() never blocks, so target.buf drains fully; a record never exceeds
  * the scratch. If there is nothing to send (no plaintext, no queued
  * ciphertext), fall back to the plaintext post-send action (read the target).
@@ -907,9 +909,14 @@ static int handle_ev_tls_detect(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		return 0;
 	}
 
-	gcp->tls_io = calloc(1, sizeof(*gcp->tls_io));
+	/* Only the header needs zeroing; rx/tx are scratch. */
+	gcp->tls_io = malloc(sizeof(*gcp->tls_io));
 	if (unlikely(!gcp->tls_io))
 		return -ENOMEM;
+	gcp->tls_io->tx_len = 0;
+	gcp->tls_io->tx_sent = 0;
+	gcp->tls_io->hs_done = false;
+	gcp->tls_io->closing = false;
 
 	gcp->client.tls = gwp_ssl_server_new(ctx->ssl_ctx);
 	if (unlikely(!gcp->client.tls))
