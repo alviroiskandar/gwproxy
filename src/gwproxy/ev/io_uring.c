@@ -1422,8 +1422,15 @@ static int finish_target_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	 * client.buf; that goes to the origin below, and the client recv is
 	 * armed only once it has drained (handle_ev_target_send()). Arming it
 	 * here would race with that send on client.buf.
+	 *
+	 * Otherwise, what the client sent right behind its request is still in
+	 * client.buf. Send it first, since the client may wait for an answer
+	 * to it before it sends anything else; the send completion arms the
+	 * client recv.
 	 */
-	if (!http_fwd) {
+	if (!http_fwd && gcp->client.len) {
+		prep_send_target(w, gcp);
+	} else if (!http_fwd) {
 		r = prep_recv_client(w, gcp);
 		if (r)
 			return r;
