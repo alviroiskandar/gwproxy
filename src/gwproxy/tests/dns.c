@@ -35,6 +35,9 @@ struct req_template {
  * many-requests shape (queue, workers, eventfd, refcounts, cache inserts) that
  * this test is actually about, and covers both address families.
  *
+ * Only "localhost" is used as a name. "ip6-localhost" is a Debian default
+ * that other hosts files leave out, and "::1" already covers IPv6.
+ *
  * The entries marked needs_ipv6 are requested only where the host can serve
  * them; /etc/hosts is not enough on its own. See has_ipv6().
  */
@@ -42,15 +45,15 @@ static const struct req_template req_template[] = {
 	{ "localhost",		"80",	false },
 	{ "127.0.0.1",		"80",	false },
 	{ "::1",		"443",	true },
-	{ "ip6-localhost",	"443",	false },
+	{ "localhost",		"1080",	false },
 	{ "localhost",		"443",	false },
 	{ "127.0.0.1",		"443",	false },
 	{ "::1",		"80",	true },
-	{ "ip6-localhost",	"80",	false },
+	{ "localhost",		"3128",	false },
 	{ "localhost",		"8080",	false },
 	{ "127.0.0.1",		"8080",	false },
 	{ "::1",		"8080",	true },
-	{ "ip6-localhost",	"8080",	false },
+	{ "localhost",		"8443",	false },
 	{ "localhost",		"9090",	false },
 	{ "127.0.0.1",		"9090",	false },
 	{ "::1",		"9090",	true },
