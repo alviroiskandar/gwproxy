@@ -539,6 +539,22 @@ static struct io_uring_sqe *prep_timer_target(struct gwp_wrk *w,
 	return s;
 }
 
+/*
+ * The tunnel or UDP association is up and its handshake timer is being
+ * removed: with --idle-timeout, arm the idle check in its place. Queued after
+ * the removal, which matches by the same user_data but runs first.
+ */
+static void arm_idle_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	int sec = w->ctx->cfg.idle_timeout;
+
+	if (sec <= 0)
+		return;
+	gcp->idle_timer = true;
+	gcp->last_act = w->now;
+	prep_timer_target(w, gcp, sec);
+}
+
 static void prep_timer_del_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct io_uring_sqe *s = get_sqe_nofail(w);
@@ -1295,6 +1311,7 @@ static int upstream_iou_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	int r;
 
 	prep_timer_del_target(w, gcp);
+	arm_idle_timer(w, gcp);
 	gcp->up_tx = false;
 	gcp->is_target_alive = true;
 	gcp->conn_state = CONN_STATE_FORWARDING;
@@ -1435,6 +1452,7 @@ static int finish_target_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		return upstream_iou_start(w, gcp);
 
 	prep_timer_del_target(w, gcp);
+	arm_idle_timer(w, gcp);
 	gcp->is_target_alive = true;
 	pr_info(&w->ctx->lh,
 		"Target socket connected (fd=%d, idx=%u, ca=%s, ta=%s)",
@@ -1573,6 +1591,28 @@ static int handle_ev_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	/* The timeout's own completion: it fired or was removed. */
 	if (!is_timer_del && gcp->nr_timers_armed)
 		gcp->nr_timers_armed--;
+
+	/*
+	 * Idle check: close the pair if nothing moved for the whole timeout,
+	 * else look again once the rest of it has passed. Only one timeout
+	 * may carry the check: a handshake timer that fired just as the
+	 * tunnel came up arrives here too, and must not start a second one.
+	 */
+	if (gcp->idle_timer && !is_timer_del && res == -ETIME &&
+	    !(gcp->flags & GWP_CONN_FLAG_IS_CANCEL)) {
+		int sec = ctx->cfg.idle_timeout;
+		uint32_t idle = w->now - gcp->last_act;
+
+		if (idle >= (uint32_t)sec) {
+			pr_info(&ctx->lh, "Idle timeout (idx=%u, ca=%s, ta=%s)",
+				gcp->idx, ip_to_str(&gcp->client_addr),
+				ip_to_str(&gcp->target_addr));
+			return -ETIMEDOUT;
+		}
+		if (!gcp->nr_timers_armed)
+			prep_timer_target(w, gcp, sec - (int)idle);
+		return 0;
+	}
 
 	if (!gcp->is_target_alive && res == -ETIME) {
 		assert(is_timer_del == false);
@@ -2154,6 +2194,7 @@ static int arm_udp_relay(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		gcp->is_target_alive = true;
 		prep_timer_del_target(w, gcp);
 	}
+	arm_idle_timer(w, gcp);
 
 	r = prep_recv_client_prot(w, gcp);
 	if (r)
@@ -2368,6 +2409,8 @@ static int handle_event(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 	if (nr_ops) {
 		assert(*nr_ops);
 		(*nr_ops)--;
+		/* Activity, for --idle-timeout. */
+		((struct gwp_conn_pair *)udata)->last_act = w->now;
 
 		/*
 		 * The pair is being torn down and its cancels are queued, so
@@ -2560,6 +2603,7 @@ static int fish_events(struct gwp_wrk *w)
 	int r;
 
 	r = io_uring_submit_and_wait(&iou->ring, 1);
+	w->now = gwp_now_sec();
 	if (unlikely(r < 0)) {
 		if (r != -EINTR) {
 			log_submit_err(w, r);

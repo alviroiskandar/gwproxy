@@ -54,6 +54,7 @@ enum {
 	OPT_OUTGOING_FAMILY,
 	OPT_BIND_IPV6_ONLY,
 	OPT_DNS_CACHE_MAX_ENTRIES,
+	OPT_IDLE_TIMEOUT,
 };
 
 static const struct option long_opts[] = {
@@ -76,6 +77,7 @@ static const struct option long_opts[] = {
 	{ "nr-workers",		required_argument,	NULL,	'w' },
 	{ "nr-dns-workers",	required_argument,	NULL,	'W' },
 	{ "connect-timeout",	required_argument,	NULL,	'c' },
+	{ "idle-timeout",	required_argument,	NULL,	OPT_IDLE_TIMEOUT },
 	{ "connect-attempt-delay", required_argument,	NULL,	'D' },
 	{ "target-buf-size",	required_argument,	NULL,	'T' },
 	{ "client-buf-size",	required_argument,	NULL,	'C' },
@@ -174,6 +176,7 @@ static void show_help(const char *app)
 	printf("  -W, --nr-dns-workers=nr         Number of DNS worker threads for SOCKS5 (default: %d)\n", default_opts.nr_dns_workers);
 	printf("                                  More are started while lookups queue up, up to 64.\n");
 	printf("  -c, --connect-timeout=sec       Connection to target timeout in seconds (default: %d)\n", default_opts.connect_timeout);
+	printf("      --idle-timeout=sec          Close a tunnel or UDP association idle this long; 0 = never (default: %d)\n", default_opts.idle_timeout);
 	printf("  -D, --connect-attempt-delay=ms  Delay before racing the next target address (Happy Eyeballs); 0 disables racing (default: %d)\n", default_opts.connect_attempt_delay);
 	printf("  -T, --target-buf-size=nr        Target buffer size in bytes (default: %d)\n", default_opts.target_buf_size);
 	printf("  -C, --client-buf-size=nr        Client buffer size in bytes (default: %d)\n", default_opts.client_buf_size);
@@ -311,6 +314,11 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 			break;
 		case 'c':
 			cfg->connect_timeout = atoi(optarg);
+			break;
+		case OPT_IDLE_TIMEOUT:
+			cfg->idle_timeout = atoi(optarg);
+			if (cfg->idle_timeout < 0)
+				cfg->idle_timeout = 0;
 			break;
 		case 'D':
 			cfg->connect_attempt_delay = atoi(optarg);

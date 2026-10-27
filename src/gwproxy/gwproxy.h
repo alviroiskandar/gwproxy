@@ -18,6 +18,7 @@
 #include <gwproxy/log.h>
 #include <assert.h>
 #include <stdatomic.h>
+#include <time.h>
 #ifdef CONFIG_IO_URING
 #include <liburing.h>
 #endif
@@ -70,6 +71,11 @@ struct gwp_cfg {
 	int		nr_workers;
 	int		nr_dns_workers;
 	int		connect_timeout;
+	/*
+	 * Close a tunnel or UDP association that has moved no data for this
+	 * many seconds; 0 keeps them for as long as both ends do.
+	 */
+	int		idle_timeout;
 	/*
 	 * Happy Eyeballs Connection Attempt Delay in milliseconds (RFC 8305
 	 * Section 5): how long before the next candidate address joins the
@@ -549,8 +555,16 @@ struct gwp_conn_pair {
 	 */
 	struct gwp_socks5_addr	up_dst;
 
+	/*
+	 * When the pair last had I/O (gwp_wrk::now), and so how long it has
+	 * been idle once @idle_timer has replaced the handshake's timer.
+	 */
+	uint32_t		last_act;
+
 	/* One-byte scalars last, so they pack instead of each opening a hole. */
 	bool			is_target_alive;
+	/* The pair's timer is now the --idle-timeout check. */
+	bool			idle_timer;
 	uint8_t			prot_type;
 	bool			udp_pinned;
 	/*
@@ -659,6 +673,11 @@ struct gwp_wrk {
 	bool			need_join;
 	struct gwp_ctx		*ctx;
 	uint32_t		idx;
+	/*
+	 * Coarse monotonic seconds, taken once per wakeup of the loop: cheap
+	 * enough to stamp every event with (gwp_conn_pair::last_act).
+	 */
+	uint32_t		now;
 	pthread_t		thread;
 
 	/*
@@ -855,6 +874,15 @@ const char *ip_to_str(const struct gwp_sockaddr *gs);
 unsigned gwp_reload_events(const struct gwp_ctx *ctx, const void *buf,
 			   size_t len);
 void gwp_ctx_reload_files(struct gwp_ctx *ctx, unsigned flags);
+
+/* Monotonic seconds, at the coarse clock's resolution (a few ms). */
+static inline uint32_t gwp_now_sec(void)
+{
+	struct timespec t;
+
+	clock_gettime(CLOCK_MONOTONIC_COARSE, &t);
+	return (uint32_t)t.tv_sec;
+}
 
 /*
  * Is the target socket carrying the upstream proxy handshake? Until the tunnel

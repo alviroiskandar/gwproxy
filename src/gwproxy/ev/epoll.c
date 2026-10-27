@@ -1219,6 +1219,37 @@ static int upstream_arm(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	return __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_MOD, gcp->target.fd, &ev);
 }
 
+/*
+ * The tunnel or UDP association is up, and the handshake's timer has served
+ * its purpose. With --idle-timeout it becomes the idle check (re-armed, not
+ * replaced, when there is one); without, it just goes.
+ */
+static int arm_idle_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	int sec = w->ctx->cfg.idle_timeout;
+	struct epoll_event ev;
+	int r;
+
+	if (sec <= 0) {
+		if (gcp->timer_fd >= 0) {
+			__sys_close(gcp->timer_fd);
+			gcp->timer_fd = -1;
+		}
+		return 0;
+	}
+
+	gcp->idle_timer = true;
+	gcp->last_act = w->now;
+	r = gwp_create_timer(gcp->timer_fd, sec, 0);
+	if (unlikely(r < 0) || gcp->timer_fd >= 0)
+		return r < 0 ? r : 0;
+
+	gcp->timer_fd = r;
+	ev.events = EPOLLIN;
+	ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_TIMER;
+	return __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, gcp->timer_fd, &ev);
+}
+
 /* The upstream tunnel is up (reply already spliced); start forwarding. */
 static int upstream_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
@@ -1226,10 +1257,9 @@ static int upstream_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	ssize_t sr;
 	int r;
 
-	if (gcp->timer_fd >= 0) {
-		__sys_close(gcp->timer_fd);
-		gcp->timer_fd = -1;
-	}
+	r = arm_idle_timer(w, gcp);
+	if (unlikely(r))
+		return r;
 
 	/*
 	 * target.ep_mask is left as upstream_arm() registered it, so that
@@ -1398,10 +1428,9 @@ static int handle_ev_target_conn_result(struct gwp_wrk *w,
 	if (ctx->upstream.enabled)
 		return upstream_start(w, gcp);
 
-	if (gcp->timer_fd >= 0) {
-		__sys_close(gcp->timer_fd);
-		gcp->timer_fd = -1;
-	}
+	r = arm_idle_timer(w, gcp);
+	if (unlikely(r))
+		return r;
 
 	if (gcp->conn_state == CONN_STATE_SOCKS5_CONNECT) {
 		r = prep_and_send_socks5_rep_connect(w, gcp, 0);
@@ -1800,6 +1829,25 @@ static int handle_ev_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	r = __sys_read(gcp->timer_fd, &val, sizeof(val));
 	if (r == -EAGAIN)
 		return 0;
+
+	/*
+	 * Idle check: close the pair if nothing moved for the whole timeout,
+	 * else look again once the rest of it has passed. Re-arming here, not
+	 * on every I/O, keeps the cost to one timerfd_settime() per timeout.
+	 */
+	if (gcp->idle_timer) {
+		int sec = w->ctx->cfg.idle_timeout;
+		uint32_t idle = w->now - gcp->last_act;
+
+		if (idle < (uint32_t)sec) {
+			r = gwp_create_timer(gcp->timer_fd, sec - (int)idle, 0);
+			return r < 0 ? (int)r : 0;
+		}
+		pr_info(&w->ctx->lh, "Idle timeout (idx=%u, ca=%s, ta=%s)",
+			gcp->idx, ip_to_str(&gcp->client_addr),
+			ip_to_str(&gcp->target_addr));
+		return -ETIMEDOUT;
+	}
 
 	pr_warn(&ctx->lh, "Connection timeout! (idx=%u, cfd=%d, tfd=%d, ca=%s, ta=%s)",
 		gcp->idx, gcp->client.fd, gcp->target.fd,
@@ -2351,16 +2399,16 @@ static int handle_ev_udp_relay(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 static int handle_udp_associate(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct epoll_event ev;
+	int r;
 
 	/*
-	 * The association is long-lived, so drop the protocol-handshake timeout
-	 * that was armed for the negotiation; otherwise it would fire and tear
-	 * the relay down mid-session. Closing the timerfd removes it from epoll.
+	 * The association is long-lived, so the protocol-handshake timeout
+	 * that was armed for the negotiation must not fire and tear the relay
+	 * down mid-session: it becomes the idle check, or goes.
 	 */
-	if (gcp->timer_fd >= 0) {
-		__sys_close(gcp->timer_fd);
-		gcp->timer_fd = -1;
-	}
+	r = arm_idle_timer(w, gcp);
+	if (unlikely(r))
+		return r;
 
 	ev.events = EPOLLIN;
 	ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_UDP_RELAY;
@@ -2744,10 +2792,16 @@ static int handle_event(struct gwp_wrk *w, struct epoll_event *ev)
 	ev_bit = GET_EV_BIT(ev->data.u64);
 	udata = U64_TO_PTR(CLEAR_EV_BIT(ev->data.u64));
 
-	/* Torn down earlier in this batch; see free_conn_pair(). */
-	if (is_ev_bit_conn_pair(ev_bit) &&
-	    (((struct gwp_conn_pair *)udata)->flags & GWP_CONN_FLAG_IS_DYING))
-		return 0;
+	if (is_ev_bit_conn_pair(ev_bit)) {
+		struct gwp_conn_pair *gcp = udata;
+
+		/* Torn down earlier in this batch; see free_conn_pair(). */
+		if (gcp->flags & GWP_CONN_FLAG_IS_DYING)
+			return 0;
+		/* Any event but its own timer is activity (--idle-timeout). */
+		if (ev_bit != EV_BIT_TIMER)
+			gcp->last_act = w->now;
+	}
 
 	/*
 	 * A racing connect attempt: the slot index rides in the tag, so the
@@ -2844,6 +2898,7 @@ static int fish_events(struct gwp_wrk *w)
 
 	w->ev_need_reload = false;
 	r = __sys_epoll_wait(w->ep_fd, w->events, w->evsz, -1);
+	w->now = gwp_now_sec();
 	if (unlikely(r < 0)) {
 		if (r != -EINTR)
 			pr_err(&w->ctx->lh, "epoll_wait failed: %s", strerror(-r));
