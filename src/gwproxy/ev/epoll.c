@@ -739,7 +739,12 @@ static int adjust_epl_mask(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 			return r;
 	}
 
-	if (target_need_ctl) {
+	/*
+	 * No target socket yet: connect attempts live in attempt_fd[] until
+	 * one wins, and adopt_winning_attempt() sets the mask it registers the
+	 * winner with. Client data arriving meanwhile must not be fatal.
+	 */
+	if (target_need_ctl && gcp->target.fd >= 0) {
 		ev.events = gcp->target.ep_mask;
 		ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_TARGET;
 
