@@ -32,6 +32,8 @@ void __pr_log(FILE *handle, int level, const char *fmt, ...)
 	va_start(ap, fmt);
 	va_copy(ap2, ap);
 	r = vsnprintf(loc_buf, sizeof(loc_buf), fmt, ap);
+	if (unlikely(r < 0))
+		goto out;	/* bad format or conversion: nothing to print */
 	if (unlikely((size_t)r >= sizeof(loc_buf))) {
 		tmp = malloc(r + 1);
 		if (!tmp)
