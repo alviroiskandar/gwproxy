@@ -723,16 +723,20 @@ static bool adj_epl_in(struct gwp_conn *src)
 	uint32_t desired;
 
 	/*
-	 * Once this fd's read side is at EOF, stop listening for EPOLLIN and
-	 * EPOLLRDHUP on it. While the buffer is full, keep RDHUP but drop IN
-	 * so we still learn of a peer close under backpressure.
+	 * Listen for input only while there is room for it. Once this fd's
+	 * read side is at EOF, or while the buffer is full, register neither
+	 * EPOLLIN nor EPOLLRDHUP. The registration is level-triggered and no
+	 * handler acts on RDHUP alone, so a peer FIN queued behind data we
+	 * have no room for would be reported on every epoll_wait() and spin
+	 * the worker until the other side drained the buffer. Nothing is
+	 * lost by not watching: EPOLLERR and EPOLLHUP are always reported,
+	 * and the FIN is read as recv() == 0 once there is room again, which
+	 * is also the only point at which data ordering lets us act on it.
 	 */
-	if (src->rd_eof)
-		desired = 0;
-	else if (src->cap - src->len)
+	if (!src->rd_eof && src->cap - src->len)
 		desired = EPOLLIN | EPOLLRDHUP;
 	else
-		desired = EPOLLRDHUP;
+		desired = 0;
 
 	if ((src->ep_mask & (EPOLLIN | EPOLLRDHUP)) != desired) {
 		src->ep_mask = (src->ep_mask & ~(EPOLLIN | EPOLLRDHUP)) | desired;
