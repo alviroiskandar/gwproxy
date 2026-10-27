@@ -18,10 +18,15 @@
 #                     it used to hit an assert, and must now resolve;
 #   cname-jump        a CNAME whose RDLENGTH walks the cursor past the buffer;
 #   rdata-truncated   an AAAA claiming 16 bytes of RDATA that stops after one;
+#   field-truncated   an answer that stops inside its TTL;
+#   tc-set            a complete-looking answer with the TC (truncated) bit;
 #   question-label    a question label length of 0xC0, which strides 193 bytes.
 #
-# The last three must be refused, not parsed -- the client sees nothing and
-# gives up, which is the point: the failure stays inside that one request.
+# The last five must be refused, not parsed: the client gets a failure reply
+# (a non-zero REP) and the failure stays inside that one request.
+# It must also stay within one query per address family. The resolver used to
+# send the same query again on every unusable answer, as fast as the server
+# answered, until the protocol timeout -- thousands of queries for one request.
 #
 # The port matters as much as the payload here. --dns-server used to drop the
 # port from "addr:port" and query 53 regardless, and because the socket is
@@ -69,9 +74,12 @@ except Exception:
 # io_uring hides the difference.
 for loop in epoll; do
 
-	for mode in good uncompressed-name cname-jump rdata-truncated question-label; do
+	for mode in good uncompressed-name cname-jump rdata-truncated \
+		    field-truncated tc-set question-label; do
 		dp="$(pick_port)"
-		python3 "$SERVERS_DIR/dns_malformed.py" "$mode" "$dp" 2>/dev/null &
+		rm -f "$WORK/nr_queries"
+		python3 "$SERVERS_DIR/dns_malformed.py" "$mode" "$dp" \
+			"$WORK/nr_queries" 2>/dev/null &
 		dns_pid=$!
 		_PIDS+=("$dns_pid")
 		sleep 0.4
@@ -89,8 +97,15 @@ for loop in epoll; do
 				fail "[$loop] $mode did not resolve (got '$rep')"
 			;;
 		*)
-			[ "$rep" = "NONE" ] || \
-				fail "[$loop] $mode was parsed rather than refused (got '$rep')"
+			case "$rep" in
+			REP=0x00|NONE)
+				fail "[$loop] $mode was not refused with a reply (got '$rep')" ;;
+			esac
+			# Anything still being sent would show up by now.
+			sleep 0.5
+			nq="$(cat "$WORK/nr_queries" 2>/dev/null)"
+			[ -n "$nq" ] && [ "$nq" -le 2 ] || \
+				fail "[$loop] $mode took '$nq' queries (want at most 2)"
 			;;
 		esac
 
@@ -102,6 +117,28 @@ for loop in epoll; do
 		wait "$GWP_PID" 2>/dev/null
 		kill "$dns_pid" 2>/dev/null
 	done
+
+	# The HTTP proxy resolves through the same raw resolver. Its CONNECT
+	# path used to treat the pending raw query as a getaddrinfo() entry
+	# and hand a field of the DNS packet to epoll_ctl() as a descriptor,
+	# so the query was never even sent.
+	dp="$(pick_port)"
+	python3 "$SERVERS_DIR/dns_malformed.py" good "$dp" 2>/dev/null &
+	dns_pid=$!
+	_PIDS+=("$dns_pid")
+	sleep 0.4
+	p="$(pick_port)"
+	gwp_start "127.0.0.1:$p" --as-http=1 --raw-dns=1 \
+		--dns-server="127.0.0.1:$dp" --event-loop="$loop" --nr-workers=1
+	code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 \
+		-p -x "http://127.0.0.1:$p" "http://probe.example.com:$hp/index.html")"
+	[ "$code" = 200 ] || \
+		fail "[$loop] HTTP CONNECT through raw DNS got '$code' (want 200)"
+	kill -0 "$GWP_PID" 2>/dev/null || \
+		fail "[$loop] proxy died on an HTTP CONNECT through raw DNS"
+	kill "$GWP_PID" 2>/dev/null
+	wait "$GWP_PID" 2>/dev/null
+	kill "$dns_pid" 2>/dev/null
 
 	# ...and the case where no response comes back at all. The socket is
 	# connected, so a DNS server that is simply not there answers with an

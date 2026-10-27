@@ -84,6 +84,16 @@ for loop in epoll io_uring; do
 	*)		fail "[$loop] CONNECT to a refused target got '$st' (want 502)" ;;
 	esac
 
+	# A port that is not one is the client's mistake, not the origin's:
+	# 400, and nothing is looked up. Service names are not ports either.
+	for auth in "localhost:99999" "localhost:http" "localhost:+80"; do
+		st="$(raw_status "$pp" "$auth")"
+		case "$st" in
+		"HTTP/1.1 400"*)	;;
+		*)	fail "[$loop] CONNECT $auth got '$st' (want 400)" ;;
+		esac
+	done
+
 	kill "$GWP_PID" 2>/dev/null
 done
 

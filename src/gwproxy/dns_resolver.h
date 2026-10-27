@@ -36,14 +36,15 @@ void gwp_dns_res_drop_query(struct gwp_dns_resolver *res,
 			    struct gwp_conn_pair *gcp, uint16_t txid);
 
 int gwp_dns_res_fetch_gcp_by_payload(struct gwp_dns_resolver *res,
-				     const uint8_t buf[UDP_MSG_LIMIT],
+				     const uint8_t buf[DNS_EDNS_UDP_SIZE],
 				     uint16_t len,
 				     struct gwp_conn_pair **gcp_p);
 
 int gwp_dns_res_complete_query(struct gwp_dns_resolver *res,
 				struct gwp_dns_packet *gdp,
-				uint8_t buf[UDP_MSG_LIMIT],
+				uint8_t buf[DNS_EDNS_UDP_SIZE],
 				uint16_t len,
-				struct gwp_sockaddr *addr);
+				struct gwp_sockaddr *addrs, uint8_t cap,
+				uint8_t *nr_addrs);
 
 #endif /* #ifndef GWPROXY__DNS_RESOLVER_H */

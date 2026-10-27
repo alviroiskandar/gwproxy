@@ -171,6 +171,7 @@ static void show_help(const char *app)
 	printf("      --dns-cache-max-entries=nr  Max DNS cache entries; 0 = unlimited (default: %d)\n", default_opts.dns_cache_max_entries);
 	printf("  -w, --nr-workers=nr             Number of worker threads (default: %d)\n", default_opts.nr_workers);
 	printf("  -W, --nr-dns-workers=nr         Number of DNS worker threads for SOCKS5 (default: %d)\n", default_opts.nr_dns_workers);
+	printf("                                  More are started while lookups queue up, up to 64.\n");
 	printf("  -c, --connect-timeout=sec       Connection to target timeout in seconds (default: %d)\n", default_opts.connect_timeout);
 	printf("  -D, --connect-attempt-delay=ms  Delay before racing the next target address (Happy Eyeballs); 0 disables racing (default: %d)\n", default_opts.connect_attempt_delay);
 	printf("  -T, --target-buf-size=nr        Target buffer size in bytes (default: %d)\n", default_opts.target_buf_size);
@@ -545,8 +546,7 @@ static void gwp_free_dns_packet(struct gwp_conn_pair *gcp)
 
 static int gwp_raw_dns_resolve(struct gwp_wrk *w,
 			       struct gwp_conn_pair *gcp,
-			       const char *host,
-			       const char *port)
+			       const char *host, uint16_t port)
 {
 	struct gwp_dns_resolver *res;
 	struct gwp_dns_packet *gdp;
@@ -568,7 +568,7 @@ static int gwp_raw_dns_resolve(struct gwp_wrk *w,
 
 	gdp->restyp = cfg_dns_restyp(&w->ctx->cfg);
 
-	gdp->port = (uint16_t)atoi(port);
+	gdp->port = port;
 	gdp->buf_len = sizeof(gdp->buf);
 	gdp->gcp = gcp;
 	r = gwp_dns_res_prep_query(res, gdp);
@@ -594,7 +594,7 @@ static void gwp_ctx_free_raw_dns(struct gwp_wrk __unused *w)
 static int gwp_raw_dns_resolve(struct gwp_wrk __unused *w,
 			       struct gwp_conn_pair __unused *gcp,
 			       const char __unused *host,
-			       const char __unused *port)
+			       uint16_t __unused port)
 {
 	return -ENOSYS;
 }
@@ -1592,7 +1592,8 @@ static int gwp_ctx_init_dns(struct gwp_ctx *ctx)
 		.max_entries = cfg->dns_cache_max_entries > 0 ?
 			       (uint32_t)cfg->dns_cache_max_entries : 0,
 		.restyp = cfg_dns_restyp(cfg),
-		.nr_workers = cfg->nr_dns_workers
+		.nr_workers = cfg->nr_dns_workers,
+		.nr_cqs = (uint32_t)cfg->nr_workers
 	};
 	int r;
 
@@ -2230,11 +2231,11 @@ int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		gwp_dns_res_drop_query(&w->dns->resolvers[0], gcp, gcp->gdp->txid);
 		gwp_free_dns_packet(gcp);
 	} else if (gcp->gde) {
-		gwp_dns_entry_put(gcp->gde);
+		gwp_dns_entry_cancel(gcp->gde);
 	}
 #else
 	if (gcp->gde)
-		gwp_dns_entry_put(gcp->gde);
+		gwp_dns_entry_cancel(gcp->gde);
 #endif
 
 	switch (gcp->prot_type) {
@@ -2674,15 +2675,23 @@ int gwp_acl_reject_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	return -EACCES;
 }
 
+/*
+ * Queue the lookup, or, when @res is an error the cache remembered for the
+ * name, an entry that already failed with it: either way the result comes
+ * back through the worker's DNS completion queue.
+ */
 static int queue_dns_resolution(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
-				const char *host, const char *port)
+				const char *host, uint16_t port, int res)
 {
 	struct gwp_dns_ctx *dns = w->ctx->dns;
 	struct gwp_dns_entry *gde;
 
-	gde = gwp_dns_queue(dns, host, port);
+	if (res)
+		gde = gwp_dns_queue_result(dns, w->idx, host, port, gcp, res);
+	else
+		gde = gwp_dns_queue(dns, w->idx, host, port, gcp);
 	if (unlikely(!gde)) {
-		pr_err(&w->ctx->lh, "Failed to allocate DNS entry for %s:%s", host, port);
+		pr_err(&w->ctx->lh, "Failed to allocate DNS entry for %s:%hu", host, port);
 		return -ENOMEM;
 	}
 
@@ -2871,7 +2880,7 @@ void gwp_conn_set_single_candidate(struct gwp_conn_pair *gcp,
 
 static int prepare_target_addr_domain(struct gwp_wrk *w,
 				      struct gwp_conn_pair *gcp,
-				      const char *host, const char *port)
+				      const char *host, uint16_t port)
 {
 	struct gwp_ctx *ctx = w->ctx;
 	struct gwp_cfg *cfg = &ctx->cfg;
@@ -2885,19 +2894,9 @@ static int prepare_target_addr_domain(struct gwp_wrk *w,
 	 * proxy. up_dst carries the domain and we're ready to connect.
 	 */
 	if (ctx->upstream.enabled && ctx->upstream.remote_dns) {
-		/*
-		 * Strict: atoi() stops at the first non-digit and reports the
-		 * prefix, so a port carrying trailing junk was silently
-		 * accepted. Unlike the resolving paths below, nothing else
-		 * validates this string before it becomes the upstream's
-		 * destination port.
-		 */
-		char *endp;
-		unsigned long p = strtoul(port, &endp, 10);
-
-		if (endp == port || *endp || !p || p > 65535)
+		if (!port)
 			return -EINVAL;
-		return upstream_dst_from_domain(host, (uint16_t)p, &gcp->up_dst);
+		return upstream_dst_from_domain(host, port, &gcp->up_dst);
 	}
 
 	if (cfg->use_raw_dns) {
@@ -2910,12 +2909,13 @@ static int prepare_target_addr_domain(struct gwp_wrk *w,
 					      GWP_MAX_CONN_CAND, &nr);
 		if (!r) {
 			gwp_conn_set_candidates(gcp, addrs, nr);
-			pr_dbg(&ctx->lh, "Found %s:%s in DNS cache %s (%u addr)",
+			pr_dbg(&ctx->lh, "Found %s:%hu in DNS cache %s (%u addr)",
 				host, port, ip_to_str(&gcp->target_addr), nr);
 			return 0;
 		}
 
-		return queue_dns_resolution(w, gcp, host, port);
+		return queue_dns_resolution(w, gcp, host, port,
+					    r == -EHOSTUNREACH ? r : 0);
 	}
 }
 
@@ -2923,16 +2923,11 @@ static int socks5_prepare_target_addr_domain(struct gwp_wrk *w,
 					     struct gwp_conn_pair *gcp)
 {
 	struct gwp_socks5_addr *dst;
-	const char *host;
-	char portstr[6];
-	uint16_t port;
 	int r;
 
 	dst = &gcp->s5_conn->dst_addr;
-	port = ntohs(dst->port);
-	host = dst->domain.str;
-	snprintf(portstr, sizeof(portstr), "%hu", port);
-	r = prepare_target_addr_domain(w, gcp, host, portstr);
+	r = prepare_target_addr_domain(w, gcp, dst->domain.str,
+				       ntohs(dst->port));
 	if (r == -EINPROGRESS)
 		gcp->conn_state = CONN_STATE_SOCKS5_DNS_QUERY;
 
@@ -3375,8 +3370,8 @@ int gwp_handle_conn_state_socks5(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		   ct == CONN_STATE_SOCKS5_CONNECT) {
 		/*
 		 * The request is parsed; we are waiting on the resolver or on
-		 * connect(), and the client is still armed for input because
-		 * arm_poll_for_dns_query() only adds the resolver's eventfd.
+		 * connect(), and the client is still armed for input: waiting
+		 * on the resolver does not touch the client's registration.
 		 * A client that pipelines data behind its request therefore
 		 * arrives here, which is rude rather than impossible -- it
 		 * used to abort the process.
@@ -3484,11 +3479,44 @@ static int http_inject_forward_request(struct gwp_conn_pair *gcp,
 	return 0;
 }
 
+/*
+ * A port as an HTTP authority carries it: decimal digits only, no sign, no
+ * service name, at most 65535.
+ */
+static int parse_port(const char *s, uint16_t *port)
+{
+	uint32_t v = 0;
+
+	if (!*s)
+		return -EINVAL;
+
+	for (; *s; s++) {
+		if (*s < '0' || *s > '9')
+			return -EINVAL;
+		v = v * 10 + (uint32_t)(*s - '0');
+		if (v > 65535)
+			return -EINVAL;
+	}
+
+	*port = (uint16_t)v;
+	return 0;
+}
+
 /* Resolve and connect to @host:@port, setting the HTTP connect/DNS state. */
 static int http_connect_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			       const char *host, const char *port)
 {
-	int r = prepare_target_addr_domain(w, gcp, host, port);
+	uint16_t p;
+	int r;
+
+	/*
+	 * The resolver takes the port as a number; a port that is not one
+	 * used to reach getaddrinfo() and come back as a 502.
+	 */
+	if (parse_port(port, &p))
+		return http_reject_bad_request(gcp);
+
+	r = prepare_target_addr_domain(w, gcp, host, p);
 
 	if (r == -EINPROGRESS)
 		gcp->conn_state = CONN_STATE_HTTP_DNS_QUERY;

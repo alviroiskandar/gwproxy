@@ -4,10 +4,13 @@
 Answers every query with a deliberately malformed response chosen by mode.
 Modes mirror the four findings in src/gwproxy/dns_parser.c.
 """
-import socket, struct, sys
+import os, socket, struct, sys
 
 mode = sys.argv[1]
 port = int(sys.argv[2])
+# Optional: a file that always holds the number of queries received so far.
+count_file = sys.argv[3] if len(sys.argv) > 3 else None
+nr_queries = 0
 
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.bind(("127.0.0.1", port))
@@ -25,6 +28,11 @@ while True:
     q, peer = s.recvfrom(2048)
     if len(q) < 12:
         continue
+    nr_queries += 1
+    if count_file:
+        with open(count_file + ".tmp", "w") as f:
+            f.write("%d\n" % nr_queries)
+        os.replace(count_file + ".tmp", count_file)
     txid = q[:2]
     qend = qname_end(q, 12)
     question = q[12:qend + 4]          # name + qtype + qclass
@@ -51,6 +59,18 @@ while True:
         # AAAA claiming 16 bytes of RDATA, response ends after one.
         rr = b"\xc0\x0c" + struct.pack("!HHIH", 28, 1, 60, 16) + b"\x01"
         resp = txid + struct.pack("!HHHHH", 0x8180, 1, 1, 0, 0) + question + rr
+
+    elif mode == "field-truncated":
+        # The reply ends two bytes into the answer's TTL, so the TTL and
+        # RDLENGTH reads run off the end of what arrived.
+        rr = b"\xc0\x0c" + struct.pack("!HH", 1, 1) + b"\x00\x00"
+        resp = txid + struct.pack("!HHHHH", 0x8180, 1, 1, 0, 0) + question + rr
+
+    elif mode == "tc-set":
+        # A well-formed A answer from a server that says it truncated the
+        # reply (TC). What is left looks complete, but may not be.
+        rr = b"\xc0\x0c" + struct.pack("!HHIH", 1, 1, 60, 4) + bytes([127, 0, 0, 1])
+        resp = txid + struct.pack("!HHHHH", 0x8380, 1, 1, 0, 0) + question + rr
 
     elif mode == "question-label":
         # Echo a question whose second label length is 0xC0 (192): the question

@@ -58,6 +58,10 @@ LIBGWDNS_TEST_TARGET = $(GWPROXY_DIR)/tests/dns.t
 LIBGWDNS_TEST_CC_SOURCES = $(GWPROXY_DIR)/tests/dns.c
 LIBGWDNS_TEST_OBJECTS = $(LIBGWDNS_TEST_CC_SOURCES:%.c=%.c.o)
 
+# White-box test of the DNS cache's hash table: it #includes dns_cache.c, so it
+# is built straight from its source, like http1's self-test below.
+LIBGWDNS_CACHE_TEST_TARGET = $(GWPROXY_DIR)/tests/dns_cache.t
+
 # http1's unit tests are embedded in http1.c, gated by the
 # GWNET_HTTP1_TESTS/GWNET_HTTP1_RUN_TESTS macros, so the self-test binary
 # is built straight from http1.c rather than a separate test source.
@@ -71,7 +75,8 @@ LIBGWHTTP_TEST_OBJECTS = $(LIBGWHTTP_TEST_CC_SOURCES:%.c=%.c.o)
 LIBGWHTTP_OBJECTS = $(GWPROXY_DIR)/http.c.o $(GWPROXY_DIR)/http1.c.o \
 		    $(GWPROXY_DIR)/auth.c.o
 
-ALL_TEST_TARGETS = $(LIBGWDNS_TEST_TARGET) $(LIBGWPSOCKS5_TEST_TARGET) \
+ALL_TEST_TARGETS = $(LIBGWDNS_TEST_TARGET) $(LIBGWDNS_CACHE_TEST_TARGET) \
+		   $(LIBGWPSOCKS5_TEST_TARGET) \
 		   $(LIBGWHTTP1_TEST_TARGET) $(LIBGWHTTP_TEST_TARGET) \
 		   $(LIBGWACL_TEST_TARGET)
 ALL_OBJECTS = $(GWPROXY_OBJECTS) $(LIBGWPSOCKS5_OBJECTS) $(LIBGWDNS_OBJECTS) $(LIBGWDNS_TEST_OBJECTS) $(LIBGWPSOCKS5_TEST_OBJECTS) $(LIBGWHTTP_TEST_OBJECTS) $(LIBGWACL_OBJECTS) $(LIBGWACL_TEST_OBJECTS)
@@ -111,6 +116,10 @@ ifeq ($(CONFIG_NEW_DNS_RESOLVER),y)
 GWPROXY_CC_SOURCES += \
 	$(GWPROXY_DIR)/dns_parser.c \
 	$(GWPROXY_DIR)/dns_resolver.c
+
+# The raw DNS parser's self-test is embedded in dns_parser.c (RUNTEST).
+DNS_PARSER_TEST_TARGET = $(GWPROXY_DIR)/tests/dns_parser.t
+ALL_TEST_TARGETS += $(DNS_PARSER_TEST_TARGET)
 endif
 
 ifeq ($(CONFIG_HTTPS),y)
@@ -183,6 +192,12 @@ $(LIBGWDNS_TARGET): $(LIBGWDNS_OBJECTS)
 
 $(LIBGWDNS_TEST_TARGET): $(LIBGWDNS_OBJECTS) $(LIBGWDNS_TEST_OBJECTS) $(LIBGWDNS_TARGET)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
+
+$(GWPROXY_DIR)/tests/dns_parser.t: $(GWPROXY_DIR)/dns_parser.c $(GWPROXY_DIR)/dns_parser.h $(GWPROXY_DIR)/net.c $(EXTRA_DEPS)
+	$(CC) $(CFLAGS) -DRUNTEST $(LDFLAGS) -o $@ $(GWPROXY_DIR)/dns_parser.c $(GWPROXY_DIR)/net.c $(LIBS)
+
+$(LIBGWDNS_CACHE_TEST_TARGET): $(GWPROXY_DIR)/tests/dns_cache.c $(GWPROXY_DIR)/dns_cache.c $(GWPROXY_DIR)/dns_cache.h $(EXTRA_DEPS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LIBS)
 
 $(LIBGWHTTP1_TEST_TARGET): $(GWPROXY_DIR)/http1.c $(GWPROXY_DIR)/http1.h $(GWPROXY_DIR)/common.h $(EXTRA_DEPS)
 	$(CC) $(CFLAGS) -DGWNET_HTTP1_TESTS -DGWNET_HTTP1_RUN_TESTS $(LDFLAGS) -o $@ $< $(LIBS)

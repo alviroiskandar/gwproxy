@@ -297,9 +297,16 @@ int gwp_dns_res_prep_query(struct gwp_dns_resolver *res,
 	} else if (gdp->restyp == GWP_DNS_RESTYP_IPV6_ONLY) {
 		ret = 0;
 		af = AF_INET6;
+		/*
+		 * The last family there is to try: if this one fails too,
+		 * the lookup fails. Left set, every unusable answer sent
+		 * the same query again, until the protocol timeout.
+		 */
+		gdp->__in_fallback_attempt = false;
 	} else if (gdp->restyp == GWP_DNS_RESTYP_IPV4_ONLY) {
 		ret = 0;
 		af = AF_INET;
+		gdp->__in_fallback_attempt = false;
 	} else {
 		ret = -EINVAL;
 		goto err;
@@ -336,7 +343,7 @@ void gwp_dns_res_drop_query(struct gwp_dns_resolver *res,
 }
 
 int gwp_dns_res_fetch_gcp_by_payload(struct gwp_dns_resolver *res,
-				     const uint8_t buf[UDP_MSG_LIMIT],
+				     const uint8_t buf[DNS_EDNS_UDP_SIZE],
 				     uint16_t len,
 				     struct gwp_conn_pair **gcp_p)
 {
@@ -358,12 +365,11 @@ int gwp_dns_res_fetch_gcp_by_payload(struct gwp_dns_resolver *res,
 
 int gwp_dns_res_complete_query(struct gwp_dns_resolver *res,
 				struct gwp_dns_packet *gdp,
-				uint8_t buf[UDP_MSG_LIMIT],
+				uint8_t buf[DNS_EDNS_UDP_SIZE],
 				uint16_t len,
-				struct gwp_sockaddr *addr)
+				struct gwp_sockaddr *addrs, uint8_t cap,
+				uint8_t *nr_addrs)
 {
-	struct gwdns_addrinfo_node *ai = NULL;
-	char port[sizeof("65535")];
 	uint16_t txid;
 	ssize_t r;
 
@@ -380,14 +386,27 @@ int gwp_dns_res_complete_query(struct gwp_dns_resolver *res,
 	if (gdp->gcp != res->sess_map->sess_map[txid])
 		return -EINVAL;
 
-	snprintf(port, sizeof(port), "%hu", gdp->port);
-	r = gwdns_parse_query(txid, port, buf, len, &ai);
+	r = gwdns_parse_query(txid, gdp->port, buf, len, addrs, cap, nr_addrs);
 	if (!r) {
-		*addr = ai->ai_addr;
-		gwdns_free_parsed_query(ai);
 		gwp_dns_res_drop_query(res, gdp->gcp, txid);
 		return 0;
 	}
+
+	/*
+	 * A datagram arrives whole, so "need more data" from the parser
+	 * means the reply is cut short. Do not pass that on as -EAGAIN,
+	 * which the caller reads as "the next query is ready to send".
+	 */
+	if (r == -EAGAIN)
+		r = -EBADMSG;
+
+	/*
+	 * A truncated answer would need a retry over TCP, which this
+	 * resolver does not do. Asking for the other family over UDP is no
+	 * answer to it either: fail the lookup.
+	 */
+	if (r == -EMSGSIZE)
+		gdp->__in_fallback_attempt = false;
 
 	if (gdp->__in_fallback_attempt) {
 		int tmp = gwp_dns_res_prep_query(res, gdp);
