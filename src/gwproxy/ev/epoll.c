@@ -1041,6 +1041,20 @@ static int prep_and_send_socks5_rep_connect(struct gwp_wrk *w,
  */
 
 /*
+ * Is the target socket carrying the upstream proxy handshake? Until the tunnel
+ * is up, gcp->target is that handshake's I/O buffer: whatever it holds (our
+ * unsent request, a partial or refusing reply) belongs to the upstream proxy
+ * and must never be relayed to the client.
+ */
+static bool in_upstream_hs(const struct gwp_conn_pair *gcp)
+{
+	int cs = gcp->conn_state;
+
+	return cs >= CONN_STATE_UPSTREAM_S5_MIN &&
+	       cs <= CONN_STATE_UPSTREAM_HTTP_MAX;
+}
+
+/*
  * Describe the upstream destination for logging. With socks5h:// the real
  * destination is a hostname (target_addr is unset), so show up_dst instead.
  */
@@ -1053,7 +1067,11 @@ static int upstream_fail(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			    int err)
 {
 	if (gcp->prot_type == GWP_PROT_TYPE_SOCKS5) {
-		int r = prep_and_send_socks5_rep_connect(w, gcp, ECONNREFUSED);
+		int r;
+
+		/* Drop the upstream's reply; the client gets only ours. */
+		gcp->target.len = 0;
+		r = prep_and_send_socks5_rep_connect(w, gcp, ECONNREFUSED);
 		if (r)
 			return r;
 	}
@@ -1451,10 +1469,7 @@ static int handle_ev_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	}
 
 	if (!gcp->is_target_alive) {
-		int cs = gcp->conn_state;
-
-		if (cs >= CONN_STATE_UPSTREAM_S5_MIN &&
-		    cs <= CONN_STATE_UPSTREAM_HTTP_MAX)
+		if (in_upstream_hs(gcp))
 			return handle_ev_upstream(w, gcp, ev);
 
 		return handle_ev_target_conn_result(w, gcp);
@@ -1533,14 +1548,25 @@ static int handle_ev_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	 * once the target socket exists -- the other user of this timer is the
 	 * protocol handshake, where the client has not asked for anything yet
 	 * and a CONNECT reply would answer a request that was never made.
+	 *
+	 * Send only what gwp_conn_fail_reply() added: plain forwarding has no
+	 * reply to give, and a stalled upstream handshake leaves its own bytes
+	 * in target.buf, which are dropped first.
 	 */
 	if ((gcp->target.fd >= 0 || has_inflight_attempt(gcp)) &&
-	    !gcp->is_target_alive &&
-	    !gwp_conn_fail_reply(w, gcp, -ETIMEDOUT) && gcp->target.len) {
-		ssize_t sr = __do_send(&gcp->target, &gcp->client);
+	    !gcp->is_target_alive) {
+		uint32_t len;
 
-		if (unlikely(sr < 0))
-			return (int)sr;
+		if (in_upstream_hs(gcp))
+			gcp->target.len = 0;
+		len = gcp->target.len;
+		if (!gwp_conn_fail_reply(w, gcp, -ETIMEDOUT) &&
+		    gcp->target.len > len) {
+			ssize_t sr = __do_send(&gcp->target, &gcp->client);
+
+			if (unlikely(sr < 0))
+				return (int)sr;
+		}
 	}
 
 	return -ETIMEDOUT;
