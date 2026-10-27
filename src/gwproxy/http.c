@@ -474,8 +474,17 @@ int gwp_http_conn_process(struct gwp_http_conn *hc, struct gwp_auth *auth,
 	r = gwnet_http_req_hdr_parse(&hc->ctx_hdr, req);
 	*in_len = hc->ctx_hdr.off;
 	hc->hdr_len += hc->ctx_hdr.off;
+	if (r == -EAGAIN)
+		return GWP_HTTP_NEED_MORE;
+	/*
+	 * A repeated field that may appear only once (Host, Content-Length,
+	 * ...) is a well-formed line in an unacceptable request; say so
+	 * rather than drop the connection without a word.
+	 */
+	if (r == -EEXIST)
+		return GWP_HTTP_BAD_REQUEST;
 	if (r < 0)
-		return (r == -EAGAIN) ? GWP_HTTP_NEED_MORE : GWP_HTTP_ERR;
+		return GWP_HTTP_ERR;
 
 	/* Header complete. */
 	hdr_len = hc->hdr_len;

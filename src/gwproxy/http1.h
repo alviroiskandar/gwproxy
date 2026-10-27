@@ -264,6 +264,8 @@ void gwnet_http_hdr_pctx_free(struct gwnet_http_hdr_pctx *ctx);
  * @return     0 on success,
  *             -EAGAIN if more data is needed,
  *             -EINVAL if the request line is malformed,
+ *             -EEXIST if a field that may appear only once is repeated,
+ *             -E2BIG if the header is too long,
  *             -ENOMEM if memory allocation fails.
  */
 int gwnet_http_req_hdr_parse(struct gwnet_http_hdr_pctx *ctx,
@@ -308,7 +310,10 @@ void gwnet_http_hdr_fields_free(struct gwnet_http_hdr_fields *ff);
  * @param klen Length of the header key.
  * @param v    Pointer to the header value.
  * @param vlen Length of the header value.
- * @return     0 on success, or a negative value on error.
+ * @return     0 on success (a repeated list field is appended to the
+ *             existing value), -EEXIST if @k is already present and may
+ *             appear only once (the stored value is left alone), or
+ *             -ENOMEM.
  */
 int gwnet_http_hdr_fields_addl(struct gwnet_http_hdr_fields *ff,
 			       const char *k, size_t klen, const char *v,

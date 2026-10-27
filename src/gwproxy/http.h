@@ -30,7 +30,9 @@ enum gwp_http_result {
 	GWP_HTTP_FORWARD,	/* Forward request; host/port + rewritten req set. */
 	GWP_HTTP_NEED_AUTH,	/* Proxy auth required/failed; reply 407. */
 	GWP_HTTP_ERR,		/* Malformed or unsupported; tear the conn down. */
-	GWP_HTTP_BAD_REQUEST,	/* Well-formed but unacceptable; reply 400. */
+	GWP_HTTP_BAD_REQUEST,	/* Well-formed but unacceptable (e.g. a field
+				 * that may appear once is repeated); reply
+				 * 400. */
 };
 
 /* Allocate/free a per-connection HTTP proxy state. */

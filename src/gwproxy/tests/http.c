@@ -4,6 +4,9 @@
  *
  * Copyright (C) 2026  Alviro Iskandar Setiawan <alviro.iskandar@gnuweeb.org>
  */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #ifdef NDEBUG
 #undef NDEBUG
 #endif
@@ -580,6 +583,50 @@ static void test_errors(void)
 	PRTEST_OK();
 }
 
+/*
+ * A field that may appear only once, sent twice, is answered with 400 rather
+ * than a silent close; repeated list fields are still merged.
+ */
+static void test_duplicate_field(void)
+{
+	static const char *const dups[] = {
+		"GET http://example.com/ HTTP/1.1\r\n"
+		"Host: example.com\r\nHost: evil.example\r\n\r\n",
+		"POST http://example.com/ HTTP/1.1\r\n"
+		"Content-Length: 1\r\nContent-Length: 2\r\n\r\n",
+		"CONNECT example.com:443 HTTP/1.1\r\n"
+		"Proxy-Authorization: Basic a\r\n"
+		"proxy-authorization: Basic b\r\n\r\n",
+	};
+	static const char list[] =
+		"GET http://example.com/ HTTP/1.1\r\n"
+		"Accept: a\r\nAccept: b\r\n\r\n";
+	struct gwp_http_conn *hc;
+	char *host, *port;
+	const char *req = NULL;
+	size_t req_len = 0, i;
+
+	for (i = 0; i < sizeof(dups) / sizeof(dups[0]); i++) {
+		size_t in_len = strlen(dups[i]);
+
+		/* Not run(): the request is refused before it is all read. */
+		hc = gwp_http_conn_alloc();
+		assert(hc);
+		assert(gwp_http_conn_process(hc, NULL, dups[i], &in_len, &host,
+					     &port, &req, &req_len) ==
+		       GWP_HTTP_BAD_REQUEST);
+		gwp_http_conn_free(hc);
+	}
+
+	hc = gwp_http_conn_alloc();
+	assert(hc);
+	assert(run(hc, NULL, list, &host, &port, &req, &req_len) ==
+	       GWP_HTTP_FORWARD);
+	assert(memmem(req, req_len, "\r\nAccept: a, b\r\n", 16));
+	gwp_http_conn_free(hc);
+	PRTEST_OK();
+}
+
 static void test_auth(void)
 {
 	static const char no_cred[] =
@@ -657,6 +704,7 @@ int main(void)
 		test_res_reject();
 		test_need_more();
 		test_errors();
+		test_duplicate_field();
 		test_auth();
 	}
 

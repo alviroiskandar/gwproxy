@@ -781,7 +781,7 @@ static int parse_hdr_fields(struct gwnet_http_hdr_pctx *ctx,
 
 		r = gwnet_http_hdr_fields_addl(ff, k, kl, v, vl);
 		if (r)
-			return (r < 0) ? r : -EINVAL;
+			return r;
 
 		ctx->tot_len += off;
 		ctx->off += off;
@@ -886,6 +886,7 @@ static int hdr_translate_ret_err(struct gwnet_http_hdr_pctx *ctx, int r)
 		ctx->err = GWNET_HTTP_HDR_ERR_INCOMPLETE;
 		break;
 	case -EINVAL:
+	case -EEXIST:
 		ctx->err = GWNET_HTTP_HDR_ERR_MALFORMED;
 		break;
 	case -E2BIG:
@@ -983,6 +984,7 @@ int gwnet_http_hdr_fields_addl(struct gwnet_http_hdr_fields *ff,
 {
 	ssize_t idx = find_hdr_field_idx(ff, k, klen);
 	struct gwnet_http_hdr_field *f;
+	size_t cur_len, new_val_len;
 	char *new_val;
 
 	if (idx < 0) {
@@ -1019,40 +1021,34 @@ int gwnet_http_hdr_fields_addl(struct gwnet_http_hdr_fields *ff,
 		return 0;
 	}
 
+	/*
+	 * A field that may appear only once is not stored a second time: the
+	 * message is refused, so there is no point in touching the value.
+	 */
+	if (!is_field_allowed_to_be_duplicate(k, klen))
+		return -EEXIST;
+
 	f = &ff->ff[idx];
-	if (is_field_allowed_to_be_duplicate(k, klen)) {
-		size_t cur_len, new_val_len;
-
-		if (!vlen)
-			return 0;
-
-		cur_len = strlen(f->val);
-		new_val_len = cur_len + vlen + 3;
-		new_val = realloc(f->val, new_val_len);
-		if (!new_val)
-			return -ENOMEM;
-
-		if (!cur_len) {
-			memcpy(new_val, v, vlen);
-			new_val[vlen] = '\0';
-		} else {
-			memcpy(&new_val[cur_len], ", ", 2);
-			memcpy(&new_val[cur_len + 2], v, vlen);
-			new_val[cur_len + 2 + vlen] = '\0';
-		}
-
-		f->val = new_val;
+	if (!vlen)
 		return 0;
-	} else {
-		new_val = realloc(f->val, vlen + 1);
-		if (!new_val)
-			return -ENOMEM;
 
+	cur_len = strlen(f->val);
+	new_val_len = cur_len + vlen + 3;
+	new_val = realloc(f->val, new_val_len);
+	if (!new_val)
+		return -ENOMEM;
+
+	if (!cur_len) {
 		memcpy(new_val, v, vlen);
 		new_val[vlen] = '\0';
-		f->val = new_val;
-		return EEXIST;
+	} else {
+		memcpy(&new_val[cur_len], ", ", 2);
+		memcpy(&new_val[cur_len + 2], v, vlen);
+		new_val[cur_len + 2 + vlen] = '\0';
 	}
+
+	f->val = new_val;
+	return 0;
 }
 
 const char *gwnet_http_hdr_fields_get(const struct gwnet_http_hdr_fields *ff,
@@ -1831,8 +1827,11 @@ static void test_req_hdr_invalid_duplicate_fields(void)
 	ctx.buf = buf;
 	ctx.len = len;
 	r = gwnet_http_req_hdr_parse(&ctx, &hdr);
-	assert(r == -EINVAL);
+	assert(r == -EEXIST);
 	assert(ctx.err == GWNET_HTTP_HDR_ERR_MALFORMED);
+	/* The first value is left as it was. */
+	assert(hdr.fields.nr == 1);
+	ASSERT_HDRF(&hdr.fields.ff[0], "Host", "example.com");
 	gwnet_http_req_hdr_free(&hdr);
 	gwnet_http_hdr_pctx_free(&ctx);
 	PRTEST_OK();
@@ -1855,7 +1854,7 @@ static void test_res_hdr_invalid_duplicate_fields(void)
 	ctx.buf = buf;
 	ctx.len = len;
 	r = gwnet_http_res_hdr_parse(&ctx, &hdr);
-	assert(r == -EINVAL);
+	assert(r == -EEXIST);
 	assert(ctx.err == GWNET_HTTP_HDR_ERR_MALFORMED);
 	gwnet_http_res_hdr_free(&hdr);
 	gwnet_http_hdr_pctx_free(&ctx);
