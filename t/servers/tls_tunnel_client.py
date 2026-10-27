@@ -20,6 +20,11 @@
 #       The origin sends <nbytes> bytes and closes. This client waits a
 #       while before it starts reading, then must get all <nbytes> bytes and
 #       a clean end of stream.
+#   upload <nbytes>
+#       Send <nbytes> bytes to an origin that reads them with short pauses,
+#       then, without closing, wait for the origin to confirm it got them
+#       all. Whatever the proxy decrypted it must also deliver, even when the
+#       client has nothing more to send.
 #
 # Exits 0 on success, 1 on failure (with a message on stderr).
 
@@ -66,6 +71,26 @@ def sized_origin(nbytes):
                 n = min(left, 65536)
                 c.sendall(b"z" * n)
                 left -= n
+        except OSError:
+            pass
+        c.close()
+    return fn
+
+
+def counting_origin(nbytes):
+    def fn(lsock):
+        c, _ = lsock.accept()
+        got = 0
+        try:
+            while got < nbytes:
+                d = c.recv(65536)
+                if not d:
+                    break
+                # Pause every 64 KiB so the proxy's buffer to us fills up.
+                if got // 65536 != (got + len(d)) // 65536:
+                    time.sleep(0.01)
+                got += len(d)
+            c.sendall(b"got %d\n" % got)
         except OSError:
             pass
         c.close()
@@ -183,6 +208,25 @@ def scen_slowread(pport, nbytes):
         die("got %d of %d bytes" % (got, nbytes))
 
 
+def scen_upload(pport, nbytes):
+    oport = start_origin(counting_origin(nbytes))
+    a = tunnel(pport, oport)
+    a.sendall(b"x" * nbytes)
+    want = b"got %d\n" % nbytes
+    a.settimeout(15)
+    rep = b""
+    try:
+        while not rep.endswith(b"\n"):
+            d = a.recv(64)
+            if not d:
+                break
+            rep += d
+    except (OSError, ssl.SSLError) as e:
+        die("no confirmation from the origin: %r" % e)
+    if rep != want:
+        die("origin reported %r, want %r" % (rep, want))
+
+
 def main():
     scen = sys.argv[1]
     pport = int(sys.argv[2])
@@ -192,6 +236,8 @@ def main():
         scen_noread(pport, int(sys.argv[3]), int(sys.argv[4]))
     elif scen == "slowread":
         scen_slowread(pport, int(sys.argv[3]))
+    elif scen == "upload":
+        scen_upload(pport, int(sys.argv[3]))
     else:
         die("unknown scenario %s" % scen)
 

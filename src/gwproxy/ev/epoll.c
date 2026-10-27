@@ -783,42 +783,15 @@ static int adjust_epl_mask(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 #ifdef CONFIG_HTTPS
 /*
- * TLS receive: pull a chunk of ciphertext from the socket into the read BIO,
- * then decrypt as much as fits into src->buf. Any ciphertext left on the socket
- * (a record we only partially read, or more than one chunk's worth) keeps the
- * level-triggered EPOLLIN live so the rest is read on the next wakeup. Returns
- * the number of plaintext bytes produced, or <0 on error.
+ * Decrypt as much of what the TLS engine holds as fits into src->buf, without
+ * touching the socket. Returns the number of plaintext bytes produced, or <0
+ * on error.
  */
-static ssize_t do_recv_tls(struct gwp_conn *src)
+static ssize_t tls_decrypt(struct gwp_conn *src)
 {
-	/*
-	 * Ciphertext scratch. Kept on the stack and modestly sized: it must
-	 * fit the -Wstack-usage budget, and a static __thread buffer passed to
-	 * the inline-asm syscall miscompiles under gcc -O2. A partial TLS
-	 * record simply stays queued in the socket and is read on the next
-	 * (level-triggered) EPOLLIN, so a small buffer is only a throughput,
-	 * not a correctness, matter.
-	 */
-	unsigned char cbuf[4096];
-	size_t space, got;
-	ssize_t n;
+	size_t space = src->cap - src->len, got = 0;
 	int sr;
 
-	space = src->cap - src->len;
-	if (unlikely(space == 0))
-		return 0;
-
-	n = __sys_recv(src->fd, cbuf, sizeof(cbuf), MSG_NOSIGNAL);
-	if (n > 0) {
-		if (gwp_ssl_bio_write(src->tls, cbuf, (size_t)n) < 0)
-			return -EIO;
-	} else if (n == 0) {
-		src->rd_eof = true;
-	} else if (n != -EAGAIN && n != -EINTR) {
-		return n;
-	}
-
-	got = 0;
 	while (space) {
 		size_t out = 0;
 
@@ -839,6 +812,42 @@ static ssize_t do_recv_tls(struct gwp_conn *src)
 	}
 
 	return (ssize_t)got;
+}
+
+/*
+ * TLS receive: pull a chunk of ciphertext from the socket into the read BIO,
+ * then decrypt as much as fits into src->buf. Any ciphertext left on the socket
+ * (a record we only partially read, or more than one chunk's worth) keeps the
+ * level-triggered EPOLLIN live so the rest is read on the next wakeup. Returns
+ * the number of plaintext bytes produced, or <0 on error.
+ */
+static ssize_t do_recv_tls(struct gwp_conn *src)
+{
+	/*
+	 * Ciphertext scratch. Kept on the stack and modestly sized: it must
+	 * fit the -Wstack-usage budget, and a static __thread buffer passed to
+	 * the inline-asm syscall miscompiles under gcc -O2. A partial TLS
+	 * record simply stays queued in the socket and is read on the next
+	 * (level-triggered) EPOLLIN, so a small buffer is only a throughput,
+	 * not a correctness, matter.
+	 */
+	unsigned char cbuf[4096];
+	ssize_t n;
+
+	if (unlikely(src->len == src->cap))
+		return 0;
+
+	n = __sys_recv(src->fd, cbuf, sizeof(cbuf), MSG_NOSIGNAL);
+	if (n > 0) {
+		if (gwp_ssl_bio_write(src->tls, cbuf, (size_t)n) < 0)
+			return -EIO;
+	} else if (n == 0) {
+		src->rd_eof = true;
+	} else if (n != -EAGAIN && n != -EINTR) {
+		return n;
+	}
+
+	return tls_decrypt(src);
 }
 
 /*
@@ -976,33 +985,68 @@ static ssize_t __do_send(struct gwp_conn *src, struct gwp_conn *dst)
 	return ret;
 }
 
+/*
+ * Receive into src->buf. The first pass of do_splice() reads the socket. A TLS
+ * source decrypts only as much as src->buf has room for, so when it filled up,
+ * the engine may still hold plaintext, or whole records, whose ciphertext has
+ * already left the socket, and no EPOLLIN would ever bring them back. Later
+ * passes decrypt only those, once the send has made room; they never read the
+ * socket, so a busy client cannot keep the worker here.
+ */
+static ssize_t splice_recv(struct gwp_conn *src, bool first)
+{
+#ifdef CONFIG_HTTPS
+	if (!first)
+		return tls_decrypt(src);
+#else
+	(void)first;
+#endif
+	return __do_recv(src);
+}
+
+static bool splice_again(const struct gwp_conn __unused *src,
+			 bool __unused was_full)
+{
+#ifdef CONFIG_HTTPS
+	return src->tls && was_full && src->len < src->cap;
+#else
+	return false;
+#endif
+}
+
 __hot
 static int do_splice(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		     struct gwp_conn *src, struct gwp_conn *dst, bool do_recv,
 		     bool do_send)
 {
+	bool first = true, full;
 	ssize_t ret;
 
-	if (do_recv) {
-		uint32_t from = src->len;
+	do {
+		full = false;
+		if (do_recv) {
+			uint32_t from = src->len;
 
-		ret = __do_recv(src);
-		if (unlikely(ret < 0))
-			return (int)ret;
+			ret = splice_recv(src, first);
+			if (unlikely(ret < 0))
+				return (int)ret;
 
-		if (gwp_http_fwd_active(gcp)) {
-			int r = gwp_http_fwd_in(w, gcp, src, from);
+			if (gwp_http_fwd_active(gcp)) {
+				int r = gwp_http_fwd_in(w, gcp, src, from);
 
-			if (unlikely(r))
-				return r;
+				if (unlikely(r))
+					return r;
+			}
+			full = src->len == src->cap;
 		}
-	}
 
-	if (do_send) {
-		ret = __do_send(src, dst);
-		if (unlikely(ret < 0))
-			return (int)ret;
-	}
+		if (do_send) {
+			ret = __do_send(src, dst);
+			if (unlikely(ret < 0))
+				return (int)ret;
+		}
+		first = false;
+	} while (splice_again(src, full));
 
 	return 0;
 }
