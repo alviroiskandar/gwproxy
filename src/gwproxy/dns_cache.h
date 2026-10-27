@@ -54,7 +54,9 @@ void gwp_dns_cache_free(struct gwp_dns_cache *cache);
 
 /**
  * Scan and remove expired entries from the DNS cache. Expected to
- * be called periodically to reclaim memory from expired entries.
+ * be called periodically to reclaim memory from expired entries. The
+ * write lock is taken for a bounded number of buckets at a time, so
+ * lookups proceed between two steps; a lookup never sweeps by itself.
  *
  * @param cache	The DNS cache to perform housekeeping on.
  */

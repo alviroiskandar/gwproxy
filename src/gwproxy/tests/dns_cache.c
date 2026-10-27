@@ -88,9 +88,69 @@ static void test_hash_flood(void)
 	gwp_dns_cache_free(cache);
 }
 
+/*
+ * A lookup that finds an expired entry reports a miss and leaves reclaiming
+ * to gwp_dns_cache_housekeep(). It used to run a sweep of the whole table
+ * under the write lock right there, in the event-loop thread that asked.
+ */
+static void test_lookup_does_not_sweep(void)
+{
+	struct gwp_dns_cache *cache = NULL;
+	struct gwp_dns_cache_addrs ca;
+	struct sockaddr_in sa;
+	struct addrinfo ai;
+	char name[32];
+	size_t n;
+	int i, r;
+
+	memset(&sa, 0, sizeof(sa));
+	sa.sin_family = AF_INET;
+	memset(&ai, 0, sizeof(ai));
+	ai.ai_family = AF_INET;
+	ai.ai_addr = (struct sockaddr *)&sa;
+	ai.ai_addrlen = sizeof(sa);
+
+	/* More buckets than one housekeeping step covers. */
+	r = gwp_dns_cache_init(&cache, 4096, 0);
+	assert(!r && cache);
+
+	/*
+	 * Insert them live and expire them afterwards: an insert reclaims the
+	 * expired entries of the chain it walks.
+	 */
+	for (i = 0; i < 100; i++) {
+		snprintf(name, sizeof(name), "gone%d.example", i);
+		r = gwp_dns_cache_insert(cache, name, &ai, time(NULL) + 100);
+		assert(!r);
+	}
+	for (i = 0; i < (int)cache->map.nr_buckets; i++) {
+		struct dns_cache_entry *e;
+
+		for (e = cache->map.table[i]; e; e = e->next)
+			e->expired_at = time(NULL) - 1;
+	}
+	r = gwp_dns_cache_insert(cache, "live.example", &ai, time(NULL) + 100);
+	assert(!r);
+	n = cache->map.nr_entries;
+	assert(n > 50);
+
+	/* -ENOENT only if inserting live.example reclaimed it already. */
+	r = gwp_dns_cache_lookup_addrs(cache, "gone7.example", &ca);
+	assert(r == -ETIMEDOUT || r == -ENOENT);
+	assert(cache->map.nr_entries == n);
+
+	gwp_dns_cache_housekeep(cache);
+	assert(cache->map.nr_entries == 1);
+	r = gwp_dns_cache_lookup_addrs(cache, "live.example", &ca);
+	assert(!r);
+
+	gwp_dns_cache_free(cache);
+}
+
 int main(void)
 {
 	test_hash_flood();
+	test_lookup_does_not_sweep();
 	printf("All tests passed.\n");
 	return 0;
 }

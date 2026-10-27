@@ -16,7 +16,6 @@
 #include <errno.h>
 #include <netdb.h>
 #include <assert.h>
-#include <stdatomic.h>
 #include <unistd.h>
 #include <endian.h>
 #ifdef CONFIG_HAVE_GETRANDOM
@@ -65,17 +64,14 @@ struct dns_hash_map {
 struct gwp_dns_cache {
 	pthread_rwlock_t	lock;
 	struct dns_hash_map	map;
-	/*
-	 * Rate-limits the lookup-triggered expiry sweep (see throttled_housekeep).
-	 * A 32-bit seconds counter, not time_t: an 8-byte atomic is not lock-free
-	 * on 32-bit targets and would pull in libatomic. Unsigned wrap of the
-	 * delta is fine for a 1-second throttle.
-	 */
-	_Atomic(uint32_t)	last_housekeep;
 };
 
-/* Minimum seconds between two lookup-triggered full sweeps. */
-#define GWP_DNS_HOUSEKEEP_MIN_INTERVAL 1
+/*
+ * Buckets swept per write-lock hold in gwp_dns_cache_housekeep(). Lookups
+ * from the event loops get the lock between two chunks, so a sweep of a large
+ * table never stalls them for the whole pass.
+ */
+#define GWP_DNS_HOUSEKEEP_CHUNK	1024
 
 /*
  * A per-cache random 128-bit key for hash_key(), so an attacker cannot tell
@@ -527,7 +523,6 @@ int gwp_dns_cache_init(struct gwp_dns_cache **cache_p, uint32_t nr_buckets,
 	if (r)
 		goto out_destroy_lock;
 
-	atomic_init(&cache->last_housekeep, (uint32_t)0);
 	*cache_p = cache;
 	return 0;
 
@@ -558,28 +553,6 @@ int gwp_dns_cache_insert(struct gwp_dns_cache *cache, const char *key,
 	return r;
 }
 
-/*
- * Sweep expired entries, but at most once per GWP_DNS_HOUSEKEEP_MIN_INTERVAL and
- * with only one sweeper at a time. Without this, a hot name expiring makes every
- * concurrent lookup that hits it (-ETIMEDOUT) launch its own O(total) full-table
- * sweep under the write lock -- a thundering-herd stall recurring at each TTL
- * boundary. The winner of the timestamp CAS performs the sweep; the rest skip.
- */
-static void throttled_housekeep(struct gwp_dns_cache *cache)
-{
-	uint32_t now = (uint32_t)time(NULL);
-	uint32_t last = atomic_load_explicit(&cache->last_housekeep,
-					     memory_order_relaxed);
-
-	if (now - last < GWP_DNS_HOUSEKEEP_MIN_INTERVAL)
-		return;
-	if (!atomic_compare_exchange_strong_explicit(&cache->last_housekeep,
-			&last, now, memory_order_relaxed, memory_order_relaxed))
-		return;
-
-	gwp_dns_cache_housekeep(cache);
-}
-
 int gwp_dns_cache_lookup_addrs(struct gwp_dns_cache *cache, const char *key,
 			       struct gwp_dns_cache_addrs *out)
 {
@@ -588,38 +561,48 @@ int gwp_dns_cache_lookup_addrs(struct gwp_dns_cache *cache, const char *key,
 	pthread_rwlock_rdlock(&cache->lock);
 	r = dns_map_lookup(&cache->map, key, out);
 	pthread_rwlock_unlock(&cache->lock);
-	if (r == -ETIMEDOUT)
-		throttled_housekeep(cache);
-
 	return r;
 }
 
-static void dns_map_scan_and_remove_expired(struct dns_hash_map *map)
+/*
+ * Unlink and free the expired entries of buckets [@start, @start + @nr), and
+ * return the bucket after the last one swept. Chains with nothing expired are
+ * only read.
+ */
+static size_t dns_map_remove_expired(struct dns_hash_map *map, size_t start,
+				     size_t nr, time_t now)
 {
-	struct dns_cache_entry *next, *cur;
-	time_t now = time(NULL);
-	size_t i;
+	size_t i, end = start + nr;
 
-	for (i = 0; i < map->nr_buckets; i++) {
-		cur = map->table[i];
-		map->table[i] = NULL;
-		while (cur) {
-			next = cur->next;
-			if (cur->expired_at <= now) {
-				map->nr_entries--;
-				put_dns_entry(cur);
-			} else {
-				cur->next = map->table[i];
-				map->table[i] = cur;
+	if (end > map->nr_buckets)
+		end = map->nr_buckets;
+
+	for (i = start; i < end; i++) {
+		struct dns_cache_entry **pp = &map->table[i], *cur;
+
+		while ((cur = *pp)) {
+			if (cur->expired_at > now) {
+				pp = &cur->next;
+				continue;
 			}
-			cur = next;
+			*pp = cur->next;
+			map->nr_entries--;
+			put_dns_entry(cur);
 		}
 	}
+
+	return end;
 }
 
 void gwp_dns_cache_housekeep(struct gwp_dns_cache *cache)
 {
-	pthread_rwlock_wrlock(&cache->lock);
-	dns_map_scan_and_remove_expired(&cache->map);
-	pthread_rwlock_unlock(&cache->lock);
+	size_t i = 0, nr_buckets = cache->map.nr_buckets;
+	time_t now = time(NULL);
+
+	while (i < nr_buckets) {
+		pthread_rwlock_wrlock(&cache->lock);
+		i = dns_map_remove_expired(&cache->map, i,
+					   GWP_DNS_HOUSEKEEP_CHUNK, now);
+		pthread_rwlock_unlock(&cache->lock);
+	}
 }
