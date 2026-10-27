@@ -687,14 +687,24 @@ static int handle_ev_accept(struct gwp_wrk *w, struct epoll_event *ev)
 
 static int handle_ev_eventfd(struct gwp_wrk *w, struct epoll_event *ev)
 {
-	eventfd_t val;
+	uint64_t val;
+	ssize_t r;
 
 	if (unlikely(ev->events & EPOLLERR)) {
 		pr_err(&w->ctx->lh, "EPOLLERR on eventfd event");
 		return -EIO;
 	}
 
-	return eventfd_read(w->ev_fd, &val);
+	/*
+	 * __sys_read(), not glibc's eventfd_read(): that returns -1 and sets
+	 * errno, which the loop would read as -EPERM. A spurious wakeup with
+	 * nothing to read (-EAGAIN) is not an error either.
+	 */
+	r = __sys_read(w->ev_fd, &val, sizeof(val));
+	if (unlikely(r < 0) && r != -EAGAIN && r != -EINTR)
+		return (int)r;
+
+	return 0;
 }
 
 static bool adj_epl_out(struct gwp_conn *src, struct gwp_conn *dst)
@@ -2603,12 +2613,18 @@ void gwp_ctx_signal_all_epoll(struct gwp_ctx *ctx)
 	ctx->stop = true;
 	for (i = 0; i < ctx->cfg.nr_workers; i++) {
 		struct gwp_wrk *w = &ctx->workers[i];
-		int r;
+		const uint64_t one = 1;
+		ssize_t r;
 
+		if (w->ev_fd < 0)
+			continue;
+
+		/*
+		 * __sys_write() returns -errno, so the EINTR retry works;
+		 * glibc's eventfd_write() returns -1 and never matched it.
+		 */
 		do {
-			if (w->ev_fd < 0)
-				break;
-			r = eventfd_write(w->ev_fd, 1);
-		} while ((r < 0) && (r == -EINTR));
+			r = __sys_write(w->ev_fd, &one, sizeof(one));
+		} while (r == -EINTR);
 	}
 }
