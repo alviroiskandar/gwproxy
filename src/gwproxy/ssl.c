@@ -250,6 +250,13 @@ size_t gwp_ssl_pending(struct gwp_ssl *s)
 	return (r > 0) ? (size_t)r : 0;
 }
 
+/*
+ * SSL_get_error() consults this thread's OpenSSL error queue, which is shared
+ * by every connection a worker serves: an entry left there by one session's
+ * failure makes the next call on any other session look fatal. Start every
+ * SSL call that is followed by SSL_get_error() with an empty queue. The
+ * entries a failing call pushes stay queued for gwp_ssl_errstr().
+ */
 static int map_err(struct gwp_ssl *s, int ret)
 {
 	switch (SSL_get_error(s->ssl, ret)) {
@@ -264,8 +271,10 @@ static int map_err(struct gwp_ssl *s, int ret)
 
 int gwp_ssl_handshake(struct gwp_ssl *s)
 {
-	int r = SSL_do_handshake(s->ssl);
+	int r;
 
+	ERR_clear_error();
+	r = SSL_do_handshake(s->ssl);
 	if (r == 1)
 		return GWP_SSL_OK;
 	return map_err(s, r);
@@ -279,6 +288,7 @@ int gwp_ssl_read(struct gwp_ssl *s, void *buf, size_t len, size_t *out_len)
 	if (!len)
 		return GWP_SSL_OK;
 
+	ERR_clear_error();
 	r = SSL_read(s->ssl, buf, cap_int(len));
 	if (r > 0) {
 		*out_len = (size_t)r;
@@ -299,6 +309,7 @@ int gwp_ssl_write(struct gwp_ssl *s, const void *buf, size_t len,
 	if (!len)
 		return GWP_SSL_OK;
 
+	ERR_clear_error();
 	r = SSL_write(s->ssl, buf, cap_int(len));
 	if (r > 0) {
 		*consumed = (size_t)r;
@@ -309,8 +320,10 @@ int gwp_ssl_write(struct gwp_ssl *s, const void *buf, size_t len,
 
 int gwp_ssl_shutdown(struct gwp_ssl *s)
 {
-	int r = SSL_shutdown(s->ssl);
+	int r;
 
+	ERR_clear_error();
+	r = SSL_shutdown(s->ssl);
 	/*
 	 * 0 = our close_notify was queued (peer's not yet seen), 1 = full
 	 * bidirectional shutdown. Both are fine for a best-effort close; the
