@@ -12,13 +12,12 @@
 #       stalls: when the connect timeout fires, a plain-forwarding client is
 #       closed without seeing those bytes, and a SOCKS5 client gets REP 0x06
 #       alone, and is then closed;
-#   (3) an upstream that refuses the CONNECT: a SOCKS5 client gets a
-#       failure REP alone, not the upstream's reply in front of it.
+#   (3) an upstream that refuses the CONNECT: a SOCKS5 client gets REP
+#       0x05 alone, not the upstream's reply in front of it, and an HTTP
+#       client a 502.
 #
-# (1) and (2) run on every available event loop, (2) with a SOCKS5 and an
-# http:// upstream. (3) runs on epoll only for now: the io_uring loop
-# answers a refused upstream CONNECT with a bare close, so there is nothing
-# to check there yet.
+# All of it runs on every available event loop, (2) with a SOCKS5 and an
+# http:// upstream.
 
 . "$(dirname "$0")/lib.sh"
 require python3
@@ -199,9 +198,7 @@ for loop in epoll io_uring; do
 		wait "$GWP_PID" 2>/dev/null
 	done
 
-	[ "$loop" = epoll ] || continue
-
-	# (3) An upstream that refuses the CONNECT, SOCKS5 client.
+	# (3) An upstream that refuses the CONNECT, SOCKS5 and HTTP clients.
 	pp="$(pick_port)"
 	gwp_start "127.0.0.1:$pp" --as-socks5=1 \
 		--upstream-proxy="socks5://127.0.0.1:$rfp" \
@@ -210,9 +207,28 @@ for loop in epoll io_uring; do
 	diag "[$loop] refusing upstream, SOCKS5: closed after ${secs}s, bytes $bytes"
 	[ "$secs" != OPEN ] || fail "[$loop] refusing upstream (SOCKS5): client left open"
 	case "$bytes" in
-	0500*) fail "[$loop] refusing upstream (SOCKS5): got a success REP: $bytes" ;;
-	05??????????????????) ;;
-	*) fail "[$loop] refusing upstream (SOCKS5): expected one failure REP, got $bytes" ;;
+	0505????????????????) ;;
+	*) fail "[$loop] refusing upstream (SOCKS5): expected REP 0x05 alone, got $bytes" ;;
+	esac
+	kill "$GWP_PID" 2>/dev/null
+	wait "$GWP_PID" 2>/dev/null
+
+	pp="$(pick_port)"
+	gwp_start "127.0.0.1:$pp" --as-http=1 \
+		--upstream-proxy="socks5://127.0.0.1:$rfp" \
+		--event-loop="$loop" --nr-workers=1 --connect-timeout=3
+	st="$(python3 - "$pp" <<-'PY'
+	import socket, sys
+	c = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=5)
+	c.sendall(b"CONNECT 127.0.0.1:80 HTTP/1.1\r\nHost: x\r\n\r\n")
+	r = c.recv(200)
+	print(r.split(b"\r\n")[0].decode(errors="replace") if r else "CLOSED")
+	PY
+	)"
+	diag "[$loop] refusing upstream, HTTP: $st"
+	case "$st" in
+	"HTTP/1."?" 502 "*) ;;
+	*) fail "[$loop] refusing upstream (HTTP): expected a 502, got '$st'" ;;
 	esac
 	kill "$GWP_PID" 2>/dev/null
 	wait "$GWP_PID" 2>/dev/null

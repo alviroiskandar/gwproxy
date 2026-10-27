@@ -207,6 +207,27 @@ static int http_parse(struct gwp_wrk *w, struct gwp_conn_pair *gcp, bool *notify
 	return r ? r : GWP_UPSTREAM_IO_DONE;
 }
 
+int gwp_upstream_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			    int err)
+{
+	int r;
+
+	gcp->target.len = 0;
+	gwp_conn_buf_compact(&gcp->target);
+
+	/*
+	 * Only a refused CONNECT says something about the destination. An
+	 * upstream that turned down our credentials, or answered something
+	 * we cannot use, is a failure of the proxy chain: REP 0x01, not the
+	 * 0x02 "not allowed by ruleset" that -EACCES would map to.
+	 */
+	if (err != -ECONNREFUSED)
+		err = -EPROTO;
+
+	r = gwp_conn_fail_reply(w, gcp, err);
+	return r ? r : (int)gcp->target.len;
+}
+
 int gwp_upstream_hs_on_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			     bool *notify)
 {

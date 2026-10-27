@@ -998,6 +998,16 @@ int gwp_upstream_hs_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 int gwp_upstream_hs_on_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			     bool *notify);
 
+/*
+ * The upstream handshake failed with @err and the client is to be told: put
+ * its failure reply in target.buf in place of whatever the upstream sent --
+ * SOCKS5 REP 0x05 for a refused CONNECT and 0x01 for anything else, an HTTP
+ * client a 502. Returns the number of bytes to send to the client (0 for
+ * plain forwarding, which has no reply to give), or a negative errno.
+ */
+int gwp_upstream_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			    int err);
+
 int gwp_socks5_handle_data(struct gwp_conn_pair *gcp);
 int gwp_handle_conn_state_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 int gwp_handle_conn_state_socks5(struct gwp_wrk *w, struct gwp_conn_pair *gcp);

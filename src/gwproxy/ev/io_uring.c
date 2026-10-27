@@ -1340,6 +1340,7 @@ static int handle_ev_upstream_s5(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				 struct io_uring_cqe *cqe)
 {
 	int r = handle_sock_ret(cqe->res);
+	bool notify;
 
 	if (r < 0)
 		return r;
@@ -1363,8 +1364,7 @@ static int handle_ev_upstream_s5(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	if (r > 0)
 		gcp->target.len += (uint32_t)r;
 
-	/* io_uring does not notify the downstream client on failure (NULL). */
-	r = gwp_upstream_hs_on_reply(w, gcp, NULL);
+	r = gwp_upstream_hs_on_reply(w, gcp, &notify);
 	switch (r) {
 	case GWP_UPSTREAM_IO_SEND:
 		prep_upstream_send(w, gcp);
@@ -1374,9 +1374,15 @@ static int handle_ev_upstream_s5(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		return 0;
 	case GWP_UPSTREAM_IO_DONE:
 		return upstream_iou_finish(w, gcp);
-	default:			/* negative errno */
-		return r;
 	}
+
+	/*
+	 * Negative errno. Tell the client when the upstream turned us down;
+	 * the reply's send goes out ahead of the teardown's cancels.
+	 */
+	if (notify && gwp_upstream_fail_reply(w, gcp, r) > 0)
+		prep_send_client(w, gcp);
+	return r;
 }
 
 /*

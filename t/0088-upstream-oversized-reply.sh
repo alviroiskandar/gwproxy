@@ -6,10 +6,8 @@
 # the handshake must fail at once, with no upstream byte reaching the
 # client. The epoll loop used to wait for the connect timeout instead,
 # with the full buffer's level-triggered EPOLLIN spinning the worker all
-# that time. What the client is told is whatever an upstream failure gets
-# today: a SOCKS5 client a failure REP on epoll, and a bare close
-# otherwise. What matters here is that it comes right away.
-# Exercised on every event loop.
+# that time. A SOCKS5 client gets REP 0x01 and an HTTP client a 502, right
+# away. Exercised on every event loop.
 
 . "$(dirname "$0")/lib.sh"
 require python3
@@ -78,8 +76,8 @@ for loop in epoll io_uring; do
 	for proto in socks5 http; do
 		got="$(ask "$p" "$proto")"
 		case "$loop:$proto:$got" in
-		epoll:socks5:REP=0x0[1-9]) ;;
-		epoll:http:CLOSED|io_uring:*:CLOSED) ;;
+		*:socks5:REP=0x01) ;;
+		*:http:"HTTP/1."?" 502 "*) ;;
 		*) fail "[$loop] $proto client got '$got' for an endless upstream reply" ;;
 		esac
 	done

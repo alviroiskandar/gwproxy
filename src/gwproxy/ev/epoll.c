@@ -1179,21 +1179,22 @@ static int prep_and_send_socks5_rep_connect(struct gwp_wrk *w,
  * destination is a hostname (target_addr is unset), so show up_dst instead.
  */
 /*
- * A handshake with the upstream proxy failed. Inform the downstream client
- * with a SOCKS5 failure reply where applicable, then return @err so the
- * caller tears the connection down.
+ * A handshake with the upstream proxy failed. Tell the downstream client in
+ * whatever protocol it speaks (gwp_upstream_fail_reply()), then return @err
+ * so the caller tears the connection down.
  */
 static int upstream_fail(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
-			    int err)
+			 int err)
 {
-	if (gcp->prot_type == GWP_PROT_TYPE_SOCKS5) {
-		int r;
+	int r = gwp_upstream_fail_reply(w, gcp, err);
 
-		/* Drop the upstream's reply; the client gets only ours. */
-		gcp->target.len = 0;
-		r = prep_and_send_socks5_rep_connect(w, gcp, ECONNREFUSED);
-		if (r)
-			return r;
+	if (r > 0) {
+		ssize_t sr = __do_send(&gcp->target, &gcp->client);
+
+		if (unlikely(sr < 0))
+			return (int)sr;
+	} else if (r < 0) {
+		return r;
 	}
 
 	return err;
