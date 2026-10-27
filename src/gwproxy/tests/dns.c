@@ -324,6 +324,34 @@ static void test_dns_cache_expiry_replace(void)
 	gwp_dns_cache_free(cache);
 }
 
+/* A long answer is cut to what a lookup can return, keeping the first ones. */
+static void test_dns_cache_many_addrs(void)
+{
+	struct gwp_dns_cache *cache = NULL;
+	struct gwp_dns_cache_addrs ca;
+	struct sockaddr_in sa[20];
+	struct addrinfo ai[20];
+	int r, i;
+
+	for (i = 0; i < 20; i++) {
+		fill_ai_v4(&ai[i], &sa[i]);
+		sa[i].sin_addr.s_addr = htonl(0x0a000001 + i);
+		ai[i].ai_next = i < 19 ? &ai[i + 1] : NULL;
+	}
+
+	r = gwp_dns_cache_init(&cache, 16, 0);
+	assert(!r && cache);
+	r = gwp_dns_cache_insert(cache, "many.example", ai, time(NULL) + 100);
+	assert(!r);
+	r = gwp_dns_cache_lookup_addrs(cache, "many.example", &ca);
+	assert(!r);
+	assert(ca.nr_i4 == GWP_DNS_CACHE_MAX_ADDRS && ca.nr_i6 == 0);
+	for (i = 0; i < (int)GWP_DNS_CACHE_MAX_ADDRS; i++)
+		assert(ca.i4[i].s_addr == htonl(0x0a000001 + i));
+
+	gwp_dns_cache_free(cache);
+}
+
 /*
  * The resolver must hand back every usable address, not just the one it would
  * have connected to, and the cache must agree with a fresh lookup -- both on
@@ -406,6 +434,7 @@ int main(void)
 	test_dns_cache_cap();
 	test_dns_cache_case();
 	test_dns_cache_expiry_replace();
+	test_dns_cache_many_addrs();
 	test_addr_list();
 	printf("All tests passed.\n");
 	return 0;

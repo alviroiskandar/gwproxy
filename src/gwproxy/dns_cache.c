@@ -288,10 +288,14 @@ static int alloc_dns_entry(struct dns_cache_entry **ep, const char *key,
 	if (nr_i4 == 0 && nr_i6 == 0)
 		return -EINVAL;
 
-	if (nr_i4 > 255)
-		nr_i4 = 255;
-	if (nr_i6 > 255)
-		nr_i6 = 255;
+	/*
+	 * A lookup never hands back more than GWP_DNS_CACHE_MAX_ADDRS per
+	 * family, so storing more only costs memory and insert time.
+	 */
+	if (nr_i4 > GWP_DNS_CACHE_MAX_ADDRS)
+		nr_i4 = GWP_DNS_CACHE_MAX_ADDRS;
+	if (nr_i6 > GWP_DNS_CACHE_MAX_ADDRS)
+		nr_i6 = GWP_DNS_CACHE_MAX_ADDRS;
 
 	/*
 	 * e->block is a variable length array that contains:
@@ -461,10 +465,8 @@ static void copy_addrs(const struct gwp_dns_cache_entry *e,
 	const uint8_t *i4b = &e->block[e->name_len];
 	const uint8_t *i6b = &i4b[e->nr_i4 * 4];
 
-	out->nr_i4 = e->nr_i4 < GWP_DNS_CACHE_MAX_ADDRS ?
-		     e->nr_i4 : GWP_DNS_CACHE_MAX_ADDRS;
-	out->nr_i6 = e->nr_i6 < GWP_DNS_CACHE_MAX_ADDRS ?
-		     e->nr_i6 : GWP_DNS_CACHE_MAX_ADDRS;
+	out->nr_i4 = e->nr_i4;
+	out->nr_i6 = e->nr_i6;
 	memcpy(out->i4, i4b, (size_t)out->nr_i4 * 4);
 	memcpy(out->i6, i6b, (size_t)out->nr_i6 * 16);
 }
