@@ -79,4 +79,12 @@ for scheme in socks5 socks5h; do
 	esac
 done
 
+# The port of an upstream is optional (1080 for socks5://), also for a
+# bracketed IPv6 literal. gwproxy validates the URL at startup, so a rejected
+# one never gets as far as listening. Nothing is dialled here: port 1080 is
+# not ours to use.
+fp="$(pick_port)"
+gwp_start "127.0.0.1:$fp" --as-socks5=1 --upstream-proxy="socks5://[::1]"
+kill "$GWP_PID" 2>/dev/null
+
 pass
