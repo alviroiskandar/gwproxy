@@ -8,17 +8,17 @@
 #       the client is closed at once, gets no bytes, and the worker does not
 #       spin in the meantime (a failed connect leaves EPOLLERR raised on the
 #       socket until it is closed); both upstream protocols;
-#   (2) an upstream that answers nothing, or one byte of its reply, and then
+#   (2) an upstream that answers nothing, or part of its reply, and then
 #       stalls: when the connect timeout fires, a plain-forwarding client is
-#       closed without seeing that byte, and a SOCKS5 client gets REP 0x06
+#       closed without seeing those bytes, and a SOCKS5 client gets REP 0x06
 #       alone, and is then closed;
 #   (3) an upstream that refuses the CONNECT: a SOCKS5 client gets a
 #       failure REP alone, not the upstream's reply in front of it.
 #
-# (1) and the silent upstream of (2) run on every available event loop. The
-# rest of (2) and (3) run on epoll only for now: the io_uring loop relays
-# what a stalled upstream sent at the timeout and answers a refused upstream
-# CONNECT with a bare close, so neither has anything to check there yet.
+# (1) and (2) run on every available event loop, (2) with a SOCKS5 and an
+# http:// upstream. (3) runs on epoll only for now: the io_uring loop
+# answers a refused upstream CONNECT with a bare close, so there is nothing
+# to check there yet.
 
 . "$(dirname "$0")/lib.sh"
 require python3
@@ -40,9 +40,10 @@ for _ in $(seq 1 50); do
 done
 [ -n "$cport" ] || fail "could not reserve a closed port"
 
-# A SOCKS5 upstream that misbehaves: "silent" reads the greeting and never
-# answers, "stall" answers one byte of the method selection and then goes
-# quiet, "refuse" accepts the method and answers the CONNECT with REP 0x05.
+# An upstream that misbehaves: "silent" reads the greeting and never answers,
+# "stall" (SOCKS5) answers one byte of the method selection and then goes
+# quiet, "hstall" (HTTP) the first lines of a CONNECT reply, and "refuse"
+# (SOCKS5) accepts the method and answers the CONNECT with REP 0x05.
 # Run it in the background: the exec makes the pid that lib.sh kills the
 # server itself.
 upstream()
@@ -61,6 +62,8 @@ upstream()
 	            pass
 	        elif mode == "stall":
 	            c.sendall(b"\x05")
+	        elif mode == "hstall":
+	            c.sendall(b"HTTP/1.1 200 OK\r\nX-Partial: ")
 	        else:
 	            c.sendall(b"\x05\x00")
 	            c.recv(512)
@@ -82,6 +85,10 @@ slp="$(pick_port)"
 upstream "$slp" silent >"$WORK/silent.log" 2>&1 &
 _PIDS+=("$!")
 wait_listen "$slp" || fail "silent upstream did not start on $slp"
+hsp="$(pick_port)"
+upstream "$hsp" hstall >"$WORK/hstall.log" 2>&1 &
+_PIDS+=("$!")
+wait_listen "$hsp" || fail "stalling HTTP upstream did not start on $hsp"
 rfp="$(pick_port)"
 upstream "$rfp" refuse >"$WORK/refuse.log" 2>&1 &
 _PIDS+=("$!")
@@ -163,8 +170,6 @@ for loop in epoll io_uring; do
 	kill "$GWP_PID" 2>/dev/null
 	wait "$GWP_PID" 2>/dev/null
 
-	[ "$loop" = epoll ] || continue
-
 	# (2) A stalled upstream, plain forwarding and SOCKS5.
 	pp="$(pick_port)"
 	gwp_start "127.0.0.1:$pp" --target="127.0.0.1:9" \
@@ -178,19 +183,23 @@ for loop in epoll io_uring; do
 	kill "$GWP_PID" 2>/dev/null
 	wait "$GWP_PID" 2>/dev/null
 
-	pp="$(pick_port)"
-	gwp_start "127.0.0.1:$pp" --as-socks5=1 \
-		--upstream-proxy="socks5://127.0.0.1:$stp" \
-		--event-loop="$loop" --nr-workers=1 --connect-timeout=1
-	read -r secs ticks bytes < <(probe "$pp" "$GWP_PID" socks5)
-	diag "[$loop] stalled upstream, SOCKS5: closed after ${secs}s, bytes $bytes"
-	[ "$secs" != OPEN ] || fail "[$loop] stalled upstream (SOCKS5): client left open"
-	case "$bytes" in
-	0506????????????????) ;;
-	*) fail "[$loop] stalled upstream (SOCKS5): expected REP 0x06 alone, got $bytes" ;;
-	esac
-	kill "$GWP_PID" 2>/dev/null
-	wait "$GWP_PID" 2>/dev/null
+	for up in "socks5://127.0.0.1:$stp" "http://127.0.0.1:$hsp"; do
+		pp="$(pick_port)"
+		gwp_start "127.0.0.1:$pp" --as-socks5=1 --upstream-proxy="$up" \
+			--event-loop="$loop" --nr-workers=1 --connect-timeout=1
+		read -r secs ticks bytes < <(probe "$pp" "$GWP_PID" socks5)
+		diag "[$loop] stalled ${up%%:*} upstream, SOCKS5: closed after ${secs}s, bytes $bytes"
+		[ "$secs" != OPEN ] || \
+			fail "[$loop] stalled ${up%%:*} upstream (SOCKS5): client left open"
+		case "$bytes" in
+		0506????????????????) ;;
+		*) fail "[$loop] stalled ${up%%:*} upstream (SOCKS5): expected REP 0x06 alone, got $bytes" ;;
+		esac
+		kill "$GWP_PID" 2>/dev/null
+		wait "$GWP_PID" 2>/dev/null
+	done
+
+	[ "$loop" = epoll ] || continue
 
 	# (3) An upstream that refuses the CONNECT, SOCKS5 client.
 	pp="$(pick_port)"

@@ -1175,20 +1175,6 @@ static int prep_and_send_socks5_rep_connect(struct gwp_wrk *w,
  */
 
 /*
- * Is the target socket carrying the upstream proxy handshake? Until the tunnel
- * is up, gcp->target is that handshake's I/O buffer: whatever it holds (our
- * unsent request, a partial or refusing reply) belongs to the upstream proxy
- * and must never be relayed to the client.
- */
-static bool in_upstream_hs(const struct gwp_conn_pair *gcp)
-{
-	int cs = gcp->conn_state;
-
-	return cs >= CONN_STATE_UPSTREAM_S5_MIN &&
-	       cs <= CONN_STATE_UPSTREAM_HTTP_MAX;
-}
-
-/*
  * Describe the upstream destination for logging. With socks5h:// the real
  * destination is a hostname (target_addr is unset), so show up_dst instead.
  */
@@ -1697,7 +1683,7 @@ static int handle_ev_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	}
 
 	if (!gcp->is_target_alive) {
-		if (in_upstream_hs(gcp))
+		if (gwp_in_upstream_hs(gcp))
 			return handle_ev_upstream(w, gcp, ev);
 
 		return handle_ev_target_conn_result(w, gcp);
@@ -1773,7 +1759,7 @@ static int handle_ev_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		return -ECONNRESET;
 	}
 
-	if (in_upstream_hs(gcp))
+	if (gwp_in_upstream_hs(gcp))
 		return handle_ev_client_upstream_hs(w, gcp, ev);
 
 	if (ev->events & (EPOLLIN | EPOLLHUP)) {
@@ -1833,7 +1819,7 @@ static int handle_ev_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	    !gcp->is_target_alive) {
 		uint32_t len;
 
-		if (in_upstream_hs(gcp))
+		if (gwp_in_upstream_hs(gcp))
 			gcp->target.len = 0;
 		len = gcp->target.len;
 		if (!gwp_conn_fail_reply(w, gcp, -ETIMEDOUT) &&
@@ -2745,7 +2731,7 @@ static bool client_past_handshake(const struct gwp_conn_pair *gcp)
 
 	return cs == CONN_STATE_SOCKS5_CONNECT ||
 	       cs == CONN_STATE_HTTP_CONNECT ||
-	       cs == CONN_STATE_FORWARDING || in_upstream_hs(gcp);
+	       cs == CONN_STATE_FORWARDING || gwp_in_upstream_hs(gcp);
 }
 
 static int handle_event(struct gwp_wrk *w, struct epoll_event *ev)

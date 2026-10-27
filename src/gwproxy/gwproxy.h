@@ -854,6 +854,20 @@ unsigned gwp_reload_events(const struct gwp_ctx *ctx, const void *buf,
 			   size_t len);
 void gwp_ctx_reload_files(struct gwp_ctx *ctx, unsigned flags);
 
+/*
+ * Is the target socket carrying the upstream proxy handshake? Until the tunnel
+ * is up, gcp->target is that handshake's I/O buffer: whatever it holds (our
+ * unsent request, a partial or refusing reply) belongs to the upstream proxy
+ * and must never be relayed to the client.
+ */
+static inline bool gwp_in_upstream_hs(const struct gwp_conn_pair *gcp)
+{
+	int cs = gcp->conn_state;
+
+	return cs >= CONN_STATE_UPSTREAM_S5_MIN &&
+	       cs <= CONN_STATE_UPSTREAM_HTTP_MAX;
+}
+
 /* Move the data back to the start of the buffer, regaining the room in front. */
 static inline void gwp_conn_buf_compact(struct gwp_conn *conn)
 {

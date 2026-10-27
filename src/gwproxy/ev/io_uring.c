@@ -1584,10 +1584,23 @@ static int handle_ev_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		 * handshake, where nothing has been requested yet. During a
 		 * race there is no target fd yet, so the in-flight attempts
 		 * count as one.
+		 *
+		 * Send only what gwp_conn_fail_reply() added: plain forwarding
+		 * has no reply to give, and a stalled upstream handshake leaves
+		 * its own bytes in target.buf, which are dropped first.
 		 */
-		if ((gcp->target.fd >= 0 || has_inflight_attempt(gcp)) &&
-		    !gwp_conn_fail_reply(w, gcp, r) && gcp->target.len)
-			prep_send_client(w, gcp);
+		if (gcp->target.fd >= 0 || has_inflight_attempt(gcp)) {
+			uint32_t len;
+
+			if (gwp_in_upstream_hs(gcp)) {
+				gcp->target.len = 0;
+				gwp_conn_buf_compact(&gcp->target);
+			}
+			len = gcp->target.len;
+			if (!gwp_conn_fail_reply(w, gcp, r) &&
+			    gcp->target.len > len)
+				prep_send_client(w, gcp);
+		}
 	}
 
 	pr_dbg(&ctx->lh,
