@@ -493,6 +493,48 @@ static void test_cancel(void)
 	gwp_dns_ctx_free(ctx);
 }
 
+/*
+ * Requests for one name share one lookup, but each gets the port it asked
+ * for. A name no resolver could take fails through the queue like any other.
+ */
+static void test_shared_lookup(void)
+{
+	struct gwp_dns_cfg cfg = { .nr_workers = 1, .nr_cqs = 1 };
+	struct gwp_dns_entry *earr[20], *bad;
+	struct gwp_dns_ctx *ctx;
+	char longname[300];
+	int i, r;
+
+	r = gwp_dns_ctx_init(&ctx, &cfg);
+	assert(!r);
+
+	for (i = 0; i < 20; i++) {
+		earr[i] = gwp_dns_queue(ctx, 0, i & 1 ? "LocalHost" : "localhost",
+					(uint16_t)(1000 + i), &earr[i]);
+		assert(earr[i]);
+	}
+	r = wait_entries(ctx, earr, 20, 5000);
+	assert(!r);
+	for (i = 0; i < 20; i++) {
+		assert(earr[i]->res == 0);
+		assert(earr[i]->nr_addrs >= 1);
+		assert(earr[i]->addrs[earr[i]->nr_addrs - 1].i4.sin_port ==
+		       htons(1000 + i));
+		gwp_dns_entry_free(earr[i]);
+	}
+
+	memset(longname, 'a', sizeof(longname) - 1);
+	longname[sizeof(longname) - 1] = '\0';
+	bad = gwp_dns_queue(ctx, 0, longname, 80, &bad);
+	assert(bad);
+	r = wait_entries(ctx, &bad, 1, 5000);
+	assert(!r);
+	assert(bad->res == -EHOSTUNREACH);
+	gwp_dns_entry_free(bad);
+
+	gwp_dns_ctx_free(ctx);
+}
+
 int main(void)
 {
 	test_basic_dns_multiple_requests();
@@ -503,6 +545,7 @@ int main(void)
 	test_dns_cache_many_addrs();
 	test_addr_list();
 	test_cancel();
+	test_shared_lookup();
 	printf("All tests passed.\n");
 	return 0;
 }

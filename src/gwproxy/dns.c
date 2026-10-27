@@ -8,6 +8,7 @@
 
 #include "dns.h"
 #include "dns_cache.h"
+#include "dns_hash.h"
 
 #include <assert.h>
 #include <stdlib.h>
@@ -64,16 +65,37 @@ struct gwp_dns_cq {
 	int				efd;
 };
 
+/*
+ * One name being resolved, with every request waiting for it. Requests for a
+ * name already queued or being resolved attach to its lookup instead of
+ * starting another, so N clients opening connections to one host at once cost
+ * one resolution, not N. The resolver type is per process, so the folded name
+ * is the whole key.
+ */
+struct dns_lookup {
+	struct dns_lookup	*hnext;		/* in-flight table chain */
+	struct dns_lookup	*qnext;		/* run queue */
+	struct gwp_dns_entry	*waiters;	/* linked through ->next */
+	uint64_t		hash;
+	size_t			len;		/* of @key, without the NUL */
+	char			key[];		/* folded name */
+};
+
+/* Buckets of the in-flight table; a power of two. */
+#define GWP_DNS_INFLIGHT_BUCKETS	4096u
+
 struct gwp_dns_ctx {
 	bool			should_stop;
 	pthread_mutex_t		lock;
 	pthread_cond_t		cond;
 	uint32_t		nr_sleeping;
-	uint32_t		nr_entries;
+	uint32_t		nr_entries;	/* queued lookups */
 	uint32_t		nr_threads;	/* RUNNING slots */
 	uint32_t		max_threads;
-	struct gwp_dns_entry	*head;
-	struct gwp_dns_entry	*tail;
+	struct dns_lookup	*head;
+	struct dns_lookup	*tail;
+	struct dns_lookup	**inflight;	/* GWP_DNS_INFLIGHT_BUCKETS */
+	uint64_t		hash_key[2];
 	struct gwp_dns_thr	*threads;	/* @max_threads slots */
 	struct gwp_dns_cache	*cache;
 	struct gwp_dns_cq	*cqs;		/* @cfg.nr_cqs of them */
@@ -242,10 +264,6 @@ int gwp_dns_resolve(struct gwp_dns_ctx *ctx, const char *name,
 
 void gwp_dns_entry_free(struct gwp_dns_entry *e)
 {
-	if (!e)
-		return;
-
-	free(e->name);
 	free(e);
 }
 
@@ -394,57 +412,110 @@ static bool wait_for_queue_entry(struct gwp_dns_thr *t)
 	return true;
 }
 
+static bool all_cancelled(const struct gwp_dns_entry *e)
+{
+	for (; e; e = e->next) {
+		if (!gwp_dns_entry_cancelled((struct gwp_dns_entry *)e))
+			return false;
+	}
+	return true;
+}
+
+static void unhash_lookup(struct gwp_dns_ctx *ctx, struct dns_lookup *l)
+{
+	struct dns_lookup **pp;
+
+	pp = &ctx->inflight[l->hash & (GWP_DNS_INFLIGHT_BUCKETS - 1)];
+	while (*pp != l)
+		pp = &(*pp)->hnext;
+	*pp = l->hnext;
+}
+
+/*
+ * Give every waiter in @e its copy of the result, with its own port, and
+ * deliver it.
+ */
+static void deliver_waiters(struct gwp_dns_entry *e, int res,
+			    const struct gwp_sockaddr *addrs, uint8_t nr)
+{
+	struct gwp_dns_entry *next;
+	uint8_t i;
+
+	for (; e; e = next) {
+		next = e->next;
+		e->res = res;
+		e->nr_addrs = nr;
+		for (i = 0; i < nr; i++) {
+			e->addrs[i] = addrs[i];
+			/* sin_port and sin6_port share an offset. */
+			e->addrs[i].i4.sin_port = htons(e->port);
+		}
+		deliver_entry(e);
+	}
+}
+
 /*
  * Must be called with ctx->lock held. May release the lock, but
  * it will reacquire it before returning.
  */
 static void process_queue_entry(struct gwp_dns_ctx *ctx)
 {
-	struct gwp_dns_entry *e = ctx->head;
+	struct gwp_sockaddr addrs[GWP_DNS_MAX_ADDRS];
+	struct dns_lookup *l = ctx->head;
+	struct gwp_dns_entry *w;
 	struct addrinfo *res;
+	uint8_t nr;
+	int r;
 
-	ctx->head = e->next;
+	ctx->head = l->qnext;
 	if (!ctx->head) {
 		ctx->tail = NULL;
 		assert(ctx->nr_entries == 1);
 	}
-
 	ctx->nr_entries--;
-	pthread_mutex_unlock(&ctx->lock);
 
-	if (gwp_dns_entry_cancelled(e)) {
+	if (all_cancelled(l->waiters)) {
 		/*
-		 * The client no longer cares about the result. Free it
+		 * Nobody cares about the result any more. Drop the lookup
 		 * without resolving the name.
 		 */
-		gwp_dns_entry_free(e);
-		goto out;
+		unhash_lookup(ctx, l);
+		pthread_mutex_unlock(&ctx->lock);
+		free_all_entries(l->waiters);
+		free(l);
+		pthread_mutex_lock(&ctx->lock);
+		return;
 	}
+	pthread_mutex_unlock(&ctx->lock);
 
-	e->res = resolve(e->name, e->port, e->addrs, GWP_DNS_MAX_ADDRS,
-			 &e->nr_addrs, ctx->cfg.restyp, &res);
+	r = resolve(l->key, 0, addrs, GWP_DNS_MAX_ADDRS, &nr,
+		    ctx->cfg.restyp, &res);
 
 	/*
 	 * Deliver first: the cache insert takes the write lock and
-	 * allocates, and the client has no reason to wait for either.
-	 * @e is not ours once delivered, so copy the name to insert; the
-	 * cache refuses names longer than this anyway.
+	 * allocates, and the clients have no reason to wait for either.
+	 * The lookup stays in the table meanwhile, so requests arriving
+	 * now still attach to it rather than miss both it and the cache;
+	 * they are delivered in the second round.
 	 */
-	if (!e->res) {
-		char name[256];
-		size_t nl = strlen(e->name);
-		bool fits = nl < sizeof(name);
+	pthread_mutex_lock(&ctx->lock);
+	w = l->waiters;
+	l->waiters = NULL;
+	pthread_mutex_unlock(&ctx->lock);
+	deliver_waiters(w, r, addrs, nr);
 
-		if (fits)
-			memcpy(name, e->name, nl + 1);
-		deliver_entry(e);
-		if (fits)
-			try_pass_result_to_cache(ctx, name, res);
+	if (!r) {
+		try_pass_result_to_cache(ctx, l->key, res);
 		freeaddrinfo(res);
-	} else {
-		deliver_entry(e);
 	}
-out:
+
+	pthread_mutex_lock(&ctx->lock);
+	w = l->waiters;
+	unhash_lookup(ctx, l);
+	pthread_mutex_unlock(&ctx->lock);
+	deliver_waiters(w, r, addrs, nr);
+	free(l);
+
 	pthread_mutex_lock(&ctx->lock);
 }
 
@@ -763,8 +834,16 @@ static int init_cqs(struct gwp_dns_ctx *ctx)
 
 static void free_all_queued_entries(struct gwp_dns_ctx *ctx)
 {
-	free_all_entries(ctx->head);
+	struct dns_lookup *l, *next;
+
+	for (l = ctx->head; l; l = next) {
+		next = l->qnext;
+		free_all_entries(l->waiters);
+		free(l);
+	}
 	ctx->head = ctx->tail = NULL;
+	free(ctx->inflight);
+	ctx->inflight = NULL;
 }
 
 /* The idle timeouts are intervals, so measure them on the monotonic clock. */
@@ -812,6 +891,13 @@ int gwp_dns_ctx_init(struct gwp_dns_ctx **ctx_p, const struct gwp_dns_cfg *cfg)
 	if (r)
 		goto out_destroy_cond;
 
+	ctx->inflight = calloc(GWP_DNS_INFLIGHT_BUCKETS, sizeof(*ctx->inflight));
+	if (!ctx->inflight) {
+		r = -ENOMEM;
+		goto out_free_cqs;
+	}
+	gwp_dns_gen_hash_key(ctx->hash_key);
+
 	r = init_cache(ctx);
 	if (r)
 		goto out_free_cqs;
@@ -833,6 +919,7 @@ int gwp_dns_ctx_init(struct gwp_dns_ctx **ctx_p, const struct gwp_dns_cfg *cfg)
 out_free_cache:
 	free_cache(ctx->cache);
 out_free_cqs:
+	free(ctx->inflight);
 	free_cqs(ctx);
 out_destroy_cond:
 	pthread_cond_destroy(&ctx->cond);
@@ -855,48 +942,96 @@ void gwp_dns_ctx_free(struct gwp_dns_ctx *ctx)
 	free(ctx);
 }
 
-static void push_queue(struct gwp_dns_ctx *ctx, struct gwp_dns_entry *e)
+static struct dns_lookup *find_lookup(struct gwp_dns_ctx *ctx,
+				      const char *key, size_t len,
+				      uint64_t hash)
 {
-	pthread_mutex_lock(&ctx->lock);
-	if (ctx->tail)
-		ctx->tail->next = e;
-	else
-		ctx->head = e;
-	ctx->tail = e;
-	e->next = NULL;
+	struct dns_lookup *l;
 
-	ctx->nr_entries++;
-	if (ctx->nr_sleeping)
-		pthread_cond_signal(&ctx->cond);
-	maybe_grow(ctx);
-	pthread_mutex_unlock(&ctx->lock);
+	l = ctx->inflight[hash & (GWP_DNS_INFLIGHT_BUCKETS - 1)];
+	for (; l; l = l->hnext) {
+		if (l->hash == hash && l->len == len && !memcmp(l->key, key, len))
+			return l;
+	}
+	return NULL;
 }
 
 struct gwp_dns_entry *gwp_dns_queue(struct gwp_dns_ctx *ctx, uint32_t cq_idx,
 				    const char *name, uint16_t port,
 				    void *udata)
 {
+	struct dns_lookup *l, *nl = NULL;
 	struct gwp_dns_entry *e;
+	char key[256];
+	size_t len, nlen;
+	uint64_t hash;
 
 	if (cq_idx >= ctx->cfg.nr_cqs)
 		return NULL;
 
-	e = malloc(sizeof(*e));
+	/* The name lives in the same allocation. */
+	nlen = strlen(name);
+	e = malloc(sizeof(*e) + nlen + 1);
 	if (!e)
 		return NULL;
 
-	e->name = strdup(name);
-	if (!e->name) {
-		free(e);
-		return NULL;
-	}
-
+	e->name = (char *)(e + 1);
+	memcpy(e->name, name, nlen + 1);
 	e->port = port;
 	atomic_init(&e->cancelled, false);
 	e->res = 0;
 	e->nr_addrs = 0;
 	e->cq = &ctx->cqs[cq_idx];
 	e->udata = udata;
-	push_queue(ctx, e);
+
+	/*
+	 * No name this long (or empty) resolves, and the cache refuses them
+	 * too: fail it at once, through the queue like any other result.
+	 */
+	len = gwp_dns_fold_name(name, key, sizeof(key));
+	if (len <= 1) {
+		e->res = -EHOSTUNREACH;
+		deliver_entry(e);
+		return e;
+	}
+	len--;
+	hash = gwp_siphash13(ctx->hash_key, key, len);
+
+	pthread_mutex_lock(&ctx->lock);
+	l = find_lookup(ctx, key, len, hash);
+	if (l) {
+		e->next = l->waiters;
+		l->waiters = e;
+		pthread_mutex_unlock(&ctx->lock);
+		return e;
+	}
+
+	nl = malloc(sizeof(*nl) + len + 1);
+	if (!nl) {
+		pthread_mutex_unlock(&ctx->lock);
+		free(e);
+		return NULL;
+	}
+
+	memcpy(nl->key, key, len + 1);
+	nl->len = len;
+	nl->hash = hash;
+	e->next = NULL;
+	nl->waiters = e;
+	nl->hnext = ctx->inflight[hash & (GWP_DNS_INFLIGHT_BUCKETS - 1)];
+	ctx->inflight[hash & (GWP_DNS_INFLIGHT_BUCKETS - 1)] = nl;
+
+	nl->qnext = NULL;
+	if (ctx->tail)
+		ctx->tail->qnext = nl;
+	else
+		ctx->head = nl;
+	ctx->tail = nl;
+
+	ctx->nr_entries++;
+	if (ctx->nr_sleeping)
+		pthread_cond_signal(&ctx->cond);
+	maybe_grow(ctx);
+	pthread_mutex_unlock(&ctx->lock);
 	return e;
 }
