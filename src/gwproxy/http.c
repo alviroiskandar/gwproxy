@@ -17,6 +17,7 @@
 #include "http.h"
 #include "http1.h"
 #include "auth.h"
+#include "common.h"
 
 struct gwp_http_conn {
 	struct gwnet_http_hdr_pctx	ctx_hdr;
@@ -886,8 +887,9 @@ struct res_line {
  * HTTP/1.x, or -E2BIG if @out is too small or the header has more than
  * RES_MAX_FIELDS field lines or CONN_MAX_TOKENS connection-options.
  */
-static ssize_t rewrite_res_hdr(const char *hdr, size_t len, char *out,
-			       size_t out_cap, int *code)
+/* Not inlined: its stack frame must not add up with its callers'. */
+static noinline ssize_t rewrite_res_hdr(const char *hdr, size_t len, char *out,
+					size_t out_cap, int *code)
 {
 	static const char cls[] = "Connection: close\r\n"
 				  "Proxy-Connection: close\r\n";
@@ -1008,10 +1010,9 @@ static size_t find_hdr_end(const char *buf, size_t len, size_t *scan)
 
 int gwp_http_fwd_res_init(struct gwp_http_conn *hc, size_t max_hdr)
 {
+	/* The hold-back buffer is allocated only if a header spans reads. */
 	free(hc->res_buf);
-	hc->res_buf = malloc(max_hdr);
-	if (!hc->res_buf)
-		return -ENOMEM;
+	hc->res_buf = NULL;
 	hc->res_cap = max_hdr;
 	hc->res_len = 0;
 	hc->res_scan = 0;
@@ -1029,6 +1030,61 @@ size_t gwp_http_fwd_res_pending(const struct gwp_http_conn *hc)
 	return hc->res_len;
 }
 
+/*
+ * The rewrite of a final header that arrived whole in one read is built here,
+ * on the stack, rather than in the hold-back buffer. Larger ones take the
+ * general path.
+ */
+#define RES_FAST_MAX		4096
+
+/*
+ * The usual case: nothing is held back and @in holds the whole final header.
+ * Rewrite it straight from @in, with no hold-back copy and no allocation.
+ * Returns 1 if the response was not handled (no complete header, an interim
+ * response, or a rewrite too large for the stack) and the general path must
+ * take it, else 0 or a negative error as res_input().
+ */
+static int res_input_fast(struct gwp_http_conn *hc, const char *in,
+			  size_t len, char *out, size_t out_cap,
+			  size_t *out_len)
+{
+	char tmp[RES_FAST_MAX];
+	size_t scan = 0, end, body;
+	ssize_t w;
+	int code;
+
+	end = find_hdr_end(in, len, &scan);
+	if (!end) {
+		/* The general path resumes the search from here. */
+		hc->res_scan = scan;
+		return 1;
+	}
+
+	w = rewrite_res_hdr(in, end, tmp,
+			    out_cap < sizeof(tmp) ? out_cap : sizeof(tmp),
+			    &code);
+	if (w == -E2BIG)
+		return 1;
+	if (w < 0)
+		return (int)w;
+	if (code < 200)
+		return 1;
+	if (code == 407)
+		return -EACCES;
+
+	/* @in may alias @out: move the body before the header goes in. */
+	body = len - end;
+	if (body > out_cap - (size_t)w)
+		return -E2BIG;
+	memmove(out + w, in + end, body);
+	memcpy(out, tmp, (size_t)w);
+	free(hc->res_buf);	/* Left from an interim response, if any. */
+	hc->res_buf = NULL;
+	hc->res_state = GWP_HTTP_RES_BODY;
+	*out_len = (size_t)w + body;
+	return 0;
+}
+
 static int res_input(struct gwp_http_conn *hc, const void *in, size_t len,
 		     bool eof, char *out, size_t out_cap, size_t *out_len)
 {
@@ -1038,6 +1094,19 @@ static int res_input(struct gwp_http_conn *hc, const void *in, size_t len,
 
 	if (len > hc->res_cap - hc->res_len)
 		return -E2BIG;
+
+	if (!hc->res_len) {
+		int r = res_input_fast(hc, in, len, out, out_cap, out_len);
+
+		if (r <= 0)
+			return r;
+	}
+
+	if (!hc->res_buf) {
+		hc->res_buf = malloc(hc->res_cap);
+		if (!hc->res_buf)
+			return -ENOMEM;
+	}
 	memcpy(hc->res_buf + hc->res_len, in, len);
 	hc->res_len += len;
 

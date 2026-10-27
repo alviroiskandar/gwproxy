@@ -597,6 +597,70 @@ static void test_res_limits(void)
 	PRTEST_OK();
 }
 
+/*
+ * A final header that arrives whole is rewritten straight from the input;
+ * the result must be the same as when it is collected in pieces, also when
+ * the input and output share a buffer and the rewrite is longer than the
+ * header (LF line ends become CRLF), and when the rewrite is too large for
+ * the direct path.
+ */
+static void test_res_direct(void)
+{
+	static char in[20000], out[20000], buf[40000], want[40000];
+	const char *cases[3];
+	struct gwp_http_conn *hc = gwp_http_conn_alloc();
+	size_t n, i, j, out_len, want_len;
+
+	assert(hc);
+	cases[0] = "HTTP/1.1 200 OK\nA: b\nConnection: x\nX: y\n\nbody bytes";
+	cases[1] = "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 204 No\r\nA: b\r\n"
+		   "\r\nrest";
+	n = (size_t)sprintf(in, "HTTP/1.1 200 OK\r\n");
+	for (i = 0; i < 200; i++)
+		n += (size_t)sprintf(in + n, "X-%zu: %060zu\r\n", i, i);
+	sprintf(in + n, "\r\ntail");
+	cases[2] = in;
+
+	for (i = 0; i < 3; i++) {
+		size_t len = strlen(cases[i]);
+
+		/* Reference: one byte at a time, through the hold-back. */
+		assert(!gwp_http_fwd_res_init(hc, 16384));
+		want_len = 0;
+		for (j = 0; j < len &&
+			    gwp_http_fwd_res_state(hc) == GWP_HTTP_RES_HDR; j++) {
+			assert(!gwp_http_fwd_res_input(hc, cases[i] + j, 1,
+						       false, want + want_len,
+						       sizeof(want) - want_len,
+						       &out_len));
+			want_len += out_len;
+		}
+		memcpy(want + want_len, cases[i] + j, len - j);
+		want_len += len - j;
+
+		/* In one read, in place. */
+		assert(!gwp_http_fwd_res_init(hc, 16384));
+		memcpy(buf, cases[i], len);
+		assert(!gwp_http_fwd_res_input(hc, buf, len, false, buf,
+					       sizeof(buf), &out_len));
+		assert(gwp_http_fwd_res_state(hc) == GWP_HTTP_RES_BODY);
+		assert(out_len == want_len && !memcmp(buf, want, want_len));
+
+		/* In one read, separate buffers. */
+		assert(!gwp_http_fwd_res_init(hc, 16384));
+		assert(!gwp_http_fwd_res_input(hc, cases[i], len, false, out,
+					       sizeof(out), &out_len));
+		assert(out_len == want_len && !memcmp(out, want, want_len));
+	}
+
+	/* Too little room for header and body: refused either way. */
+	assert(!gwp_http_fwd_res_init(hc, 16384));
+	assert(gwp_http_fwd_res_input(hc, cases[0], strlen(cases[0]), false,
+				      out, 40, &out_len) == -E2BIG);
+	gwp_http_conn_free(hc);
+	PRTEST_OK();
+}
+
 static void test_res_reject(void)
 {
 	static const char *const bad[] = {
@@ -970,6 +1034,7 @@ int main(void)
 		test_res_interim();
 		test_res_reject();
 		test_res_limits();
+		test_res_direct();
 		test_need_more();
 		test_errors();
 		test_duplicate_field();
