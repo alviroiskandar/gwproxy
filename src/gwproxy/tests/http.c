@@ -4,6 +4,9 @@
  *
  * Copyright (C) 2026  Alviro Iskandar Setiawan <alviro.iskandar@gnuweeb.org>
  */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #ifdef NDEBUG
 #undef NDEBUG
 #endif
@@ -304,6 +307,46 @@ static int req_body(const char *hdr, const char *body, size_t step,
 	return r;
 }
 
+/*
+ * The forwarded request drops what Connection names, checked against the
+ * options split once; more than 32 distinct options is refused with 400.
+ */
+static void test_forward_conn_limit(void)
+{
+	static char buf[4096];
+	struct gwp_http_conn *hc;
+	char *host, *port;
+	const char *req = NULL;
+	size_t req_len = 0, n;
+	int i;
+
+	n = (size_t)sprintf(buf, "GET http://example.com/ HTTP/1.1\r\n"
+			    "X-0: a\r\nConnection: ");
+	for (i = 0; i < 32; i++)
+		n += (size_t)sprintf(buf + n, "x-%d, X-%d,", i, i);
+	n += (size_t)sprintf(buf + n, "\r\nX-31: b\r\nX-32: c\r\n\r\n");
+	hc = gwp_http_conn_alloc();
+	assert(hc);
+	assert(run(hc, NULL, buf, &host, &port, &req, &req_len) ==
+	       GWP_HTTP_FORWARD);
+	{
+		static const char want[] =
+			"GET / HTTP/1.1\r\nHost: example.com\r\n"
+			"X-32: c\r\nConnection: close\r\n\r\n";
+
+		assert(req_len == strlen(want) && !memcmp(req, want, req_len));
+	}
+	gwp_http_conn_free(hc);
+
+	sprintf(buf + n - 2, "Connection: X-32\r\n\r\n");
+	hc = gwp_http_conn_alloc();
+	assert(hc);
+	assert(run(hc, NULL, buf, &host, &port, &req, &req_len) ==
+	       GWP_HTTP_BAD_REQUEST);
+	gwp_http_conn_free(hc);
+	PRTEST_OK();
+}
+
 static void test_req_framing(void)
 {
 	static const char next[] = "GET http://other/ HTTP/1.1\r\n\r\n";
@@ -480,6 +523,144 @@ static void test_res_interim(void)
 	PRTEST_OK();
 }
 
+/*
+ * The response rewrite checks every field against the Connection options, so
+ * both are bounded: at most 256 field lines and 32 distinct options, past
+ * which the response is refused (the caller answers 502). Repeated options
+ * count once, and the options may come from several Connection lines,
+ * before or after the fields they name.
+ */
+static void test_res_limits(void)
+{
+	static char in[40000], out[40000];
+	struct gwp_http_conn *hc = gwp_http_conn_alloc();
+	size_t n, out_len;
+	int i;
+
+	assert(hc);
+
+	/* 256 field lines: fine. 257: refused. */
+	n = (size_t)sprintf(in, "HTTP/1.1 200 OK\r\n");
+	for (i = 0; i < 256; i++)
+		n += (size_t)sprintf(in + n, "X-%d: v\r\n", i);
+	sprintf(in + n, "\r\n");
+	assert(!gwp_http_fwd_res_init(hc, sizeof(in)));
+	assert(gwp_http_fwd_res_input(hc, in, strlen(in), false, out,
+				      sizeof(out), &out_len) == 0);
+	assert(gwp_http_fwd_res_state(hc) == GWP_HTTP_RES_BODY);
+	sprintf(in + n, "X-x: v\r\n\r\n");
+	assert(!gwp_http_fwd_res_init(hc, sizeof(in)));
+	assert(gwp_http_fwd_res_input(hc, in, strlen(in), false, out,
+				      sizeof(out), &out_len) == -E2BIG);
+
+	/* 32 distinct options over two lines, each repeated: fine. */
+	n = (size_t)sprintf(in, "HTTP/1.1 200 OK\r\nX-0: drop\r\n"
+			    "Connection: ");
+	for (i = 0; i < 16; i++)
+		n += (size_t)sprintf(in + n, "x-%d, X-%d ,", i, i);
+	n += (size_t)sprintf(in + n, "\r\nKeep: me\r\nConnection: ");
+	for (i = 16; i < 32; i++)
+		n += (size_t)sprintf(in + n, ",, X-%d,x-%d", i, i);
+	n += (size_t)sprintf(in + n, "\r\nX-31: drop\r\n");
+	sprintf(in + n, "\r\n");
+	assert(!gwp_http_fwd_res_init(hc, sizeof(in)));
+	assert(gwp_http_fwd_res_input(hc, in, strlen(in), false, out,
+				      sizeof(out), &out_len) == 0);
+	{
+		static const char want[] =
+			"HTTP/1.1 200 OK\r\nKeep: me\r\n"
+			"Connection: close\r\nProxy-Connection: close\r\n"
+			"\r\n";
+
+		assert(out_len == strlen(want) && !memcmp(out, want, out_len));
+	}
+
+	/* A 33rd distinct option: refused. */
+	sprintf(in + n, "Connection: X-32\r\n\r\n");
+	assert(!gwp_http_fwd_res_init(hc, sizeof(in)));
+	assert(gwp_http_fwd_res_input(hc, in, strlen(in), false, out,
+				      sizeof(out), &out_len) == -E2BIG);
+
+	/* A long list of one repeated option is one option. */
+	n = (size_t)sprintf(in, "HTTP/1.1 200 OK\r\nConnection: a");
+	for (i = 0; i < 5000; i++)
+		n += (size_t)sprintf(in + n, ",a");
+	sprintf(in + n, "\r\nA: x\r\nB: y\r\n\r\n");
+	assert(!gwp_http_fwd_res_init(hc, sizeof(in)));
+	assert(gwp_http_fwd_res_input(hc, in, strlen(in), false, out,
+				      sizeof(out), &out_len) == 0);
+	assert(out_len == strlen("HTTP/1.1 200 OK\r\nB: y\r\n"
+				 "Connection: close\r\n"
+				 "Proxy-Connection: close\r\n\r\n"));
+
+	gwp_http_conn_free(hc);
+	PRTEST_OK();
+}
+
+/*
+ * A final header that arrives whole is rewritten straight from the input;
+ * the result must be the same as when it is collected in pieces, also when
+ * the input and output share a buffer and the rewrite is longer than the
+ * header (LF line ends become CRLF), and when the rewrite is too large for
+ * the direct path.
+ */
+static void test_res_direct(void)
+{
+	static char in[20000], out[20000], buf[40000], want[40000];
+	const char *cases[3];
+	struct gwp_http_conn *hc = gwp_http_conn_alloc();
+	size_t n, i, j, out_len, want_len;
+
+	assert(hc);
+	cases[0] = "HTTP/1.1 200 OK\nA: b\nConnection: x\nX: y\n\nbody bytes";
+	cases[1] = "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 204 No\r\nA: b\r\n"
+		   "\r\nrest";
+	n = (size_t)sprintf(in, "HTTP/1.1 200 OK\r\n");
+	for (i = 0; i < 200; i++)
+		n += (size_t)sprintf(in + n, "X-%zu: %060zu\r\n", i, i);
+	sprintf(in + n, "\r\ntail");
+	cases[2] = in;
+
+	for (i = 0; i < 3; i++) {
+		size_t len = strlen(cases[i]);
+
+		/* Reference: one byte at a time, through the hold-back. */
+		assert(!gwp_http_fwd_res_init(hc, 16384));
+		want_len = 0;
+		for (j = 0; j < len &&
+			    gwp_http_fwd_res_state(hc) == GWP_HTTP_RES_HDR; j++) {
+			assert(!gwp_http_fwd_res_input(hc, cases[i] + j, 1,
+						       false, want + want_len,
+						       sizeof(want) - want_len,
+						       &out_len));
+			want_len += out_len;
+		}
+		memcpy(want + want_len, cases[i] + j, len - j);
+		want_len += len - j;
+
+		/* In one read, in place. */
+		assert(!gwp_http_fwd_res_init(hc, 16384));
+		memcpy(buf, cases[i], len);
+		assert(!gwp_http_fwd_res_input(hc, buf, len, false, buf,
+					       sizeof(buf), &out_len));
+		assert(gwp_http_fwd_res_state(hc) == GWP_HTTP_RES_BODY);
+		assert(out_len == want_len && !memcmp(buf, want, want_len));
+
+		/* In one read, separate buffers. */
+		assert(!gwp_http_fwd_res_init(hc, 16384));
+		assert(!gwp_http_fwd_res_input(hc, cases[i], len, false, out,
+					       sizeof(out), &out_len));
+		assert(out_len == want_len && !memcmp(out, want, want_len));
+	}
+
+	/* Too little room for header and body: refused either way. */
+	assert(!gwp_http_fwd_res_init(hc, 16384));
+	assert(gwp_http_fwd_res_input(hc, cases[0], strlen(cases[0]), false,
+				      out, 40, &out_len) == -E2BIG);
+	gwp_http_conn_free(hc);
+	PRTEST_OK();
+}
+
 static void test_res_reject(void)
 {
 	static const char *const bad[] = {
@@ -549,6 +730,108 @@ static void test_need_more(void)
 	PRTEST_OK();
 }
 
+/*
+ * Feed @req to a new connection @step bytes at a time, keeping unconsumed
+ * bytes buffered the way gwp_handle_conn_state_http() does. Returns the
+ * result; *@tail is set to how many bytes were left unconsumed, and the
+ * rewritten request (if any) is copied to @fwd.
+ */
+static int feed_steps(const char *req, size_t len, size_t step, char *fwd,
+		      size_t *fwd_len, char *hp, size_t *tail)
+{
+	static char buf[32768];
+	struct gwp_http_conn *hc = gwp_http_conn_alloc();
+	size_t have = 0, pos = 0, in, rl = 0;
+	int r = GWP_HTTP_NEED_MORE;
+	const char *rq = NULL;
+	char *h, *p;
+
+	assert(hc);
+	while (r == GWP_HTTP_NEED_MORE && pos < len) {
+		size_t n = (len - pos < step) ? len - pos : step;
+
+		memcpy(buf + have, req + pos, n);
+		have += n;
+		pos += n;
+		in = have;
+		r = gwp_http_conn_process(hc, NULL, buf, &in, &h, &p, &rq, &rl);
+		assert(in <= have);
+		have -= in;
+		memmove(buf, buf + in, have);
+	}
+	*fwd_len = 0;
+	if (r == GWP_HTTP_FORWARD) {
+		memcpy(fwd, rq, rl);
+		*fwd_len = rl;
+	}
+	if (r == GWP_HTTP_FORWARD || r == GWP_HTTP_CONNECT)
+		sprintf(hp, "%s|%s", h, p);
+	else
+		hp[0] = '\0';
+	*tail = have + (len - pos);
+	gwp_http_conn_free(hc);
+	return r;
+}
+
+/*
+ * The parser is only re-run once a line end has arrived, so whatever the
+ * size of the reads the outcome must be exactly that of one read: the same
+ * result, target, rewritten request and leftover body bytes.
+ */
+static void test_incremental(void)
+{
+	static char longline[17000], longfield[17000];
+	const char *reqs[] = {
+		"GET http://example.com:8080/a/b?q=1 HTTP/1.1\r\n"
+		"Host: example.com\r\nUser-Agent: x\r\n"
+		"Accept: a\r\nAccept: b\r\nContent-Length: 4\r\n\r\nbody",
+		"CONNECT example.com:443 HTTP/1.1\nHost: x\n\nearly",
+		"GET http://example.com/ HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n",
+		"GET http://example.com/ HTTP/1.1\r\nX : bad\r\n\r\n",
+		"WAT / HTTP/1.1\r\n\r\n",
+		longline,
+		longfield,
+	};
+	static char fwd1[40000], fwd2[40000];
+	char hp1[300], hp2[300];
+	size_t i, s, n, l1, l2, t1, t2;
+	static const size_t steps[] = { 1, 2, 3, 7, 64, 1000 };
+	int r1, r2;
+
+	/* A request line, and then a field, past the 16 KiB limit. */
+	n = (size_t)sprintf(longline, "GET http://example.com/");
+	memset(longline + n, 'a', 16500);
+	sprintf(longline + n + 16500, " HTTP/1.1\r\n\r\n");
+	n = (size_t)sprintf(longfield, "GET http://example.com/ HTTP/1.1\r\n"
+			    "X: ");
+	memset(longfield + n, 'a', 16500);
+	sprintf(longfield + n + 16500, "\r\n\r\n");
+
+	for (i = 0; i < sizeof(reqs) / sizeof(reqs[0]); i++) {
+		size_t len = strlen(reqs[i]);
+
+		r1 = feed_steps(reqs[i], len, len, fwd1, &l1, hp1, &t1);
+		for (s = 0; s < sizeof(steps) / sizeof(steps[0]); s++) {
+			r2 = feed_steps(reqs[i], len, steps[s], fwd2, &l2,
+					hp2, &t2);
+			assert(r1 == r2);
+			if (r1 == GWP_HTTP_ERR || r1 == GWP_HTTP_BAD_REQUEST ||
+			    r1 == GWP_HTTP_TOO_LARGE)
+				continue;
+			assert(t1 == t2);
+			assert(!strcmp(hp1, hp2));
+			assert(l1 == l2 && !memcmp(fwd1, fwd2, l1));
+		}
+	}
+	assert(feed_steps(reqs[0], strlen(reqs[0]), 1, fwd1, &l1, hp1, &t1) ==
+	       GWP_HTTP_FORWARD && t1 == 4);
+	assert(feed_steps(longline, strlen(longline), 1, fwd1, &l1, hp1,
+			  &t1) == GWP_HTTP_TOO_LARGE);
+	assert(feed_steps(longfield, strlen(longfield), 3, fwd1, &l1, hp1,
+			  &t1) == GWP_HTTP_TOO_LARGE);
+	PRTEST_OK();
+}
+
 static void test_errors(void)
 {
 	static const char https[] =	/* unsupported scheme (no TLS) */
@@ -577,6 +860,143 @@ static void test_errors(void)
 	assert(run(hc, NULL, badmethod, &host, &port, &req, &req_len) == GWP_HTTP_ERR);
 	gwp_http_conn_free(hc);
 
+	PRTEST_OK();
+}
+
+/*
+ * A field that may appear only once, sent twice, is answered with 400 rather
+ * than a silent close; repeated list fields are still merged.
+ */
+static void test_duplicate_field(void)
+{
+	static const char *const dups[] = {
+		"GET http://example.com/ HTTP/1.1\r\n"
+		"Host: example.com\r\nHost: evil.example\r\n\r\n",
+		"POST http://example.com/ HTTP/1.1\r\n"
+		"Content-Length: 1\r\nContent-Length: 2\r\n\r\n",
+		"CONNECT example.com:443 HTTP/1.1\r\n"
+		"Proxy-Authorization: Basic a\r\n"
+		"proxy-authorization: Basic b\r\n\r\n",
+	};
+	static const char list[] =
+		"GET http://example.com/ HTTP/1.1\r\n"
+		"Accept: a\r\nAccept: b\r\n\r\n";
+	struct gwp_http_conn *hc;
+	char *host, *port;
+	const char *req = NULL;
+	size_t req_len = 0, i;
+
+	for (i = 0; i < sizeof(dups) / sizeof(dups[0]); i++) {
+		size_t in_len = strlen(dups[i]);
+
+		/* Not run(): the request is refused before it is all read. */
+		hc = gwp_http_conn_alloc();
+		assert(hc);
+		assert(gwp_http_conn_process(hc, NULL, dups[i], &in_len, &host,
+					     &port, &req, &req_len) ==
+		       GWP_HTTP_BAD_REQUEST);
+		gwp_http_conn_free(hc);
+	}
+
+	hc = gwp_http_conn_alloc();
+	assert(hc);
+	assert(run(hc, NULL, list, &host, &port, &req, &req_len) ==
+	       GWP_HTTP_FORWARD);
+	assert(memmem(req, req_len, "\r\nAccept: a, b\r\n", 16));
+	gwp_http_conn_free(hc);
+	PRTEST_OK();
+}
+
+/*
+ * A request header may hold at most GWNET_HTTP_HDR_MAX_FIELDS (128) field
+ * lines and 16 KiB; past either it is refused with 431 instead of being
+ * parsed at a cost that grows with the square of the field count.
+ */
+static void test_header_limits(void)
+{
+	static char buf[20000];
+	struct gwp_http_conn *hc;
+	char *host, *port;
+	const char *req = NULL;
+	size_t req_len = 0, n, in_len;
+	int i, r;
+
+	/* Exactly at the limit: accepted. */
+	n = (size_t)sprintf(buf, "GET http://example.com/ HTTP/1.1\r\n");
+	for (i = 0; i < 128; i++)
+		n += (size_t)sprintf(buf + n, "X-%d: v\r\n", i);
+	n += (size_t)sprintf(buf + n, "\r\n");
+	hc = gwp_http_conn_alloc();
+	assert(hc);
+	assert(run(hc, NULL, buf, &host, &port, &req, &req_len) ==
+	       GWP_HTTP_FORWARD);
+	gwp_http_conn_free(hc);
+
+	/* One more field line, even a merged list field: refused. */
+	sprintf(buf + n - 2, "Accept: a\r\n\r\n");
+	hc = gwp_http_conn_alloc();
+	assert(hc);
+	in_len = strlen(buf);
+	r = gwp_http_conn_process(hc, NULL, buf, &in_len, &host, &port, &req,
+				  &req_len);
+	assert(r == GWP_HTTP_TOO_LARGE);
+	gwp_http_conn_free(hc);
+
+	/* A single field longer than 16 KiB: refused, not dropped. */
+	n = (size_t)sprintf(buf, "GET http://example.com/ HTTP/1.1\r\nX: ");
+	memset(buf + n, 'a', 17000);
+	n += 17000;
+	sprintf(buf + n, "\r\n\r\n");
+	hc = gwp_http_conn_alloc();
+	assert(hc);
+	in_len = strlen(buf);
+	r = gwp_http_conn_process(hc, NULL, buf, &in_len, &host, &port, &req,
+				  &req_len);
+	assert(r == GWP_HTTP_TOO_LARGE);
+	gwp_http_conn_free(hc);
+	PRTEST_OK();
+}
+
+/*
+ * The upstream proxy's CONNECT reply follows the same rules as an origin's
+ * response: HTTP/1.0 or 1.1 only, a three-digit code ending at a space or
+ * the line end, LF or CRLF line ends; bytes after the header are left alone.
+ */
+static void test_upstream_reply(void)
+{
+	static const struct {
+		const char	*in;
+		int		ret;
+		int		status;
+		size_t		consumed;
+	} cases[] = {
+		{ "HTTP/1.1 200 Connection established\r\n\r\n", 0, 200, 39 },
+		{ "HTTP/1.0 200 OK\r\nVia: x\r\n\r\ntunnel", 0, 200, 27 },
+		{ "HTTP/1.1 200\n\n", 0, 200, 14 },
+		{ "HTTP/1.1 407 Auth\nX: y\r\n\r\n", 0, 407, 26 },
+		{ "HTTP/1.1 200 OK\r\n", -EAGAIN, 0, 0 },
+		{ "HTTP/1.1 200 OK\r\n\r", -EAGAIN, 0, 0 },
+		{ "HTTP/1.x 200 OK\r\n\r\n", -EINVAL, 0, 0 },
+		{ "HTTP/1.2 200 OK\r\n\r\n", -EINVAL, 0, 0 },
+		{ "HTTP/1.1 2000 OK\r\n\r\n", -EINVAL, 0, 0 },
+		{ "HTTP/1.1 20\r\n\r\n", -EINVAL, 0, 0 },
+		{ "SSH-2.0-x\r\n\r\n", -EINVAL, 0, 0 },
+	};
+	size_t i, consumed;
+	int status, r;
+
+	for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+		consumed = 0;
+		status = 0;
+		r = gwp_http_cli_parse_connect_reply(cases[i].in,
+						     strlen(cases[i].in),
+						     &status, &consumed);
+		assert(r == cases[i].ret);
+		if (r)
+			continue;
+		assert(status == cases[i].status);
+		assert(consumed == cases[i].consumed);
+	}
 	PRTEST_OK();
 }
 
@@ -651,14 +1071,23 @@ int main(void)
 		test_forward_default_port();
 		test_forward_hop_by_hop();
 		test_forward_conn_lists_framing();
+		test_forward_conn_limit();
 		test_req_framing();
 		test_res_rewrite();
 		test_res_interim();
 		test_res_reject();
+		test_res_limits();
+		test_res_direct();
 		test_need_more();
 		test_errors();
+		test_duplicate_field();
+		test_header_limits();
 		test_auth();
+		test_upstream_reply();
 	}
+
+	/* Byte-by-byte feeding of 17 KiB headers: once is enough. */
+	test_incremental();
 
 	printf("All tests passed!\n");
 	return 0;

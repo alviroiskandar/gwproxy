@@ -17,6 +17,7 @@
 #include "http.h"
 #include "http1.h"
 #include "auth.h"
+#include "common.h"
 
 struct gwp_http_conn {
 	struct gwnet_http_hdr_pctx	ctx_hdr;
@@ -32,14 +33,33 @@ struct gwp_http_conn {
 	size_t				hdr_len;
 
 	/*
+	 * How much of the not-yet-consumed request bytes has been searched for
+	 * a line end without finding one. The parser only takes complete
+	 * lines, so it is run again only once a new line end has arrived;
+	 * otherwise a long line received in small pieces would be parsed from
+	 * its start on every read, at a cost quadratic in its length.
+	 */
+	size_t				scan;
+
+	/*
 	 * True for a forwarding request (absolute-form target, e.g.
 	 * "GET http://host/path") as opposed to a CONNECT tunnel.
 	 */
 	bool				is_forward;
 
-	/* Rewritten origin-form request header for a forwarding request. */
+	/*
+	 * Rewritten origin-form request header for a forwarding request, kept
+	 * only until the caller has taken it (gwp_http_conn_drop_req()).
+	 */
 	char				*fwd_req;
 	size_t				fwd_req_len;
+
+	/*
+	 * The target's host and port ("host\0port\0"), once classified. They
+	 * outlive the parsed request, which is freed as soon as the request
+	 * has been classified: nothing else in it is needed afterwards.
+	 */
+	char				*target;
 
 	/* Authenticated username (Basic auth), for ACL "-m user" matching. */
 	bool				have_user;
@@ -68,6 +88,9 @@ struct gwp_http_conn {
 	size_t				res_scan;
 };
 
+/* Longest request header accepted, in bytes. */
+#define REQ_HDR_MAX		16384
+
 struct gwp_http_conn *gwp_http_conn_alloc(void)
 {
 	struct gwp_http_conn *hc = calloc(1, sizeof(*hc));
@@ -79,6 +102,7 @@ struct gwp_http_conn *gwp_http_conn_alloc(void)
 		free(hc);
 		return NULL;
 	}
+	hc->ctx_hdr.max_len = REQ_HDR_MAX;
 
 	return hc;
 }
@@ -91,8 +115,16 @@ void gwp_http_conn_free(struct gwp_http_conn *hc)
 	gwnet_http_hdr_pctx_free(&hc->ctx_hdr);
 	gwnet_http_req_hdr_free(&hc->req_hdr);
 	free(hc->fwd_req);
+	free(hc->target);
 	free(hc->res_buf);
 	free(hc);
+}
+
+void gwp_http_conn_drop_req(struct gwp_http_conn *hc)
+{
+	free(hc->fwd_req);
+	hc->fwd_req = NULL;
+	hc->fwd_req_len = 0;
 }
 
 bool gwp_http_conn_is_forward(const struct gwp_http_conn *hc)
@@ -192,84 +224,143 @@ static int split_authority(char *authority, char **host_p, char **port_p,
  * "100-continue" expectation is forwarded to the origin (RFC 9110 Section
  * 10.1.1). "Proxy-Connection" is non-standard but sent by some clients.
  */
-static bool is_hop_by_hop(const char *k)
+static bool is_hop_by_hop(const char *k, size_t klen)
 {
-	static const char *const hbh[] = {
-		"Connection", "Proxy-Connection", "Keep-Alive", "TE",
-		"Trailer", "Upgrade", "Proxy-Authorization",
-		"Proxy-Authenticate",
+#define HBH(s)	{ s, sizeof(s) - 1 }
+	static const struct {
+		const char	*name;
+		size_t		len;
+	} hbh[] = {
+		HBH("Connection"), HBH("Proxy-Connection"), HBH("Keep-Alive"),
+		HBH("TE"), HBH("Trailer"), HBH("Upgrade"),
+		HBH("Proxy-Authorization"), HBH("Proxy-Authenticate"),
 	};
+#undef HBH
 	size_t i;
 
 	for (i = 0; i < sizeof(hbh) / sizeof(hbh[0]); i++) {
-		if (!strcasecmp(k, hbh[i]))
+		if (hbh[i].len == klen && !strncasecmp(k, hbh[i].name, klen))
 			return true;
 	}
 	return false;
 }
 
 /*
- * Whether @name appears as one of the comma-separated connection-options in a
- * Connection header value @conn (which may be NULL). Such fields are
- * connection-specific and must also be dropped (RFC 9110 Section 7.6.1).
+ * Most distinct connection-options accepted in a message's Connection
+ * header(s). Real messages name one or two; the limit keeps checking every
+ * other field against them cheap.
  */
-static bool conn_listsl(const char *conn, const char *name, size_t nlen)
+#define CONN_MAX_TOKENS		32
+
+/* A connection-option: @len bytes at @p, not NUL-terminated. */
+struct conn_tok {
+	const char	*p;
+	size_t		len;
+};
+
+/*
+ * Add the connection-options of the Connection value at @v (@len bytes) to
+ * the @nr already in @toks, skipping empty list elements and options already
+ * there (case-insensitively). Returns the new count, or -E2BIG if that would
+ * take more than CONN_MAX_TOKENS.
+ */
+static int conn_tokenise(const char *v, size_t len, struct conn_tok *toks,
+			 int nr)
 {
-	const char *p = conn;
+	const char *p = v, *end = v + len;
 
-	if (!conn)
-		return false;
-
-	while (*p) {
+	while (p < end) {
 		const char *e;
 		size_t tlen;
+		int i;
 
-		while (*p == ',' || *p == ' ' || *p == '\t')
+		while (p < end && (*p == ',' || *p == ' ' || *p == '\t'))
 			p++;
-		for (e = p; *e && *e != ','; e++)
-			;
+		if (p == end)
+			break;
+		e = memchr(p, ',', (size_t)(end - p));
+		if (!e)
+			e = end;
 		tlen = (size_t)(e - p);
 		while (tlen > 0 && (p[tlen - 1] == ' ' || p[tlen - 1] == '\t'))
 			tlen--;
-		if (tlen == nlen && !strncasecmp(p, name, nlen))
-			return true;
+
+		for (i = 0; i < nr; i++) {
+			if (toks[i].len == tlen &&
+			    !strncasecmp(toks[i].p, p, tlen))
+				break;
+		}
+		if (i == nr) {
+			if (nr >= CONN_MAX_TOKENS)
+				return -E2BIG;
+			toks[nr].p = p;
+			toks[nr].len = tlen;
+			nr++;
+		}
 		p = e;
+	}
+	return nr;
+}
+
+/* Whether the field name @k (@klen bytes) is one of the @nr options. */
+static bool conn_toks_have(const struct conn_tok *toks, int nr, const char *k,
+			   size_t klen)
+{
+	int i;
+
+	for (i = 0; i < nr; i++) {
+		if (toks[i].len == klen && !strncasecmp(toks[i].p, k, klen))
+			return true;
 	}
 	return false;
 }
 
-static bool conn_lists(const char *conn, const char *name)
+/* Append @len bytes at @p to @buf (@cap bytes, @n used); false if full. */
+static bool buf_add(char *buf, size_t cap, size_t *n, const char *p,
+		    size_t len)
 {
-	return conn_listsl(conn, name, strlen(name));
+	if (len > cap - *n)
+		return false;
+	memcpy(buf + *n, p, len);
+	*n += len;
+	return true;
 }
 
 /*
  * Rebuild the request in origin-form into hc->fwd_req: the absolute-form
  * request-target is replaced by @path, hop-by-hop / connection-specific
  * headers are dropped and "Connection: close" is appended (this proxy handles
- * one request per connection). @hdr_len is the length of the parsed request
+ * one request per connection). @authority is the URI's authority, passed as
+ * pointer+length because at this point it is still part of the request line
+ * and not NUL-terminated. @hdr_len is the length of the parsed request
  * header, used to size the scratch buffer (the rewrite is never materially
  * larger). Returns 0 or a negative error.
- */
-/*
- * Build the origin-form request forwarded upstream. @authority is the URI's
- * authority, passed as pointer+length because at this point it is still part
- * of the request line and not NUL-terminated.
  */
 static int build_forward_request(struct gwp_http_conn *hc, const char *path,
 				 const char *authority, size_t auth_len,
 				 size_t hdr_len)
 {
+	static const char cls[] = "Connection: close\r\n\r\n";
 	struct gwnet_http_req_hdr *req = &hc->req_hdr;
 	const char *method = http_method_str(req->method);
-	const char *ver = (req->version == GWNET_HTTP_VER_1_0) ? "1.0" : "1.1";
+	const char *ver = (req->version == GWNET_HTTP_VER_1_0) ?
+			  " HTTP/1.0\r\n" : " HTTP/1.1\r\n";
 	const char *conn = gwnet_http_hdr_fields_get(&req->fields, "Connection");
+	struct conn_tok toks[CONN_MAX_TOKENS];
 	size_t cap = hdr_len * 2 + 64, n = 0, i;
+	int nr_toks = 0;
+	bool ok;
 	char *buf;
-	int w;
 
 	if (!method)
 		return -EINVAL;
+
+	/* Too many options to check every field against is not plausible. */
+	if (conn) {
+		nr_toks = conn_tokenise(conn, strlen(conn), toks, 0);
+		if (nr_toks < 0)
+			return -EBADMSG;
+	}
 
 	/*
 	 * Fields the Connection header names are dropped below, as RFC 9110
@@ -280,19 +371,21 @@ static int build_forward_request(struct gwp_http_conn *hc, const char *path,
 	 * past the rewrite above. Host is replaced anyway, and listing it is
 	 * just as meaningless. Nothing legitimate does this; refuse it.
 	 */
-	if (conn_lists(conn, "Content-Length") ||
-	    conn_lists(conn, "Transfer-Encoding") ||
-	    conn_lists(conn, "Host"))
+	if (conn_toks_have(toks, nr_toks, "Content-Length", 14) ||
+	    conn_toks_have(toks, nr_toks, "Transfer-Encoding", 17) ||
+	    conn_toks_have(toks, nr_toks, "Host", 4))
 		return -EBADMSG;
 
 	buf = malloc(cap);
 	if (!buf)
 		return -ENOMEM;
 
-	w = snprintf(buf, cap, "%s %s HTTP/%s\r\n", method, path, ver);
-	if (w < 0 || (size_t)w >= cap)
+	ok = buf_add(buf, cap, &n, method, strlen(method)) &&
+	     buf_add(buf, cap, &n, " ", 1) &&
+	     buf_add(buf, cap, &n, path, strlen(path)) &&
+	     buf_add(buf, cap, &n, ver, 11);
+	if (!ok)
 		goto too_big;
-	n = (size_t)w;
 
 	/*
 	 * RFC 9112 s3.2.2: with an absolute-form target the proxy MUST ignore
@@ -320,33 +413,35 @@ static int build_forward_request(struct gwp_http_conn *hc, const char *path,
 			return -EINVAL;
 		}
 
-		w = snprintf(buf + n, cap - n, "Host: %.*s\r\n", (int)hlen,
-			     host);
-		if (w < 0 || (size_t)w >= cap - n)
+		ok = buf_add(buf, cap, &n, "Host: ", 6) &&
+		     buf_add(buf, cap, &n, host, hlen) &&
+		     buf_add(buf, cap, &n, "\r\n", 2);
+		if (!ok)
 			goto too_big;
-		n += (size_t)w;
 	}
 
 	for (i = 0; i < req->fields.nr; i++) {
-		const char *k = req->fields.ff[i].key;
-		const char *v = req->fields.ff[i].val;
+		const struct gwnet_http_hdr_field *f = &req->fields.ff[i];
 
 		/* Drop hop-by-hop and Connection-listed headers, and the
 		 * client's Host -- ours is already in place above. */
-		if (is_hop_by_hop(k) || conn_lists(conn, k) ||
-		    !strcasecmp(k, "Host"))
+		if (is_hop_by_hop(f->key, f->klen) ||
+		    conn_toks_have(toks, nr_toks, f->key, f->klen) ||
+		    (f->klen == 4 && !strncasecmp(f->key, "Host", 4)))
 			continue;
 
-		w = snprintf(buf + n, cap - n, "%s: %s\r\n", k, v);
-		if (w < 0 || (size_t)w >= cap - n)
+		ok = buf_add(buf, cap, &n, f->key, f->klen) &&
+		     buf_add(buf, cap, &n, ": ", 2) &&
+		     buf_add(buf, cap, &n, f->val, f->vlen) &&
+		     buf_add(buf, cap, &n, "\r\n", 2);
+		if (!ok)
 			goto too_big;
-		n += (size_t)w;
 	}
 
-	w = snprintf(buf + n, cap - n, "Connection: close\r\n\r\n");
-	if (w < 0 || (size_t)w >= cap - n)
+	/* NUL-terminated as well, for whoever wants to log or search it. */
+	if (!buf_add(buf, cap, &n, cls, sizeof(cls)))
 		goto too_big;
-	n += (size_t)w;
+	n--;
 
 	free(hc->fwd_req);
 	hc->fwd_req = buf;
@@ -459,26 +554,98 @@ static int classify_forward(struct gwp_http_conn *hc, size_t hdr_len,
 	return GWP_HTTP_FORWARD;
 }
 
+static int classify_req(struct gwp_http_conn *hc, struct gwp_auth *auth,
+			char **host_p, char **port_p, const char **req_p,
+			size_t *req_len_p);
+
+/* Copy the target's host and port into @hc; point @host_p, @port_p there. */
+static int keep_target(struct gwp_http_conn *hc, char **host_p, char **port_p)
+{
+	size_t hl = strlen(*host_p), pl = strlen(*port_p);
+	char *t = malloc(hl + pl + 2);
+
+	if (!t)
+		return -ENOMEM;
+	memcpy(t, *host_p, hl + 1);
+	memcpy(t + hl + 1, *port_p, pl + 1);
+	free(hc->target);
+	hc->target = t;
+	*host_p = t;
+	*port_p = t + hl + 1;
+	return 0;
+}
+
 int gwp_http_conn_process(struct gwp_http_conn *hc, struct gwp_auth *auth,
 			  const void *in, size_t *in_len,
 			  char **host_p, char **port_p,
 			  const char **req_p, size_t *req_len_p)
 {
 	struct gwnet_http_req_hdr *req = &hc->req_hdr;
-	size_t hdr_len;
+	size_t len = *in_len, used;
+	const char *p = in;
 	int r;
 
+	/*
+	 * Nothing to do until a line is complete: only the bytes not searched
+	 * yet are looked at. Past the length limit the parser runs anyway, to
+	 * refuse the header.
+	 */
+	if (hc->scan > len)
+		hc->scan = 0;
+	if (hc->hdr_len + len <= REQ_HDR_MAX &&
+	    !memchr(p + hc->scan, '\n', len - hc->scan)) {
+		hc->scan = len;
+		*in_len = 0;
+		return GWP_HTTP_NEED_MORE;
+	}
+
 	hc->ctx_hdr.buf = in;
-	hc->ctx_hdr.len = *in_len;
+	hc->ctx_hdr.len = len;
 	hc->ctx_hdr.off = 0;
 	r = gwnet_http_req_hdr_parse(&hc->ctx_hdr, req);
-	*in_len = hc->ctx_hdr.off;
-	hc->hdr_len += hc->ctx_hdr.off;
+	used = hc->ctx_hdr.off;
+	*in_len = used;
+	hc->hdr_len += used;
+	if (r == -EAGAIN) {
+		/*
+		 * Every complete line has been taken; what is left is the
+		 * start of the next one. Should the parser ever leave a line
+		 * end behind, search from the start again so it is not missed.
+		 */
+		hc->scan = memchr(p + used, '\n', len - used) ? 0 : len - used;
+		return GWP_HTTP_NEED_MORE;
+	}
+	/*
+	 * A repeated field that may appear only once (Host, Content-Length,
+	 * ...) is a well-formed line in an unacceptable request; say so
+	 * rather than drop the connection without a word.
+	 */
+	if (r == -EEXIST)
+		return GWP_HTTP_BAD_REQUEST;
+	if (r == -E2BIG)
+		return GWP_HTTP_TOO_LARGE;
 	if (r < 0)
-		return (r == -EAGAIN) ? GWP_HTTP_NEED_MORE : GWP_HTTP_ERR;
+		return GWP_HTTP_ERR;
 
-	/* Header complete. */
-	hdr_len = hc->hdr_len;
+	/*
+	 * Header complete. Once classified, only the target (copied out), the
+	 * username and the body framing are needed; the parsed request and
+	 * its fields are freed rather than kept for the connection's life.
+	 */
+	r = classify_req(hc, auth, host_p, port_p, req_p, req_len_p);
+	if ((r == GWP_HTTP_CONNECT || r == GWP_HTTP_FORWARD) &&
+	    keep_target(hc, host_p, port_p) < 0)
+		r = GWP_HTTP_ERR;
+	gwnet_http_req_hdr_free(req);
+	return r;
+}
+
+static int classify_req(struct gwp_http_conn *hc, struct gwp_auth *auth,
+			char **host_p, char **port_p, const char **req_p,
+			size_t *req_len_p)
+{
+	struct gwnet_http_req_hdr *req = &hc->req_hdr;
+	size_t hdr_len = hc->hdr_len;
 
 	/*
 	 * "Basic" proxy authentication (shared with SOCKS5) applies to CONNECT
@@ -517,14 +684,20 @@ int gwp_http_conn_process(struct gwp_http_conn *hc, struct gwp_auth *auth,
  */
 static bool is_res_hop_by_hop(const char *k, size_t klen)
 {
-	static const char *const hbh[] = {
-		"Connection", "Proxy-Connection", "Keep-Alive", "Upgrade",
-		"TE", "Proxy-Authenticate", "Proxy-Authentication-Info",
+#define HBH(s)	{ s, sizeof(s) - 1 }
+	static const struct {
+		const char	*name;
+		size_t		len;
+	} hbh[] = {
+		HBH("Connection"), HBH("Proxy-Connection"), HBH("Keep-Alive"),
+		HBH("Upgrade"), HBH("TE"), HBH("Proxy-Authenticate"),
+		HBH("Proxy-Authentication-Info"),
 	};
+#undef HBH
 	size_t i;
 
 	for (i = 0; i < sizeof(hbh) / sizeof(hbh[0]); i++) {
-		if (strlen(hbh[i]) == klen && !strncasecmp(k, hbh[i], klen))
+		if (hbh[i].len == klen && !strncasecmp(k, hbh[i].name, klen))
 			return true;
 	}
 	return false;
@@ -733,24 +906,32 @@ int gwp_http_fwd_req_body(struct gwp_http_conn *hc, const void *in,
 }
 
 /*
- * Return the length of the line at @p (at most @len bytes, which always
- * include its LF) excluding the line terminator, which is LF or CRLF.
+ * Return the line after the one at @p, which ends before @end; *@n is set to
+ * the length of the line at @p without its terminator (LF or CRLF).
  */
-static size_t line_len(const char *p, size_t len)
+static const char *next_line(const char *p, const char *end, size_t *n)
 {
-	const char *lf = memchr(p, '\n', len);
-	size_t n = (size_t)(lf - p);
+	const char *lf = memchr(p, '\n', (size_t)(end - p));
 
-	if (n && p[n - 1] == '\r')
-		n--;
-	return n;
+	*n = (size_t)(lf - p);
+	if (*n && p[*n - 1] == '\r')
+		(*n)--;
+	return lf + 1;
 }
 
-/* The line after the one at @p; the header ending at @end has one. */
-static const char *next_line(const char *p, const char *end)
-{
-	return (const char *)memchr(p, '\n', (size_t)(end - p)) + 1;
-}
+/*
+ * Most field lines accepted in one response header. Ordinary responses have
+ * a few dozen; without a limit the work per header grows with the size of
+ * the hold-back buffer (-T).
+ */
+#define RES_MAX_FIELDS		256
+
+/* Where a field line sits in the header: offset, length and name length. */
+struct res_line {
+	uint32_t	off;
+	uint32_t	len;
+	uint32_t	klen;
+};
 
 /*
  * Rewrite one complete response header (@len bytes, ending with its blank
@@ -759,20 +940,23 @@ static const char *next_line(const char *p, const char *end)
  * told that the connection closes after it. *@code is set to the status code.
  *
  * Returns the length written, -EBADMSG for a header that is not valid
- * HTTP/1.x, or -E2BIG if @out is too small.
+ * HTTP/1.x, or -E2BIG if @out is too small or the header has more than
+ * RES_MAX_FIELDS field lines or CONN_MAX_TOKENS connection-options.
  */
-static ssize_t rewrite_res_hdr(const char *hdr, size_t len, char *out,
-			       size_t out_cap, int *code)
+/* Not inlined: its stack frame must not add up with its callers'. */
+static noinline ssize_t rewrite_res_hdr(const char *hdr, size_t len, char *out,
+					size_t out_cap, int *code)
 {
 	static const char cls[] = "Connection: close\r\n"
 				  "Proxy-Connection: close\r\n";
+	struct res_line lines[RES_MAX_FIELDS];
+	struct conn_tok toks[CONN_MAX_TOKENS];
 	const char *p = hdr, *end = hdr + len, *q;
-	char *conn = NULL;
-	size_t n, o = 0, conn_len = 0, i;
-	ssize_t ret = -EBADMSG;
+	int nr_toks = 0, nr_lines = 0, l;
+	size_t n, o, i;
 
 	/* Status line: HTTP/1.x SP 3DIGIT [ SP reason-phrase ] */
-	n = line_len(p, (size_t)(end - p));
+	q = next_line(p, end, &n);
 	if (n < 12 || memcmp(p, "HTTP/1.", 7) || (p[7] != '0' && p[7] != '1') ||
 	    p[8] != ' ' || p[9] < '1' || p[9] > '5' || p[10] < '0' ||
 	    p[10] > '9' || p[11] < '0' || p[11] > '9' ||
@@ -788,77 +972,68 @@ static ssize_t rewrite_res_hdr(const char *hdr, size_t len, char *out,
 	memcpy(out, p, n);
 	memcpy(out + n, "\r\n", 2);
 	o = n + 2;
-	p = next_line(p, end);
 
 	/*
-	 * Validate the field lines and gather every Connection value into one
-	 * list first: a field may be named by a Connection line that comes
-	 * after it.
+	 * Validate the field lines, note where each one is and collect the
+	 * connection-options first: a field may be named by a Connection line
+	 * that comes after it.
 	 */
-	conn = malloc(len + 1);
-	if (!conn)
-		return -ENOMEM;
-	for (q = p; ; ) {
+	for (p = q; ; p = q) {
 		const char *colon, *v;
 
-		n = line_len(q, (size_t)(end - q));
+		q = next_line(p, end, &n);
 		if (!n)
 			break;
+		if (nr_lines == RES_MAX_FIELDS)
+			return -E2BIG;
 		/* obs-fold (RFC 9112 Section 5.2) is refused, not unfolded. */
-		colon = memchr(q, ':', n);
-		if (!colon || colon == q)
-			goto out;
-		for (v = q; v < colon; v++) {
-			if (!is_tchar(*v))
-				goto out;
-		}
-		for (v = colon + 1; v < q + n; v++) {
-			if (!is_field_char(*v))
-				goto out;
-		}
-		if (colon - q == 10 && !strncasecmp(q, "Connection", 10)) {
-			conn[conn_len++] = ',';
-			memcpy(conn + conn_len, colon + 1, n - 11);
-			conn_len += n - 11;
-		}
-		q = next_line(q, end);
-	}
-	conn[conn_len] = '\0';
-
-	for (;;) {
-		const char *colon;
-		size_t klen;
-
-		n = line_len(p, (size_t)(end - p));
-		if (!n)
-			break;
 		colon = memchr(p, ':', n);
-		klen = (size_t)(colon - p);
-		if (!is_res_hop_by_hop(p, klen) &&
-		    (is_framing_field(p, klen) || !conn_listsl(conn, p, klen))) {
-			if (o + n + 2 > out_cap) {
-				ret = -E2BIG;
-				goto out;
-			}
-			memcpy(out + o, p, n);
-			memcpy(out + o + n, "\r\n", 2);
-			o += n + 2;
+		if (!colon || colon == p)
+			return -EBADMSG;
+		for (v = p; v < colon; v++) {
+			if (!is_tchar(*v))
+				return -EBADMSG;
 		}
-		p = next_line(p, end);
+		for (v = colon + 1; v < p + n; v++) {
+			if (!is_field_char(*v))
+				return -EBADMSG;
+		}
+		lines[nr_lines].off = (uint32_t)(p - hdr);
+		lines[nr_lines].len = (uint32_t)n;
+		lines[nr_lines].klen = (uint32_t)(colon - p);
+		nr_lines++;
+		if (colon - p == 10 && !strncasecmp(p, "Connection", 10)) {
+			nr_toks = conn_tokenise(colon + 1, n - 11, toks,
+						nr_toks);
+			if (nr_toks < 0)
+				return nr_toks;
+		}
+	}
+
+	for (l = 0; l < nr_lines; l++) {
+		const char *k = hdr + lines[l].off;
+		size_t klen = lines[l].klen;
+
+		n = lines[l].len;
+		if (is_res_hop_by_hop(k, klen))
+			continue;
+		if (!is_framing_field(k, klen) &&
+		    conn_toks_have(toks, nr_toks, k, klen))
+			continue;
+		if (o + n + 2 > out_cap)
+			return -E2BIG;
+		memcpy(out + o, k, n);
+		memcpy(out + o + n, "\r\n", 2);
+		o += n + 2;
 	}
 
 	/* An interim response says nothing about the connection. */
 	n = (*code >= 200) ? sizeof(cls) - 1 : 0;
-	if (o + n + 2 > out_cap) {
-		ret = -E2BIG;
-		goto out;
-	}
+	if (o + n + 2 > out_cap)
+		return -E2BIG;
 	memcpy(out + o, cls, n);
 	memcpy(out + o + n, "\r\n", 2);
-	ret = (ssize_t)(o + n + 2);
-out:
-	free(conn);
-	return ret;
+	return (ssize_t)(o + n + 2);
 }
 
 /*
@@ -891,10 +1066,9 @@ static size_t find_hdr_end(const char *buf, size_t len, size_t *scan)
 
 int gwp_http_fwd_res_init(struct gwp_http_conn *hc, size_t max_hdr)
 {
+	/* The hold-back buffer is allocated only if a header spans reads. */
 	free(hc->res_buf);
-	hc->res_buf = malloc(max_hdr);
-	if (!hc->res_buf)
-		return -ENOMEM;
+	hc->res_buf = NULL;
 	hc->res_cap = max_hdr;
 	hc->res_len = 0;
 	hc->res_scan = 0;
@@ -912,6 +1086,61 @@ size_t gwp_http_fwd_res_pending(const struct gwp_http_conn *hc)
 	return hc->res_len;
 }
 
+/*
+ * The rewrite of a final header that arrived whole in one read is built here,
+ * on the stack, rather than in the hold-back buffer. Larger ones take the
+ * general path.
+ */
+#define RES_FAST_MAX		4096
+
+/*
+ * The usual case: nothing is held back and @in holds the whole final header.
+ * Rewrite it straight from @in, with no hold-back copy and no allocation.
+ * Returns 1 if the response was not handled (no complete header, an interim
+ * response, or a rewrite too large for the stack) and the general path must
+ * take it, else 0 or a negative error as res_input().
+ */
+static int res_input_fast(struct gwp_http_conn *hc, const char *in,
+			  size_t len, char *out, size_t out_cap,
+			  size_t *out_len)
+{
+	char tmp[RES_FAST_MAX];
+	size_t scan = 0, end, body;
+	ssize_t w;
+	int code;
+
+	end = find_hdr_end(in, len, &scan);
+	if (!end) {
+		/* The general path resumes the search from here. */
+		hc->res_scan = scan;
+		return 1;
+	}
+
+	w = rewrite_res_hdr(in, end, tmp,
+			    out_cap < sizeof(tmp) ? out_cap : sizeof(tmp),
+			    &code);
+	if (w == -E2BIG)
+		return 1;
+	if (w < 0)
+		return (int)w;
+	if (code < 200)
+		return 1;
+	if (code == 407)
+		return -EACCES;
+
+	/* @in may alias @out: move the body before the header goes in. */
+	body = len - end;
+	if (body > out_cap - (size_t)w)
+		return -E2BIG;
+	memmove(out + w, in + end, body);
+	memcpy(out, tmp, (size_t)w);
+	free(hc->res_buf);	/* Left from an interim response, if any. */
+	hc->res_buf = NULL;
+	hc->res_state = GWP_HTTP_RES_BODY;
+	*out_len = (size_t)w + body;
+	return 0;
+}
+
 static int res_input(struct gwp_http_conn *hc, const void *in, size_t len,
 		     bool eof, char *out, size_t out_cap, size_t *out_len)
 {
@@ -921,6 +1150,19 @@ static int res_input(struct gwp_http_conn *hc, const void *in, size_t len,
 
 	if (len > hc->res_cap - hc->res_len)
 		return -E2BIG;
+
+	if (!hc->res_len) {
+		int r = res_input_fast(hc, in, len, out, out_cap, out_len);
+
+		if (r <= 0)
+			return r;
+	}
+
+	if (!hc->res_buf) {
+		hc->res_buf = malloc(hc->res_cap);
+		if (!hc->res_buf)
+			return -ENOMEM;
+	}
 	memcpy(hc->res_buf + hc->res_len, in, len);
 	hc->res_len += len;
 
@@ -1180,34 +1422,36 @@ int gwp_http_cli_build_connect(const char *authority, const char *user,
 }
 
 /*
- * Parse an upstream HTTP CONNECT reply. Returns -EAGAIN until the status line
- * and header terminator ("\r\n\r\n") have both arrived. On completion it sets
- * *status to the HTTP status code and *consumed to the number of bytes up to and
- * including the blank line (any bytes after that are early tunnel data), and
- * returns 0. Returns -EINVAL on a malformed status line.
+ * Parse an upstream HTTP CONNECT reply. Returns -EAGAIN until the header,
+ * up to and including the blank line that ends it, has arrived. On
+ * completion it sets *status to the HTTP status code and *consumed to the
+ * number of bytes of the header (any bytes after that are early tunnel data),
+ * and returns 0. Returns -EINVAL on a malformed status line.
+ *
+ * The status line and the line ends are held to the same rules as an
+ * origin's response in forwarding mode (rewrite_res_hdr(), find_hdr_end()):
+ * "HTTP/1.0" or "HTTP/1.1", a three-digit code followed by a space or the
+ * end of the line, LF or CRLF line ends.
  */
 int gwp_http_cli_parse_connect_reply(const void *buf, size_t len, int *status,
 				     size_t *consumed)
 {
-	const char *p = buf, *end;
-	int code;
+	const char *p = buf;
+	size_t scan = 0, end, n;
 
 	/* Need the full header block. */
-	end = memmem(p, len, "\r\n\r\n", 4);
+	end = find_hdr_end(p, len, &scan);
 	if (!end)
 		return -EAGAIN;
 
-	/* Status line: "HTTP/1.x SSS ...". */
-	if (len < 12 || memcmp(p, "HTTP/1.", 7))
-		return -EINVAL;
-	if (p[8] != ' ')
-		return -EINVAL;
-	if (p[9] < '0' || p[9] > '9' || p[10] < '0' || p[10] > '9' ||
-	    p[11] < '0' || p[11] > '9')
+	next_line(p, p + end, &n);
+	if (n < 12 || memcmp(p, "HTTP/1.", 7) || (p[7] != '0' && p[7] != '1') ||
+	    p[8] != ' ' || p[9] < '0' || p[9] > '9' || p[10] < '0' ||
+	    p[10] > '9' || p[11] < '0' || p[11] > '9' ||
+	    (n > 12 && p[12] != ' '))
 		return -EINVAL;
 
-	code = (p[9] - '0') * 100 + (p[10] - '0') * 10 + (p[11] - '0');
-	*status = code;
-	*consumed = (size_t)(end - p) + 4;
+	*status = (p[9] - '0') * 100 + (p[10] - '0') * 10 + (p[11] - '0');
+	*consumed = end;
 	return 0;
 }

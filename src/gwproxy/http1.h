@@ -50,19 +50,28 @@ enum {
 	GWNET_HTTP_METHOD_CONNECT	= 9,
 };
 
+/*
+ * One stored field. @key and @val share a single allocation, owned through
+ * @key; @val follows the key's NUL. Their lengths are kept so a lookup or a
+ * merge does not have to strlen() them.
+ */
 struct gwnet_http_hdr_field {
 	char	*key;
 	char	*val;
+	size_t	klen;
+	size_t	vlen;
 };
 
 struct gwnet_http_hdr_fields {
 	struct gwnet_http_hdr_field	*ff;
 	size_t				nr;
+	size_t				cap;
 };
 
 struct gwnet_http_req_hdr {
 	uint8_t		method;
 	uint8_t		version;
+	/* One allocation, owned through @path; @uri and @qs point into it. */
 	char		*path;
 	char		*uri;
 	char		*qs;
@@ -134,7 +143,19 @@ struct gwnet_http_hdr_pctx {
 	 * will be set to default by the parser (16384 bytes).
 	 */
 	uint64_t	max_len;
+
+	/*
+	 * Field lines accepted so far, and the most that are accepted
+	 * (filled by the caller; 0 means GWNET_HTTP_HDR_MAX_FIELDS). One
+	 * more makes the parser fail with -E2BIG. Every field line costs a
+	 * lookup among those already stored, so without a limit a header of
+	 * many small fields costs time quadratic in its size.
+	 */
+	uint32_t	nr_fields;
+	uint32_t	max_fields;
 };
+
+#define GWNET_HTTP_HDR_MAX_FIELDS	128
 
 enum {
 	GWNET_HTTP_BODY_ERR_NONE		= 0,
@@ -264,11 +285,15 @@ void gwnet_http_hdr_pctx_free(struct gwnet_http_hdr_pctx *ctx);
  * @return     0 on success,
  *             -EAGAIN if more data is needed,
  *             -EINVAL if the request line is malformed,
+ *             -EEXIST if a field that may appear only once is repeated,
+ *             -E2BIG if the header is too long or has too many
+ *                    field lines,
  *             -ENOMEM if memory allocation fails.
  */
 int gwnet_http_req_hdr_parse(struct gwnet_http_hdr_pctx *ctx,
 			     struct gwnet_http_req_hdr *hdr);
 
+#ifdef GWNET_HTTP1_TESTS
 /**
  * Parses an HTTP response header from the given parsing context.
  *
@@ -283,8 +308,12 @@ int gwnet_http_req_hdr_parse(struct gwnet_http_hdr_pctx *ctx,
 int gwnet_http_res_hdr_parse(struct gwnet_http_hdr_pctx *ctx,
 			     struct gwnet_http_res_hdr *hdr);
 
+#endif
+
 void gwnet_http_req_hdr_free(struct gwnet_http_req_hdr *hdr);
+#ifdef GWNET_HTTP1_TESTS
 void gwnet_http_res_hdr_free(struct gwnet_http_res_hdr *hdr);
+#endif
 
 /**
  * Free all memory associated with the given HTTP header fields
@@ -295,32 +324,6 @@ void gwnet_http_res_hdr_free(struct gwnet_http_res_hdr *hdr);
 void gwnet_http_hdr_fields_free(struct gwnet_http_hdr_fields *ff);
 
 /**
- * Add a header field with the specified key and value to the HTTP
- * header fields structure.
- *
- * @param ff Pointer to the HTTP header fields structure.
- * @param k  Null-terminated string containing the header key.
- * @param v  Null-terminated string containing the header value.
- * @return   0 on success, or a negative value on error.
- */
-int gwnet_http_hdr_fields_add(struct gwnet_http_hdr_fields *ff, const char *k,
-			      const char *v);
-
-/**
- * Add a header field with the specified key and a formatted value to
- * the HTTP header fields structure.
- *
- * @param ff  Pointer to the HTTP header fields structure.
- * @param k   Null-terminated string containing the header key.
- * @param fmt printf-style format string for the header value.
- * @param ... Arguments for the format string.
- * @return    0 on success, or a negative value on error.
- */
-__attribute__((__format__(printf, 3, 4)))
-int gwnet_http_hdr_fields_addf(struct gwnet_http_hdr_fields *ff,
-			       const char *k, const char *fmt, ...);
-
-/**
  * Add a header field with the specified key and value, using explicit
  * lengths for both key and value.
  *
@@ -329,7 +332,10 @@ int gwnet_http_hdr_fields_addf(struct gwnet_http_hdr_fields *ff,
  * @param klen Length of the header key.
  * @param v    Pointer to the header value.
  * @param vlen Length of the header value.
- * @return     0 on success, or a negative value on error.
+ * @return     0 on success (a repeated list field is appended to the
+ *             existing value), -EEXIST if @k is already present and may
+ *             appear only once (the stored value is left alone), or
+ *             -ENOMEM.
  */
 int gwnet_http_hdr_fields_addl(struct gwnet_http_hdr_fields *ff,
 			       const char *k, size_t klen, const char *v,
@@ -359,6 +365,11 @@ const char *gwnet_http_hdr_fields_getl(const struct gwnet_http_hdr_fields *ff,
 				       const char *k, size_t klen);
 
 
+/*
+ * The response-header and chunked-body parsers are built only into the
+ * self-tests (GWNET_HTTP1_TESTS); gwproxy does not use them.
+ */
+#ifdef GWNET_HTTP1_TESTS
 /**
  * Initialize the HTTP body processing context.
  *
@@ -395,5 +406,6 @@ int gwnet_http_body_parse_chunked(struct gwnet_http_body_pctx *ctx,
 void gwnet_http_run_tests(void);
 
 void gwnet_http_body_pctx_free(struct gwnet_http_body_pctx *ctx);
+#endif /* #ifdef GWNET_HTTP1_TESTS */
 
 #endif /* #ifndef GWNET_HTTP1_H */

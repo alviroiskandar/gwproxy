@@ -30,7 +30,10 @@ enum gwp_http_result {
 	GWP_HTTP_FORWARD,	/* Forward request; host/port + rewritten req set. */
 	GWP_HTTP_NEED_AUTH,	/* Proxy auth required/failed; reply 407. */
 	GWP_HTTP_ERR,		/* Malformed or unsupported; tear the conn down. */
-	GWP_HTTP_BAD_REQUEST,	/* Well-formed but unacceptable; reply 400. */
+	GWP_HTTP_BAD_REQUEST,	/* Well-formed but unacceptable (e.g. a field
+				 * that may appear once is repeated); reply
+				 * 400. */
+	GWP_HTTP_TOO_LARGE,	/* Header too long or too many fields; 431. */
 };
 
 /* Allocate/free a per-connection HTTP proxy state. */
@@ -55,10 +58,11 @@ const char *gwp_http_conn_username(const struct gwp_http_conn *hc);
  * @in		Client bytes to parse.
  * @in_len	In: number of bytes in @in. Out: number of bytes consumed.
  * @host_p	Out (CONNECT/FORWARD): target host, NUL-terminated, owned by @hc
- *		and valid until the next call or gwp_http_conn_free().
+ *		and valid until gwp_http_conn_free().
  * @port_p	Out (CONNECT/FORWARD): target port string, same lifetime.
  * @req_p	Out (FORWARD): the rewritten origin-form request header to send
- *		to the origin, owned by @hc.
+ *		to the origin, owned by @hc and valid until
+ *		gwp_http_conn_drop_req() or gwp_http_conn_free().
  * @req_len_p	Out (FORWARD): length of *@req_p.
  * @return	One of enum gwp_http_result.
  */
@@ -66,6 +70,12 @@ int gwp_http_conn_process(struct gwp_http_conn *hc, struct gwp_auth *auth,
 			  const void *in, size_t *in_len,
 			  char **host_p, char **port_p,
 			  const char **req_p, size_t *req_len_p);
+
+/*
+ * Free the rewritten request returned by gwp_http_conn_process() once the
+ * caller has copied it, rather than keeping it for the connection's life.
+ */
+void gwp_http_conn_drop_req(struct gwp_http_conn *hc);
 
 /**
  * Delimit the body of a forwarding request. Called with each run of client
@@ -124,7 +134,8 @@ size_t gwp_http_fwd_res_pending(const struct gwp_http_conn *hc);
  * @return	0; or, with the state moved to GWP_HTTP_RES_FAILED and nothing
  *		written, a negative error the caller answers with 502:
  *		-EBADMSG (not a valid HTTP/1.x header, a 101, or the origin
- *		closed early), -E2BIG (header too large), -EACCES (the origin
+ *		closed early), -E2BIG (header too large, or more than 256
+ *		field lines or 32 Connection options), -EACCES (the origin
  *		answered 407), -ENOMEM.
  */
 int gwp_http_fwd_res_input(struct gwp_http_conn *hc, const void *in,
@@ -182,7 +193,8 @@ int gwp_http_build_gateway_timeout_reply(void *out, size_t out_cap);
 
 /**
  * Build a "431 Request Header Fields Too Large" reply (RFC 6585 Section 5),
- * for a request header that does not fit in the client buffer.
+ * for a request header that does not fit in the client buffer or has too
+ * many fields (GWP_HTTP_TOO_LARGE).
  *
  * @return	Number of bytes written to @out, or -ENOBUFS if too small.
  */
@@ -204,8 +216,9 @@ int gwp_http_cli_build_connect(const char *authority, const char *user,
  * Parse an upstream HTTP CONNECT reply.
  *
  * @return	0 with *status (HTTP code) and *consumed (bytes through the
- *		"\r\n\r\n") set once the header block has arrived; -EAGAIN if
- *		more data is needed; -EINVAL on a malformed status line.
+ *		blank line, CRLF or LF) set once the header block has arrived;
+ *		-EAGAIN if more data is needed; -EINVAL on a malformed status
+ *		line (not "HTTP/1.0" or "HTTP/1.1" SP 3DIGIT).
  */
 int gwp_http_cli_parse_connect_reply(const void *buf, size_t len, int *status,
 				     size_t *consumed);
