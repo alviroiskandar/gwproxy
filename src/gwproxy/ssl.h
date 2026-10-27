@@ -90,8 +90,6 @@ size_t gwp_ssl_bio_pending(struct gwp_ssl *s);
  */
 const void *gwp_ssl_bio_peek(struct gwp_ssl *s, size_t *len);
 void gwp_ssl_bio_consume(struct gwp_ssl *s, size_t len);
-/* Number of decrypted plaintext bytes buffered and immediately readable. */
-size_t gwp_ssl_pending(struct gwp_ssl *s);
 
 /* Drive the TLS handshake. Returns GWP_SSL_OK / WANT_READ / WANT_WRITE / ERROR. */
 int gwp_ssl_handshake(struct gwp_ssl *s);

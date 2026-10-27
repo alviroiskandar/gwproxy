@@ -432,13 +432,6 @@ void gwp_ssl_bio_consume(struct gwp_ssl *s, size_t len)
 	q_consume(&s->wq, len);
 }
 
-size_t gwp_ssl_pending(struct gwp_ssl *s)
-{
-	int r = SSL_pending(s->ssl);
-
-	return (r > 0) ? (size_t)r : 0;
-}
-
 /*
  * SSL_get_error() consults this thread's OpenSSL error queue, which is shared
  * by every connection a worker serves: an entry left there by one session's

@@ -815,39 +815,48 @@ static ssize_t tls_decrypt(struct gwp_conn *src)
 }
 
 /*
- * TLS receive: pull a chunk of ciphertext from the socket into the read BIO,
- * then decrypt as much as fits into src->buf. Any ciphertext left on the socket
- * (a record we only partially read, or more than one chunk's worth) keeps the
- * level-triggered EPOLLIN live so the rest is read on the next wakeup. Returns
- * the number of plaintext bytes produced, or <0 on error.
+ * TLS receive: decrypt into src->buf, reading more ciphertext from the socket
+ * only once the engine has used up what it already holds, so its input stays
+ * within about two records. The ciphertext goes straight into the engine's
+ * input queue, at least one whole record's worth per call, with no bounce
+ * buffer. Anything left on the socket keeps the level-triggered EPOLLIN live.
+ * Returns the number of plaintext bytes produced, or <0 on error.
  */
 static ssize_t do_recv_tls(struct gwp_conn *src)
 {
-	/*
-	 * Ciphertext scratch. Kept on the stack and modestly sized: it must
-	 * fit the -Wstack-usage budget, and a static __thread buffer passed to
-	 * the inline-asm syscall miscompiles under gcc -O2. A partial TLS
-	 * record simply stays queued in the socket and is read on the next
-	 * (level-triggered) EPOLLIN, so a small buffer is only a throughput,
-	 * not a correctness, matter.
-	 */
-	unsigned char cbuf[4096];
-	ssize_t n;
+	ssize_t got = 0, n;
+	size_t len;
+	void *p;
 
 	if (unlikely(src->len == src->cap))
 		return 0;
 
-	n = __sys_recv(src->fd, cbuf, sizeof(cbuf), MSG_NOSIGNAL);
+	if (gwp_ssl_rx_more(src->tls)) {
+		got = tls_decrypt(src);
+		if (got < 0 || src->len == src->cap)
+			return got;
+	}
+
+	if (src->rd_eof)
+		return got;
+
+	p = gwp_ssl_rx_space(src->tls, GWP_SSL_RECORD_MAX, &len);
+	if (unlikely(!p))
+		return -ENOMEM;
+
+	n = __sys_recv(src->fd, p, len, MSG_NOSIGNAL);
 	if (n > 0) {
-		if (gwp_ssl_bio_write(src->tls, cbuf, (size_t)n) < 0)
-			return -EIO;
+		gwp_ssl_rx_commit(src->tls, (size_t)n);
 	} else if (n == 0) {
 		src->rd_eof = true;
 	} else if (n != -EAGAIN && n != -EINTR) {
 		return n;
 	}
 
-	return tls_decrypt(src);
+	n = tls_decrypt(src);
+	if (n < 0)
+		return n;
+	return got + n;
 }
 
 /*
@@ -2336,15 +2345,19 @@ static int tls_flush_hs(struct gwp_conn *c)
 static int handle_ev_tls_handshake(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_conn *c = &gcp->client;
-	unsigned char cbuf[4096];	/* see do_recv_tls() on the sizing */
 	uint32_t mask;
+	size_t len;
 	ssize_t n;
 	int hs, r;
+	void *p;
 
-	n = __sys_recv(c->fd, cbuf, sizeof(cbuf), MSG_NOSIGNAL);
+	p = gwp_ssl_rx_space(c->tls, GWP_SSL_RECORD_MAX, &len);
+	if (unlikely(!p))
+		return -ENOMEM;
+
+	n = __sys_recv(c->fd, p, len, MSG_NOSIGNAL);
 	if (n > 0) {
-		if (gwp_ssl_bio_write(c->tls, cbuf, (size_t)n) < 0)
-			return -EIO;
+		gwp_ssl_rx_commit(c->tls, (size_t)n);
 	} else if (n == 0) {
 		return -ECONNRESET;		/* peer closed mid-handshake */
 	} else if (n != -EAGAIN && n != -EINTR) {
@@ -2453,14 +2466,14 @@ static int handle_ev_client_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 
 #ifdef CONFIG_HTTPS
 		/*
-		 * Application data already decrypted and buffered in the engine
-		 * would not be surfaced by another EPOLLIN (its ciphertext is
-		 * already off the socket), so drain it here while the protocol
-		 * buffer still has room.
+		 * Application data the engine holds, decrypted or not, would
+		 * not be surfaced by another EPOLLIN (its ciphertext is already
+		 * off the socket), so drain it here while the protocol buffer
+		 * still has room.
 		 */
 		while (gcp->client.tls && gcp->conn_state == CONN_STATE_PROT &&
 		       gcp->client.len < gcp->client.cap &&
-		       gwp_ssl_pending(gcp->client.tls) > 0) {
+		       gwp_ssl_rx_more(gcp->client.tls)) {
 			r = handle_ev_client_prot_in(w, gcp);
 			if (r)
 				return r;
