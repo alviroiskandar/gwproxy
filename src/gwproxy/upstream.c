@@ -183,6 +183,17 @@ static int http_parse(struct gwp_wrk *w, struct gwp_conn_pair *gcp, bool *notify
 
 	r = gwp_http_cli_parse_connect_reply(gcp->target.buf, gcp->target.len,
 					     &status, &consumed);
+	/*
+	 * A reply header that fills the buffer without ending never will:
+	 * there is no room left to receive the rest. Waiting for it only
+	 * holds the client until the connect timeout, so fail it now.
+	 */
+	if (r == -EAGAIN && gcp->target.len >= gcp->target.cap) {
+		pr_err(&w->ctx->lh, "Upstream HTTP CONNECT reply header too large (idx=%u, dst=%s)",
+			gcp->idx, gwp_upstream_dst_str(gcp));
+		*notify = true;
+		return -EMSGSIZE;
+	}
 	if (r)
 		return r == -EAGAIN ? GWP_UPSTREAM_IO_RECV : r;
 
