@@ -2252,7 +2252,6 @@ static int handle_event(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 	uint64_t ev_bit = GET_EV_BIT(cqe->user_data);
 	struct gwp_ctx *ctx = w->ctx;
 	struct gwp_conn_pair *gcp;
-	const char *inv_op;
 	int r;
 
 	/*
@@ -2377,8 +2376,17 @@ static int handle_event(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 	case EV_BIT_IOU_MSG_RING:
 		return 0;
 	case EV_BIT_IOU_CLOSE:
-		inv_op = "close";
-		goto out_bug;
+		/*
+		 * Closes are queued with IOSQE_CQE_SKIP_SUCCESS, so only a
+		 * failure gets here. The descriptor is gone either way (close
+		 * releases it even when it reports an error), and nothing
+		 * waits on it, so this concerns no connection but its own:
+		 * report it and keep serving the others.
+		 */
+		pr_warn(&ctx->lh, "close(%u) failed: %s",
+			(unsigned)CLEAR_EV_BIT(cqe->user_data),
+			strerror(-cqe->res));
+		return 0;
 	default:
 		pr_err(&ctx->lh, "Unknown event bit: %" PRIu64 "; res=%d", ev_bit, cqe->res);
 		return -EINVAL;
@@ -2391,11 +2399,6 @@ out:
 
 	put_gcp(w, gcp);
 	return 0;
-
-out_bug:
-	pr_err(&ctx->lh, "Bug, invalid %s: res=%d, udata=%" PRIu64 ", s=%s", inv_op,
-		cqe->res, PTR_TO_U64(udata), strerror(-cqe->res));
-	return cqe->res;
 }
 
 static int handle_events(struct gwp_wrk *w)
