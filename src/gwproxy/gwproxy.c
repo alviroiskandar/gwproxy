@@ -2081,6 +2081,14 @@ out_free_gcp:
 	return NULL;
 }
 
+/*
+ * Shrink with hysteresis: only once the array is less than a quarter used,
+ * and then only to half its size, so it never ends up exactly full. Shrinking
+ * to exactly @nr (and freeing it at zero) made the next accept double it
+ * again: two reallocs per connection at a steady load, each an mremap()
+ * syscall once the array outgrows the mmap threshold. The array itself is
+ * only walked at teardown, which frees it.
+ */
 static int shrink_conn_slot(struct gwp_wrk *w)
 {
 	struct gwp_conn_slot *gcs = &w->conn_slot;
@@ -2088,21 +2096,10 @@ static int shrink_conn_slot(struct gwp_wrk *w)
 	struct gwp_ctx *ctx = w->ctx;
 	uint32_t new_cap;
 
-	if (!gcs->pairs)
+	if (gcs->cap <= 16 || gcs->nr >= gcs->cap / 4)
 		return 0;
 
-	if (!gcs->nr) {
-		free(gcs->pairs);
-		gcs->pairs = NULL;
-		gcs->cap = 0;
-		pr_dbg(&ctx->lh, "Connection slot capacity shrunk to 0");
-		return 0;
-	}
-
-	if (gcs->cap <= 16 || (gcs->cap - gcs->nr) < 16)
-		return 0;
-
-	new_cap = gcs->nr;
+	new_cap = gcs->cap / 2;
 	new_pairs = realloc(gcs->pairs, new_cap * sizeof(*new_pairs));
 	if (!new_pairs) {
 		pr_err(&ctx->lh, "Failed to shrink connection slot!");
