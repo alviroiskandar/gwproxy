@@ -239,6 +239,20 @@ int gwp_ctx_init_thread_epoll(struct gwp_wrk *w)
 		goto out_close_ev_fd;
 	}
 
+	/*
+	 * Every event tears down at most one pair, except the accept event,
+	 * which handles up to 32 connections (see handle_ev_accept()). The
+	 * list never fills in practice; free_conn_pair() copes if it does.
+	 */
+	w->nr_dead = 0;
+	w->dead_cap = w->evsz + 32;
+	w->dead = calloc(w->dead_cap, sizeof(*w->dead));
+	if (!w->dead) {
+		r = -ENOMEM;
+		free(events);
+		goto out_close_ev_fd;
+	}
+
 	w->ev_fd = ev_fd;
 	w->ep_fd = ep_fd;
 	w->events = events;
@@ -292,6 +306,8 @@ int gwp_ctx_init_thread_epoll(struct gwp_wrk *w)
 out_free_events:
 	free(events);
 	w->events = NULL;
+	free(w->dead);
+	w->dead = NULL;
 out_close_ev_fd:
 	__sys_close(ev_fd);
 out_close_ep_fd:
@@ -319,6 +335,8 @@ void gwp_ctx_free_thread_epoll(struct gwp_wrk *w)
 
 	free(w->events);
 	w->events = NULL;
+	free(w->dead);
+	w->dead = NULL;
 	free(w->udp_buf);
 	w->udp_buf = NULL;
 }
@@ -379,7 +397,7 @@ static int credit_fd_closed(struct gwp_wrk *w, int n)
 }
 
 __hot
-static int free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+static int __free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_dns_entry *gde = gcp->gde;
 	struct gwp_ctx *ctx = w->ctx;
@@ -394,10 +412,8 @@ static int free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		}
 	}
 
-	if (gcp->client.fd >= 0) {
+	if (gcp->client.fd >= 0)
 		nr_fd_closed++;
-		w->ev_need_reload = true;
-	}
 
 	if (gcp->timer_fd >= 0)
 		nr_fd_closed++;
@@ -427,6 +443,54 @@ static int free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	}
 
 	return credit_fd_closed(w, nr_fd_closed);
+}
+
+/*
+ * Tear a pair down. Events later in the batch being handled may still carry
+ * a pointer to it, so it is only marked dying here: handle_event() skips its
+ * events, and reap_dead_pairs() frees it once the batch is done. Freeing at
+ * once used to force a fresh epoll_wait() after every closed connection,
+ * throwing away the rest of the batch only to collect it again.
+ *
+ * Its descriptors stay open until then, which also keeps their numbers from
+ * being reused within the batch. The one way to reach a pair that is not an
+ * event of its own, a raw DNS reply looked up by transaction id, is cut off
+ * here, so a reply later in the batch cannot revive it.
+ */
+static int free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	if (gcp->flags & GWP_CONN_FLAG_IS_DYING)
+		return 0;
+
+	if (unlikely(w->nr_dead >= w->dead_cap)) {
+		w->ev_need_reload = true;
+		return __free_conn_pair(w, gcp);
+	}
+
+#ifdef CONFIG_NEW_DNS_RESOLVER
+	if (w->ctx->cfg.use_raw_dns && gcp->gdp)
+		gwp_dns_res_drop_query(&w->dns->resolvers[0], gcp,
+				       gcp->gdp->txid);
+#endif
+
+	gcp->flags |= GWP_CONN_FLAG_IS_DYING;
+	w->dead[w->nr_dead++] = gcp;
+	return 0;
+}
+
+static int reap_dead_pairs(struct gwp_wrk *w)
+{
+	int r, ret = 0;
+	uint16_t i;
+
+	for (i = 0; i < w->nr_dead; i++) {
+		r = __free_conn_pair(w, w->dead[i]);
+		if (unlikely(r) && !ret)
+			ret = r;
+	}
+
+	w->nr_dead = 0;
+	return ret;
 }
 
 __hot
@@ -1236,7 +1300,6 @@ static int adopt_winning_attempt(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		r = credit_fd_closed(w, closed);
 		if (unlikely(r))
 			return r;
-		w->ev_need_reload = true;
 	}
 
 	gcp->target.fd = fd;
@@ -2484,6 +2547,11 @@ static int handle_event(struct gwp_wrk *w, struct epoll_event *ev)
 	ev_bit = GET_EV_BIT(ev->data.u64);
 	udata = U64_TO_PTR(CLEAR_EV_BIT(ev->data.u64));
 
+	/* Torn down earlier in this batch; see free_conn_pair(). */
+	if (is_ev_bit_conn_pair(ev_bit) &&
+	    (((struct gwp_conn_pair *)udata)->flags & GWP_CONN_FLAG_IS_DYING))
+		return 0;
+
 	/*
 	 * A racing connect attempt: the slot index rides in the tag, so the
 	 * pair pointer in the low bits is untouched.
@@ -2552,7 +2620,7 @@ static int handle_events(struct gwp_wrk *w, int nr_events)
 {
 	struct epoll_event *events = w->events;
 	struct gwp_ctx *ctx = w->ctx;
-	int i, r = 0;
+	int i, r = 0, x;
 
 	for (i = 0; i < nr_events; i++) {
 		if (unlikely(ctx->stop))
@@ -2562,9 +2630,13 @@ static int handle_events(struct gwp_wrk *w, int nr_events)
 		if (unlikely(r < 0))
 			break;
 
-		if (w->ev_need_reload)
+		if (unlikely(w->ev_need_reload))
 			break;
 	}
+
+	x = reap_dead_pairs(w);
+	if (unlikely(x) && r >= 0)
+		r = x;
 
 	return r;
 }
