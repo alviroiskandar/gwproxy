@@ -1980,6 +1980,7 @@ static int init_conn(struct gwp_conn *conn, uint32_t buf_size)
 	conn->fd = -1;
 	conn->len = 0;
 	conn->cap = buf_size;
+	conn->off = 0;
 	conn->ep_mask = 0;
 	/*
 	 * Nothing needs these page aligned (no registered buffers, O_DIRECT or
@@ -1996,13 +1997,15 @@ static void free_conn(struct gwp_conn *conn)
 		return;
 
 	if (conn->buf)
-		free(conn->buf);
+		free(conn->buf - conn->off);
 
 	if (conn->fd >= 0)
 		__sys_close(conn->fd);
 
+	conn->buf = NULL;
 	conn->len = 0;
 	conn->cap = 0;
+	conn->off = 0;
 	conn->ep_mask = 0;
 }
 
@@ -3454,6 +3457,8 @@ static int http_fwd_res_fail(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		err == -EACCES ? "it asked for proxy authentication" :
 				 strerror(-err), gcp->idx);
 
+	/* The cap below counts from the start of the buffer. */
+	gwp_conn_buf_compact(t);
 	t->cap = (uint32_t)w->ctx->cfg.target_buf_size;
 	t->len = from;
 	r = gwp_http_build_bad_gateway_reply(t->buf + t->len, t->cap - t->len);
@@ -3486,6 +3491,12 @@ static int http_fwd_target_in(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	if (t->len == from && !t->rd_eof)
 		return 0;
 
+	/*
+	 * The header is rewritten in place and the caps set below count from
+	 * the start of the buffer, so put the data back there first. @from
+	 * is relative to t->buf and stays valid.
+	 */
+	gwp_conn_buf_compact(t);
 	r = gwp_http_fwd_res_input(hc, t->buf + from, t->len - from, t->rd_eof,
 				   t->buf + from, cap - from, &out_len);
 	if (r < 0)
@@ -3560,6 +3571,7 @@ int gwp_http_fwd_begin(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	r = gwp_http_fwd_res_init(gcp->http_conn, cap - HTTP_FWD_RES_SLACK);
 	if (r)
 		return r;
+	gwp_conn_buf_compact(&gcp->target);
 	gcp->target.cap = cap - HTTP_FWD_RES_SLACK;
 
 	/*

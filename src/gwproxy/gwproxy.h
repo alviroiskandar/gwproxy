@@ -333,8 +333,17 @@ enum {
 
 struct gwp_conn {
 	int		fd;
+	/*
+	 * @buf points at the first byte not consumed yet and holds @len bytes
+	 * of data, with room for @cap bytes from @buf. @off bytes in front of
+	 * @buf were already consumed (the allocation starts at buf - off).
+	 * gwp_conn_buf_consume() only moves @buf forward, so a partial send
+	 * does not shift the rest of the data down; gwp_conn_buf_compact()
+	 * moves it back to the start of the allocation.
+	 */
 	uint32_t	len;
 	uint32_t	cap;
+	uint32_t	off;
 	char		*buf;
 	uint32_t	ep_mask;
 
@@ -789,12 +798,50 @@ const char *ip_to_str(const struct gwp_sockaddr *gs);
  * the reload handlers use this to reload only for their own file. */
 bool gwp_inotify_event_matches(const void *buf, size_t len, const char *path);
 
-static inline void gwp_conn_buf_advance(struct gwp_conn *conn, size_t len)
+/* Move the data back to the start of the buffer, regaining the room in front. */
+static inline void gwp_conn_buf_compact(struct gwp_conn *conn)
+{
+	if (!conn->off)
+		return;
+	if (conn->len)
+		memmove(conn->buf - conn->off, conn->buf, conn->len);
+	conn->buf -= conn->off;
+	conn->cap += conn->off;
+	conn->off = 0;
+}
+
+static inline void __gwp_conn_buf_skip(struct gwp_conn *conn, size_t len)
 {
 	assert(len <= conn->len);
-	conn->len -= len;
-	if (conn->len)
-		memmove(conn->buf, conn->buf + len, conn->len);
+	conn->buf += len;
+	conn->len -= (uint32_t)len;
+	conn->cap -= (uint32_t)len;
+	conn->off += (uint32_t)len;
+}
+
+/*
+ * Drop @len bytes from the front and keep the rest at the start of the
+ * buffer. For the protocol parsers, which want the next message at the start
+ * and the whole buffer behind it.
+ */
+static inline void gwp_conn_buf_advance(struct gwp_conn *conn, size_t len)
+{
+	__gwp_conn_buf_skip(conn, len);
+	gwp_conn_buf_compact(conn);
+}
+
+/*
+ * Drop @len bytes from the front after they were sent. The rest stays where
+ * it is: it is compacted only once the buffer is empty (which costs nothing)
+ * or once at least half of it lies consumed in front of the data, so the
+ * bytes moved never exceed the bytes sent. Moving the rest down on every
+ * partial send copied up to a whole buffer each time.
+ */
+static inline void gwp_conn_buf_consume(struct gwp_conn *conn, size_t len)
+{
+	__gwp_conn_buf_skip(conn, len);
+	if (!conn->len || conn->off >= conn->cap)
+		gwp_conn_buf_compact(conn);
 }
 
 /*

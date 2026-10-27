@@ -1724,7 +1724,7 @@ static int handle_ev_client_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 #endif
 
 	if (r > 0)
-		gwp_conn_buf_advance(&gcp->target, (size_t)r);
+		gwp_conn_buf_consume(&gcp->target, (size_t)r);
 
 	/*
 	 * A short send leaves unsent bytes in target.buf; flush the remainder
@@ -1758,7 +1758,7 @@ static int handle_ev_target_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		return r;
 
 	if (r > 0)
-		gwp_conn_buf_advance(&gcp->client, (size_t)r);
+		gwp_conn_buf_consume(&gcp->client, (size_t)r);
 
 	/* Short send: flush the rest before reading more from the client. */
 	if (gcp->client.len > 0) {

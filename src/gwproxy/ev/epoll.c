@@ -954,7 +954,7 @@ static ssize_t __do_send(struct gwp_conn *src, struct gwp_conn *dst)
 		return -ECONNRESET;
 	}
 
-	gwp_conn_buf_advance(src, (size_t)ret);
+	gwp_conn_buf_consume(src, (size_t)ret);
 	return ret;
 }
 
