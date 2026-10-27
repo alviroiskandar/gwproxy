@@ -360,6 +360,24 @@ static int rearm_accept(struct gwp_wrk *w, int nr_fd_closed)
 	return 0;
 }
 
+/*
+ * Credit @n closed descriptors to the accept throttle, and rearm accept once
+ * enough have been returned. Only while this worker's accept is stopped: the
+ * shared counter is reset when the last stopped worker rearms, so credits
+ * taken in normal operation would pile up without bound and let the next
+ * EMFILE rearm at once, which is the churn the throttle exists to prevent.
+ */
+static int credit_fd_closed(struct gwp_wrk *w, int n)
+{
+	int x;
+
+	if (likely(!w->accept_is_stopped) || !n)
+		return 0;
+
+	x = atomic_fetch_add(&w->ctx->nr_fd_closed, n);
+	return rearm_accept(w, x);
+}
+
 __hot
 static int free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
@@ -408,20 +426,7 @@ static int free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		return r;
 	}
 
-	if (unlikely(w->accept_is_stopped)) {
-		int x;
-		/*
-		 * If we have closed at least one file descriptor, we can
-		 * rearm the main TCP socket with EPOLLIN to accept new
-		 * connections.
-		 */
-		x = atomic_fetch_add(&ctx->nr_fd_closed, nr_fd_closed);
-		r = rearm_accept(w, x);
-		if (r)
-			return r;
-	}
-
-	return 0;
+	return credit_fd_closed(w, nr_fd_closed);
 }
 
 __hot
@@ -1205,7 +1210,7 @@ static int adopt_winning_attempt(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 {
 	struct epoll_event ev;
 	int fd = gcp->attempt_fd[slot];
-	int closed;
+	int closed, r;
 
 	gcp->attempt_fd[slot] = -1;
 	closed = gwp_conn_close_attempts(gcp);
@@ -1214,7 +1219,9 @@ static int adopt_winning_attempt(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		 * Losing sockets are descriptors returned to the process; the
 		 * accept path throttles on that count, so tell it.
 		 */
-		atomic_fetch_add(&w->ctx->nr_fd_closed, closed);
+		r = credit_fd_closed(w, closed);
+		if (unlikely(r))
+			return r;
 		w->ev_need_reload = true;
 	}
 
@@ -1314,7 +1321,9 @@ static int handle_ev_target_attempt(struct gwp_wrk *w,
 
 		__sys_close(fd);
 		gcp->attempt_fd[slot] = -1;
-		atomic_fetch_add(&ctx->nr_fd_closed, 1);
+		r = credit_fd_closed(w, 1);
+		if (unlikely(r))
+			return r;
 
 		/*
 		 * Another attempt may still be racing; only step to a new
