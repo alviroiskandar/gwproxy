@@ -15,11 +15,17 @@
 # Controlling which addresses a name has means controlling /etc/hosts, so the
 # body runs inside a private user+mount namespace with a hosts file bind-mounted
 # over the real one. Nothing outside the namespace is touched.
+#
+# The namespace has its own network stack too. The body listens on fixed ports
+# (it has to name them in the hosts entries' targets and in each request), and
+# on the host's network two runs of this test at once -- `make -jN` in two
+# checkouts, say -- would fight over them and fail at random.
 
 . "$(dirname "$0")/lib.sh"
 require curl
 require python3
 require unshare
+require ip
 
 # Re-exec: everything below the marker runs inside the namespace. ns_drop_setup
 # has to stay in this branch -- inside, "id -u" is the MAPPED root, and its
@@ -27,11 +33,11 @@ require unshare
 # there. See lib.sh for why the drop is needed at all.
 if [ "${1:-}" != "--inner" ]; then
 	ns_drop_setup
-	$NS_DROP unshare -rm --map-root-user true 2>/dev/null \
-		|| skip "no user+mount namespaces (unshare -rm) available"
+	$NS_DROP unshare -rmn --map-root-user true 2>/dev/null \
+		|| skip "no user+mount+net namespaces (unshare -rmn) available"
 	out="$WORK/inner.out"
 	# Detached: a backgrounded proxy holding the pipe would wedge the read.
-	setsid $NS_DROP unshare -rm --map-root-user "$0" --inner "$WORK" \
+	setsid $NS_DROP unshare -rmn --map-root-user "$0" --inner "$WORK" \
 		</dev/null >"$out" 2>&1 &
 	for i in $(seq 1 60); do
 		grep -q '^INNER-DONE' "$out" 2>/dev/null && break
@@ -58,7 +64,7 @@ cleanup_inner()
 }
 trap cleanup_inner EXIT
 
-ip link set lo up 2>/dev/null
+ip link set lo up || exit 1
 
 # 127.0.0.7 is refused (nothing listens), 127.0.0.8 black-holes, 127.0.0.9 lives.
 op=39701
