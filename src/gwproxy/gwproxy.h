@@ -590,6 +590,14 @@ struct gwp_wrk_dns {
 	uint32_t			nr;
 };
 
+/*
+ * Each worker owns its own cache lines: the conn slot fields are written on
+ * every accept and close, and the loop fields next to them are read on every
+ * iteration, so a worker must not share a line with its neighbour in the
+ * workers array (which is allocated GWP_CACHELINE aligned).
+ */
+#define GWP_CACHELINE	64
+
 struct gwp_wrk {
 	int			tcp_fd;
 	struct gwp_conn_slot	conn_slot;
@@ -628,7 +636,7 @@ struct gwp_wrk {
 #ifdef CONFIG_NEW_DNS_RESOLVER
 	struct gwp_wrk_dns	*dns;
 #endif
-};
+} __attribute__((__aligned__(GWP_CACHELINE)));
 
 enum {
 	GWP_EV_EPOLL,

@@ -955,9 +955,10 @@ static int gwp_ctx_init_threads(struct gwp_ctx *ctx)
 		return r;
 	}
 
-	workers = calloc(cfg->nr_workers, sizeof(*workers));
-	if (!workers)
+	if (posix_memalign((void **)&workers, GWP_CACHELINE,
+			   (size_t)cfg->nr_workers * sizeof(*workers)))
 		return -ENOMEM;
+	memset(workers, 0, (size_t)cfg->nr_workers * sizeof(*workers));
 
 	ctx->workers = workers;
 	for (i = 0; i < cfg->nr_workers; i++) {
