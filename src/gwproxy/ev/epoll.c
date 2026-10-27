@@ -1942,21 +1942,11 @@ static int handle_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	}
 
 	/*
-	 * If epoll_ctl() calls fail, don't bother closing the
-	 * newly created file descriptors as they will be closed
-	 * in free_conn_pair() anyway.
-	 */
-	{
-		struct epoll_event ev;
-
-		ev.events = gcp->client.ep_mask;
-		ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_CLIENT;
-		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_MOD, gcp->client.fd, &ev);
-		if (unlikely(r))
-			return r;
-	}
-
-	/*
+	 * The client stays registered under EV_BIT_CLIENT_PROT: from here on
+	 * the pair's state hands its events to handle_ev_client() (see
+	 * client_past_handshake()), which saves an EPOLL_CTL_MOD that would
+	 * only change the tag.
+	 *
 	 * Take the first candidate the ACL allows; the same helper walks the
 	 * rest, so a candidate that cannot even be started is not fatal while
 	 * others remain.
@@ -2549,6 +2539,21 @@ static int handle_ev_client_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	return 0;
 }
 
+/*
+ * Has the client's handshake handed over to the connect? handle_connect()
+ * does not retag the client fd, so a client still registered under
+ * EV_BIT_CLIENT_PROT belongs to handle_ev_client() from then on: it buffers
+ * what the client sends until the target is up, and then forwards.
+ */
+static bool client_past_handshake(const struct gwp_conn_pair *gcp)
+{
+	int cs = gcp->conn_state;
+
+	return cs == CONN_STATE_SOCKS5_CONNECT ||
+	       cs == CONN_STATE_HTTP_CONNECT ||
+	       cs == CONN_STATE_FORWARDING || in_upstream_hs(gcp);
+}
+
 static int handle_event(struct gwp_wrk *w, struct epoll_event *ev)
 {
 	uint64_t ev_bit;
@@ -2593,7 +2598,10 @@ static int handle_event(struct gwp_wrk *w, struct epoll_event *ev)
 		r = handle_ev_client(w, udata, ev);
 		break;
 	case EV_BIT_CLIENT_PROT:
-		r = handle_ev_client_prot(w, udata, ev);
+		if (client_past_handshake(udata))
+			r = handle_ev_client(w, udata, ev);
+		else
+			r = handle_ev_client_prot(w, udata, ev);
 		break;
 	case EV_BIT_UDP_RELAY:
 		r = handle_ev_udp_relay(w, udata);
