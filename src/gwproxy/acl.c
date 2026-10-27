@@ -160,7 +160,19 @@ struct gwp_acl {
 	pthread_rwlock_t	lock;
 	/* Bumped by every successful reload; see gwp_acl_generation(). */
 	_Atomic(uint32_t)	gen;
+	/*
+	 * ACL_SUM_* summary of @rs, published with it: an empty chain's
+	 * verdict is its policy, and the evaluators answer that from here
+	 * without taking the lock (the built-in default ACL has no INPUT
+	 * rules, so that is every accepted connection).
+	 */
+	_Atomic(uint8_t)	sum;
 };
+
+#define ACL_SUM_IN_EMPTY	(1u << 0)
+#define ACL_SUM_OUT_EMPTY	(1u << 1)
+#define ACL_SUM_IN_REJECT	(1u << 2)
+#define ACL_SUM_OUT_REJECT	(1u << 3)
 
 #define ACL_MAX_TOKENS	32
 
@@ -1169,6 +1181,21 @@ static int read_file(const char *path, char **out)
  * ------------------------------------------------------------------------
  */
 
+static uint8_t ruleset_summary(const struct gwp_acl_ruleset *rs)
+{
+	uint8_t sum = 0;
+
+	if (!rs->in_head)
+		sum |= ACL_SUM_IN_EMPTY;
+	if (!rs->out_head)
+		sum |= ACL_SUM_OUT_EMPTY;
+	if (rs->in_policy == GWP_ACL_REJECT)
+		sum |= ACL_SUM_IN_REJECT;
+	if (rs->out_policy == GWP_ACL_REJECT)
+		sum |= ACL_SUM_OUT_REJECT;
+	return sum;
+}
+
 /*
  * Every worker takes the read lock per evaluation, and the only writer is the
  * reload, which runs on worker 0's event loop. glibc's default rwlock prefers
@@ -1216,6 +1243,7 @@ int gwp_acl_parse_str(struct gwp_acl **out, const char *text)
 		free(acl);
 		return r;
 	}
+	atomic_init(&acl->sum, ruleset_summary(&acl->rs));
 
 	*out = acl;
 	return 0;
@@ -1278,6 +1306,13 @@ int gwp_acl_reload(struct gwp_acl *acl)
 	pthread_rwlock_wrlock(&acl->lock);
 	old = acl->rs;
 	acl->rs = rs;
+	/*
+	 * Summary before generation: a lock-free reader loads the generation
+	 * first, so one that sees the new generation also sees the new
+	 * summary, and a verdict is never tagged newer than its rules.
+	 */
+	atomic_store_explicit(&acl->sum, ruleset_summary(&rs),
+			      memory_order_release);
 	atomic_store_explicit(&acl->gen,
 			      atomic_load_explicit(&acl->gen,
 						   memory_order_relaxed) + 1,
@@ -1558,6 +1593,8 @@ enum gwp_acl_verdict gwp_acl_eval_output(struct gwp_acl *acl,
 					 struct gwp_acl_req *req)
 {
 	enum gwp_acl_verdict verdict;
+	uint32_t gen;
+	uint8_t sum;
 
 	req->dnat_applied = false;
 	req->mark_set = false;
@@ -1566,6 +1603,14 @@ enum gwp_acl_verdict gwp_acl_eval_output(struct gwp_acl *acl,
 	req->cacheable = true;
 	if (!acl)
 		return GWP_ACL_ACCEPT;
+
+	gen = gwp_acl_generation(acl);
+	sum = atomic_load_explicit(&acl->sum, memory_order_acquire);
+	if (sum & ACL_SUM_OUT_EMPTY) {
+		req->gen = gen;
+		return (sum & ACL_SUM_OUT_REJECT) ? GWP_ACL_REJECT
+						  : GWP_ACL_ACCEPT;
+	}
 
 	pthread_rwlock_rdlock(&acl->lock);
 	req->gen = atomic_load_explicit(&acl->gen, memory_order_relaxed);
@@ -1593,9 +1638,15 @@ enum gwp_acl_verdict gwp_acl_eval_input(struct gwp_acl *acl,
 					struct gwp_acl_req *req)
 {
 	enum gwp_acl_verdict verdict;
+	uint8_t sum;
 
 	if (!acl)
 		return GWP_ACL_ACCEPT;
+
+	sum = atomic_load_explicit(&acl->sum, memory_order_acquire);
+	if (sum & ACL_SUM_IN_EMPTY)
+		return (sum & ACL_SUM_IN_REJECT) ? GWP_ACL_REJECT
+						 : GWP_ACL_ACCEPT;
 
 	pthread_rwlock_rdlock(&acl->lock);
 	verdict = eval_chain(acl->rs.in_head, acl->rs.in_policy, req);

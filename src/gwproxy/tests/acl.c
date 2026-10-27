@@ -1109,6 +1109,55 @@ static void test_memo(void)
 	gwp_acl_destroy(a);
 }
 
+/*
+ * An empty chain is answered from a summary published with the rules,
+ * without the lock: it must follow both the policy and every reload.
+ */
+static void test_empty_chain_policy(void)
+{
+	static const char *const files[] = {
+		"-P INPUT REJECT\n",
+		"-P OUTPUT REJECT\n-A INPUT -s 10.0.0.0/8 -j REJECT\n",
+		"-A OUTPUT --dports 80 -j REJECT\n",
+		"",
+	};
+	/* in(10.1.1.1), in(192.0.2.1), out(:80), out(:443) per file */
+	static const enum gwp_acl_verdict want[][4] = {
+		{ GWP_ACL_REJECT, GWP_ACL_REJECT, GWP_ACL_ACCEPT, GWP_ACL_ACCEPT },
+		{ GWP_ACL_REJECT, GWP_ACL_ACCEPT, GWP_ACL_REJECT, GWP_ACL_REJECT },
+		{ GWP_ACL_ACCEPT, GWP_ACL_ACCEPT, GWP_ACL_REJECT, GWP_ACL_ACCEPT },
+		{ GWP_ACL_ACCEPT, GWP_ACL_ACCEPT, GWP_ACL_ACCEPT, GWP_ACL_ACCEPT },
+	};
+	struct gwp_sockaddr c1 = sa4("10.1.1.1", 1234);
+	struct gwp_sockaddr c2 = sa4("192.0.2.1", 1234);
+	struct gwp_sockaddr t = sa4("93.184.216.34", 80);
+	struct gwp_acl *a;
+	char *path;
+	size_t i;
+	int fd;
+
+	path = write_tmp_rules(files[0]);
+	assert(!gwp_acl_create(&a, path));
+	for (i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+		if (i) {
+			size_t len = strlen(files[i]);
+
+			fd = open(path, O_WRONLY | O_TRUNC);
+			assert(fd >= 0);
+			assert(write(fd, files[i], len) == (ssize_t)len);
+			close(fd);
+			assert(!gwp_acl_reload(a));
+		}
+		assert(in(a, &c1, 1234, GWP_ACL_PROTO_TCP) == want[i][0]);
+		assert(in(a, &c2, 1234, GWP_ACL_PROTO_TCP) == want[i][1]);
+		assert(out(a, &t, NULL, 80, GWP_ACL_PROTO_TCP) == want[i][2]);
+		assert(out(a, &t, NULL, 443, GWP_ACL_PROTO_TCP) == want[i][3]);
+	}
+	gwp_acl_destroy(a);
+	unlink(path);
+	free(path);
+}
+
 static void run_tests(void)
 {
 	size_t i;
@@ -1117,6 +1166,7 @@ static void run_tests(void)
 	test_parse_errors();
 	test_reload_under_readers();
 	test_generation();
+	test_empty_chain_policy();
 
 	for (i = 0; i < 200; i++) {
 		test_default_ruleset();

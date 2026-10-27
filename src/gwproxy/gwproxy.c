@@ -1331,7 +1331,10 @@ static int upstream_dst_from_sockaddr(const struct gwp_sockaddr *sa,
 
 /*
  * Fill the inputs of an OUTPUT request for @target (NULL when only a domain is
- * known) from @client, with the optional requested @domain / @user.
+ * known) from @client, with the optional requested @domain / @user. Only the
+ * inputs: gwp_acl_eval_output() resets the output flags itself, and the
+ * output payloads are only read behind those flags, so zeroing the whole
+ * request first would be done twice.
  */
 static void acl_out_req(struct gwp_acl_req *req,
 			const struct gwp_sockaddr *client,
@@ -1339,7 +1342,7 @@ static void acl_out_req(struct gwp_acl_req *req,
 			const char *domain, const char *user,
 			enum gwp_acl_proto proto)
 {
-	memset(req, 0, sizeof(*req));
+	req->memo = NULL;
 	req->client = client;
 	req->target = target;
 	req->domain = domain;
