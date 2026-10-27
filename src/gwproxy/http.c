@@ -192,55 +192,25 @@ static int split_authority(char *authority, char **host_p, char **port_p,
  * "100-continue" expectation is forwarded to the origin (RFC 9110 Section
  * 10.1.1). "Proxy-Connection" is non-standard but sent by some clients.
  */
-static bool is_hop_by_hop(const char *k)
+static bool is_hop_by_hop(const char *k, size_t klen)
 {
-	static const char *const hbh[] = {
-		"Connection", "Proxy-Connection", "Keep-Alive", "TE",
-		"Trailer", "Upgrade", "Proxy-Authorization",
-		"Proxy-Authenticate",
+#define HBH(s)	{ s, sizeof(s) - 1 }
+	static const struct {
+		const char	*name;
+		size_t		len;
+	} hbh[] = {
+		HBH("Connection"), HBH("Proxy-Connection"), HBH("Keep-Alive"),
+		HBH("TE"), HBH("Trailer"), HBH("Upgrade"),
+		HBH("Proxy-Authorization"), HBH("Proxy-Authenticate"),
 	};
+#undef HBH
 	size_t i;
 
 	for (i = 0; i < sizeof(hbh) / sizeof(hbh[0]); i++) {
-		if (!strcasecmp(k, hbh[i]))
+		if (hbh[i].len == klen && !strncasecmp(k, hbh[i].name, klen))
 			return true;
 	}
 	return false;
-}
-
-/*
- * Whether @name appears as one of the comma-separated connection-options in a
- * Connection header value @conn (which may be NULL). Such fields are
- * connection-specific and must also be dropped (RFC 9110 Section 7.6.1).
- */
-static bool conn_listsl(const char *conn, const char *name, size_t nlen)
-{
-	const char *p = conn;
-
-	if (!conn)
-		return false;
-
-	while (*p) {
-		const char *e;
-		size_t tlen;
-
-		while (*p == ',' || *p == ' ' || *p == '\t')
-			p++;
-		for (e = p; *e && *e != ','; e++)
-			;
-		tlen = (size_t)(e - p);
-		while (tlen > 0 && (p[tlen - 1] == ' ' || p[tlen - 1] == '\t'))
-			tlen--;
-		if (tlen == nlen && !strncasecmp(p, name, nlen))
-			return true;
-		p = e;
-	}
-	return false;
-}
-
-static bool conn_lists(const char *conn, const char *name)
-{
-	return conn_listsl(conn, name, strlen(name));
 }
 
 /*
@@ -313,33 +283,52 @@ static bool conn_toks_have(const struct conn_tok *toks, int nr, const char *k,
 	return false;
 }
 
+/* Append @len bytes at @p to @buf (@cap bytes, @n used); false if full. */
+static bool buf_add(char *buf, size_t cap, size_t *n, const char *p,
+		    size_t len)
+{
+	if (len > cap - *n)
+		return false;
+	memcpy(buf + *n, p, len);
+	*n += len;
+	return true;
+}
+
 /*
  * Rebuild the request in origin-form into hc->fwd_req: the absolute-form
  * request-target is replaced by @path, hop-by-hop / connection-specific
  * headers are dropped and "Connection: close" is appended (this proxy handles
- * one request per connection). @hdr_len is the length of the parsed request
+ * one request per connection). @authority is the URI's authority, passed as
+ * pointer+length because at this point it is still part of the request line
+ * and not NUL-terminated. @hdr_len is the length of the parsed request
  * header, used to size the scratch buffer (the rewrite is never materially
  * larger). Returns 0 or a negative error.
- */
-/*
- * Build the origin-form request forwarded upstream. @authority is the URI's
- * authority, passed as pointer+length because at this point it is still part
- * of the request line and not NUL-terminated.
  */
 static int build_forward_request(struct gwp_http_conn *hc, const char *path,
 				 const char *authority, size_t auth_len,
 				 size_t hdr_len)
 {
+	static const char cls[] = "Connection: close\r\n\r\n";
 	struct gwnet_http_req_hdr *req = &hc->req_hdr;
 	const char *method = http_method_str(req->method);
-	const char *ver = (req->version == GWNET_HTTP_VER_1_0) ? "1.0" : "1.1";
+	const char *ver = (req->version == GWNET_HTTP_VER_1_0) ?
+			  " HTTP/1.0\r\n" : " HTTP/1.1\r\n";
 	const char *conn = gwnet_http_hdr_fields_get(&req->fields, "Connection");
+	struct conn_tok toks[CONN_MAX_TOKENS];
 	size_t cap = hdr_len * 2 + 64, n = 0, i;
+	int nr_toks = 0;
+	bool ok;
 	char *buf;
-	int w;
 
 	if (!method)
 		return -EINVAL;
+
+	/* Too many options to check every field against is not plausible. */
+	if (conn) {
+		nr_toks = conn_tokenise(conn, strlen(conn), toks, 0);
+		if (nr_toks < 0)
+			return -EBADMSG;
+	}
 
 	/*
 	 * Fields the Connection header names are dropped below, as RFC 9110
@@ -350,19 +339,21 @@ static int build_forward_request(struct gwp_http_conn *hc, const char *path,
 	 * past the rewrite above. Host is replaced anyway, and listing it is
 	 * just as meaningless. Nothing legitimate does this; refuse it.
 	 */
-	if (conn_lists(conn, "Content-Length") ||
-	    conn_lists(conn, "Transfer-Encoding") ||
-	    conn_lists(conn, "Host"))
+	if (conn_toks_have(toks, nr_toks, "Content-Length", 14) ||
+	    conn_toks_have(toks, nr_toks, "Transfer-Encoding", 17) ||
+	    conn_toks_have(toks, nr_toks, "Host", 4))
 		return -EBADMSG;
 
 	buf = malloc(cap);
 	if (!buf)
 		return -ENOMEM;
 
-	w = snprintf(buf, cap, "%s %s HTTP/%s\r\n", method, path, ver);
-	if (w < 0 || (size_t)w >= cap)
+	ok = buf_add(buf, cap, &n, method, strlen(method)) &&
+	     buf_add(buf, cap, &n, " ", 1) &&
+	     buf_add(buf, cap, &n, path, strlen(path)) &&
+	     buf_add(buf, cap, &n, ver, 11);
+	if (!ok)
 		goto too_big;
-	n = (size_t)w;
 
 	/*
 	 * RFC 9112 s3.2.2: with an absolute-form target the proxy MUST ignore
@@ -390,33 +381,35 @@ static int build_forward_request(struct gwp_http_conn *hc, const char *path,
 			return -EINVAL;
 		}
 
-		w = snprintf(buf + n, cap - n, "Host: %.*s\r\n", (int)hlen,
-			     host);
-		if (w < 0 || (size_t)w >= cap - n)
+		ok = buf_add(buf, cap, &n, "Host: ", 6) &&
+		     buf_add(buf, cap, &n, host, hlen) &&
+		     buf_add(buf, cap, &n, "\r\n", 2);
+		if (!ok)
 			goto too_big;
-		n += (size_t)w;
 	}
 
 	for (i = 0; i < req->fields.nr; i++) {
-		const char *k = req->fields.ff[i].key;
-		const char *v = req->fields.ff[i].val;
+		const struct gwnet_http_hdr_field *f = &req->fields.ff[i];
 
 		/* Drop hop-by-hop and Connection-listed headers, and the
 		 * client's Host -- ours is already in place above. */
-		if (is_hop_by_hop(k) || conn_lists(conn, k) ||
-		    !strcasecmp(k, "Host"))
+		if (is_hop_by_hop(f->key, f->klen) ||
+		    conn_toks_have(toks, nr_toks, f->key, f->klen) ||
+		    (f->klen == 4 && !strncasecmp(f->key, "Host", 4)))
 			continue;
 
-		w = snprintf(buf + n, cap - n, "%s: %s\r\n", k, v);
-		if (w < 0 || (size_t)w >= cap - n)
+		ok = buf_add(buf, cap, &n, f->key, f->klen) &&
+		     buf_add(buf, cap, &n, ": ", 2) &&
+		     buf_add(buf, cap, &n, f->val, f->vlen) &&
+		     buf_add(buf, cap, &n, "\r\n", 2);
+		if (!ok)
 			goto too_big;
-		n += (size_t)w;
 	}
 
-	w = snprintf(buf + n, cap - n, "Connection: close\r\n\r\n");
-	if (w < 0 || (size_t)w >= cap - n)
+	/* NUL-terminated as well, for whoever wants to log or search it. */
+	if (!buf_add(buf, cap, &n, cls, sizeof(cls)))
 		goto too_big;
-	n += (size_t)w;
+	n--;
 
 	free(hc->fwd_req);
 	hc->fwd_req = buf;

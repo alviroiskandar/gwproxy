@@ -307,6 +307,46 @@ static int req_body(const char *hdr, const char *body, size_t step,
 	return r;
 }
 
+/*
+ * The forwarded request drops what Connection names, checked against the
+ * options split once; more than 32 distinct options is refused with 400.
+ */
+static void test_forward_conn_limit(void)
+{
+	static char buf[4096];
+	struct gwp_http_conn *hc;
+	char *host, *port;
+	const char *req = NULL;
+	size_t req_len = 0, n;
+	int i;
+
+	n = (size_t)sprintf(buf, "GET http://example.com/ HTTP/1.1\r\n"
+			    "X-0: a\r\nConnection: ");
+	for (i = 0; i < 32; i++)
+		n += (size_t)sprintf(buf + n, "x-%d, X-%d,", i, i);
+	n += (size_t)sprintf(buf + n, "\r\nX-31: b\r\nX-32: c\r\n\r\n");
+	hc = gwp_http_conn_alloc();
+	assert(hc);
+	assert(run(hc, NULL, buf, &host, &port, &req, &req_len) ==
+	       GWP_HTTP_FORWARD);
+	{
+		static const char want[] =
+			"GET / HTTP/1.1\r\nHost: example.com\r\n"
+			"X-32: c\r\nConnection: close\r\n\r\n";
+
+		assert(req_len == strlen(want) && !memcmp(req, want, req_len));
+	}
+	gwp_http_conn_free(hc);
+
+	sprintf(buf + n - 2, "Connection: X-32\r\n\r\n");
+	hc = gwp_http_conn_alloc();
+	assert(hc);
+	assert(run(hc, NULL, buf, &host, &port, &req, &req_len) ==
+	       GWP_HTTP_BAD_REQUEST);
+	gwp_http_conn_free(hc);
+	PRTEST_OK();
+}
+
 static void test_req_framing(void)
 {
 	static const char next[] = "GET http://other/ HTTP/1.1\r\n\r\n";
@@ -822,6 +862,7 @@ int main(void)
 		test_forward_default_port();
 		test_forward_hop_by_hop();
 		test_forward_conn_lists_framing();
+		test_forward_conn_limit();
 		test_req_framing();
 		test_res_rewrite();
 		test_res_interim();
