@@ -85,7 +85,10 @@ int gwp_dns_cache_lookup_addrs(struct gwp_dns_cache *cache, const char *key,
  *
  * @param cache		The DNS cache to insert the entry into.
  * @param key		The key for the entry, typically a domain name.
- * @param ai		The address information to insert.
+ * @param ai		The address information to insert. NULL, or a list
+ *			without IPv4 or IPv6 addresses, records that @key
+ *			does not resolve: a lookup then succeeds with no
+ *			addresses.
  * @param expired_at	The time when the entry expires.
  * @return int		0 on success, negative error code on failure.
  */

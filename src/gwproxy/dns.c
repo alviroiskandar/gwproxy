@@ -217,12 +217,33 @@ static void try_pass_result_to_cache(struct gwp_dns_ctx *ctx, const char *name,
 }
 
 /*
+ * Remember for a short while that @name does not resolve, so a client that
+ * retries, or a page full of links to a dead host, does not cost a full
+ * resolution each time. Never longer than positive answers are kept.
+ */
+#define GWP_DNS_NEG_TTL			30
+#define GWP_DNS_NEG_TTL_TRANSIENT	5
+
+static void cache_failure(struct gwp_dns_ctx *ctx, const char *name,
+			  bool transient)
+{
+	int ttl = transient ? GWP_DNS_NEG_TTL_TRANSIENT : GWP_DNS_NEG_TTL;
+
+	if (!ctx->cache)
+		return;
+
+	if (ttl > ctx->cfg.cache_expiry)
+		ttl = ctx->cfg.cache_expiry;
+	gwp_dns_cache_insert(ctx->cache, name, NULL, time(NULL) + ttl);
+}
+
+/*
  * Resolve @name into @addrs/@nr_addrs. On success *@res_p holds the
  * getaddrinfo() result, which the caller passes to the cache and frees.
  */
 static int resolve(const char *name, uint16_t port, struct gwp_sockaddr *addrs,
 		   uint8_t cap, uint8_t *nr_addrs, uint32_t restyp,
-		   struct addrinfo **res_p)
+		   struct addrinfo **res_p, bool *transient)
 {
 	struct addrinfo *res = NULL, hints;
 	uint8_t n;
@@ -230,10 +251,19 @@ static int resolve(const char *name, uint16_t port, struct gwp_sockaddr *addrs,
 
 	*res_p = NULL;
 	*nr_addrs = 0;
+	*transient = false;
 	prep_hints(&hints, restyp);
 	r = getaddrinfo(name, NULL, &hints, &res);
-	if (r)
+	if (r) {
+		/*
+		 * "No such name" and "no address of the family asked for"
+		 * are answers; anything else (a timeout, SERVFAIL, a local
+		 * error) may well go away by itself.
+		 */
+		*transient = r != EAI_NONAME && r != EAI_NODATA &&
+			     r != EAI_ADDRFAMILY;
 		return -EHOSTUNREACH;
+	}
 
 	n = collect_addr_list(res, addrs, cap, restyp, port);
 	if (!n) {
@@ -251,9 +281,10 @@ int gwp_dns_resolve(struct gwp_dns_ctx *ctx, const char *name,
 		    uint8_t cap, uint8_t *nr_addrs, uint32_t restyp)
 {
 	struct addrinfo *res;
+	bool transient;
 	int r;
 
-	r = resolve(name, port, addrs, cap, nr_addrs, restyp, &res);
+	r = resolve(name, port, addrs, cap, nr_addrs, restyp, &res, &transient);
 	if (r)
 		return r;
 
@@ -464,6 +495,7 @@ static void process_queue_entry(struct gwp_dns_ctx *ctx)
 	struct dns_lookup *l = ctx->head;
 	struct gwp_dns_entry *w;
 	struct addrinfo *res;
+	bool transient;
 	uint8_t nr;
 	int r;
 
@@ -489,7 +521,7 @@ static void process_queue_entry(struct gwp_dns_ctx *ctx)
 	pthread_mutex_unlock(&ctx->lock);
 
 	r = resolve(l->key, 0, addrs, GWP_DNS_MAX_ADDRS, &nr,
-		    ctx->cfg.restyp, &res);
+		    ctx->cfg.restyp, &res, &transient);
 
 	/*
 	 * Deliver first: the cache insert takes the write lock and
@@ -507,6 +539,8 @@ static void process_queue_entry(struct gwp_dns_ctx *ctx)
 	if (!r) {
 		try_pass_result_to_cache(ctx, l->key, res);
 		freeaddrinfo(res);
+	} else {
+		cache_failure(ctx, l->key, transient);
 	}
 
 	pthread_mutex_lock(&ctx->lock);
@@ -956,15 +990,12 @@ static struct dns_lookup *find_lookup(struct gwp_dns_ctx *ctx,
 	return NULL;
 }
 
-struct gwp_dns_entry *gwp_dns_queue(struct gwp_dns_ctx *ctx, uint32_t cq_idx,
-				    const char *name, uint16_t port,
-				    void *udata)
+static struct gwp_dns_entry *alloc_entry(struct gwp_dns_ctx *ctx,
+					 uint32_t cq_idx, const char *name,
+					 uint16_t port, void *udata)
 {
-	struct dns_lookup *l, *nl = NULL;
 	struct gwp_dns_entry *e;
-	char key[256];
-	size_t len, nlen;
-	uint64_t hash;
+	size_t nlen;
 
 	if (cq_idx >= ctx->cfg.nr_cqs)
 		return NULL;
@@ -983,6 +1014,37 @@ struct gwp_dns_entry *gwp_dns_queue(struct gwp_dns_ctx *ctx, uint32_t cq_idx,
 	e->nr_addrs = 0;
 	e->cq = &ctx->cqs[cq_idx];
 	e->udata = udata;
+	return e;
+}
+
+struct gwp_dns_entry *gwp_dns_queue_result(struct gwp_dns_ctx *ctx,
+					   uint32_t cq_idx, const char *name,
+					   uint16_t port, void *udata, int res)
+{
+	struct gwp_dns_entry *e;
+
+	e = alloc_entry(ctx, cq_idx, name, port, udata);
+	if (!e)
+		return NULL;
+
+	e->res = res;
+	deliver_entry(e);
+	return e;
+}
+
+struct gwp_dns_entry *gwp_dns_queue(struct gwp_dns_ctx *ctx, uint32_t cq_idx,
+				    const char *name, uint16_t port,
+				    void *udata)
+{
+	struct dns_lookup *l, *nl = NULL;
+	struct gwp_dns_entry *e;
+	char key[256];
+	uint64_t hash;
+	size_t len;
+
+	e = alloc_entry(ctx, cq_idx, name, port, udata);
+	if (!e)
+		return NULL;
 
 	/*
 	 * No name this long (or empty) resolves, and the cache refuses them

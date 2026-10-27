@@ -104,6 +104,15 @@ struct gwp_dns_entry *gwp_dns_queue(struct gwp_dns_ctx *ctx, uint32_t cq_idx,
 				    void *udata);
 
 /*
+ * As gwp_dns_queue(), but for an outcome already known (a failure the cache
+ * remembered): the entry is finished with result @res and delivered at once,
+ * so the caller handles it like any other result.
+ */
+struct gwp_dns_entry *gwp_dns_queue_result(struct gwp_dns_ctx *ctx,
+					   uint32_t cq_idx, const char *name,
+					   uint16_t port, void *udata, int res);
+
+/*
  * The non-blocking eventfd that signals completions on queue @cq_idx. It is
  * written once when the queue goes from empty to non-empty, so a wakeup can
  * stand for many entries.
@@ -147,6 +156,7 @@ void gwp_dns_entry_free(struct gwp_dns_entry *e);
  * Error values:
  * -ENOSYS: Cache is disabled.
  * -ENOENT: Entry not found in the cache.
+ * -EHOSTUNREACH: The cache remembers that the name does not resolve.
  * -EINVAL: Invalid parameters.
  */
 int gwp_dns_cache_lookup(struct gwp_dns_ctx *ctx, const char *name,

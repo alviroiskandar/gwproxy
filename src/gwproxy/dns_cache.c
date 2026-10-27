@@ -172,9 +172,8 @@ static int alloc_dns_entry(struct dns_cache_entry **ep, const char *key,
 	if (name_len <= 1 || name_len > 255)
 		return -EINVAL;
 
+	/* No address at all records that the name does not resolve. */
 	count_addrinfo(ai, &nr_i4, &nr_i6);
-	if (nr_i4 == 0 && nr_i6 == 0)
-		return -EINVAL;
 
 	/*
 	 * A lookup never hands back more than GWP_DNS_CACHE_MAX_ADDRS per

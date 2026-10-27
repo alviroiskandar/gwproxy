@@ -2611,13 +2611,21 @@ int gwp_acl_reject_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	return -EACCES;
 }
 
+/*
+ * Queue the lookup, or, when @res is an error the cache remembered for the
+ * name, an entry that already failed with it: either way the result comes
+ * back through the worker's DNS completion queue.
+ */
 static int queue_dns_resolution(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
-				const char *host, uint16_t port)
+				const char *host, uint16_t port, int res)
 {
 	struct gwp_dns_ctx *dns = w->ctx->dns;
 	struct gwp_dns_entry *gde;
 
-	gde = gwp_dns_queue(dns, w->idx, host, port, gcp);
+	if (res)
+		gde = gwp_dns_queue_result(dns, w->idx, host, port, gcp, res);
+	else
+		gde = gwp_dns_queue(dns, w->idx, host, port, gcp);
 	if (unlikely(!gde)) {
 		pr_err(&w->ctx->lh, "Failed to allocate DNS entry for %s:%hu", host, port);
 		return -ENOMEM;
@@ -2841,7 +2849,8 @@ static int prepare_target_addr_domain(struct gwp_wrk *w,
 			return 0;
 		}
 
-		return queue_dns_resolution(w, gcp, host, port);
+		return queue_dns_resolution(w, gcp, host, port,
+					    r == -EHOSTUNREACH ? r : 0);
 	}
 }
 

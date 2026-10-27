@@ -535,6 +535,62 @@ static void test_shared_lookup(void)
 	gwp_dns_ctx_free(ctx);
 }
 
+/*
+ * A name that does not resolve is remembered for a while, so the next request
+ * for it fails from the cache instead of resolving again.
+ */
+static void test_negative_cache(void)
+{
+	struct gwp_dns_cfg cfg = { .nr_workers = 1, .cache_expiry = 10,
+				   .nr_cqs = 1 };
+	struct gwp_dns_cache_addrs ca;
+	struct gwp_sockaddr addr;
+	struct gwp_dns_cache *cache;
+	struct gwp_dns_ctx *ctx;
+	struct gwp_dns_entry *e;
+	int r, i;
+
+	r = gwp_dns_cache_init(&cache, 16, 0);
+	assert(!r);
+	r = gwp_dns_cache_insert(cache, "gone.example", NULL, time(NULL) + 100);
+	assert(!r);
+	r = gwp_dns_cache_lookup_addrs(cache, "gone.example", &ca);
+	assert(!r && !ca.nr_i4 && !ca.nr_i6);
+	gwp_dns_cache_free(cache);
+
+	r = gwp_dns_ctx_init(&ctx, &cfg);
+	assert(!r);
+	r = gwp_dns_cache_lookup(ctx, "no-such-host.invalid", 80, &addr);
+	assert(r == -ENOENT);
+
+	/* .invalid never resolves (RFC 2606), online or not. */
+	e = gwp_dns_queue(ctx, 0, "no-such-host.invalid", 80, &e);
+	assert(e);
+	r = wait_entries(ctx, &e, 1, 30000);
+	assert(!r);
+	assert(e->res == -EHOSTUNREACH);
+	gwp_dns_entry_free(e);
+
+	/* Inserted after delivery; wait for it. */
+	for (i = 0; i < 1000; i++) {
+		r = gwp_dns_cache_lookup(ctx, "no-such-host.invalid", 80, &addr);
+		if (r != -ENOENT)
+			break;
+		usleep(1000);
+	}
+	assert(r == -EHOSTUNREACH);
+
+	/* A remembered failure comes back through the queue like any other. */
+	e = gwp_dns_queue_result(ctx, 0, "no-such-host.invalid", 80, &e, r);
+	assert(e);
+	r = wait_entries(ctx, &e, 1, 5000);
+	assert(!r);
+	assert(e->res == -EHOSTUNREACH);
+	gwp_dns_entry_free(e);
+
+	gwp_dns_ctx_free(ctx);
+}
+
 int main(void)
 {
 	test_basic_dns_multiple_requests();
@@ -546,6 +602,7 @@ int main(void)
 	test_addr_list();
 	test_cancel();
 	test_shared_lookup();
+	test_negative_cache();
 	printf("All tests passed.\n");
 	return 0;
 }
