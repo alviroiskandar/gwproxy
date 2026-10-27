@@ -493,10 +493,53 @@ static void test_auth_userpass(void)
 }
 
 /*
- * Auth entry with an empty password ("user" with no ':' in the file). The
- * client sends PLEN == 0, so gwp_socks5_auth_check() is called with p == NULL
- * and plen == 0. This must authenticate successfully without dereferencing the
- * NULL password pointer (a plain memcmp(NULL, ..., 0) is UB and trips UBSan).
+ * Load a credential file made of @data; returns gwp_auth_create()'s result
+ * and destroys the store again.
+ */
+static int try_cred_file(const char *data)
+{
+	char cred_file[] = "/tmp/gwp_socks5_auth.XXXXXX";
+	struct gwp_auth *auth = NULL;
+	ssize_t w;
+	int r;
+
+	w = write_temp_file(cred_file, data, strlen(data));
+	assert(w == (ssize_t)strlen(data));
+	r = gwp_auth_create(&auth, cred_file);
+	if (!r)
+		gwp_auth_destroy(auth);
+	unlink(cred_file);
+	return r;
+}
+
+/*
+ * The credential file takes "user:password" lines, both parts 1 to 255
+ * bytes, plus comments and blank lines. A line with no colon used to become
+ * a user with an empty password, which a client could log in as by sending
+ * none (PLEN 0); a comment line did the same.
+ */
+static void test_auth_file_lines(void)
+{
+	char longline[5000];
+
+	assert(!try_cred_file("# admins\n\nuser:pw\n  # indented\n"));
+	assert(try_cred_file("user\n") == -EINVAL);
+	assert(try_cred_file("user:pw\n#\nother\n") == -EINVAL);
+	assert(try_cred_file("user:\n") == -EINVAL);
+	assert(try_cred_file(":pw\n") == -EINVAL);
+
+	/* Too long for one read: an error, not two entries. */
+	memset(longline, 'a', sizeof(longline) - 2);
+	longline[sizeof(longline) - 2] = '\n';
+	longline[sizeof(longline) - 1] = '\0';
+	memcpy(longline + 4100, ":pw", 3);
+	assert(try_cred_file(longline) == -EINVAL);
+}
+
+/*
+ * A client that sends no password (PLEN == 0) is refused, and the check is
+ * made with p == NULL and plen == 0 without dereferencing the NULL password
+ * pointer (a plain memcmp(NULL, ..., 0) is UB and trips UBSan).
  */
 static void test_auth_userpass_empty_password(void)
 {
@@ -508,7 +551,7 @@ static void test_auth_userpass_empty_password(void)
 		'u', 's', 'e', 'r',	/* UNAME */
 		0x00,			/* PLEN = 0 (no password) */
 	};
-	static const char cred_data[] = "user\n";
+	static const char cred_data[] = "user:pw\n";
 	char cred_file[] = "/tmp/gwp_socks5_auth.XXXXXX";
 	struct gwp_socks5_conn *conn;
 	struct gwp_socks5_ctx *ctx;
@@ -553,8 +596,8 @@ static void test_auth_userpass_empty_password(void)
 	assert(in_len == 7);
 	assert(out_len == 2);
 	assert(out[0] == 0x01);
-	assert(out[1] == 0x00); /* STATUS: success */
-	assert(conn->state == GWP_SOCKS5_ST_CMD);
+	assert(out[1] == 0x01); /* STATUS: failure */
+	assert(conn->state == GWP_SOCKS5_ST_ERR);
 
 	gwp_socks5_conn_free(conn);
 	gwp_socks5_ctx_free(ctx);
@@ -1084,6 +1127,9 @@ static void test_udp_hdr_codec(void)
 static void gwp_socks5_run_tests(void)
 {
 	size_t i;
+
+	/* Once: each refused file prints its parse error. */
+	test_auth_file_lines();
 
 	for (i = 0; i < 5000; i++) {
 		test_udp_associate();

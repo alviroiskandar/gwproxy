@@ -1063,7 +1063,7 @@ static void test_auth(void)
 /*
  * The credential store indexes entries by username: every entry of a large
  * file must still be found, a duplicate username accepts each of its
- * passwords, and a line without ':' is a user with an empty password.
+ * passwords, and an empty password matches nobody.
  */
 static void test_auth_store(void)
 {
@@ -1079,7 +1079,7 @@ static void test_auth_store(void)
 	for (i = 0; i < 2000; i++)
 		len += (size_t)snprintf(data + len, cap - len, "u%d:p%d\n", i, i);
 	len += (size_t)snprintf(data + len, cap - len,
-				"dup:one\ndup:two\nnopass\nempty:\n");
+				"dup:one\ndup:two\n");
 	w = write_temp_file(cred_file, data, len);
 	assert(w == (ssize_t)len);
 	free(data);
@@ -1098,9 +1098,8 @@ static void test_auth_store(void)
 	assert(gwp_auth_check(auth, "dup", 3, "one", 3));
 	assert(gwp_auth_check(auth, "dup", 3, "two", 3));
 	assert(!gwp_auth_check(auth, "dup", 3, "three", 5));
-	assert(gwp_auth_check(auth, "nopass", 6, NULL, 0));
-	assert(!gwp_auth_check(auth, "nopass", 6, "x", 1));
-	assert(gwp_auth_check(auth, "empty", 5, "", 0));
+	assert(!gwp_auth_check(auth, "dup", 3, NULL, 0));
+	assert(!gwp_auth_check(auth, "dup", 3, "", 0));
 	assert(!gwp_auth_check(auth, "", 0, "", 0));
 
 	gwp_auth_destroy(auth);

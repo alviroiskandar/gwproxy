@@ -169,16 +169,22 @@ static int add_auth_entry(struct auth_set *set, const char *line, size_t len)
 	memcpy(u, line, len);
 	u[len] = '\0';
 
+	/*
+	 * "user:password", both parts 1 to 255 bytes, as RFC 1929 has them.
+	 * A line with no colon used to become a user with an empty password,
+	 * which any client could log in as by sending none.
+	 */
 	p = strchr(u, ':');
-	if (p)
-		*p++ = '\0';
+	if (!p)
+		goto out_free_u;
+	*p++ = '\0';
 
 	ulen = strlen(u);
-	if (ulen > 255)
+	if (!ulen || ulen > 255)
 		goto out_free_u;
 
-	plen = p ? strlen(p) : 0;
-	if (plen > 255)
+	plen = strlen(p);
+	if (!plen || plen > 255)
 		goto out_free_u;
 
 	ae = &set->entries[set->nr++];
@@ -202,6 +208,7 @@ out_free_u:
 static int load_auth_set(const char *path, struct auth_set **out)
 {
 	struct auth_set *set;
+	unsigned lineno = 0;
 	char buf[4096], *t;
 	FILE *fp;
 	size_t l;
@@ -219,12 +226,28 @@ static int load_auth_set(const char *path, struct auth_set **out)
 	}
 
 	while ((t = fgets(buf, sizeof(buf), fp))) {
+		lineno++;
+		/*
+		 * A line too long for the buffer would come back in pieces,
+		 * each taken for an entry of its own. No valid line is that
+		 * long (two 255-byte fields and a colon).
+		 */
+		l = strlen(buf);
+		if (l && buf[l - 1] != '\n' && !feof(fp)) {
+			fprintf(stderr, "auth: line %u is too long\n", lineno);
+			r = -EINVAL;
+			break;
+		}
+
 		t = trim_str(buf);
 		l = strlen(t);
-		if (!l)
+		if (!l || t[0] == '#')
 			continue;
 
 		r = add_auth_entry(set, t, l);
+		if (r == -EINVAL)
+			fprintf(stderr, "auth: parse error on line %u: expected \"user:password\", each 1 to 255 bytes\n",
+				lineno);
 		if (r < 0)
 			break;
 	}
