@@ -851,14 +851,14 @@ static ssize_t do_recv_tls(struct gwp_conn *src)
 }
 
 /*
- * TLS send: encrypt src->buf into the send BIO and flush the ciphertext to
- * dst->fd, consuming only what the socket accepts (a memory BIO cannot push
- * read bytes back). Unflushed ciphertext stays queued in the BIO;
- * adj_epl_out() keeps EPOLLOUT armed on a TLS peer while bytes remain.
+ * TLS send: encrypt src->buf into the send queue and flush the ciphertext to
+ * dst->fd straight from the queue, consuming only what the socket accepts.
+ * Unflushed ciphertext stays queued; adj_epl_out() keeps EPOLLOUT armed on a
+ * TLS peer while bytes remain.
  *
- * The memory BIO takes any amount, so encrypt only while less than one source
+ * The send queue takes any amount, so encrypt only while less than one source
  * buffer of ciphertext is queued. Past that the plaintext stays in src->buf,
- * whose full buffer stops adj_epl_in() reading from the source, and the BIO
+ * whose full buffer stops adj_epl_in() reading from the source, and the queue
  * stays bounded when the peer does not read.
  *
  * Returns the number of ciphertext bytes flushed, or <0 on a fatal error.
@@ -909,7 +909,7 @@ again:
 		}
 	}
 
-	/* The BIO drained with plaintext held back by the cap: go on. */
+	/* The queue drained with plaintext held back by the cap: go on. */
 	if (capped)
 		goto again;
 
