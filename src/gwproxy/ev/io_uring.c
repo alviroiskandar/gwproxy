@@ -2349,6 +2349,20 @@ static int handle_event(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 	if (nr_ops) {
 		assert(*nr_ops);
 		(*nr_ops)--;
+
+		/*
+		 * The pair is being torn down and its cancels are queued, so
+		 * nothing may queue more I/O on it. Its handler would carry on
+		 * with the connection regardless: the send of the reply to a
+		 * timeout, completing, armed a recv on the upstream socket that
+		 * no cancel would ever reach, and that recv's reference kept the
+		 * pair and both sockets open for as long as the worker ran.
+		 */
+		gcp = udata;
+		if (gcp->flags & GWP_CONN_FLAG_IS_CANCEL) {
+			put_gcp(w, gcp);
+			return 0;
+		}
 	}
 
 	/*

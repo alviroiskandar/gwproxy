@@ -8,16 +8,17 @@
 #       the client is closed at once, gets no bytes, and the worker does not
 #       spin in the meantime (a failed connect leaves EPOLLERR raised on the
 #       socket until it is closed); both upstream protocols;
-#   (2) an upstream that answers one byte of its reply and then stalls: when
-#       the connect timeout fires, a plain-forwarding client is closed
-#       without seeing that byte, and a SOCKS5 client gets REP 0x06 alone;
+#   (2) an upstream that answers nothing, or one byte of its reply, and then
+#       stalls: when the connect timeout fires, a plain-forwarding client is
+#       closed without seeing that byte, and a SOCKS5 client gets REP 0x06
+#       alone, and is then closed;
 #   (3) an upstream that refuses the CONNECT: a SOCKS5 client gets a
 #       failure REP alone, not the upstream's reply in front of it.
 #
-# (1) runs on every available event loop. (2) and (3) run on epoll only for
-# now: the io_uring loop does not bound the upstream handshake by the
-# connect timeout and answers a refused upstream CONNECT with a bare close,
-# so neither has anything to check there yet.
+# (1) and the silent upstream of (2) run on every available event loop. The
+# rest of (2) and (3) run on epoll only for now: the io_uring loop relays
+# what a stalled upstream sent at the timeout and answers a refused upstream
+# CONNECT with a bare close, so neither has anything to check there yet.
 
 . "$(dirname "$0")/lib.sh"
 require python3
@@ -39,10 +40,11 @@ for _ in $(seq 1 50); do
 done
 [ -n "$cport" ] || fail "could not reserve a closed port"
 
-# A SOCKS5 upstream that misbehaves: "stall" answers one byte of the method
-# selection and then goes quiet, "refuse" accepts the method and answers the
-# CONNECT with REP 0x05. Run it in the background: the exec makes the pid
-# that lib.sh kills the server itself.
+# A SOCKS5 upstream that misbehaves: "silent" reads the greeting and never
+# answers, "stall" answers one byte of the method selection and then goes
+# quiet, "refuse" accepts the method and answers the CONNECT with REP 0x05.
+# Run it in the background: the exec makes the pid that lib.sh kills the
+# server itself.
 upstream()
 {
 	exec python3 - "$@" <<-'PY'
@@ -55,7 +57,9 @@ upstream()
 	def h(c):
 	    try:
 	        c.recv(512)
-	        if mode == "stall":
+	        if mode == "silent":
+	            pass
+	        elif mode == "stall":
 	            c.sendall(b"\x05")
 	        else:
 	            c.sendall(b"\x05\x00")
@@ -74,6 +78,10 @@ stp="$(pick_port)"
 upstream "$stp" stall >"$WORK/stall.log" 2>&1 &
 _PIDS+=("$!")
 wait_listen "$stp" || fail "stalling upstream did not start on $stp"
+slp="$(pick_port)"
+upstream "$slp" silent >"$WORK/silent.log" 2>&1 &
+_PIDS+=("$!")
+wait_listen "$slp" || fail "silent upstream did not start on $slp"
 rfp="$(pick_port)"
 upstream "$rfp" refuse >"$WORK/refuse.log" 2>&1 &
 _PIDS+=("$!")
@@ -138,6 +146,22 @@ for loop in epoll io_uring; do
 		kill "$GWP_PID" 2>/dev/null
 		wait "$GWP_PID" 2>/dev/null
 	done
+
+	# (2) An upstream that never answers, SOCKS5 client: REP 0x06 at the
+	#     connect timeout, and then the connection closes.
+	pp="$(pick_port)"
+	gwp_start "127.0.0.1:$pp" --as-socks5=1 \
+		--upstream-proxy="socks5://127.0.0.1:$slp" \
+		--event-loop="$loop" --nr-workers=1 --connect-timeout=1
+	read -r secs ticks bytes < <(probe "$pp" "$GWP_PID" socks5)
+	diag "[$loop] silent upstream, SOCKS5: closed after ${secs}s, bytes $bytes"
+	[ "$secs" != OPEN ] || fail "[$loop] silent upstream (SOCKS5): client left open"
+	case "$bytes" in
+	0506????????????????) ;;
+	*) fail "[$loop] silent upstream (SOCKS5): expected REP 0x06 alone, got $bytes" ;;
+	esac
+	kill "$GWP_PID" 2>/dev/null
+	wait "$GWP_PID" 2>/dev/null
 
 	[ "$loop" = epoll ] || continue
 
