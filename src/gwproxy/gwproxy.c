@@ -3384,6 +3384,118 @@ static int http_connect_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	return r;
 }
 
+/*
+ * Room kept free in the target buffer while the response header is held back:
+ * enough for the "Connection: close" and "Proxy-Connection: close" lines the
+ * rewrite adds. A header therefore gets at most target-buf-size minus this,
+ * counted together with any interim (1xx) responses still queued for the
+ * client. That is enough for any CRLF header that fits, but the rewrite also
+ * turns bare LF line ends into CRLF, so an LF-only header near the limit can
+ * still outgrow the buffer; the rewrite is bounds-checked and answers 502.
+ */
+#define HTTP_FWD_RES_SLACK	64
+
+/*
+ * The origin's response is unusable (see gwp_http_fwd_res_input()). Throw
+ * away whatever it sent that the client has not seen, answer 502 in its
+ * place, and treat the origin as finished: the normal forwarding path then
+ * delivers the 502 and closes towards the client.
+ */
+static int http_fwd_res_fail(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			     uint32_t from, int err)
+{
+	struct gwp_conn *t = &gcp->target;
+	int r;
+
+	pr_info(&w->ctx->lh, "Rejecting response from origin %s: %s (idx=%u)",
+		ip_to_str(&gcp->target_addr),
+		err == -EACCES ? "it asked for proxy authentication" :
+				 strerror(-err), gcp->idx);
+
+	t->cap = (uint32_t)w->ctx->cfg.target_buf_size;
+	t->len = from;
+	r = gwp_http_build_bad_gateway_reply(t->buf + t->len, t->cap - t->len);
+	if (r < 0)
+		return r;
+	t->len += (uint32_t)r;
+	t->rd_eof = true;
+	return 0;
+}
+
+static int http_fwd_target_in(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			      uint32_t from)
+{
+	struct gwp_http_conn *hc = gcp->http_conn;
+	uint32_t cap = (uint32_t)w->ctx->cfg.target_buf_size;
+	struct gwp_conn *t = &gcp->target;
+	size_t out_len, pending;
+	int r;
+
+	switch (gwp_http_fwd_res_state(hc)) {
+	case GWP_HTTP_RES_NONE:
+	case GWP_HTTP_RES_BODY:
+		return 0;
+	case GWP_HTTP_RES_FAILED:
+		/* Already answered 502; whatever else it says is dropped. */
+		t->len = from;
+		return 0;
+	}
+
+	if (t->len == from && !t->rd_eof)
+		return 0;
+
+	r = gwp_http_fwd_res_input(hc, t->buf + from, t->len - from, t->rd_eof,
+				   t->buf + from, cap - from, &out_len);
+	if (r < 0)
+		return http_fwd_res_fail(w, gcp, from, r);
+
+	t->len = from + (uint32_t)out_len;
+	if (gwp_http_fwd_res_state(hc) != GWP_HTTP_RES_HDR) {
+		t->cap = cap;
+		return 0;
+	}
+
+	/*
+	 * Still collecting the header. Shrink the buffer the event loop reads
+	 * into, so that what is held back, what is still queued for the
+	 * client (an interim response) and the next read can never add up to
+	 * more than the rewritten header and the body behind it can occupy.
+	 */
+	pending = gwp_http_fwd_res_pending(hc);
+	if (t->len + pending + HTTP_FWD_RES_SLACK >= cap)
+		return http_fwd_res_fail(w, gcp, from, -E2BIG);
+	t->cap = cap - HTTP_FWD_RES_SLACK - (uint32_t)pending;
+	return 0;
+}
+
+int gwp_http_fwd_in(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+		    struct gwp_conn *c, uint32_t from)
+{
+	if (c == &gcp->target)
+		return http_fwd_target_in(w, gcp, from);
+	return 0;
+}
+
+int gwp_http_fwd_begin(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	uint32_t cap = (uint32_t)w->ctx->cfg.target_buf_size;
+	int r;
+
+	if (!gwp_http_fwd_active(gcp))
+		return 0;
+
+	r = gwp_http_fwd_res_init(gcp->http_conn, cap - HTTP_FWD_RES_SLACK);
+	if (r)
+		return r;
+	gcp->target.cap = cap - HTTP_FWD_RES_SLACK;
+
+	/*
+	 * Bytes may already be waiting: an upstream proxy can deliver some
+	 * behind its CONNECT reply. They are the start of the response.
+	 */
+	return http_fwd_target_in(w, gcp, 0);
+}
+
 int gwp_handle_conn_state_http(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_ctx *ctx = w->ctx;

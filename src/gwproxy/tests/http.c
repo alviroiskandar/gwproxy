@@ -14,6 +14,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <errno.h>
 #include <unistd.h>
 
@@ -269,6 +270,145 @@ static void test_forward_conn_lists_framing(void)
 	PRTEST_OK();
 }
 
+/* Feed @in to a fresh response filter in one go; returns its result. */
+static int res_feed(struct gwp_http_conn *hc, const char *in, bool eof,
+		    char *out, size_t out_cap, size_t *out_len)
+{
+	assert(!gwp_http_fwd_res_init(hc, 1024));
+	return gwp_http_fwd_res_input(hc, in, strlen(in), eof, out, out_cap,
+				      out_len);
+}
+
+static void test_res_rewrite(void)
+{
+	/*
+	 * The client must learn that the connection closes, whatever the
+	 * origin claims, and must not see the origin's hop-by-hop fields. The
+	 * framing fields stay even when Connection names them (the body is
+	 * relayed as is), and so do duplicates such as Set-Cookie.
+	 */
+	static const char in[] =
+		"HTTP/1.1 200 OK\r\n"
+		"Connection: keep-alive, X-Drop, Content-Length\r\n"
+		"Keep-Alive: timeout=100\r\n"
+		"Proxy-Authenticate: Basic realm=\"evil\"\r\n"
+		"X-Drop: 1\r\n"
+		"Set-Cookie: a=1\r\n"
+		"Set-Cookie: b=2\r\n"
+		"Content-Length: 5\r\n"
+		"\r\n"
+		"hello";
+	static const char want[] =
+		"HTTP/1.1 200 OK\r\n"
+		"Set-Cookie: a=1\r\n"
+		"Set-Cookie: b=2\r\n"
+		"Content-Length: 5\r\n"
+		"Connection: close\r\n"
+		"Proxy-Connection: close\r\n"
+		"\r\n"
+		"hello";
+	struct gwp_http_conn *hc = gwp_http_conn_alloc();
+	char out[1024];
+	size_t out_len, i;
+
+	assert(hc);
+	assert(res_feed(hc, in, false, out, sizeof(out), &out_len) == 0);
+	assert(gwp_http_fwd_res_state(hc) == GWP_HTTP_RES_BODY);
+	assert(out_len == strlen(want) && !memcmp(out, want, out_len));
+
+	/* Same, dribbled in a byte at a time, with LF-only line ends. */
+	assert(!gwp_http_fwd_res_init(hc, 1024));
+	{
+		static const char lf[] =
+			"HTTP/1.0 200 OK\nKeep-Alive: x\nA: b\n\nbody";
+		static const char lf_want[] =
+			"HTTP/1.0 200 OK\r\nA: b\r\n"
+			"Connection: close\r\nProxy-Connection: close\r\n\r\n"
+			"body";
+		size_t o = 0;
+
+		/* Nothing comes out until the blank line is in. */
+		for (i = 0; gwp_http_fwd_res_state(hc) == GWP_HTTP_RES_HDR; i++) {
+			assert(gwp_http_fwd_res_input(hc, lf + i, 1, false,
+						      out, sizeof(out),
+						      &out_len) == 0);
+			if (i < strlen(lf) - 5)
+				assert(!out_len);
+		}
+		/* From there on the body is the caller's to relay. */
+		memcpy(out + out_len, lf + i, strlen(lf) - i);
+		o = out_len + strlen(lf) - i;
+		assert(o == strlen(lf_want) && !memcmp(out, lf_want, o));
+	}
+
+	gwp_http_conn_free(hc);
+	PRTEST_OK();
+}
+
+static void test_res_interim(void)
+{
+	/* A 100 Continue is passed on at once, without "Connection: close". */
+	static const char in[] = "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 20";
+	static const char rest[] = "4 No Content\r\n\r\n";
+	struct gwp_http_conn *hc = gwp_http_conn_alloc();
+	char out[1024];
+	size_t out_len;
+
+	assert(hc);
+	assert(res_feed(hc, in, false, out, sizeof(out), &out_len) == 0);
+	assert(gwp_http_fwd_res_state(hc) == GWP_HTTP_RES_HDR);
+	assert(out_len == 25 && !memcmp(out, "HTTP/1.1 100 Continue\r\n\r\n", 25));
+	assert(gwp_http_fwd_res_pending(hc) == 11);
+
+	assert(gwp_http_fwd_res_input(hc, rest, strlen(rest), false, out,
+				      sizeof(out), &out_len) == 0);
+	assert(gwp_http_fwd_res_state(hc) == GWP_HTTP_RES_BODY);
+	assert(strstr(out, "HTTP/1.1 204 No Content\r\nConnection: close\r\n"));
+
+	gwp_http_conn_free(hc);
+	PRTEST_OK();
+}
+
+static void test_res_reject(void)
+{
+	static const char *const bad[] = {
+		("HTTP/1.1 407 Proxy Authentication Required\r\n"
+		 "Proxy-Authenticate: Basic realm=\"x\"\r\n\r\n"),
+		"HTTP/1.1 101 Switching Protocols\r\nUpgrade: x\r\n\r\n",
+		"SSH-2.0-OpenSSH\r\n\r\n",
+		"HTTP/1.1 200 OK\r\nX: a\rb\r\n\r\n",	/* bare CR */
+		"HTTP/1.1 200 OK\r\nX: a\r\n b\r\n\r\n",	/* obs-fold */
+		"HTTP/1.1 200 OK\r\nX : a\r\n\r\n",
+		"HTTP/1.1 600 OK\r\n\r\n",
+	};
+	struct gwp_http_conn *hc = gwp_http_conn_alloc();
+	char out[1024], big[1100];
+	size_t out_len, i;
+
+	assert(hc);
+	for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+		assert(res_feed(hc, bad[i], false, out, sizeof(out),
+				&out_len) < 0);
+		assert(gwp_http_fwd_res_state(hc) == GWP_HTTP_RES_FAILED);
+		assert(!out_len);
+	}
+	assert(res_feed(hc, bad[0], false, out, sizeof(out), &out_len) ==
+	       -EACCES);
+
+	/* The origin closing before the header is complete. */
+	assert(res_feed(hc, "HTTP/1.1 200 OK\r\n", true, out, sizeof(out),
+			&out_len) == -EBADMSG);
+
+	/* A header that cannot fit in what the filter may hold back. */
+	memset(big, 'a', sizeof(big) - 1);
+	big[sizeof(big) - 1] = '\0';
+	memcpy(big, "HTTP/1.1 200 OK\r\nX: ", 20);
+	assert(res_feed(hc, big, false, out, sizeof(out), &out_len) == -E2BIG);
+
+	gwp_http_conn_free(hc);
+	PRTEST_OK();
+}
+
 static void test_need_more(void)
 {
 	/* Request line complete, header fields not yet terminated. */
@@ -400,6 +540,9 @@ int main(void)
 		test_forward_default_port();
 		test_forward_hop_by_hop();
 		test_forward_conn_lists_framing();
+		test_res_rewrite();
+		test_res_interim();
+		test_res_reject();
 		test_need_more();
 		test_errors();
 		test_auth();

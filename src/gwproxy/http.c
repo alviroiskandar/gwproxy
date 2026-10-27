@@ -44,6 +44,18 @@ struct gwp_http_conn {
 	/* Authenticated username (Basic auth), for ACL "-m user" matching. */
 	bool				have_user;
 	char				user[256];
+
+	/*
+	 * The origin's response to a forwarding request. Its header is held
+	 * back in @res_buf until complete, so nothing the origin says reaches
+	 * the client before it has been rewritten; @res_scan is how far the
+	 * search for the blank line that ends it has got.
+	 */
+	uint8_t				res_state;
+	char				*res_buf;
+	size_t				res_len;
+	size_t				res_cap;
+	size_t				res_scan;
 };
 
 struct gwp_http_conn *gwp_http_conn_alloc(void)
@@ -69,6 +81,7 @@ void gwp_http_conn_free(struct gwp_http_conn *hc)
 	gwnet_http_hdr_pctx_free(&hc->ctx_hdr);
 	gwnet_http_req_hdr_free(&hc->req_hdr);
 	free(hc->fwd_req);
+	free(hc->res_buf);
 	free(hc);
 }
 
@@ -190,9 +203,8 @@ static bool is_hop_by_hop(const char *k)
  * Connection header value @conn (which may be NULL). Such fields are
  * connection-specific and must also be dropped (RFC 9110 Section 7.6.1).
  */
-static bool conn_lists(const char *conn, const char *name)
+static bool conn_listsl(const char *conn, const char *name, size_t nlen)
 {
-	size_t nlen = strlen(name);
 	const char *p = conn;
 
 	if (!conn)
@@ -214,6 +226,11 @@ static bool conn_lists(const char *conn, const char *name)
 		p = e;
 	}
 	return false;
+}
+
+static bool conn_lists(const char *conn, const char *name)
+{
+	return conn_listsl(conn, name, strlen(name));
 }
 
 /*
@@ -427,6 +444,318 @@ int gwp_http_conn_process(struct gwp_http_conn *hc, struct gwp_auth *auth,
 
 	hc->is_forward = false;
 	return GWP_HTTP_CONNECT;
+}
+
+/*
+ * Response header fields that describe the proxy-to-origin connection only
+ * and are not passed on to the client. Content-Length and Transfer-Encoding
+ * are absent because the body is relayed verbatim and the client needs them
+ * to frame it; Trailer stays with Transfer-Encoding for the same reason.
+ * Proxy-Authenticate and Proxy-Authentication-Info are addressed to a proxy:
+ * coming from an origin they could only be an attempt to have the client
+ * offer its proxy credentials.
+ */
+static bool is_res_hop_by_hop(const char *k, size_t klen)
+{
+	static const char *const hbh[] = {
+		"Connection", "Proxy-Connection", "Keep-Alive", "Upgrade",
+		"TE", "Proxy-Authenticate", "Proxy-Authentication-Info",
+	};
+	size_t i;
+
+	for (i = 0; i < sizeof(hbh) / sizeof(hbh[0]); i++) {
+		if (strlen(hbh[i]) == klen && !strncasecmp(k, hbh[i], klen))
+			return true;
+	}
+	return false;
+}
+
+static bool is_framing_field(const char *k, size_t klen)
+{
+	return (klen == 14 && !strncasecmp(k, "Content-Length", 14)) ||
+	       (klen == 17 && !strncasecmp(k, "Transfer-Encoding", 17));
+}
+
+static bool is_tchar(unsigned char c)
+{
+	if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+	    (c >= 'a' && c <= 'z'))
+		return true;
+	return c && strchr("!#$%&'*+-.^_`|~", c);
+}
+
+/*
+ * Field values and the reason phrase may hold HTAB, SP, VCHAR and obs-text
+ * (RFC 9110 Section 5.5); a bare CR, NUL or any other control byte is not
+ * valid anywhere in a header and would let the origin split the line it is
+ * copied into.
+ */
+static bool is_field_char(unsigned char c)
+{
+	return c == '\t' || (c >= 0x20 && c != 0x7f);
+}
+
+/*
+ * Return the length of the line at @p (at most @len bytes, which always
+ * include its LF) excluding the line terminator, which is LF or CRLF.
+ */
+static size_t line_len(const char *p, size_t len)
+{
+	const char *lf = memchr(p, '\n', len);
+	size_t n = (size_t)(lf - p);
+
+	if (n && p[n - 1] == '\r')
+		n--;
+	return n;
+}
+
+/* The line after the one at @p; the header ending at @end has one. */
+static const char *next_line(const char *p, const char *end)
+{
+	return (const char *)memchr(p, '\n', (size_t)(end - p)) + 1;
+}
+
+/*
+ * Rewrite one complete response header (@len bytes, ending with its blank
+ * line) into @out: lines are normalised to CRLF, hop-by-hop fields and fields
+ * named by Connection are dropped and, for a final response, the client is
+ * told that the connection closes after it. *@code is set to the status code.
+ *
+ * Returns the length written, -EBADMSG for a header that is not valid
+ * HTTP/1.x, or -E2BIG if @out is too small.
+ */
+static ssize_t rewrite_res_hdr(const char *hdr, size_t len, char *out,
+			       size_t out_cap, int *code)
+{
+	static const char cls[] = "Connection: close\r\n"
+				  "Proxy-Connection: close\r\n";
+	const char *p = hdr, *end = hdr + len, *q;
+	char *conn = NULL;
+	size_t n, o = 0, conn_len = 0, i;
+	ssize_t ret = -EBADMSG;
+
+	/* Status line: HTTP/1.x SP 3DIGIT [ SP reason-phrase ] */
+	n = line_len(p, (size_t)(end - p));
+	if (n < 12 || memcmp(p, "HTTP/1.", 7) || (p[7] != '0' && p[7] != '1') ||
+	    p[8] != ' ' || p[9] < '1' || p[9] > '5' || p[10] < '0' ||
+	    p[10] > '9' || p[11] < '0' || p[11] > '9' ||
+	    (n > 12 && p[12] != ' '))
+		return -EBADMSG;
+	for (i = 12; i < n; i++) {
+		if (!is_field_char(p[i]))
+			return -EBADMSG;
+	}
+	*code = (p[9] - '0') * 100 + (p[10] - '0') * 10 + (p[11] - '0');
+	if (n + 2 > out_cap)
+		return -E2BIG;
+	memcpy(out, p, n);
+	memcpy(out + n, "\r\n", 2);
+	o = n + 2;
+	p = next_line(p, end);
+
+	/*
+	 * Validate the field lines and gather every Connection value into one
+	 * list first: a field may be named by a Connection line that comes
+	 * after it.
+	 */
+	conn = malloc(len + 1);
+	if (!conn)
+		return -ENOMEM;
+	for (q = p; ; ) {
+		const char *colon, *v;
+
+		n = line_len(q, (size_t)(end - q));
+		if (!n)
+			break;
+		/* obs-fold (RFC 9112 Section 5.2) is refused, not unfolded. */
+		colon = memchr(q, ':', n);
+		if (!colon || colon == q)
+			goto out;
+		for (v = q; v < colon; v++) {
+			if (!is_tchar(*v))
+				goto out;
+		}
+		for (v = colon + 1; v < q + n; v++) {
+			if (!is_field_char(*v))
+				goto out;
+		}
+		if (colon - q == 10 && !strncasecmp(q, "Connection", 10)) {
+			conn[conn_len++] = ',';
+			memcpy(conn + conn_len, colon + 1, n - 11);
+			conn_len += n - 11;
+		}
+		q = next_line(q, end);
+	}
+	conn[conn_len] = '\0';
+
+	for (;;) {
+		const char *colon;
+		size_t klen;
+
+		n = line_len(p, (size_t)(end - p));
+		if (!n)
+			break;
+		colon = memchr(p, ':', n);
+		klen = (size_t)(colon - p);
+		if (!is_res_hop_by_hop(p, klen) &&
+		    (is_framing_field(p, klen) || !conn_listsl(conn, p, klen))) {
+			if (o + n + 2 > out_cap) {
+				ret = -E2BIG;
+				goto out;
+			}
+			memcpy(out + o, p, n);
+			memcpy(out + o + n, "\r\n", 2);
+			o += n + 2;
+		}
+		p = next_line(p, end);
+	}
+
+	/* An interim response says nothing about the connection. */
+	n = (*code >= 200) ? sizeof(cls) - 1 : 0;
+	if (o + n + 2 > out_cap) {
+		ret = -E2BIG;
+		goto out;
+	}
+	memcpy(out + o, cls, n);
+	memcpy(out + o + n, "\r\n", 2);
+	ret = (ssize_t)(o + n + 2);
+out:
+	free(conn);
+	return ret;
+}
+
+/*
+ * Return the length of the header at the start of @buf up to and including
+ * the blank line that ends it, or 0 if it is not complete yet. *@scan is where
+ * the search resumes, so a header dribbled in byte by byte is not rescanned
+ * from the start on every call.
+ */
+static size_t find_hdr_end(const char *buf, size_t len, size_t *scan)
+{
+	size_t i;
+
+	for (i = *scan; i < len; i++) {
+		if (buf[i] != '\n')
+			continue;
+		if (i + 1 >= len)
+			break;
+		if (buf[i + 1] == '\n')
+			return i + 2;
+		if (buf[i + 1] != '\r')
+			continue;
+		if (i + 2 >= len)
+			break;
+		if (buf[i + 2] == '\n')
+			return i + 3;
+	}
+	*scan = i;
+	return 0;
+}
+
+int gwp_http_fwd_res_init(struct gwp_http_conn *hc, size_t max_hdr)
+{
+	free(hc->res_buf);
+	hc->res_buf = malloc(max_hdr);
+	if (!hc->res_buf)
+		return -ENOMEM;
+	hc->res_cap = max_hdr;
+	hc->res_len = 0;
+	hc->res_scan = 0;
+	hc->res_state = GWP_HTTP_RES_HDR;
+	return 0;
+}
+
+int gwp_http_fwd_res_state(const struct gwp_http_conn *hc)
+{
+	return hc->res_state;
+}
+
+size_t gwp_http_fwd_res_pending(const struct gwp_http_conn *hc)
+{
+	return hc->res_len;
+}
+
+static int res_input(struct gwp_http_conn *hc, const void *in, size_t len,
+		     bool eof, char *out, size_t out_cap, size_t *out_len)
+{
+	size_t o = 0, end;
+	ssize_t w;
+	int code;
+
+	if (len > hc->res_cap - hc->res_len)
+		return -E2BIG;
+	memcpy(hc->res_buf + hc->res_len, in, len);
+	hc->res_len += len;
+
+	for (;;) {
+		end = find_hdr_end(hc->res_buf, hc->res_len, &hc->res_scan);
+		if (!end) {
+			if (eof)
+				return -EBADMSG;
+			if (hc->res_len >= hc->res_cap)
+				return -E2BIG;
+			*out_len = o;
+			return 0;
+		}
+
+		w = rewrite_res_hdr(hc->res_buf, end, out + o, out_cap - o,
+				    &code);
+		if (w < 0)
+			return (int)w;
+
+		/*
+		 * The proxy took the Upgrade header out of the request, so a
+		 * 101 is not something the client asked for. A 407 is the
+		 * origin asking for the client's proxy credentials, which are
+		 * none of its business.
+		 */
+		if (code == 101)
+			return -EBADMSG;
+		if (code == 407)
+			return -EACCES;
+
+		o += (size_t)w;
+		hc->res_len -= end;
+		memmove(hc->res_buf, hc->res_buf + end, hc->res_len);
+		hc->res_scan = 0;
+
+		/* Interim (1xx): pass it on and wait for the next header. */
+		if (code < 200)
+			continue;
+
+		/* Body bytes that came in behind the header follow it. */
+		if (hc->res_len > out_cap - o)
+			return -E2BIG;
+		memcpy(out + o, hc->res_buf, hc->res_len);
+		o += hc->res_len;
+		free(hc->res_buf);
+		hc->res_buf = NULL;
+		hc->res_len = 0;
+		hc->res_state = GWP_HTTP_RES_BODY;
+		*out_len = o;
+		return 0;
+	}
+}
+
+int gwp_http_fwd_res_input(struct gwp_http_conn *hc, const void *in,
+			   size_t len, bool eof, void *out, size_t out_cap,
+			   size_t *out_len)
+{
+	int r;
+
+	*out_len = 0;
+	if (hc->res_state != GWP_HTTP_RES_HDR)
+		return 0;
+
+	r = res_input(hc, in, len, eof, out, out_cap, out_len);
+	if (r < 0) {
+		*out_len = 0;
+		free(hc->res_buf);
+		hc->res_buf = NULL;
+		hc->res_len = 0;
+		hc->res_state = GWP_HTTP_RES_FAILED;
+	}
+	return r;
 }
 
 int gwp_http_build_connect_reply(const struct gwp_http_conn *hc, void *out,

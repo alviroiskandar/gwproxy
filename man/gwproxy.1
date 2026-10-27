@@ -836,6 +836,19 @@ of ordinary absolute\-form requests such as "GET http://host/path", which
 gwproxy rewrites to origin form, fetches from the origin and relays back, one
 request per connection.
 .PP
+The origin's response header is rewritten before the client sees it: its
+hop\-by\-hop fields are dropped and "Connection: close" is added, so the client
+does not send another request on the connection, and the connection is closed
+once the origin has finished. A response that is not valid HTTP/1.x, one whose
+header is too large, and a 407 from the origin, which would invite the client
+to hand over its proxy credentials, are answered with "502 Bad Gateway"
+instead. The response header, together with any interim (1xx) responses before
+it that the client has not yet received, may take at most
+.B \-\-target\-buf\-size
+minus 64 bytes, and must still fit in
+.B \-\-target\-buf\-size
+once rewritten (bare LF line ends become CRLF).
+.PP
 With
 .B \-\-auth\-file
 set, "Basic" proxy authentication (RFC 7617) is required and a missing or wrong

@@ -929,15 +929,25 @@ static ssize_t __do_send(struct gwp_conn *src, struct gwp_conn *dst)
 }
 
 __hot
-static int do_splice(struct gwp_conn *src, struct gwp_conn *dst, bool do_recv,
+static int do_splice(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+		     struct gwp_conn *src, struct gwp_conn *dst, bool do_recv,
 		     bool do_send)
 {
 	ssize_t ret;
 
 	if (do_recv) {
+		uint32_t from = src->len;
+
 		ret = __do_recv(src);
 		if (unlikely(ret < 0))
 			return (int)ret;
+
+		if (gwp_http_fwd_active(gcp)) {
+			int r = gwp_http_fwd_in(w, gcp, src, from);
+
+			if (unlikely(r))
+				return r;
+		}
 	}
 
 	if (do_send) {
@@ -1021,6 +1031,7 @@ static int upstream_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_ctx *ctx = w->ctx;
 	ssize_t sr;
+	int r;
 
 	if (gcp->timer_fd >= 0) {
 		__sys_close(gcp->timer_fd);
@@ -1031,6 +1042,10 @@ static int upstream_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	gcp->is_target_alive = true;
 	gcp->conn_state = CONN_STATE_FORWARDING;
 	gcp->target.ep_mask = EPOLLOUT | EPOLLIN | EPOLLRDHUP;
+
+	r = gwp_http_fwd_begin(w, gcp);
+	if (unlikely(r))
+		return r;
 
 	pr_info(&ctx->lh, "Upstream tunnel established (idx=%u, ca=%s, dst=%s)",
 		gcp->idx, ip_to_str(&gcp->client_addr),
@@ -1187,6 +1202,10 @@ static int handle_ev_target_conn_result(struct gwp_wrk *w,
 
 	gcp->is_target_alive = true;
 	gcp->conn_state = CONN_STATE_FORWARDING;
+
+	r = gwp_http_fwd_begin(w, gcp);
+	if (unlikely(r))
+		return r;
 
 	if (gcp->client.len) {
 		sr = __do_send(&gcp->client, &gcp->target);
@@ -1377,13 +1396,13 @@ static int handle_ev_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	 * triggered) until recv() returns 0 and sets rd_eof.
 	 */
 	if (ev->events & (EPOLLIN | EPOLLHUP)) {
-		r = do_splice(&gcp->target, &gcp->client, true, true);
+		r = do_splice(w, gcp, &gcp->target, &gcp->client, true, true);
 		if (r)
 			return r;
 	}
 
 	if (ev->events & EPOLLOUT) {
-		r = do_splice(&gcp->client, &gcp->target, true, true);
+		r = do_splice(w, gcp, &gcp->client, &gcp->target, true, true);
 		if (r)
 			return r;
 	}
@@ -1406,13 +1425,14 @@ static int handle_ev_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	}
 
 	if (ev->events & (EPOLLIN | EPOLLHUP)) {
-		r = do_splice(&gcp->client, &gcp->target, true, gcp->is_target_alive);
+		r = do_splice(w, gcp, &gcp->client, &gcp->target, true,
+			      gcp->is_target_alive);
 		if (r)
 			return r;
 	}
 
 	if (ev->events & EPOLLOUT) {
-		r = do_splice(&gcp->target, &gcp->client, true, true);
+		r = do_splice(w, gcp, &gcp->target, &gcp->client, true, true);
 		if (r)
 			return r;
 	}
