@@ -17,11 +17,8 @@
 #include <netdb.h>
 #include <assert.h>
 #include <unistd.h>
-#include <endian.h>
-#ifdef CONFIG_HAVE_GETRANDOM
-#include <sys/random.h>
-#endif
 #include <gwproxy/dns_cache.h>
+#include <gwproxy/dns_hash.h>
 #include <arpa/inet.h>
 
 struct gwp_dns_cache_entry {
@@ -73,114 +70,9 @@ struct gwp_dns_cache {
  */
 #define GWP_DNS_HOUSEKEEP_CHUNK	1024
 
-/*
- * A per-cache random 128-bit key for hash_key(), so an attacker cannot tell
- * which hostnames share a bucket. getrandom() is preferred; the fallback mixes
- * time/pid/address, which is not cryptographic but still unknown to a remote
- * attacker.
- *
- * The fallback covers two cases: getrandom() failing at run time, and libcs
- * that do not provide it at all (Termux on Android, say), where calling it
- * would not even compile -- hence the configure probe rather than a bare
- * __has_include or a version check.
- */
-static void gen_hash_key(uint64_t key[2])
-{
-	uint64_t s;
-
-#ifdef CONFIG_HAVE_GETRANDOM
-	if (getrandom(key, 2 * sizeof(*key), 0) == (ssize_t)(2 * sizeof(*key)))
-		return;
-#endif
-
-	s = (uint64_t)time(NULL);
-	s ^= (uint64_t)getpid() * 0x9e3779b97f4a7c15ULL;
-	s ^= (uint64_t)(uintptr_t)&s;
-	key[0] = s;
-	key[1] = (s ^ (uint64_t)(uintptr_t)key) * 0xbf58476d1ce4e5b9ULL;
-}
-
-static inline uint64_t rotl64(uint64_t x, unsigned int b)
-{
-	return (x << b) | (x >> (64 - b));
-}
-
-#define SIPROUND(v0, v1, v2, v3)			\
-	do {						\
-		v0 += v1; v1 = rotl64(v1, 13);		\
-		v1 ^= v0; v0 = rotl64(v0, 32);		\
-		v2 += v3; v3 = rotl64(v3, 16);		\
-		v3 ^= v2;				\
-		v0 += v3; v3 = rotl64(v3, 21);		\
-		v3 ^= v0;				\
-		v2 += v1; v1 = rotl64(v1, 17);		\
-		v1 ^= v2; v2 = rotl64(v2, 32);		\
-	} while (0)
-
-/*
- * SipHash-1-3 of @len bytes at @in under the 128-bit @key.
- *
- * A keyed PRF, not a seeded hash: DJB2 started from a random seed still made
- * two names of equal length collide under every seed when they collided under
- * one (the seed only scales the whole sum), so an attacker with a wildcard
- * zone could still fill one bucket chain. With a secret key, which names share
- * a bucket cannot be predicted.
- */
-static uint64_t siphash13(const uint64_t key[2], const void *in, size_t len)
-{
-	const unsigned char *p = in;
-	uint64_t v0 = 0x736f6d6570736575ULL ^ key[0];
-	uint64_t v1 = 0x646f72616e646f6dULL ^ key[1];
-	uint64_t v2 = 0x6c7967656e657261ULL ^ key[0];
-	uint64_t v3 = 0x7465646279746573ULL ^ key[1];
-	uint64_t b = (uint64_t)len << 56, m;
-	size_t i, left = len & 7;
-
-	for (i = 0; i + 8 <= len; i += 8) {
-		memcpy(&m, p + i, 8);
-		m = le64toh(m);
-		v3 ^= m;
-		SIPROUND(v0, v1, v2, v3);
-		v0 ^= m;
-	}
-
-	for (p += i; left--;)
-		b |= (uint64_t)p[left] << (8 * left);
-
-	v3 ^= b;
-	SIPROUND(v0, v1, v2, v3);
-	v0 ^= b;
-	v2 ^= 0xff;
-	SIPROUND(v0, v1, v2, v3);
-	SIPROUND(v0, v1, v2, v3);
-	SIPROUND(v0, v1, v2, v3);
-	return v0 ^ v1 ^ v2 ^ v3;
-}
-
 static uint64_t hash_key(const uint64_t key[2], const char *name, size_t len)
 {
-	return siphash13(key, name, len);
-}
-
-/*
- * ASCII-lowercase @key into @buf (capacity @cap) and return the length incl. the
- * NUL terminator, or 0 if it does not fit. DNS is case-insensitive, so keying on
- * the folded name avoids duplicate entries (and lookup misses) for case-varied
- * requests. Only A-Z is folded (hostnames are ASCII; avoids locale tolower()).
- */
-static size_t normalize_key(const char *key, char *buf, size_t cap)
-{
-	size_t i;
-
-	for (i = 0; key[i]; i++) {
-		unsigned char c = (unsigned char)key[i];
-
-		if (i + 1 >= cap)
-			return 0;
-		buf[i] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : (char)c;
-	}
-	buf[i] = '\0';
-	return i + 1;
+	return gwp_siphash13(key, name, len);
 }
 
 static int dns_map_init(struct dns_hash_map *map, size_t nr_buckets,
@@ -193,7 +85,7 @@ static int dns_map_init(struct dns_hash_map *map, size_t nr_buckets,
 	map->nr_buckets = nr_buckets;
 	map->nr_entries = 0;
 	map->max_entries = max_entries;
-	gen_hash_key(map->key);
+	gwp_dns_gen_hash_key(map->key);
 	return 0;
 }
 
@@ -322,7 +214,7 @@ static int dns_map_insert(struct dns_hash_map *map, const char *key,
 	char lkey[256];
 	int r;
 
-	if (!normalize_key(key, lkey, sizeof(lkey)))
+	if (!gwp_dns_fold_name(key, lkey, sizeof(lkey)))
 		return -EINVAL;
 
 	r = alloc_dns_entry(&de, lkey, ai, expired_at);
@@ -476,7 +368,7 @@ static int dns_map_lookup(struct dns_hash_map *map, const char *key,
 	char lkey[256];
 	size_t nl;
 
-	nl = normalize_key(key, lkey, sizeof(lkey));
+	nl = gwp_dns_fold_name(key, lkey, sizeof(lkey));
 	if (nl <= 1 || nl > 255)
 		return -EINVAL;
 
