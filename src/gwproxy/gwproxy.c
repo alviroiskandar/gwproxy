@@ -598,14 +598,17 @@ static int gwp_raw_dns_resolve(struct gwp_wrk __unused *w,
 
 #define FULL_ADDRSTRLEN (INET6_ADDRSTRLEN + sizeof(":65535[]") - 1)
 
-__hot
+/*
+ * Never NULL: the result goes straight to "%s". An address that is not set
+ * yet (the target of a pair closed during its handshake) prints as "-".
+ */
 const char *ip_to_str(const struct gwp_sockaddr *gs)
 {
 	static __thread char buf[8][FULL_ADDRSTRLEN];
 	static __thread uint8_t idx = 0;
 	char *bp = buf[idx++ % 8];
 
-	return convert_ssaddr_to_str(bp, gs) ? NULL : bp;
+	return convert_ssaddr_to_str(bp, gs) ? "-" : bp;
 }
 
 __cold
