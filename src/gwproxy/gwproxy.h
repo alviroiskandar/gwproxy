@@ -543,6 +543,14 @@ struct gwp_conn_pair {
 	uint8_t			next_cand;
 #ifdef CONFIG_IO_URING
 	bool			attempt_timer_armed;
+	/*
+	 * Protocol/connect timeouts (EV_BIT_IOU_TIMER) still outstanding. Each
+	 * holds a reference, so teardown has to remove them or the pair, and
+	 * the client socket with it, stays open until they expire. A count
+	 * rather than a flag: the protocol timer can still be pending when the
+	 * connect timer is armed.
+	 */
+	uint8_t			nr_timers_armed;
 #endif
 };
 

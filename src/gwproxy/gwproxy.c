@@ -697,6 +697,14 @@ static int gwp_ctx_init_thread_sock(struct gwp_wrk *w,
 	__sys_setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &v, sizeof(v));
 
 	/*
+	 * The client-side TCP options. An accepted socket inherits
+	 * TCP_NODELAY, SO_KEEPALIVE and the keepalive timings from the
+	 * listener, so setting them here once covers every client of this
+	 * worker, whichever event loop accepts it.
+	 */
+	gwp_setup_cli_sock_options(w, fd);
+
+	/*
 	 * --bind-ipv6-only. Set unconditionally on an IPv6 listener rather than
 	 * only when asked, so the behaviour does not depend on the host's
 	 * net.ipv6.bindv6only sysctl: a wildcard [::] bind accepts IPv4 clients

@@ -43,6 +43,7 @@ struct gwp_iou_tls {
 	uint32_t	tx_len;		/* ciphertext bytes queued in @tx  */
 	uint32_t	tx_sent;	/* of those, already written       */
 	bool		hs_done;	/* handshake finished              */
+	bool		closing;	/* close_notify queued             */
 	unsigned char	rx[GWP_TLS_CIPHER_CAP];
 	unsigned char	tx[GWP_TLS_CIPHER_CAP];
 };
@@ -50,7 +51,7 @@ struct gwp_iou_tls {
 /* Defined further down but referenced by earlier prep/dispatch code. */
 static int handle_sock_ret(int r);
 static int chk_prot_result(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int r);
-static int iou_forward_progress(struct gwp_conn_pair *gcp);
+static int iou_forward_progress(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 static void prep_tls_detect(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 static void send_client_tls(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 static int tls_forward_pump(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
@@ -460,6 +461,7 @@ static struct io_uring_sqe *prep_timer_target(struct gwp_wrk *w,
 	io_uring_sqe_set_data(s, gcp);
 	s->user_data |= EV_BIT_IOU_TIMER;
 	get_gcp(gcp);
+	gcp->nr_timers_armed++;
 	pr_dbg(&w->ctx->lh,
 		"Prepared timer for target fd=%d, ts=%lld.%09lld, ref_cnt=%d",
 		gcp->target.fd, gcp->ts.tv_sec, gcp->ts.tv_nsec, gcp->ref_cnt);
@@ -577,6 +579,17 @@ static void shutdown_gcp(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 			cancel_attempt(w, gcp, i);
 	}
 	prep_attempt_timer_del(w, gcp);
+
+	/*
+	 * The protocol and connect timeouts hold a reference too. Left armed,
+	 * they keep the pair -- and the client socket -- open until they
+	 * expire, so a client that was just sent an error reply (a 407, say)
+	 * would sit on an open connection for the whole protocol timeout. A
+	 * removal that finds the timeout already gone completes with -ENOENT,
+	 * which handle_ev_timer() ignores.
+	 */
+	for (i = 0; i < gcp->nr_timers_armed; i++)
+		prep_timer_del_target(w, gcp);
 
 	/*
 	 * IORING_ASYNC_CANCEL_ALL: an fd can carry more than one in-flight
@@ -721,7 +734,7 @@ static int tls_forward_pump(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 			return -EIO;
 		if (sr == GWP_SSL_OK && got == 0) {	/* clean close_notify */
 			c->rd_eof = true;
-			return iou_forward_progress(gcp);
+			return iou_forward_progress(w, gcp);
 		}
 		c->len += (uint32_t)got;
 	}
@@ -1473,6 +1486,10 @@ static int handle_ev_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	struct gwp_ctx *ctx = w->ctx;
 	int r = 0;
 
+	/* The timeout's own completion: it fired or was removed. */
+	if (!is_timer_del && gcp->nr_timers_armed)
+		gcp->nr_timers_armed--;
+
 	if (!gcp->is_target_alive && res == -ETIME) {
 		assert(is_timer_del == false);
 		r = -ETIME;
@@ -1526,9 +1543,47 @@ static int handle_sock_ret(int r)
  * The pair is torn down only after both directions have been shut, so a client
  * that half-closes its write side still receives the whole response.
  */
-static int iou_forward_progress(struct gwp_conn_pair *gcp)
+#ifdef CONFIG_HTTPS
+/*
+ * A TLS client is owed a close_notify before the FIN, as the epoll loop sends
+ * one: without it the client cannot tell the end of a response that is
+ * delimited by the connection closing from a truncation, and strict clients
+ * (OpenSSL 3, curl) report the read as failed. Queue it through the normal
+ * ciphertext send. Returns true once nothing of ours is left to send, so the
+ * write side can be shut; false while ciphertext is still on its way, whose
+ * send completion comes back through iou_forward_progress().
+ */
+static bool tls_close_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	struct gwp_iou_tls *t = gcp->tls_io;
+	int n;
+
+	if (t->tx_sent < t->tx_len)
+		return false;
+	if (t->closing)
+		return true;
+
+	t->closing = true;
+	gwp_ssl_shutdown(gcp->client.tls);
+	n = gwp_ssl_bio_read(gcp->client.tls, t->tx, sizeof(t->tx));
+	if (n <= 0)
+		return true;
+
+	t->tx_len = (uint32_t)n;
+	t->tx_sent = 0;
+	prep_send_client_cipher(w, gcp, EV_BIT_IOU_CLIENT_SEND);
+	return false;
+}
+#endif
+
+static int iou_forward_progress(struct gwp_wrk __unused *w,
+				struct gwp_conn_pair *gcp)
 {
 	if (gcp->target.rd_eof && gcp->target.len == 0 && !gcp->client.wr_shut) {
+#ifdef CONFIG_HTTPS
+		if (client_is_tls(gcp) && !tls_close_client(w, gcp))
+			return 0;
+#endif
 		__sys_shutdown(gcp->client.fd, SHUT_WR);
 		gcp->client.wr_shut = true;
 	}
@@ -1562,7 +1617,7 @@ static int handle_ev_client_recv(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	if (client_is_tls(gcp)) {
 		if (r == 0) {
 			gcp->client.rd_eof = true;
-			return iou_forward_progress(gcp);
+			return iou_forward_progress(w, gcp);
 		}
 		if (gwp_ssl_bio_write(gcp->client.tls, gcp->tls_io->rx,
 				      (size_t)r) < 0)
@@ -1578,7 +1633,7 @@ static int handle_ev_client_recv(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		 * target's response until it too is done.
 		 */
 		gcp->client.rd_eof = true;
-		return iou_forward_progress(gcp);
+		return iou_forward_progress(w, gcp);
 	}
 
 	from = gcp->client.len;
@@ -1632,7 +1687,7 @@ static int handle_ev_target_recv(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		return 0;
 	}
 	if (gcp->target.rd_eof)
-		return iou_forward_progress(gcp);
+		return iou_forward_progress(w, gcp);
 
 	prep_recv_target(w, gcp);
 	return 0;
@@ -1661,7 +1716,7 @@ static int handle_ev_client_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		    gwp_ssl_bio_pending(gcp->client.tls) > 0)
 			send_client_tls(w, gcp);
 		else if (gcp->target.rd_eof)
-			return iou_forward_progress(gcp);
+			return iou_forward_progress(w, gcp);
 		else if (gcp->target.fd >= 0)
 			prep_recv_target(w, gcp);
 		return 0;
@@ -1686,7 +1741,7 @@ static int handle_ev_client_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	 * forwarding filter delivers its own reply after the origin's EOF.
 	 */
 	if (gcp->target.rd_eof)
-		return iou_forward_progress(gcp);
+		return iou_forward_progress(w, gcp);
 
 	if (gcp->target.fd >= 0)
 		prep_recv_target(w, gcp);
