@@ -1,4 +1,7 @@
 #define _DEFAULT_SOURCE
+#ifdef RUNTEST
+#undef NDEBUG
+#endif
 #include <endian.h>
 #include <stdbool.h>
 #include <gwproxy/dns_parser.h>
@@ -67,7 +70,7 @@ static int skip_literal_name(const uint8_t *in, size_t in_len, size_t idx)
 	return -EINVAL;
 }
 
-static int calculate_question_len(uint8_t *in, size_t in_len)
+static int calculate_question_len(const uint8_t *in, size_t in_len)
 {
 	const uint8_t *p = in;
 	int tot_len, advance_len;
@@ -105,24 +108,40 @@ static int calculate_question_len(uint8_t *in, size_t in_len)
 	return  tot_len;
 }
 
-static int serialize_answ(uint16_t txid, uint8_t *in, size_t in_len, gwdns_answ_data *out)
+static void put_addr(struct gwp_sockaddr *sa, int family, const uint8_t *rdata,
+		     uint16_t port)
 {
-	gwdns_header_pkt *hdr;
-	uint16_t raw_flags;
-	size_t idx, i;
-	void *ptr;
+	memset(sa, 0, sizeof(*sa));
+	if (family == AF_INET6) {
+		sa->i6.sin6_family = AF_INET6;
+		sa->i6.sin6_port = htons(port);
+		memcpy(&sa->i6.sin6_addr, rdata, 16);
+	} else {
+		sa->i4.sin_family = AF_INET;
+		sa->i4.sin_port = htons(port);
+		memcpy(&sa->i4.sin_addr, rdata, 4);
+	}
+}
+
+int gwdns_parse_query(uint16_t txid, uint16_t port, const uint8_t *in,
+		      size_t in_len, struct gwp_sockaddr *addrs, uint8_t cap,
+		      uint8_t *nr_addrs)
+{
+	uint16_t raw_flags, ancount, i;
+	gwdns_header_pkt hdr;
+	uint8_t n = 0;
+	size_t idx;
 	int ret;
 
-	idx = sizeof(*hdr);
+	idx = sizeof(hdr);
 	if (idx >= in_len)
 		return -EAGAIN;
 
-	hdr = (void *)in;
-	if (memcmp(&txid, &hdr->id, sizeof(txid)))
+	memcpy(&hdr, in, sizeof(hdr));
+	if (memcmp(&txid, &hdr.id, sizeof(txid)))
 		return -EINVAL;
 
-	memcpy(&raw_flags, &hdr->flags, sizeof(raw_flags));
-	raw_flags = ntohs(raw_flags);
+	raw_flags = ntohs(hdr.flags);
 	/* QR MUST 1 = response from dns server */
 	if (!DNS_QR(raw_flags))
 		return -EINVAL;
@@ -135,9 +154,8 @@ static int serialize_answ(uint16_t txid, uint8_t *in, size_t in_len, gwdns_answ_
 	if (DNS_RCODE(raw_flags))
 		return -EPROTO;
 
-	// is it safe or recommended to alter the in buffer directly?
-	hdr->ancount = ntohs(hdr->ancount);
-	if (!hdr->ancount)
+	ancount = ntohs(hdr.ancount);
+	if (!ancount)
 		return -ENODATA;
 
 	/*
@@ -160,29 +178,14 @@ static int serialize_answ(uint16_t txid, uint8_t *in, size_t in_len, gwdns_answ_
 	if (idx >= in_len)
 		return -EAGAIN;
 
-	out->hdr.ancount = 0;
-	ptr = malloc(hdr->ancount * sizeof(uint8_t *));
-	if (!ptr)
-		return -ENOMEM;
+	for (i = 0; i < ancount; i++) {
+		uint16_t w, type, rdlength;
 
-	out->rr_answ = ptr;
-	for (i = 0; i < hdr->ancount; i++) {
-		uint16_t is_compressed, rdlength;
-		gwdns_serialized_answ *item = malloc(sizeof(gwdns_serialized_answ));
-		if (!item) {
-			ret = -ENOMEM;
-			goto exit_free;
-		}
+		if (idx + 2 > in_len)
+			return -EAGAIN;
 
-		if (idx + sizeof(is_compressed) > in_len) {
-			ret = -EAGAIN;
-			free(item);
-			goto exit_free;
-		}
-		memcpy(&is_compressed, &in[idx], sizeof(is_compressed));
-		is_compressed = ntohs(is_compressed);
-		is_compressed = DNS_IS_COMPRESSED(is_compressed);
-		if (is_compressed) {
+		memcpy(&w, &in[idx], 2);
+		if (DNS_IS_COMPRESSED(ntohs(w))) {
 			idx += 2; // NAME
 		} else {
 			/*
@@ -191,219 +194,60 @@ static int serialize_answ(uint16_t txid, uint8_t *in, size_t in_len, gwdns_answ_
 			 * owner name out in full, and plenty do. A label
 			 * length is 0..63, so its top two bits are always
 			 * clear and this arm is what a literal name takes.
-			 * Asserting here brought the whole proxy down on a
-			 * conforming answer; walking the labels is all it
-			 * ever needed.
 			 */
 			ret = skip_literal_name(in, in_len, idx);
-			if (ret < 0) {
-				free(item);
-				goto exit_free;
-			}
+			if (ret < 0)
+				return ret;
 			idx = (size_t)ret;
 		}
 
 		/*
 		 * TYPE, CLASS, TTL and RDLENGTH: ten bytes, all of which
-		 * must be there before any is read. Checking for one byte
-		 * per field let a reply cut inside one read up to three
-		 * bytes past the end of the buffer.
+		 * must be there before any is read.
 		 */
-		if (idx > in_len || in_len - idx < 10) {
-			ret = -EAGAIN;
-			free(item);
-			goto exit_free;
-		}
+		if (idx > in_len || in_len - idx < 10)
+			return -EAGAIN;
 
-		memcpy(&item->rr_type, &in[idx], 2);
-		item->rr_type = ntohs(item->rr_type);
-		idx += 2; // TYPE
-		memcpy(&item->rr_class, &in[idx], 2);
-		item->rr_class = ntohs(item->rr_class);
-		idx += 2; // CLASS
-		memcpy(&item->ttl, &in[idx], 4);
-		item->ttl = be32toh(item->ttl);
-		idx += 4; // TTL
-
-		memcpy(&rdlength, &in[idx], sizeof(rdlength));
+		memcpy(&type, &in[idx], 2);
+		type = ntohs(type);
+		memcpy(&rdlength, &in[idx + 8], 2);
 		rdlength = ntohs(rdlength);
-		switch (item->rr_type) {
-		case TYPE_AAAA:
-			if (rdlength != sizeof(struct in6_addr)) {
-				ret = -EINVAL;
-				free(item);
-				goto exit_free;
-			}
-			break;
-		case TYPE_A:
-			if (rdlength != sizeof(struct in_addr)) {
-				ret = -EINVAL;
-				free(item);
-				goto exit_free;
-			}
-			break;
-		case TYPE_CNAME:
-			/*
-			 * @rdlength is 16 bits of whatever the responder sent,
-			 * so this is the one arm that moves the cursor by an
-			 * attacker's number. Every other field re-checks the
-			 * bound afterwards; this one jumped straight back to
-			 * the top of the loop, where the first thing read is
-			 * in[idx] -- up to 64 KiB past a 512-byte stack
-			 * buffer.
-			 */
-			if ((size_t)2 + rdlength > in_len - idx) {
-				ret = -EINVAL;
-				free(item);
-				goto exit_free;
-			}
-			idx += 2 + rdlength;
-			free(item);
-			continue;
-
-		default:
-			ret = -EINVAL;
-			free(item);
-			goto exit_free;
-			break;
-		}
-
-		item->rdlength = rdlength;
-		idx += 2;
-		if (idx >= in_len) {
-			ret = -EAGAIN;
-			free(item);
-			goto exit_free;
-		}
-
-		ptr = malloc(rdlength);
-		if (!ptr) {
-			ret = -ENOMEM;
-			free(item);
-			goto exit_free;
-		}
+		idx += 10;
 
 		/*
-		 * Check before copying, not after: the old order had already
-		 * read past the end by the time it noticed. An AAAA claims 16
-		 * bytes of RDATA, so a response ending one byte in took 15
-		 * from beyond the buffer.
+		 * @rdlength is 16 bits of whatever the responder sent, so
+		 * check it against what is left before moving by it.
 		 */
-		if ((size_t)rdlength > in_len - idx) {
-			ret = -EINVAL;
-			free(item);
-			free(ptr);
-			goto exit_free;
+		if (rdlength > in_len - idx)
+			return -EINVAL;
+
+		switch (type) {
+		case TYPE_A:
+			if (rdlength != 4)
+				return -EINVAL;
+			if (n < cap)
+				put_addr(&addrs[n++], AF_INET, &in[idx], port);
+			break;
+		case TYPE_AAAA:
+			if (rdlength != 16)
+				return -EINVAL;
+			if (n < cap)
+				put_addr(&addrs[n++], AF_INET6, &in[idx], port);
+			break;
+		case TYPE_CNAME:
+			break;
+		default:
+			return -EINVAL;
 		}
-		memcpy(ptr, &in[idx], rdlength);
+
 		idx += rdlength;
-
-		item->rdata = ptr;
-		out->rr_answ[out->hdr.ancount] = item;
-		out->hdr.ancount++;
 	}
 
-	if (!out->hdr.ancount) {
-		free(out->rr_answ);
+	if (!n)
 		return -ENODATA;
-	}
 
+	*nr_addrs = n;
 	return 0;
-exit_free:
-	for (i = 0; i < out->hdr.ancount; i++) {
-		free(out->rr_answ[i]->rdata);
-		free(out->rr_answ[i]);
-	}
-	free(out->rr_answ);
-	return ret;
-}
-
-static void free_serialize_answ(gwdns_answ_data *answ)
-{
-	size_t i;
-	for (i = 0; i < answ->hdr.ancount; i++) {
-		free(answ->rr_answ[i]->rdata);
-		free(answ->rr_answ[i]);
-	}
-	free(answ->rr_answ);
-}
-
-int gwdns_parse_query(uint16_t txid, const char *service,
-			uint8_t *in, size_t in_len,
-			struct gwdns_addrinfo_node **ai)
-{
-	struct gwdns_addrinfo_node *results, *tail;
-	gwdns_answ_data raw_answ;
-	int r, port;
-	size_t i;
-
-	port = atoi(service);
-	if (port < 0)
-		return -EINVAL;
-	port = htons(port);
-
-	r = serialize_answ(txid, in, in_len, &raw_answ);
-	if (r)
-		return r;
-
-	results = tail = NULL;
-	for (i = 0; i < raw_answ.hdr.ancount; i++) {
-		struct gwdns_addrinfo_node *new_node;
-		gwdns_serialized_answ *answ;
-		struct sockaddr_in6 *i6;
-		struct sockaddr_in *i4;
-
-		answ = raw_answ.rr_answ[i];
-		new_node = malloc(sizeof(*new_node));
-		if (!new_node) {
-			r = -ENOMEM;
-			goto exit_free;
-		}
-		new_node->ai_next = NULL;
-
-		if (answ->rr_type == TYPE_AAAA) {
-			i6 = &new_node->ai_addr.i6;
-			new_node->ai_family = AF_INET6;
-			new_node->ai_addrlen = sizeof(i6);
-			i6->sin6_port = port;
-			i6->sin6_family = AF_INET6;
-			assert(sizeof(i6->sin6_addr) == answ->rdlength);
-			memcpy(&i6->sin6_addr, answ->rdata, answ->rdlength);
-		} else {
-			i4 = &new_node->ai_addr.i4;
-			new_node->ai_family = AF_INET;
-			new_node->ai_addrlen = sizeof(i4);
-			i4->sin_port = port;
-			i4->sin_family = AF_INET;
-			assert(sizeof(i4->sin_addr) == answ->rdlength);
-			memcpy(&i4->sin_addr, answ->rdata, answ->rdlength);
-			new_node->ai_ttl = answ->ttl;
-		}
-
-		if (!tail)
-			results = new_node;
-		else
-			tail->ai_next = new_node;
-		tail = new_node;
-	}
-
-	*ai = results;
-	r = 0;
-exit_free:
-	if (r && results)
-		gwdns_free_parsed_query(results);
-	free_serialize_answ(&raw_answ);
-	return r;
-}
-
-void gwdns_free_parsed_query(struct gwdns_addrinfo_node *ai)
-{
-	struct gwdns_addrinfo_node *tmp, *node = ai;
-	while (node) {
-		tmp = node->ai_next;
-		free(node);
-		node = tmp;
-	}
 }
 
 static ssize_t construct_question(gwdns_question_part *question)
@@ -431,7 +275,7 @@ static ssize_t construct_question(gwdns_question_part *question)
 	*/
 	memset(hdr, 0, sizeof(*hdr));
 	/*
-	 * no need to htons, so no ntohs for comparison in serialize_answ.
+	 * no need to htons, so no ntohs for comparison in gwdns_parse_query().
 	 */
 	hdr->id = question->txid;
 	DNS_SET_RD(hdr->flags, true);
@@ -477,9 +321,10 @@ ssize_t gwdns_build_query(uint16_t txid, const char *name, int family, uint8_t *
 
 #ifdef RUNTEST
 
-void test_parse_ipv4(void)
+static void test_parse_ipv4(void)
 {
-	struct gwdns_addrinfo_node *d, *node;
+	struct gwp_sockaddr addrs[8];
+	uint8_t nr, i;
 	uint16_t txid;
 
 	uint8_t recv_pkt[] = {
@@ -497,27 +342,21 @@ void test_parse_ipv4(void)
 	};
 
 	memcpy(&txid, recv_pkt, 2);
-	d = NULL;
-	assert(!gwdns_parse_query(txid, "80", recv_pkt, sizeof(recv_pkt), &d));
-	assert(d);
-	node = d;
-	while (node) {
-		struct gwdns_addrinfo_node *tmp;
+	assert(!gwdns_parse_query(txid, 80, recv_pkt, sizeof(recv_pkt), addrs, 8, &nr));
+	assert(nr == 6);
+	for (i = 0; i < nr; i++) {
 		char buff[FULL_ADDRSTRLEN];
 
-		tmp = node->ai_next;
-		assert(node->ai_family == AF_INET);
-		convert_ssaddr_to_str(buff, &node->ai_addr);
+		assert(addrs[i].sa.sa_family == AF_INET);
+		convert_ssaddr_to_str(buff, &addrs[i]);
 		printf("IPv4: %s\n", buff);
-		node = tmp;
 	}
-
-	gwdns_free_parsed_query(d);
 }
 
-void test_parse_ipv6(void)
+static void test_parse_ipv6(void)
 {
-	struct gwdns_addrinfo_node *d, *node;
+	struct gwp_sockaddr addrs[8];
+	uint8_t nr, i;
 	uint16_t txid;
 
 	uint8_t recv_pkt[] = {
@@ -563,25 +402,18 @@ void test_parse_ipv6(void)
 
 	memcpy(&txid, recv_pkt, sizeof(txid));
 
-	node = NULL;
-	assert(!gwdns_parse_query(txid, "80", recv_pkt, sizeof(recv_pkt), &d));
-	assert(d);
-	node = d;
-	while (node) {
-		struct gwdns_addrinfo_node *tmp;
+	assert(!gwdns_parse_query(txid, 80, recv_pkt, sizeof(recv_pkt), addrs, 8, &nr));
+	assert(nr == 4);
+	for (i = 0; i < nr; i++) {
 		char buff[FULL_ADDRSTRLEN];
 
-		tmp = node->ai_next;
-		assert(node->ai_family == AF_INET6);
-		convert_ssaddr_to_str(buff, &node->ai_addr);
+		assert(addrs[i].sa.sa_family == AF_INET6);
+		convert_ssaddr_to_str(buff, &addrs[i]);
 		printf("IPv6: %s\n", buff);
-		node = tmp;
 	}
-
-	gwdns_free_parsed_query(d);
 }
 
-void test_build_ipv4(void)
+static void test_build_ipv4(void)
 {
 	uint8_t buff[UDP_MSG_LIMIT];
 	gwdns_header_pkt *hdr;
@@ -601,7 +433,7 @@ void test_build_ipv4(void)
 	assert(!memcmp(buff + 12 + 12, &c, 2));
 }
 
-void test_build_ipv6(void)
+static void test_build_ipv6(void)
 {
 	uint8_t buff[UDP_MSG_LIMIT];
 	gwdns_header_pkt *hdr;
@@ -627,11 +459,50 @@ void test_build_ipv6(void)
  * the mock data are produced by this script:
  * https://gist.github.com/realyukii/d7b450b4ddc305c66a2d8cd5600f23c4
  */
-void run_all_tests(void)
+/*
+ * A reply with more addresses than the caller has room for: the extra ones
+ * are checked but dropped, and a reply cut short anywhere is refused.
+ */
+static void test_parse_cap_and_truncation(void)
+{
+	uint8_t pkt[] = {
+		0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00,
+		0x01, 'a', 0x01, 'b', 0x00, 0x00, 0x01, 0x00, 0x01,
+		0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x04,
+		10, 0, 0, 1,
+		0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x04,
+		10, 0, 0, 2,
+		0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x04,
+		10, 0, 0, 3,
+	};
+	struct gwp_sockaddr addrs[2];
+	uint16_t txid;
+	uint8_t nr;
+	size_t len;
+
+	memcpy(&txid, pkt, 2);
+	assert(!gwdns_parse_query(txid, 443, pkt, sizeof(pkt), addrs, 2, &nr));
+	assert(nr == 2);
+	assert(addrs[0].i4.sin_addr.s_addr == htonl(0x0a000001));
+	assert(addrs[1].i4.sin_addr.s_addr == htonl(0x0a000002));
+	assert(addrs[1].i4.sin_port == htons(443));
+
+	/* Every shorter prefix fails, and none reads past its end (ASan). */
+	for (len = 0; len < sizeof(pkt); len++) {
+		uint8_t *cut = malloc(len ? len : 1);
+
+		assert(cut);
+		memcpy(cut, pkt, len);
+		assert(gwdns_parse_query(txid, 443, cut, len, addrs, 2, &nr));
+		free(cut);
+	}
+}
+
+static void run_all_tests(void)
 {
 	/*
-	 * We can't use serialize_answ to parse multiple response at once.
-	 * The caller MUST call serialize_answ more than one time if there's
+	 * We can't use gwdns_parse_query() to parse multiple response at once.
+	 * The caller MUST call gwdns_parse_query() more than one time if there's
 	 * more than one response, because txid is passed to only verify one
 	 * response.
 	 */
@@ -643,6 +514,7 @@ void run_all_tests(void)
 	test_parse_ipv4();
 	fprintf(stderr, "test parsing DNS standard query packet for TYPE_AAAA!\n");
 	test_parse_ipv6();
+	test_parse_cap_and_truncation();
 	fprintf(stderr, "all tests passed!\n");
 }
 

@@ -111,9 +111,11 @@ static ssize_t __do_send(struct gwp_conn *src, struct gwp_conn *dst);
 static int handle_ev_raw_dns_query(struct gwp_wrk *w)
 {
 	struct gwp_dns_resolver *res = &w->dns->resolvers[0];
+	struct gwp_sockaddr addrs[GWP_MAX_CONN_CAND];
 	struct gwp_conn_pair *gcp = NULL;
 	struct gwp_ctx *ctx = w->ctx;
 	uint8_t buf[UDP_MSG_LIMIT];
+	uint8_t nr = 0;
 	uint16_t len;
 	ssize_t ret;
 	int r;
@@ -140,21 +142,19 @@ static int handle_ev_raw_dns_query(struct gwp_wrk *w)
 	if (unlikely(ret < 0))
 		return 0;
 
-	ret = gwp_dns_res_complete_query(res, gcp->gdp, buf, len,
-					 &gcp->target_addr);
+	ret = gwp_dns_res_complete_query(res, gcp->gdp, buf, len, addrs,
+					 GWP_MAX_CONN_CAND, &nr);
 	if (ret == -EAGAIN) {
 		/* Retry with the fallback record type. */
 		ret = send_dns_payload(res, gcp);
 		if (likely(!ret))
 			return 0;
 	} else if (likely(!ret)) {
-		pr_dbg(&ctx->lh, "Resolved DNS query for %s to %s (gcp_idx=%u)",
-			gcp->gdp->host, ip_to_str(&gcp->target_addr), gcp->idx);
-		/*
-		 * The raw resolver still yields one address per reply, so
-		 * there is nothing to fall back to here yet.
-		 */
-		gwp_conn_set_single_candidate(gcp, &gcp->target_addr);
+		/* Every address of the reply, so a dead one has a fallback. */
+		gwp_conn_set_candidates(gcp, addrs, nr);
+		pr_dbg(&ctx->lh, "Resolved DNS query for %s to %s (%u addr, gcp_idx=%u)",
+			gcp->gdp->host, ip_to_str(&gcp->target_addr), nr,
+			gcp->idx);
 		r = handle_connect(w, gcp);
 		goto out;
 	}

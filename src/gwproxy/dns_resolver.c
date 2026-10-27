@@ -360,10 +360,9 @@ int gwp_dns_res_complete_query(struct gwp_dns_resolver *res,
 				struct gwp_dns_packet *gdp,
 				uint8_t buf[UDP_MSG_LIMIT],
 				uint16_t len,
-				struct gwp_sockaddr *addr)
+				struct gwp_sockaddr *addrs, uint8_t cap,
+				uint8_t *nr_addrs)
 {
-	struct gwdns_addrinfo_node *ai = NULL;
-	char port[sizeof("65535")];
 	uint16_t txid;
 	ssize_t r;
 
@@ -380,11 +379,8 @@ int gwp_dns_res_complete_query(struct gwp_dns_resolver *res,
 	if (gdp->gcp != res->sess_map->sess_map[txid])
 		return -EINVAL;
 
-	snprintf(port, sizeof(port), "%hu", gdp->port);
-	r = gwdns_parse_query(txid, port, buf, len, &ai);
+	r = gwdns_parse_query(txid, gdp->port, buf, len, addrs, cap, nr_addrs);
 	if (!r) {
-		*addr = ai->ai_addr;
-		gwdns_free_parsed_query(ai);
 		gwp_dns_res_drop_query(res, gdp->gcp, txid);
 		return 0;
 	}

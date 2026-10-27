@@ -44,6 +44,7 @@ int gwp_dns_res_complete_query(struct gwp_dns_resolver *res,
 				struct gwp_dns_packet *gdp,
 				uint8_t buf[UDP_MSG_LIMIT],
 				uint16_t len,
-				struct gwp_sockaddr *addr);
+				struct gwp_sockaddr *addrs, uint8_t cap,
+				uint8_t *nr_addrs);
 
 #endif /* #ifndef GWPROXY__DNS_RESOLVER_H */
