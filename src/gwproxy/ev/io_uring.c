@@ -13,6 +13,7 @@
 #include <gwproxy/common.h>
 #include <gwproxy/acl.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <inttypes.h>
 #include <sys/eventfd.h>
 #include <errno.h>
@@ -93,13 +94,24 @@ int gwp_ctx_init_thread_io_uring(struct gwp_wrk *w)
 	if (!iou)
 		return -ENOMEM;
 
-	r = io_uring_queue_init(1024, &iou->ring, 0);
+	/*
+	 * Stop doorbell, see gwp_ctx_signal_all_io_uring(). Created before
+	 * the ring so a worker never exists without one.
+	 */
+	r = __sys_eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
 	if (r < 0)
 		goto err_free_iou;
+	iou->stop_efd = r;
+
+	r = io_uring_queue_init(1024, &iou->ring, 0);
+	if (r < 0)
+		goto err_close_efd;
 
 	w->iou = iou;
 	return 0;
 
+err_close_efd:
+	__sys_close(iou->stop_efd);
 err_free_iou:
 	free(iou);
 	return r;
@@ -156,6 +168,7 @@ __cold
 void gwp_ctx_free_thread_io_uring(struct gwp_wrk *w)
 {
 	io_uring_queue_exit(&w->iou->ring);
+	__sys_close(w->iou->stop_efd);
 	pr_dbg(&w->ctx->lh, "Worker %u io_uring queue exited", w->idx);
 	free(w->iou);
 	w->iou = NULL;
@@ -184,6 +197,20 @@ static void arm_accept(struct gwp_wrk *w)
 	*addr_len = sizeof(iou->accept_addr);
 	io_uring_prep_accept(s, w->tcp_fd, addr, addr_len, SOCK_CLOEXEC);
 	s->user_data = EV_BIT_IOU_ACCEPT;
+}
+
+/*
+ * Watch this worker's stop doorbell. One-shot and never re-armed: the eventfd
+ * is never read, so once rung it stays readable, and a poll armed after the
+ * ring still completes at once -- a stop cannot slip in between the loop's
+ * ctx->stop test and its wait.
+ */
+static void arm_stop_poll(struct gwp_wrk *w)
+{
+	struct io_uring_sqe *s = get_sqe_nofail(w);
+
+	io_uring_prep_poll_add(s, w->iou->stop_efd, POLLIN);
+	s->user_data = EV_BIT_IOU_STOP;
 }
 
 /*
@@ -2371,7 +2398,8 @@ static int handle_event(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 		pr_dbg(&ctx->lh, "Handling DNS query event: %d", cqe->res);
 		r = handle_ev_dns_query(w, udata);
 		break;
-	case EV_BIT_IOU_MSG_RING:
+	case EV_BIT_IOU_STOP:
+		pr_dbg(&ctx->lh, "Handling stop doorbell: %d", cqe->res);
 		return 0;
 	case EV_BIT_IOU_CLOSE:
 		/*
@@ -2462,6 +2490,7 @@ int gwp_ctx_thread_entry_io_uring(struct gwp_wrk *w)
 		prep_acl_reload(w);
 
 	io_uring_set_iowait(&w->iou->ring, false);
+	arm_stop_poll(w);
 	arm_accept(w);
 	while (!ctx->stop) {
 		r = fish_events(w);
@@ -2482,22 +2511,35 @@ int gwp_ctx_thread_entry_io_uring(struct gwp_wrk *w)
 	return r;
 }
 
+/*
+ * Ask every worker to stop. Each worker is woken through its own eventfd,
+ * which its own ring polls (arm_stop_poll()), so no thread ever touches another
+ * thread's ring, and the only things done here are an atomic exchange and one
+ * write(2) per worker: both async-signal-safe, so sig_handler() can call this.
+ *
+ * Every exiting worker calls this again, as do gwp_ctx_stop() and
+ * gwp_ctx_free_threads(), so ring the doorbells only on the first call. That
+ * also keeps a late signal away from the workers once gwp_ctx_free_threads()
+ * has started tearing them down: by then the flag is set.
+ */
 __cold
 void gwp_ctx_signal_all_io_uring(struct gwp_ctx *ctx)
 {
-	struct gwp_wrk *we = &ctx->workers[0];
+	static const uint64_t one = 1;
 	int i;
 
 	ctx->stop = true;
-	for (i = 0; i < ctx->cfg.nr_workers; i++) {
-		struct io_uring_sqe *s = __get_sqe_nofail(&we->iou->ring);
-		struct gwp_wrk *wo = &ctx->workers[i];
-		int fd = wo->iou->ring.ring_fd;
-		io_uring_prep_msg_ring(s, fd, 0, EV_BIT_IOU_MSG_RING, 0);
-		s->user_data = EV_BIT_IOU_MSG_RING;
-	}
+	if (atomic_exchange(&ctx->stop_signalled, true))
+		return;
 
-	io_uring_submit_eintr(&we->iou->ring, 8);
+	for (i = 0; i < ctx->cfg.nr_workers; i++) {
+		int fd = ctx->workers[i].iou->stop_efd;
+		ssize_t r;
+
+		do {
+			r = __sys_write(fd, &one, sizeof(one));
+		} while (r == -EINTR);
+	}
 }
 
 #endif // CONFIG_IO_URING

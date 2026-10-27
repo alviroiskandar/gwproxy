@@ -3743,12 +3743,20 @@ static int gwp_ctx_run(struct gwp_ctx *ctx)
 
 static struct gwp_ctx *g_ctx = NULL;
 
+/*
+ * Runs on whichever thread the signal lands on, possibly in the middle of a
+ * worker's event loop, so gwp_ctx_stop() must stay async-signal-safe: set the
+ * stop flag and wake the workers through their eventfds, nothing more.
+ */
 __cold
 static void sig_handler(int sig)
 {
+	int saved_errno = errno;
+
 	if (g_ctx)
 		gwp_ctx_stop(g_ctx);
 
+	errno = saved_errno;
 	(void)sig;
 }
 

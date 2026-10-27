@@ -209,7 +209,7 @@ enum {
 	EV_BIT_IOU_TARGET_CANCEL	= (13ull << 48ull),
 	EV_BIT_IOU_CLIENT_CANCEL	= (14ull << 48ull),
 	EV_BIT_IOU_TIMER_DEL		= (15ull << 48ull),
-	EV_BIT_IOU_MSG_RING		= (16ull << 48ull),
+	EV_BIT_IOU_STOP			= (16ull << 48ull),
 	EV_BIT_IOU_TLS_DETECT		= (17ull << 48ull),
 	EV_BIT_IOU_TLS_HS_RECV		= (18ull << 48ull),
 	EV_BIT_IOU_TLS_HS_SEND		= (19ull << 48ull),
@@ -572,6 +572,12 @@ struct iou {
 	 * due to fd exhaustion (EMFILE/ENFILE). Must outlive SQE submission.
 	 */
 	struct __kernel_timespec accept_retry_ts;
+
+	/*
+	 * Stop doorbell: gwp_ctx_signal_all_io_uring() writes it, and a poll
+	 * in this worker's own ring wakes the worker up.
+	 */
+	int			stop_efd;
 };
 #endif
 
@@ -656,6 +662,8 @@ struct gwp_ctx {
 	char				*acl_ino_buf;
 	_Atomic(int32_t)		nr_fd_closed;
 	_Atomic(int32_t)		nr_accept_stopped;
+	/* The workers' stop doorbells have been rung (io_uring). */
+	_Atomic(bool)			stop_signalled;
 };
 
 struct gwp_conn_pair *gwp_alloc_conn_pair(struct gwp_wrk *w);
