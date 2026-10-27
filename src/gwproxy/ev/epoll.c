@@ -2712,6 +2712,24 @@ static int handle_ev_client_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 #endif
 	}
 
+	/*
+	 * While the request waits on DNS or the connect, what the client
+	 * sends behind it stays in client.buf. Once that is full, recv() is
+	 * skipped, and a level-triggered EPOLLIN would report the same unread
+	 * data on every epoll_wait(), spinning the worker for as long as the
+	 * lookup takes. Park the fd as forwarding does (adj_epl_in());
+	 * __adjust_epl_mask() takes it back once the target is up and the
+	 * buffer drains.
+	 */
+	if (adj_epl_in(&gcp->client)) {
+		struct epoll_event cev;
+
+		cev.events = gcp->client.ep_mask;
+		cev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_CLIENT_PROT;
+		return __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_MOD, gcp->client.fd,
+				       &cev);
+	}
+
 	return 0;
 }
 

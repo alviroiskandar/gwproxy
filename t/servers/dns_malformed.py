@@ -4,7 +4,7 @@
 Answers every query with a deliberately malformed response chosen by mode.
 Modes mirror the four findings in src/gwproxy/dns_parser.c.
 """
-import os, socket, struct, sys
+import os, socket, struct, sys, time
 
 mode = sys.argv[1]
 port = int(sys.argv[2])
@@ -43,7 +43,13 @@ while True:
     question = q[12:qend + 4]          # name + qtype + qclass
     name = q[12:qend]
 
-    if mode == "good":
+    if mode == "slow":
+        # The ordinary answer, but only after a lookup's worth of waiting.
+        time.sleep(2)
+        rr = b"\xc0\x0c" + struct.pack("!HHIH", 1, 1, 60, 4) + bytes([127, 0, 0, 1])
+        resp = txid + struct.pack("!HHHHH", 0x8180, 1, 1, 0, 0) + question + rr
+
+    elif mode == "good":
         # Control: a perfectly ordinary compressed-name A record.
         rr = b"\xc0\x0c" + struct.pack("!HHIH", 1, 1, 60, 4) + bytes([127, 0, 0, 1])
         resp = txid + struct.pack("!HHHHH", 0x8180, 1, 1, 0, 0) + question + rr
