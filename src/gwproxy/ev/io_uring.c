@@ -1095,6 +1095,24 @@ out_close:
 	return r ? r : -ENOMEM;
 }
 
+/*
+ * accept(2) errors that say the listening socket itself is unusable, as
+ * opposed to the one connection being accepted.
+ */
+static bool is_listener_error(int r)
+{
+	switch (r) {
+	case -EBADF:
+	case -EFAULT:
+	case -EINVAL:
+	case -ENOTSOCK:
+	case -EOPNOTSUPP:
+		return true;
+	default:
+		return false;
+	}
+}
+
 static int handle_ev_accept(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 {
 	int r = __handle_ev_accept(w, cqe);
@@ -1117,8 +1135,30 @@ static int handle_ev_accept(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 			return 0;
 		}
 
-		pr_err(&w->ctx->lh, "Failed to handle accept event: %s", strerror(-r));
-		return r;
+		/*
+		 * Only a listener that is itself broken is worth stopping
+		 * for: re-arming accept on it would fail the same way
+		 * forever. Everything else concerns one connection -- an
+		 * accept(2) the man page says to retry (ECONNABORTED and
+		 * friends), or a pair that failed after a successful accept,
+		 * such as a strict --bind-iface naming a device that is not
+		 * there -- and has been logged and freed already. Returning
+		 * it would stop this worker, and gwp_ctx_thread_entry() would
+		 * then stop the whole proxy, so one client could take every
+		 * live connection down with it. The epoll loop already keeps
+		 * going in this case.
+		 */
+		if (cqe->res < 0 && is_listener_error(r)) {
+			pr_err(&w->ctx->lh, "Failed to accept new connection: %s",
+			       strerror(-r));
+			return r;
+		}
+
+		if (cqe->res < 0)
+			pr_warn(&w->ctx->lh, "Failed to accept new connection: %s",
+				strerror(-r));
+		arm_accept(w);
+		return 0;
 	}
 
 	if (unlikely(w->accept_is_stopped)) {
