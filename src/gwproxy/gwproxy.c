@@ -498,8 +498,8 @@ static int gwp_ctx_init_raw_dns(struct gwp_wrk *w)
 	if (r < 0)
 		goto err_resolvers;
 
-	pr_dbg(&ctx->lh, "Worker %u initialized raw DNS resolver: %s (fd=%d)",
-		w->idx, ctx->cfg.dns_servers, w->dns->resolvers[0].udp_fd);
+	pr_dbg(&ctx->lh, "Worker %u initialized raw DNS resolver: %s",
+		w->idx, ctx->cfg.dns_servers);
 	return 0;
 
 err_resolvers:
@@ -532,12 +532,17 @@ static void gwp_ctx_free_raw_dns(struct gwp_wrk *w)
 static int gwp_alloc_dns_packet(struct gwp_conn_pair *gcp)
 {
 	gcp->gdp = calloc(1, sizeof(*gcp->gdp));
-	return gcp->gdp ? 0 : -ENOMEM;
+	if (!gcp->gdp)
+		return -ENOMEM;
+
+	gcp->gdp->fd = -1;
+	return 0;
 }
 
 static void gwp_free_dns_packet(struct gwp_conn_pair *gcp)
 {
 	if (gcp->gdp) {
+		gwp_dns_res_drop_query(gcp->gdp);
 		free(gcp->gdp->host);
 		free(gcp->gdp);
 		gcp->gdp = NULL;
@@ -569,7 +574,6 @@ static int gwp_raw_dns_resolve(struct gwp_wrk *w,
 	gdp->restyp = cfg_dns_restyp(&w->ctx->cfg);
 
 	gdp->port = port;
-	gdp->buf_len = sizeof(gdp->buf);
 	gdp->gcp = gcp;
 	r = gwp_dns_res_prep_query(res, gdp);
 	if (r < 0)
@@ -2237,13 +2241,7 @@ int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 #ifdef CONFIG_NEW_DNS_RESOLVER
 	if (w->ctx->cfg.use_raw_dns && gcp->gdp) {
-		/*
-		 * A raw DNS query may still be outstanding in the resolver's
-		 * session map (connection torn down before the reply arrived);
-		 * drop it so the map slot is not left dangling at this freed
-		 * gcp, then free the packet (including gdp->host).
-		 */
-		gwp_dns_res_drop_query(&w->dns->resolvers[0], gcp, gcp->gdp->txid);
+		/* Closes the query's socket if it is still open. */
 		gwp_free_dns_packet(gcp);
 	} else if (gcp->gde) {
 		gwp_dns_entry_cancel(gcp->gde);

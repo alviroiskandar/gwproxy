@@ -10,6 +10,8 @@ mode = sys.argv[1]
 port = int(sys.argv[2])
 # Optional: a file that always holds the number of queries received so far.
 count_file = sys.argv[3] if len(sys.argv) > 3 else None
+# Optional: a file to append "<txid> <source port>" to for every query.
+query_log = sys.argv[4] if len(sys.argv) > 4 else None
 nr_queries = 0
 
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -34,6 +36,9 @@ while True:
             f.write("%d\n" % nr_queries)
         os.replace(count_file + ".tmp", count_file)
     txid = q[:2]
+    if query_log:
+        with open(query_log, "a") as f:
+            f.write("%d %d\n" % (struct.unpack("!H", txid)[0], peer[1]))
     qend = qname_end(q, 12)
     question = q[12:qend + 4]          # name + qtype + qclass
     name = q[12:qend]

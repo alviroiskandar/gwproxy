@@ -27,60 +27,13 @@ static int tls_flush_hs(struct gwp_conn *c);
 
 #ifdef CONFIG_NEW_DNS_RESOLVER
 #include <gwproxy/dns_resolver.h>
-static int register_dns_to_epoll(struct gwp_wrk *w)
-{
-	struct gwp_wrk_dns *dns = w->dns;
-	uint32_t i;
-
-	if (!dns)
-		return 0;
-
-	for (i = 0; i < dns->nr; i++) {
-		struct gwp_dns_resolver *res = &dns->resolvers[i];
-		struct epoll_event ev;
-		int r;
-
-		if (res->udp_fd < 0)
-			continue;
-
-		/*
-		 * The only tagged payload that is not a gwp_conn_pair, so it
-		 * needs its own check against the same 48-bit budget.
-		 */
-		if (unlikely(!EV_PTR_OK(res))) {
-			pr_err(&w->ctx->lh,
-			       "BUG: DNS resolver %p has bits 48..63 set; the event word cannot carry it",
-			       (void *)res);
-			return -EOVERFLOW;
-		}
-
-		ev.events = EPOLLIN;
-		ev.data.u64 = PTR_TO_U64(res) | EV_BIT_RAW_DNS_QUERY;
-		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, res->udp_fd, &ev);
-		if (r < 0) {
-			pr_err(&w->ctx->lh,
-			       "Failed to add raw DNS UDP socket to epoll: %s\n",
-			       strerror(-r));
-			return r;
-		}
-
-		pr_dbg(&w->ctx->lh,
-			"Worker %u registered raw DNS UDP socket to epoll (fd=%d)",
-			w->idx, res->udp_fd);
-	}
-
-	return 0;
-}
-
-static int send_dns_payload(struct gwp_dns_resolver *res,
-			    struct gwp_conn_pair *gcp)
+static int send_dns_payload(struct gwp_conn_pair *gcp)
 {
 	struct gwp_dns_packet *gdp = gcp->gdp;
-	const void *b = gdp->buf;
-	size_t l = gdp->buf_len;
 	ssize_t sr;
 
-	sr = __sys_sendto(res->udp_fd, b, l, MSG_NOSIGNAL, NULL, 0);
+	sr = __sys_sendto(gdp->fd, gdp->buf, gdp->buf_len, MSG_NOSIGNAL,
+			  NULL, 0);
 	if (unlikely(sr < 0))
 		return (int)sr;
 
@@ -96,8 +49,16 @@ static int chk_handle_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	struct gwp_cfg *cfg = &w->ctx->cfg;
 
 	if (cfg->use_raw_dns) {
-		struct gwp_dns_resolver *res = &w->dns->resolvers[0];
-		return send_dns_payload(res, gcp);
+		struct epoll_event ev;
+		int r;
+
+		/* The reply comes back on the query's own socket. */
+		ev.events = EPOLLIN;
+		ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_RAW_DNS_QUERY;
+		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, gcp->gdp->fd, &ev);
+		if (unlikely(r))
+			return r;
+		return send_dns_payload(gcp);
 	}
 
 	return 0;
@@ -107,41 +68,44 @@ static int handle_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 static int free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 static ssize_t __do_send(struct gwp_conn *src, struct gwp_conn *dst);
 
-static int handle_raw_dns_reply(struct gwp_wrk *w, uint8_t *buf, uint16_t len)
+/*
+ * One datagram from the query's socket. Returns 1 when the lookup is still
+ * pending (a stray reply, or the fallback query went out), 0 when it is
+ * done with, or a negative error that ends the connection.
+ */
+static int handle_raw_dns_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+				uint8_t *buf, uint16_t len)
 {
 	struct gwp_dns_resolver *res = &w->dns->resolvers[0];
 	struct gwp_sockaddr addrs[GWP_MAX_CONN_CAND];
-	struct gwp_conn_pair *gcp = NULL;
 	struct gwp_ctx *ctx = w->ctx;
 	uint8_t nr = 0;
 	ssize_t ret;
 	int r;
 
-	ret = gwp_dns_res_fetch_gcp_by_payload(res, buf, len, &gcp);
-	if (unlikely(ret < 0))
-		return 0;
-
 	ret = gwp_dns_res_complete_query(res, gcp->gdp, buf, len, addrs,
 					 GWP_MAX_CONN_CAND, &nr);
+	if (ret == -ESRCH)
+		return 1;
 	if (ret == -EAGAIN) {
 		/* Retry with the fallback record type. */
-		ret = send_dns_payload(res, gcp);
+		ret = send_dns_payload(gcp);
 		if (likely(!ret))
-			return 0;
+			return 1;
 	} else if (likely(!ret)) {
 		/* Every address of the reply, so a dead one has a fallback. */
 		gwp_conn_set_candidates(gcp, addrs, nr);
 		pr_dbg(&ctx->lh, "Resolved DNS query for %s to %s (%u addr, gcp_idx=%u)",
 			gcp->gdp->host, ip_to_str(&gcp->target_addr), nr,
 			gcp->idx);
-		r = handle_connect(w, gcp);
-		goto out;
+		return handle_connect(w, gcp);
 	}
 
 	/*
 	 * The name did not resolve, so the origin is unreachable: answer
 	 * in whatever protocol the client speaks (SOCKS5 REP, or HTTP 502)
-	 * and close, as the getaddrinfo path does.
+	 * and close, as the getaddrinfo path does. The error then tears
+	 * down this one pair (handle_event()).
 	 */
 	r = gwp_conn_fail_reply(w, gcp, (int)ret);
 	if (!r && gcp->target.len) {
@@ -150,25 +114,10 @@ static int handle_raw_dns_reply(struct gwp_wrk *w, uint8_t *buf, uint16_t len)
 		if (unlikely(sr < 0))
 			r = (int)sr;
 	}
-	if (!r)
-		r = (int)ret;
 
-out:
-	/*
-	 * Whatever failed here belongs to this one connection. The event
-	 * is tagged EV_BIT_RAW_DNS_QUERY, not with a pair bit, so
-	 * handle_event() would not free the pair; it would hand the error
-	 * to the worker loop instead, which exits and stops every worker.
-	 * One request resolving to an ACL-denied address took the whole
-	 * proxy down that way. Any reply due to the client has been sent
-	 * by now; tear the pair down here (which also drops its resolver
-	 * slot) and let only a failure to do that reach the loop.
-	 */
-	if (unlikely(r))
-		return free_conn_pair(w, gcp);
-
-	return 0;
+	return r ? r : (int)ret;
 }
+
 /*
  * Replies read per wakeup, at most: enough to take a burst in one go, few
  * enough that a flood on this socket cannot starve the worker's other
@@ -177,53 +126,45 @@ out:
  */
 #define GWP_RAW_DNS_BUDGET	64
 
-static int handle_ev_raw_dns_query(struct gwp_wrk *w)
+static int handle_ev_raw_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
-	struct gwp_dns_resolver *res = &w->dns->resolvers[0];
 	struct gwp_ctx *ctx = w->ctx;
 	uint8_t buf[DNS_EDNS_UDP_SIZE];
 	ssize_t ret;
 	int i, r;
 
 	for (i = 0; i < GWP_RAW_DNS_BUDGET; i++) {
-		ret = __sys_recv(res->udp_fd, buf, sizeof(buf), 0);
+		ret = __sys_recv(gcp->gdp->fd, buf, sizeof(buf), 0);
 		if (ret < 0) {
 			/*
-			 * Nothing that arrives on this socket may take the
-			 * worker down with it. The descriptor is connected,
-			 * so an ICMP port unreachable from a DNS server that
-			 * is down -- or simply not listening where we were
-			 * told -- is reported here as -ECONNREFUSED, and
-			 * returning it broke the event loop and killed every
-			 * connection the worker was carrying. The pending
-			 * queries time out on their own.
+			 * The socket is connected, so an ICMP port unreachable
+			 * from a DNS server that is down -- or simply not
+			 * listening where we were told -- is reported here as
+			 * -ECONNREFUSED. It ends nothing: the lookup times out
+			 * on its own, as it would with no reply at all.
 			 */
 			if (ret != -EAGAIN && ret != -EINTR)
-				pr_err(&ctx->lh, "DNS socket recv failed: %s",
+				pr_dbg(&ctx->lh, "DNS socket recv failed: %s",
 				       strerror((int)-ret));
 			return 0;
 		}
 
-		r = handle_raw_dns_reply(w, buf, (uint16_t)ret);
-		if (unlikely(r))
+		r = handle_raw_dns_reply(w, gcp, buf, (uint16_t)ret);
+		if (r <= 0)
 			return r;
 	}
 
 	return 0;
 }
 #else
-static int register_dns_to_epoll(struct gwp_wrk __unused *w)
-{
-	return 0;
-}
-
 static int chk_handle_dns_query(struct gwp_wrk __unused *w,
 				struct gwp_conn_pair __unused *gcp)
 {
 	return 0;
 }
 
-static int handle_ev_raw_dns_query(struct gwp_wrk __unused *w)
+static int handle_ev_raw_dns_query(struct gwp_wrk __unused *w,
+				   struct gwp_conn_pair __unused *gcp)
 {
 	return -ENOSYS;
 }
@@ -302,10 +243,6 @@ int gwp_ctx_init_thread_epoll(struct gwp_wrk *w)
 		if (unlikely(r))
 			goto out_free_events;
 	}
-
-	r = register_dns_to_epoll(w);
-	if (r)
-		goto out_free_events;
 
 	/* Results of this worker's getaddrinfo() lookups. */
 	if (ctx->dns) {
@@ -439,6 +376,10 @@ static int __free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		nr_fd_closed++;
 	if (gcp->udp_fd >= 0)
 		nr_fd_closed++;
+#ifdef CONFIG_NEW_DNS_RESOLVER
+	if (gcp->gdp && gcp->gdp->fd >= 0)
+		nr_fd_closed++;	/* a raw DNS query's socket */
+#endif
 
 	/*
 	 * A race that was still running when the pair went away: those sockets
@@ -486,9 +427,18 @@ static int free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	}
 
 #ifdef CONFIG_NEW_DNS_RESOLVER
-	if (w->ctx->cfg.use_raw_dns && gcp->gdp)
-		gwp_dns_res_drop_query(&w->dns->resolvers[0], gcp,
-				       gcp->gdp->txid);
+	/*
+	 * Close the query's socket now, so no reply for this pair is read
+	 * later in the batch, and count it towards the accept throttle.
+	 */
+	if (w->ctx->cfg.use_raw_dns && gcp->gdp && gcp->gdp->fd >= 0) {
+		int r;
+
+		gwp_dns_res_drop_query(gcp->gdp);
+		r = credit_fd_closed(w, 1);
+		if (unlikely(r))
+			return r;
+	}
 #endif
 
 	gcp->flags |= GWP_CONN_FLAG_IS_DYING;
@@ -2336,6 +2286,7 @@ static bool is_ev_bit_conn_pair(uint64_t ev_bit)
 	case EV_BIT_CLIENT_SOCKS5:
 	case EV_BIT_CLIENT_PROT:
 	case EV_BIT_UDP_RELAY:
+	case EV_BIT_RAW_DNS_QUERY:
 		return true;
 	default:
 		return false;
@@ -2840,7 +2791,7 @@ static int handle_event(struct gwp_wrk *w, struct epoll_event *ev)
 		r = handle_ev_reload_files(w);
 		break;
 	case EV_BIT_RAW_DNS_QUERY:
-		r = handle_ev_raw_dns_query(w);
+		r = handle_ev_raw_dns_query(w, udata);
 		break;
 	default:
 		pr_err(&w->ctx->lh, "Unknown event bit: %" PRIu64, ev_bit);
