@@ -1981,8 +1981,13 @@ static int init_conn(struct gwp_conn *conn, uint32_t buf_size)
 	conn->len = 0;
 	conn->cap = buf_size;
 	conn->ep_mask = 0;
-	conn->buf = NULL;
-	return posix_memalign((void **)&conn->buf, 4096, buf_size) ? -ENOMEM : 0;
+	/*
+	 * Nothing needs these page aligned (no registered buffers, O_DIRECT or
+	 * zero-copy send), and an aligned allocation makes glibc over-allocate
+	 * and split chunks, which fragments the heap.
+	 */
+	conn->buf = malloc(buf_size);
+	return conn->buf ? 0 : -ENOMEM;
 }
 
 static void free_conn(struct gwp_conn *conn)
