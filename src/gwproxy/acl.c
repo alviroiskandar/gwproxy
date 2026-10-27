@@ -169,6 +169,20 @@ struct gwp_acl {
 static pthread_once_t g_regex_once = PTHREAD_ONCE_INIT;
 static pcre2_match_context *g_regex_mctx;
 
+/*
+ * Match data is scratch space for one pcre2_match() call. Keep one per thread
+ * instead of a malloc/free pair per match (about a third of the cost of a
+ * simple JIT match); the key's destructor frees it when the thread exits.
+ */
+static pthread_key_t g_regex_md_key;
+static bool g_regex_md_key_ok;
+static __thread pcre2_match_data *t_regex_md;
+
+static void regex_md_free(void *md)
+{
+	pcre2_match_data_free(md);
+}
+
 static void regex_ctx_init(void)
 {
 	g_regex_mctx = pcre2_match_context_create(NULL);
@@ -176,6 +190,7 @@ static void regex_ctx_init(void)
 		pcre2_set_match_limit(g_regex_mctx, 100000);
 		pcre2_set_depth_limit(g_regex_mctx, 1000);
 	}
+	g_regex_md_key_ok = !pthread_key_create(&g_regex_md_key, regex_md_free);
 }
 
 /*
@@ -201,6 +216,24 @@ static pcre2_code *regex_compile(const char *pat, bool caseless)
 	return re;
 }
 
+/* This thread's match data, created on first use; NULL on OOM. */
+static pcre2_match_data *regex_md(void)
+{
+	pcre2_match_data *md = t_regex_md;
+
+	if (md)
+		return md;
+	md = pcre2_match_data_create(1, NULL);
+	if (!md)
+		return NULL;
+	if (!g_regex_md_key_ok || pthread_setspecific(g_regex_md_key, md)) {
+		/* Nothing would free it at thread exit; do not cache it. */
+		return md;
+	}
+	t_regex_md = md;
+	return md;
+}
+
 /*
  * True if @re matches @subj. Fails closed (no match) on OOM or if the match hits
  * the configured limits (a would-be ReDoS is treated as a non-match, not an
@@ -213,12 +246,13 @@ static bool regex_match(const pcre2_code *re, const char *subj)
 
 	if (!subj)
 		return false;
-	md = pcre2_match_data_create(1, NULL);
+	md = regex_md();
 	if (!md)
 		return false;
 	rc = pcre2_match(re, (PCRE2_SPTR)subj, PCRE2_ZERO_TERMINATED, 0, 0,
 			 md, g_regex_mctx);
-	pcre2_match_data_free(md);
+	if (md != t_regex_md)
+		pcre2_match_data_free(md);
 	return rc >= 0;
 }
 #endif /* CONFIG_PCRE */
