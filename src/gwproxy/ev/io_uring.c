@@ -129,7 +129,7 @@ static int io_uring_submit_eintr(struct io_uring *ring, size_t nr_attemps)
 
 	while (nr_attemps--) {
 		r = io_uring_submit(ring);
-		if (likely(r >= 0 || r != -EINTR))
+		if (likely(r != -EINTR))
 			break;
 	}
 
@@ -196,19 +196,6 @@ void gwp_ctx_free_thread_io_uring(struct gwp_wrk *w)
 	w->iou = NULL;
 }
 
-static int prep_nr_sqes(struct gwp_wrk *w, unsigned nr)
-{
-	if (io_uring_sq_space_left(&w->iou->ring) < nr) {
-		int r = io_uring_submit_eintr(&w->iou->ring, 8);
-		if (unlikely(r < 0)) {
-			log_submit_err(w, r);
-			return r;
-		}
-	}
-
-	return 0;
-}
-
 static void arm_accept(struct gwp_wrk *w)
 {
 	struct io_uring_sqe *s = get_sqe_nofail(w);
@@ -255,11 +242,6 @@ static void arm_accept_retry(struct gwp_wrk *w)
 static void prep_close(struct gwp_wrk *w, int fd)
 {
 	struct io_uring_sqe *s = get_sqe_nofail(w);
-	if (unlikely(!s)) {
-		pr_err(&w->ctx->lh, "Failed to get io_uring sqe for close");
-		__sys_close(fd);
-		return;
-	}
 
 	io_uring_prep_close(s, fd);
 	s->flags |= IOSQE_CQE_SKIP_SUCCESS;
@@ -337,19 +319,13 @@ static int start_connect_attempt(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	struct gwp_sockaddr *ca;
 	struct io_uring_sqe *s;
 	socklen_t addr_len;
-	int fd, r;
+	int fd;
 
 	ca = ctx->upstream.enabled ? &ctx->upstream.addr : &gcp->target_addr;
 
 	fd = gwp_create_sock_target(w, ca, &gcp->acl_sockopt, NULL, false);
 	if (unlikely(fd < 0))
 		return fd;
-
-	r = prep_nr_sqes(w, 1);
-	if (unlikely(r < 0)) {
-		__sys_close(fd);
-		return r;
-	}
 
 	gcp->attempt_fd[slot] = fd;
 	/* Post-ACL, so a -j DNAT rewrite is what gets recorded. */
@@ -978,13 +954,6 @@ static int handle_ev_tls_detect(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 static int arm_gcp_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_ctx *ctx = w->ctx;
-	int r;
-
-	r = prep_nr_sqes(w, 4);
-	if (unlikely(r < 0)) {
-		pr_err(&w->ctx->lh, "Failed to prepare sqes for connection pair");
-		return r;
-	}
 
 	gcp->conn_state = CONN_STATE_PROT;
 #ifdef CONFIG_HTTPS
@@ -1014,12 +983,6 @@ static int do_prep_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_ctx *ctx = w->ctx;
 	int r;
-
-	r = prep_nr_sqes(w, 4);
-	if (unlikely(r < 0)) {
-		pr_err(&w->ctx->lh, "Failed to prepare sqes for connection pair");
-		return r;
-	}
 
 	/*
 	 * Take the first candidate the ACL allows; the same helper walks the
@@ -2086,15 +2049,9 @@ static int handle_ev_udp_tx(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
  */
 static int arm_udp_relay(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
-	int r;
-
 	gcp->udp_iou = calloc(1, sizeof(*gcp->udp_iou));
 	if (unlikely(!gcp->udp_iou))
 		return -ENOMEM;
-
-	r = prep_nr_sqes(w, 3);
-	if (unlikely(r < 0))
-		return r;
 
 	if (w->ctx->cfg.protocol_timeout > 0) {
 		/*
