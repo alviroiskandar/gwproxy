@@ -2292,12 +2292,20 @@ int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
  * REDIRECT (used by --as-transparent). @client is the accepted peer address,
  * used to pick the right protocol level (an IPv4 or v4-mapped peer carries an
  * IPv4 original destination).
+ *
+ * Returns -ELOOP when that destination is the proxy itself: a client that
+ * reached the listener directly, with no REDIRECT on the way, still has a
+ * conntrack entry, and its "original destination" is the address it
+ * connected to. Forwarding there connects to the listener again, whose new
+ * connection is just the same, and so on until descriptors run out.
  */
 int gwp_get_orig_dst(int fd, const struct gwp_sockaddr *client,
 		     struct gwp_sockaddr *dst)
 {
+	struct gwp_sockaddr local;
 	socklen_t len;
 	bool v4;
+	int r;
 
 	v4 = (client->sa.sa_family == AF_INET) ||
 	     (client->sa.sa_family == AF_INET6 &&
@@ -2306,13 +2314,25 @@ int gwp_get_orig_dst(int fd, const struct gwp_sockaddr *client,
 	memset(dst, 0, sizeof(*dst));
 	if (v4) {
 		len = sizeof(dst->i4);
-		return __sys_getsockopt(fd, IPPROTO_IP, SO_ORIGINAL_DST,
-					&dst->i4, &len);
+		r = __sys_getsockopt(fd, IPPROTO_IP, SO_ORIGINAL_DST,
+				     &dst->i4, &len);
+	} else {
+		len = sizeof(dst->i6);
+		r = __sys_getsockopt(fd, IPPROTO_IPV6, IP6T_SO_ORIGINAL_DST,
+				     &dst->i6, &len);
 	}
+	if (r)
+		return r;
 
-	len = sizeof(dst->i6);
-	return __sys_getsockopt(fd, IPPROTO_IPV6, IP6T_SO_ORIGINAL_DST,
-				&dst->i6, &len);
+	len = sizeof(local);
+	r = __sys_getsockname(fd, &local.sa, &len);
+	if (r)
+		return r;
+
+	if (gwp_sockaddr_ip_eq(dst, &local) && sa_port_h(dst) == sa_port_h(&local))
+		return -ELOOP;
+
+	return 0;
 }
 
 static int setskopt_int(int fd, int level, int optname, int value)

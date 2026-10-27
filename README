@@ -31,7 +31,8 @@ Features
     --use-openssl; works on both the epoll and io_uring event loops.
   - Transparent proxy: recover each connection's original destination from
     the SO_ORIGINAL_DST socket option, for use behind an iptables REDIRECT
-    rule.
+    rule. Keep the listener out of direct reach: a connection that was not
+    redirected names the proxy itself as its destination, so it is refused.
   - Upstream proxy chaining: route every outgoing connection through a
     next-hop SOCKS5 proxy (socks5:// local or socks5h:// remote name
     resolution) or HTTP CONNECT proxy (http://), with optional
