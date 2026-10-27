@@ -20,14 +20,25 @@
 
 struct auth_entry {
 	char	*u, *p;
+	size_t	next;	/* next entry in the same hash bucket, or AUTH_NIL */
 	uint8_t	ulen, plen;
 };
 
-/* One parsed credential file. Immutable once published in gwp_auth::set. */
+#define AUTH_NIL	SIZE_MAX
+
+/*
+ * One parsed credential file. Immutable once published in gwp_auth::set.
+ * Entries are indexed by username in a chained hash table (@bucket holds the
+ * first entry index of each chain, @mask + 1 buckets), so a check looks at
+ * the entries for that username only instead of the whole file. Duplicate
+ * usernames share a chain and each of their passwords is accepted, as before.
+ */
 struct auth_set {
 	struct auth_entry	*entries;
 	size_t			nr;
 	size_t			cap;
+	size_t			*bucket;
+	size_t			mask;
 };
 
 struct gwp_auth {
@@ -82,7 +93,54 @@ static void free_auth_set(struct auth_set *set)
 		free(set->entries[i].u);
 
 	free(set->entries);
+	free(set->bucket);
 	free(set);
+}
+
+/*
+ * FNV-1a. The table is built from the operator's file, so a client cannot
+ * pick colliding keys to fill it; a client-chosen username only decides
+ * which one chain is walked.
+ */
+static size_t auth_hash(const char *u, size_t ulen)
+{
+	uint64_t h = 0xcbf29ce484222325ull;
+	size_t i;
+
+	for (i = 0; i < ulen; i++) {
+		h ^= (unsigned char)u[i];
+		h *= 0x100000001b3ull;
+	}
+	return (size_t)h;
+}
+
+/* Build the username index over the parsed entries; 0 or -ENOMEM. */
+static int index_auth_set(struct auth_set *set)
+{
+	size_t nb = 16, i;
+
+	while (nb < set->nr * 2)
+		nb <<= 1;
+
+	set->bucket = malloc(nb * sizeof(*set->bucket));
+	if (!set->bucket)
+		return -ENOMEM;
+	set->mask = nb - 1;
+	for (i = 0; i < nb; i++)
+		set->bucket[i] = AUTH_NIL;
+
+	/*
+	 * Insert back to front at the chain heads, so each chain lists its
+	 * entries in file order.
+	 */
+	for (i = set->nr; i-- > 0;) {
+		struct auth_entry *ae = &set->entries[i];
+		size_t b = auth_hash(ae->u, ae->ulen) & set->mask;
+
+		ae->next = set->bucket[b];
+		set->bucket[b] = i;
+	}
+	return 0;
 }
 
 static int add_auth_entry(struct auth_set *set, const char *line, size_t len)
@@ -173,6 +231,8 @@ static int load_auth_set(const char *path, struct auth_set **out)
 	if (!r && ferror(fp))
 		r = -EIO;
 	fclose(fp);
+	if (!r)
+		r = index_auth_set(set);
 
 	if (r < 0) {
 		free_auth_set(set);
@@ -238,13 +298,18 @@ bool gwp_auth_check(struct gwp_auth *auth, const char *u, size_t ulen,
 	 */
 	pthread_rwlock_rdlock(&auth->lock);
 	set = auth->set;
-	for (i = 0; i < set->nr; i++) {
+	i = set->bucket[auth_hash(u, ulen) & set->mask];
+	for (; i != AUTH_NIL; i = set->entries[i].next) {
 		const struct auth_entry *ae = &set->entries[i];
-		if (ulen != ae->ulen)
+
+		/*
+		 * Only the password is compared in constant time. Whether a
+		 * username exists already shows through which chain is walked
+		 * and its length; the password must not.
+		 */
+		if (ulen != ae->ulen || (ulen && memcmp(u, ae->u, ulen)))
 			continue;
 		if (plen != ae->plen)
-			continue;
-		if (!ct_bytes_eq(u, ae->u, ulen))
 			continue;
 		if (!ct_bytes_eq(p, ae->p, plen))
 			continue;
