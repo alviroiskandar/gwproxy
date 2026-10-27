@@ -2918,10 +2918,11 @@ void gwp_conn_set_single_candidate(struct gwp_conn_pair *gcp,
 
 static int prepare_target_addr_domain(struct gwp_wrk *w,
 				      struct gwp_conn_pair *gcp,
-				      const char *host, uint16_t port)
+				      char *host, uint16_t port)
 {
 	struct gwp_ctx *ctx = w->ctx;
 	struct gwp_cfg *cfg = &ctx->cfg;
+	size_t hl;
 	int r;
 
 	if (!req_host_valid(host)) {
@@ -2929,6 +2930,16 @@ static int prepare_target_addr_domain(struct gwp_wrk *w,
 			gcp->idx);
 		return -EINVAL;
 	}
+
+	/*
+	 * "name." is the same name as "name" to the resolver and to an
+	 * upstream, so it must be the same name to the ACL too, or a deny rule
+	 * for "name" (or a regexp anchored with '$') is dodged by the dot.
+	 * req_host_valid() has ruled out "." and "..".
+	 */
+	hl = strlen(host);
+	if (host[hl - 1] == '.')
+		host[hl - 1] = '\0';
 
 	/* Remember the requested hostname for ACL "-m domain" matching. */
 	gcp->req_domain = host;
@@ -2976,6 +2987,8 @@ static int socks5_prepare_target_addr_domain(struct gwp_wrk *w,
 	else
 		r = prepare_target_addr_domain(w, gcp, dst->domain.str,
 					       ntohs(dst->port));
+	/* The name may have lost its trailing dot. */
+	dst->domain.len = (uint8_t)strlen(dst->domain.str);
 	if (r == -EINPROGRESS)
 		gcp->conn_state = CONN_STATE_SOCKS5_DNS_QUERY;
 	else if (r == -EINVAL && !gwp_conn_fail_reply(w, gcp, r))
@@ -3554,7 +3567,7 @@ static int parse_port(const char *s, uint16_t *port)
 
 /* Resolve and connect to @host:@port, setting the HTTP connect/DNS state. */
 static int http_connect_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
-			       const char *host, const char *port)
+			       char *host, const char *port)
 {
 	uint16_t p;
 	int r;

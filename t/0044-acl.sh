@@ -147,6 +147,11 @@ for loop in epoll io_uring; do
 		"http://localhost:$hp/payload.bin" -o /dev/null 2>/dev/null; then
 		fail "$loop -m domain rule did not block the hostname request"
 	fi
+	# The same name with a trailing dot is the same name to the resolver.
+	rep="$(python3 "$SERVERS_DIR/socks5_probe.py" --host 127.0.0.1 \
+		--atyp domain --dst localhost. "$dp" "$hp")"
+	[ "$rep" = "REP=0x02" ] \
+		|| fail "$loop -m domain rule let 'localhost.' through ($rep)"
 	curl -s --max-time 20 -x "socks5://127.0.0.1:$dp" \
 		"http://127.0.0.1:$hp/payload.bin" -o "$WORK/dom.out" \
 		|| fail "$loop literal-IP request wrongly blocked by -m domain"
@@ -167,6 +172,10 @@ for loop in epoll io_uring; do
 			"http://localhost:$hp/payload.bin" -o /dev/null 2>/dev/null; then
 			fail "$loop --domain-regexp did not block the hostname"
 		fi
+		rep="$(python3 "$SERVERS_DIR/socks5_probe.py" --host 127.0.0.1 \
+			--atyp domain --dst localhost. "$rp" "$hp")"
+		[ "$rep" = "REP=0x02" ] \
+			|| fail "$loop --domain-regexp let 'localhost.' through ($rep)"
 		curl -s --max-time 20 -x "socks5://127.0.0.1:$rp" \
 			"http://127.0.0.1:$hp/payload.bin" -o "$WORK/domre.out" \
 			|| fail "$loop literal-IP wrongly blocked by --domain-regexp"
