@@ -3468,12 +3468,43 @@ static int http_fwd_target_in(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	return 0;
 }
 
+/*
+ * Client bytes: only the rest of the request's body goes to the origin. What
+ * follows it -- typically the client's next request, for whatever host, with
+ * its Proxy-Authorization -- was never checked against the ACL and is meant
+ * for somebody else, so it is dropped.
+ */
+static int http_fwd_client_in(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			      uint32_t from)
+{
+	struct gwp_conn *c = &gcp->client;
+	size_t fwd;
+	int r;
+
+	if (c->len == from)
+		return 0;
+
+	r = gwp_http_fwd_req_body(gcp->http_conn, c->buf + from, c->len - from,
+				  &fwd);
+	if (r < 0) {
+		pr_dbg(&w->ctx->lh, "Malformed request body (idx=%u)", gcp->idx);
+		return r;
+	}
+
+	if (fwd < c->len - from)
+		pr_dbg(&w->ctx->lh,
+			"Dropping %zu client bytes after the request (idx=%u)",
+			c->len - from - fwd, gcp->idx);
+	c->len = from + (uint32_t)fwd;
+	return 0;
+}
+
 int gwp_http_fwd_in(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		    struct gwp_conn *c, uint32_t from)
 {
 	if (c == &gcp->target)
 		return http_fwd_target_in(w, gcp, from);
-	return 0;
+	return http_fwd_client_in(w, gcp, from);
 }
 
 int gwp_http_fwd_begin(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
@@ -3551,6 +3582,12 @@ int gwp_handle_conn_state_http(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		r = http_inject_forward_request(gcp, req, req_len);
 		if (r == -E2BIG)
 			return http_reject_too_large(gcp);
+		if (r < 0)
+			return r;
+		/* Whatever came in behind the header is the body, or not. */
+		r = http_fwd_client_in(w, gcp, (uint32_t)req_len);
+		if (r == -EBADMSG)
+			return http_reject_bad_request(gcp);
 		if (r < 0)
 			return r;
 		return http_connect_target(w, gcp, host, port);

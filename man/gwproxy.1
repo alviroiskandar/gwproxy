@@ -836,6 +836,13 @@ of ordinary absolute\-form requests such as "GET http://host/path", which
 gwproxy rewrites to origin form, fetches from the origin and relays back, one
 request per connection.
 .PP
+Only that one request reaches the origin: its body, delimited by Content\-Length
+or chunked Transfer\-Encoding, is forwarded, and anything the client sends after
+it is discarded. A request gwproxy cannot delimit unambiguously (both framing
+headers, a Transfer\-Encoding other than "chunked", an invalid Content\-Length,
+or a Connection header naming Content\-Length, Transfer\-Encoding or Host) is
+answered with "400 Bad Request"; a malformed chunked body closes the connection.
+.PP
 The origin's response header is rewritten before the client sees it: its
 hop\-by\-hop fields are dropped and "Connection: close" is added, so the client
 does not send another request on the connection, and the connection is closed

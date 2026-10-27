@@ -46,6 +46,16 @@ struct gwp_http_conn {
 	char				user[256];
 
 	/*
+	 * Framing of a forwarding request's body (enum req_body), and what is
+	 * left of it: the bytes of a Content-Length body, or the size or data
+	 * bytes of the current chunk. Nothing after the body is forwarded.
+	 */
+	uint8_t				req_body;
+	uint8_t				chunk_st;
+	uint8_t				chunk_digits;
+	uint64_t			req_rem;
+
+	/*
 	 * The origin's response to a forwarding request. Its header is held
 	 * back in @res_buf until complete, so nothing the origin says reaches
 	 * the client before it has been rewritten; @res_scan is how far the
@@ -348,6 +358,54 @@ too_big:
 	return -E2BIG;
 }
 
+enum req_body {
+	REQ_BODY_DONE = 0,	/* No body, or all of it has been seen. */
+	REQ_BODY_LENGTH,	/* Content-Length; req_rem bytes to go. */
+	REQ_BODY_CHUNKED,	/* Transfer-Encoding: chunked; see chunk_st. */
+};
+
+/*
+ * Work out how the request body is delimited (RFC 9112 Section 6.3), so that
+ * exactly that body follows the header to the origin and nothing after it
+ * does. Anything the origin might delimit differently from us is refused
+ * rather than guessed at: both Content-Length and Transfer-Encoding, a
+ * Transfer-Encoding other than plain "chunked" (or any, from an HTTP/1.0
+ * client, which cannot use it), and a Content-Length that is not a number.
+ * Returns 0 or -EBADMSG.
+ */
+static int set_req_framing(struct gwp_http_conn *hc)
+{
+	const struct gwnet_http_hdr_fields *ff = &hc->req_hdr.fields;
+	const char *te = gwnet_http_hdr_fields_get(ff, "Transfer-Encoding");
+	const char *cl = gwnet_http_hdr_fields_get(ff, "Content-Length");
+	uint64_t len = 0;
+
+	if (te && cl)
+		return -EBADMSG;
+
+	if (te) {
+		if (hc->req_hdr.version == GWNET_HTTP_VER_1_0 ||
+		    strcasecmp(te, "chunked"))
+			return -EBADMSG;
+		hc->req_body = REQ_BODY_CHUNKED;
+		return 0;
+	}
+
+	if (cl) {
+		if (!*cl)
+			return -EBADMSG;
+		for (; *cl; cl++) {
+			if (*cl < '0' || *cl > '9' || len > (UINT64_MAX - 9) / 10)
+				return -EBADMSG;
+			len = len * 10 + (uint64_t)(*cl - '0');
+		}
+	}
+
+	hc->req_rem = len;
+	hc->req_body = len ? REQ_BODY_LENGTH : REQ_BODY_DONE;
+	return 0;
+}
+
 /*
  * Classify a fully-parsed forwarding request: rebuild it in origin-form and
  * split the http:// authority into host/port. Returns GWP_HTTP_FORWARD,
@@ -381,8 +439,10 @@ static int classify_forward(struct gwp_http_conn *hc, size_t hdr_len,
 	 * authority is isolated (and the path's leading '/' overwritten) only
 	 * afterwards.
 	 */
-	r = build_forward_request(hc, path, authority,
-				  (size_t)(slash - authority), hdr_len);
+	r = set_req_framing(hc);
+	if (!r)
+		r = build_forward_request(hc, path, authority,
+					  (size_t)(slash - authority), hdr_len);
 	if (r == -EBADMSG)
 		return GWP_HTTP_BAD_REQUEST;
 	if (r < 0)
@@ -493,6 +553,183 @@ static bool is_tchar(unsigned char c)
 static bool is_field_char(unsigned char c)
 {
 	return c == '\t' || (c >= 0x20 && c != 0x7f);
+}
+
+/*
+ * States of the chunked body scanner (RFC 9112 Section 7.1). It only finds
+ * where the body ends; the bytes themselves pass through unchanged. Line ends
+ * must be CRLF: being stricter than the origin is harmless, being more lenient
+ * would let the two disagree on where the body stops.
+ */
+enum {
+	CH_SIZE = 0,	/* chunk-size hex digits */
+	CH_BWS,		/* whitespace between chunk-size and ';' */
+	CH_EXT,		/* chunk extensions, up to CR */
+	CH_SIZE_LF,	/* LF ending the chunk-size line */
+	CH_DATA,	/* chunk data, req_rem bytes to go */
+	CH_DATA_CR,	/* CRLF after chunk data */
+	CH_DATA_LF,
+	CH_TRAILER,	/* start of a trailer line, or the final CRLF */
+	CH_TRAILER_NAME,	/* trailer field-name, up to ':' */
+	CH_TRAILER_VALUE,	/* trailer field-value, up to CR */
+	CH_TRAILER_LF,
+	CH_END_LF,	/* LF of the final CRLF */
+};
+
+static int hex_val(unsigned char c)
+{
+	if (c >= '0' && c <= '9')
+		return c - '0';
+	c |= 0x20;
+	if (c >= 'a' && c <= 'f')
+		return c - 'a' + 10;
+	return -1;
+}
+
+/*
+ * Largest chunk accepted. Nothing legitimate sends a 2 GiB chunk, and a size
+ * near 2^64 is where implementations that parse it into a narrower or signed
+ * type start to disagree with us about where the chunk ends.
+ */
+#define CHUNK_SIZE_MAX	0x7fffffffull
+
+/*
+ * Scan @len bytes of a chunked body. *@used is set to how many of them belong
+ * to it; fewer than @len only once the body has ended. Returns 0, or -EBADMSG
+ * on a malformed body.
+ */
+static int scan_chunked(struct gwp_http_conn *hc, const unsigned char *p,
+			size_t len, size_t *used)
+{
+	size_t i = 0, n;
+	int d;
+
+	while (i < len && hc->req_body == REQ_BODY_CHUNKED) {
+		unsigned char c = p[i];
+
+		switch (hc->chunk_st) {
+		case CH_SIZE:
+			d = hex_val(c);
+			if (d >= 0) {
+				/* Leading zeros count too; keep it bounded. */
+				if (++hc->chunk_digits > 16)
+					return -EBADMSG;
+				hc->req_rem = (hc->req_rem << 4) | (uint64_t)d;
+				if (hc->req_rem > CHUNK_SIZE_MAX)
+					return -EBADMSG;
+				break;
+			}
+			if (!hc->chunk_digits)
+				return -EBADMSG;
+			if (c == '\r')
+				hc->chunk_st = CH_SIZE_LF;
+			else if (c == ';')
+				hc->chunk_st = CH_EXT;
+			else if (c == ' ' || c == '\t')
+				hc->chunk_st = CH_BWS;
+			else
+				return -EBADMSG;
+			break;
+		case CH_BWS:
+			/* BWS is only allowed ahead of a chunk extension. */
+			if (c == ';')
+				hc->chunk_st = CH_EXT;
+			else if (c != ' ' && c != '\t')
+				return -EBADMSG;
+			break;
+		case CH_EXT:
+			if (c == '\r')
+				hc->chunk_st = CH_SIZE_LF;
+			else if (!is_field_char(c))
+				return -EBADMSG;
+			break;
+		case CH_SIZE_LF:
+			if (c != '\n')
+				return -EBADMSG;
+			hc->chunk_st = hc->req_rem ? CH_DATA : CH_TRAILER;
+			break;
+		case CH_DATA:
+			n = len - i;
+			if (n > hc->req_rem)
+				n = (size_t)hc->req_rem;
+			hc->req_rem -= n;
+			if (!hc->req_rem)
+				hc->chunk_st = CH_DATA_CR;
+			i += n;
+			continue;
+		case CH_DATA_CR:
+			if (c != '\r')
+				return -EBADMSG;
+			hc->chunk_st = CH_DATA_LF;
+			break;
+		case CH_DATA_LF:
+			if (c != '\n')
+				return -EBADMSG;
+			hc->chunk_st = CH_SIZE;
+			hc->chunk_digits = 0;
+			break;
+		case CH_TRAILER:
+			if (c == '\r')
+				hc->chunk_st = CH_END_LF;
+			else if (is_tchar(c))
+				hc->chunk_st = CH_TRAILER_NAME;
+			else
+				return -EBADMSG;
+			break;
+		case CH_TRAILER_NAME:
+			/*
+			 * A trailer is a field line, "name: value". Anything
+			 * else -- a request line, say -- is where an origin
+			 * that ends the body early would find a request of
+			 * the client's choosing.
+			 */
+			if (c == ':')
+				hc->chunk_st = CH_TRAILER_VALUE;
+			else if (!is_tchar(c))
+				return -EBADMSG;
+			break;
+		case CH_TRAILER_VALUE:
+			if (c == '\r')
+				hc->chunk_st = CH_TRAILER_LF;
+			else if (!is_field_char(c))
+				return -EBADMSG;
+			break;
+		case CH_TRAILER_LF:
+			if (c != '\n')
+				return -EBADMSG;
+			hc->chunk_st = CH_TRAILER;
+			break;
+		case CH_END_LF:
+			if (c != '\n')
+				return -EBADMSG;
+			hc->req_body = REQ_BODY_DONE;
+			break;
+		}
+		i++;
+	}
+
+	*used = i;
+	return 0;
+}
+
+int gwp_http_fwd_req_body(struct gwp_http_conn *hc, const void *in,
+			  size_t len, size_t *fwd_len)
+{
+	switch (hc->req_body) {
+	case REQ_BODY_LENGTH:
+		if (len > hc->req_rem)
+			len = (size_t)hc->req_rem;
+		hc->req_rem -= len;
+		if (!hc->req_rem)
+			hc->req_body = REQ_BODY_DONE;
+		*fwd_len = len;
+		return 0;
+	case REQ_BODY_CHUNKED:
+		return scan_chunked(hc, in, len, fwd_len);
+	default:
+		*fwd_len = 0;
+		return 0;
+	}
 }
 
 /*

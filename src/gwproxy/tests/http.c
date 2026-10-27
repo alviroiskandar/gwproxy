@@ -270,6 +270,117 @@ static void test_forward_conn_lists_framing(void)
 	PRTEST_OK();
 }
 
+/*
+ * Classify @hdr as a forwarding request, then pass @body through the request
+ * body filter @step bytes at a time. Returns the filter's first error, or 0
+ * with *@fwd set to how many body bytes it let through.
+ */
+static int req_body(const char *hdr, const char *body, size_t step,
+		    size_t *fwd)
+{
+	struct gwp_http_conn *hc = gwp_http_conn_alloc();
+	size_t len = strlen(body), i, n, f;
+	char *host, *port;
+	const char *req;
+	size_t req_len;
+	bool held = false;
+	int r = 0;
+
+	assert(hc);
+	assert(run(hc, NULL, hdr, &host, &port, &req, &req_len) ==
+	       GWP_HTTP_FORWARD);
+	*fwd = 0;
+	for (i = 0; i < len; i += n) {
+		n = (len - i < step) ? len - i : step;
+		r = gwp_http_fwd_req_body(hc, body + i, n, &f);
+		if (r)
+			break;
+		/* Once something is held back, nothing more gets through. */
+		assert(!held || !f);
+		held = f < n;
+		*fwd += f;
+	}
+	gwp_http_conn_free(hc);
+	return r;
+}
+
+static void test_req_framing(void)
+{
+	static const char next[] = "GET http://other/ HTTP/1.1\r\n\r\n";
+	static const char chunked[] =
+		"5\r\nhello\r\n"
+		"1A;ext=\"v\"\r\nabcdefghijklmnopqrstuvwxyz\r\n"
+		"0003 ;x\r\nabc\r\n"
+		"0\r\nX-Trailer: t\r\nX-T: v\r\n\r\n";
+	static const char *const bad_hdr[] = {
+		"POST http://h/ HTTP/1.1\r\nContent-Length: 1\r\n"
+		"Transfer-Encoding: chunked\r\n\r\n",
+		"POST http://h/ HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n",
+		"POST http://h/ HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n",
+		"POST http://h/ HTTP/1.1\r\nContent-Length: 1x\r\n\r\n",
+		"POST http://h/ HTTP/1.1\r\nContent-Length: -1\r\n\r\n",
+		"POST http://h/ HTTP/1.1\r\n"
+		"Content-Length: 99999999999999999999\r\n\r\n",
+	};
+	static const char *const bad_chunked[] = {
+		"5\nhello\r\n0\r\n\r\n",	/* bare LF */
+		"5\r\nhelloX\r\n0\r\n\r\n",	/* data longer than its size */
+		"g\r\n",
+		"\r\n",
+		"11111111111111111\r\n",	/* more than 64 bits */
+		"0\r\nX: a\nb\r\n\r\n",
+		/* A request smuggled in as "trailers". */
+		"0\r\nGET /admin HTTP/1.1\r\nHost: internal\r\n\r\n",
+		"0\r\nX\r\n\r\n",		/* no colon */
+		"0\r\nX : v\r\n\r\n",	/* space before colon */
+		"80000000\r\n",		/* chunk of 2 GiB */
+		"100000005\r\nhello\r\n0\r\n\r\n",
+		"5 6\r\nhello\r\n0\r\n\r\n",	/* bare-space extension */
+		"5 \r\nhello\r\n0\r\n\r\n",
+	};
+	char body[256];
+	size_t fwd, step, i;
+	struct gwp_http_conn *hc;
+	char *host, *port;
+	const char *req;
+	size_t req_len;
+
+	for (step = 1; step <= 64; step *= 4) {
+		/* Content-Length: exactly that many bytes, the rest dropped. */
+		snprintf(body, sizeof(body), "hello%s", next);
+		assert(!req_body("POST http://h/ HTTP/1.1\r\n"
+				 "Content-Length: 5\r\n\r\n", body, step, &fwd));
+		assert(fwd == 5);
+
+		/* No framing: no body; a pipelined request goes nowhere. */
+		assert(!req_body("GET http://h/ HTTP/1.1\r\n\r\n", next, step,
+				 &fwd));
+		assert(fwd == 0);
+
+		/* Chunked, extensions and trailers included. */
+		snprintf(body, sizeof(body), "%s%s", chunked, next);
+		assert(!req_body("POST http://h/ HTTP/1.1\r\n"
+				 "Transfer-Encoding: Chunked\r\n\r\n", body,
+				 step, &fwd));
+		assert(fwd == strlen(chunked));
+
+		for (i = 0; i < sizeof(bad_chunked) / sizeof(bad_chunked[0]);
+		     i++)
+			assert(req_body("POST http://h/ HTTP/1.1\r\n"
+					"Transfer-Encoding: chunked\r\n\r\n",
+					bad_chunked[i], step, &fwd) == -EBADMSG);
+	}
+
+	for (i = 0; i < sizeof(bad_hdr) / sizeof(bad_hdr[0]); i++) {
+		hc = gwp_http_conn_alloc();
+		assert(hc);
+		assert(run(hc, NULL, bad_hdr[i], &host, &port, &req,
+			   &req_len) == GWP_HTTP_BAD_REQUEST);
+		gwp_http_conn_free(hc);
+	}
+	PRTEST_OK();
+}
+
 /* Feed @in to a fresh response filter in one go; returns its result. */
 static int res_feed(struct gwp_http_conn *hc, const char *in, bool eof,
 		    char *out, size_t out_cap, size_t *out_len)
@@ -540,6 +651,7 @@ int main(void)
 		test_forward_default_port();
 		test_forward_hop_by_hop();
 		test_forward_conn_lists_framing();
+		test_req_framing();
 		test_res_rewrite();
 		test_res_interim();
 		test_res_reject();

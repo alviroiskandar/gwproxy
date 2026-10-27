@@ -2093,6 +2093,7 @@ static int handle_conn_state_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 static int handle_ev_client_prot_in(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
+	uint32_t from = gcp->client.len;
 	ssize_t ret;
 	int r, ct;
 
@@ -2103,6 +2104,16 @@ static int handle_ev_client_prot_in(struct gwp_wrk *w, struct gwp_conn_pair *gcp
 		return -ECONNRESET;
 	if (!ret)
 		return 0;
+
+	/*
+	 * More of a forwarding request's body (or what follows it) arriving
+	 * while the origin is still being resolved.
+	 */
+	if (gwp_http_fwd_active(gcp)) {
+		r = gwp_http_fwd_in(w, gcp, &gcp->client, from);
+		if (unlikely(r))
+			return r;
+	}
 
 	ct = gcp->conn_state;
 	if (ct == CONN_STATE_SOCKS5_UDP_ASSOCIATE) {

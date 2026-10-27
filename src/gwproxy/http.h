@@ -67,6 +67,19 @@ int gwp_http_conn_process(struct gwp_http_conn *hc, struct gwp_auth *auth,
 			  char **host_p, char **port_p,
 			  const char **req_p, size_t *req_len_p);
 
+/**
+ * Delimit the body of a forwarding request. Called with each run of client
+ * bytes that follows the request header; returns in *@fwd_len how many of the
+ * @len bytes at @in still belong to the request and go to the origin. The
+ * rest, and everything after it, is not part of the request: this proxy
+ * serves one request per connection, and whatever the client sends next is
+ * meant for a server it has not been checked against.
+ *
+ * @return	0, or -EBADMSG for a malformed chunked body.
+ */
+int gwp_http_fwd_req_body(struct gwp_http_conn *hc, const void *in,
+			  size_t len, size_t *fwd_len);
+
 /*
  * Where the response to a forwarding request stands (gwp_http_fwd_res_state()).
  */

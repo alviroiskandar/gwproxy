@@ -712,6 +712,7 @@ static int tls_forward_pump(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_conn *c = &gcp->client;
 	size_t space = c->cap - c->len, got = 0;
+	uint32_t from = c->len;
 	int sr;
 
 	if (space) {
@@ -723,6 +724,12 @@ static int tls_forward_pump(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 			return iou_forward_progress(gcp);
 		}
 		c->len += (uint32_t)got;
+	}
+
+	if (gwp_http_fwd_active(gcp)) {
+		sr = gwp_http_fwd_in(w, gcp, c, from);
+		if (sr)
+			return sr;
 	}
 
 	if (c->len)
@@ -1501,6 +1508,7 @@ static int handle_ev_client_recv(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				 struct io_uring_cqe *cqe)
 {
 	int r = cqe->res;
+	uint32_t from;
 
 	if (r < 0) {
 		if (r == -EAGAIN || r == -EINTR) {
@@ -1533,8 +1541,19 @@ static int handle_ev_client_recv(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		return iou_forward_progress(gcp);
 	}
 
+	from = gcp->client.len;
 	gcp->client.len += (uint32_t)r;
-	prep_send_target(w, gcp);
+	if (gwp_http_fwd_active(gcp)) {
+		r = gwp_http_fwd_in(w, gcp, &gcp->client, from);
+		if (r)
+			return r;
+	}
+
+	/* An HTTP forwarding filter may have dropped all of it. */
+	if (gcp->client.len)
+		prep_send_target(w, gcp);
+	else
+		prep_recv_client(w, gcp);
 	return 0;
 }
 
