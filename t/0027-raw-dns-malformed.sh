@@ -21,8 +21,11 @@
 #   field-truncated   an answer that stops inside its TTL;
 #   question-label    a question label length of 0xC0, which strides 193 bytes.
 #
-# The last four must be refused, not parsed -- the client sees nothing and
-# gives up, which is the point: the failure stays inside that one request.
+# The last four must be refused, not parsed: the client gets a failure reply
+# (a non-zero REP) and the failure stays inside that one request.
+# It must also stay within one query per address family. The resolver used to
+# send the same query again on every unusable answer, as fast as the server
+# answered, until the protocol timeout -- thousands of queries for one request.
 #
 # The port matters as much as the payload here. --dns-server used to drop the
 # port from "addr:port" and query 53 regardless, and because the socket is
@@ -73,7 +76,9 @@ for loop in epoll; do
 	for mode in good uncompressed-name cname-jump rdata-truncated \
 		    field-truncated question-label; do
 		dp="$(pick_port)"
-		python3 "$SERVERS_DIR/dns_malformed.py" "$mode" "$dp" 2>/dev/null &
+		rm -f "$WORK/nr_queries"
+		python3 "$SERVERS_DIR/dns_malformed.py" "$mode" "$dp" \
+			"$WORK/nr_queries" 2>/dev/null &
 		dns_pid=$!
 		_PIDS+=("$dns_pid")
 		sleep 0.4
@@ -91,8 +96,15 @@ for loop in epoll; do
 				fail "[$loop] $mode did not resolve (got '$rep')"
 			;;
 		*)
-			[ "$rep" = "NONE" ] || \
-				fail "[$loop] $mode was parsed rather than refused (got '$rep')"
+			case "$rep" in
+			REP=0x00|NONE)
+				fail "[$loop] $mode was not refused with a reply (got '$rep')" ;;
+			esac
+			# Anything still being sent would show up by now.
+			sleep 0.5
+			nq="$(cat "$WORK/nr_queries" 2>/dev/null)"
+			[ -n "$nq" ] && [ "$nq" -le 2 ] || \
+				fail "[$loop] $mode took '$nq' queries (want at most 2)"
 			;;
 		esac
 
