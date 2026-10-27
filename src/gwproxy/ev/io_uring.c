@@ -42,7 +42,6 @@
 struct gwp_iou_tls {
 	uint32_t	tx_len;		/* ciphertext bytes queued in @tx  */
 	uint32_t	tx_sent;	/* of those, already written       */
-	bool		hs_done;	/* handshake finished              */
 	bool		closing;	/* close_notify queued             */
 	unsigned char	rx[GWP_TLS_CIPHER_CAP];
 	unsigned char	tx[GWP_TLS_CIPHER_CAP];
@@ -787,7 +786,6 @@ static int tls_hs_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	pr_dbg(&w->ctx->lh, "TLS handshake complete (cfd=%d, alpn=%s)",
 	       gcp->client.fd, gwp_ssl_alpn(gcp->client.tls) ?: "none");
-	gcp->tls_io->hs_done = true;
 	gcp->conn_state = CONN_STATE_PROT;
 	/* App data may already sit in the engine from the last handshake recv. */
 	return tls_prot_pump(w, gcp);
