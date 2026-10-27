@@ -254,6 +254,50 @@ static void get_gcp(struct gwp_conn_pair *gcp)
 	gcp->ref_cnt++;
 }
 
+/*
+ * The in-flight request count of the socket that requests with selector
+ * @ev_bit operate on, or NULL when they are not I/O on one of the pair's
+ * sockets (timeouts, cancels, connect attempts, the DNS poll). The same
+ * mapping counts a request when it is queued and uncounts it when it
+ * completes, so the two cannot disagree.
+ */
+static uint8_t *nr_ops_of(struct gwp_conn_pair *gcp, uint64_t ev_bit)
+{
+	switch (ev_bit) {
+	case EV_BIT_IOU_CLIENT_RECV:
+	case EV_BIT_IOU_CLIENT_SEND:
+	case EV_BIT_IOU_CLIENT_PROT:
+	case EV_BIT_IOU_TLS_DETECT:
+	case EV_BIT_IOU_TLS_HS_RECV:
+	case EV_BIT_IOU_TLS_HS_SEND:
+		return &gcp->nr_ops_client;
+	case EV_BIT_IOU_TARGET_RECV:
+	case EV_BIT_IOU_TARGET_SEND:
+	case EV_BIT_IOU_UPSTREAM_S5:
+		return &gcp->nr_ops_target;
+	case EV_BIT_IOU_UDP_RX:
+	case EV_BIT_IOU_UDP_TX:
+		return &gcp->nr_ops_udp;
+	default:
+		return NULL;
+	}
+}
+
+/*
+ * Take the pair reference for request @s, which does I/O on one of the pair's
+ * sockets, and count it against that socket. Call it once @s->user_data
+ * carries its selector.
+ */
+static void get_gcp_io(struct gwp_conn_pair *gcp, struct io_uring_sqe *s)
+{
+	uint8_t *nr = nr_ops_of(gcp, GET_EV_BIT(s->user_data));
+
+	assert(nr);
+	if (likely(nr))
+		(*nr)++;
+	get_gcp(gcp);
+}
+
 static bool put_gcp(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	int x = gcp->ref_cnt--;
@@ -368,7 +412,7 @@ static struct io_uring_sqe *prep_recv_target(struct gwp_wrk *w,
 	io_uring_prep_recv(s, fd, buf, len, MSG_NOSIGNAL);
 	io_uring_sqe_set_data(s, gcp);
 	s->user_data |= EV_BIT_IOU_TARGET_RECV;
-	get_gcp(gcp);
+	get_gcp_io(gcp, s);
 	pr_dbg(&w->ctx->lh,
 		"Prepared recv for target fd=%d, len=%zu, buf=%p, ref_cnt=%d",
 		fd, len, buf, gcp->ref_cnt);
@@ -399,7 +443,7 @@ static struct io_uring_sqe *prep_recv_client(struct gwp_wrk *w,
 	io_uring_prep_recv(s, fd, buf, len, MSG_NOSIGNAL);
 	io_uring_sqe_set_data(s, gcp);
 	s->user_data |= EV_BIT_IOU_CLIENT_RECV;
-	get_gcp(gcp);
+	get_gcp_io(gcp, s);
 	pr_dbg(&w->ctx->lh,
 		"Prepared recv for client fd=%d, len=%zu, buf=%p, ref_cnt=%d",
 		fd, len, buf, gcp->ref_cnt);
@@ -422,7 +466,7 @@ static struct io_uring_sqe *prep_send_target(struct gwp_wrk *w,
 #endif
 	io_uring_sqe_set_data(s, gcp);
 	s->user_data |= EV_BIT_IOU_TARGET_SEND;
-	get_gcp(gcp);
+	get_gcp_io(gcp, s);
 	pr_dbg(&w->ctx->lh,
 		"Prepared send for target fd=%d, len=%zu, buf=%p, ref_cnt=%d",
 		fd, len, buf, gcp->ref_cnt);
@@ -444,7 +488,8 @@ static struct io_uring_sqe *__prep_send_client(struct gwp_wrk *w,
 	io_uring_prep_send(s, fd, buf, len, MSG_NOSIGNAL);
 #endif
 	io_uring_sqe_set_data(s, gcp);
-	get_gcp(gcp);
+	s->user_data |= EV_BIT_IOU_CLIENT_SEND;
+	get_gcp_io(gcp, s);
 	pr_dbg(&w->ctx->lh,
 		"Prepared send for client fd=%d, len=%zu, buf=%p, ref_cnt=%d",
 		fd, len, buf, gcp->ref_cnt);
@@ -454,8 +499,6 @@ static struct io_uring_sqe *__prep_send_client(struct gwp_wrk *w,
 static struct io_uring_sqe *prep_send_client(struct gwp_wrk *w,
 					     struct gwp_conn_pair *gcp)
 {
-	struct io_uring_sqe *s;
-
 #ifdef CONFIG_HTTPS
 	/*
 	 * A TLS client is fed encrypted bytes: send_client_tls() encrypts
@@ -468,9 +511,7 @@ static struct io_uring_sqe *prep_send_client(struct gwp_wrk *w,
 	}
 #endif
 
-	s = __prep_send_client(w, gcp);
-	s->user_data |= EV_BIT_IOU_CLIENT_SEND;
-	return s;
+	return __prep_send_client(w, gcp);
 }
 
 static struct io_uring_sqe *prep_timer_target(struct gwp_wrk *w,
@@ -616,15 +657,19 @@ static void shutdown_gcp(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		prep_timer_del_target(w, gcp);
 
 	/*
-	 * IORING_ASYNC_CANCEL_ALL: an fd can carry more than one in-flight
-	 * request -- the plain forwarding path arms a target recv while the
-	 * connect is still pending, and a relay may have a recv and a send
-	 * outstanding at once. Without it the kernel cancels exactly one, and
-	 * every survivor keeps a reference that stops put_gcp() from ever
-	 * reaching zero, leaking the pair and both fds for the process's life.
+	 * Cancel what is still in flight on the pair's sockets. Only where
+	 * there is something: a pair usually ends because both directions
+	 * hit EOF, with nothing armed on either socket, and a cancel then
+	 * costs an SQE and a CQE for nothing. IORING_ASYNC_CANCEL_ALL, since
+	 * a socket can carry more than one request -- a forwarding pair has a
+	 * recv and a send outstanding on one fd at once, as may the UDP
+	 * relay. Without it the kernel cancels exactly one, and every
+	 * survivor keeps a reference that stops put_gcp() from ever reaching
+	 * zero, leaking the pair and both fds for the process's life.
 	 */
-	if (gcp->target.fd >= 0) {
-		pr_dbg(&ctx->lh, "Cancelling target recv (fd=%d)", gcp->target.fd);
+	if (gcp->target.fd >= 0 && gcp->nr_ops_target) {
+		pr_dbg(&ctx->lh, "Cancelling target I/O (fd=%d, nr=%u)",
+		       gcp->target.fd, gcp->nr_ops_target);
 		s = get_sqe_nofail(w);
 		io_uring_prep_cancel_fd(s, gcp->target.fd, IORING_ASYNC_CANCEL_ALL);
 		io_uring_sqe_set_data(s, gcp);
@@ -632,8 +677,9 @@ static void shutdown_gcp(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		get_gcp(gcp);
 	}
 
-	if (gcp->client.fd >= 0) {
-		pr_dbg(&ctx->lh, "Cancelling client recv (fd=%d)", gcp->client.fd);
+	if (gcp->client.fd >= 0 && gcp->nr_ops_client) {
+		pr_dbg(&ctx->lh, "Cancelling client I/O (fd=%d, nr=%u)",
+		       gcp->client.fd, gcp->nr_ops_client);
 		s = get_sqe_nofail(w);
 		io_uring_prep_cancel_fd(s, gcp->client.fd, IORING_ASYNC_CANCEL_ALL);
 		io_uring_sqe_set_data(s, gcp);
@@ -641,8 +687,9 @@ static void shutdown_gcp(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		get_gcp(gcp);
 	}
 
-	if (gcp->udp_fd >= 0) {
-		pr_dbg(&ctx->lh, "Cancelling UDP relay (fd=%d)", gcp->udp_fd);
+	if (gcp->udp_fd >= 0 && gcp->nr_ops_udp) {
+		pr_dbg(&ctx->lh, "Cancelling UDP relay (fd=%d, nr=%u)",
+		       gcp->udp_fd, gcp->nr_ops_udp);
 		s = get_sqe_nofail(w);
 		io_uring_prep_cancel_fd(s, gcp->udp_fd, IORING_ASYNC_CANCEL_ALL);
 		io_uring_sqe_set_data(s, gcp);
@@ -686,7 +733,7 @@ static void prep_recv_client_cipher(struct gwp_wrk *w, struct gwp_conn_pair *gcp
 	io_uring_prep_recv(s, gcp->client.fd, t->rx, sizeof(t->rx), MSG_NOSIGNAL);
 	io_uring_sqe_set_data(s, gcp);
 	s->user_data |= ev_bit;
-	get_gcp(gcp);
+	get_gcp_io(gcp, s);
 }
 
 static void prep_send_client_cipher(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
@@ -699,7 +746,7 @@ static void prep_send_client_cipher(struct gwp_wrk *w, struct gwp_conn_pair *gcp
 			   t->tx_len - t->tx_sent, MSG_NOSIGNAL);
 	io_uring_sqe_set_data(s, gcp);
 	s->user_data |= ev_bit;
-	get_gcp(gcp);
+	get_gcp_io(gcp, s);
 }
 
 /*
@@ -904,7 +951,7 @@ static void prep_tls_detect(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 			   MSG_PEEK | MSG_NOSIGNAL);
 	io_uring_sqe_set_data(s, gcp);
 	s->user_data |= EV_BIT_IOU_TLS_DETECT;
-	get_gcp(gcp);
+	get_gcp_io(gcp, s);
 }
 
 static int handle_ev_tls_detect(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
@@ -1218,7 +1265,7 @@ static struct io_uring_sqe *prep_upstream_send(struct gwp_wrk *w,
 			   MSG_NOSIGNAL);
 	io_uring_sqe_set_data(s, gcp);
 	s->user_data |= EV_BIT_IOU_UPSTREAM_S5;
-	get_gcp(gcp);
+	get_gcp_io(gcp, s);
 	return s;
 }
 
@@ -1232,7 +1279,7 @@ static struct io_uring_sqe *prep_upstream_recv(struct gwp_wrk *w,
 	io_uring_prep_recv(s, gcp->target.fd, buf, len, MSG_NOSIGNAL);
 	io_uring_sqe_set_data(s, gcp);
 	s->user_data |= EV_BIT_IOU_UPSTREAM_S5;
-	get_gcp(gcp);
+	get_gcp_io(gcp, s);
 	return s;
 }
 
@@ -1964,7 +2011,7 @@ static void prep_udp_recv(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	io_uring_prep_recvmsg(s, gcp->udp_fd, &u->mh, 0);
 	io_uring_sqe_set_data(s, gcp);
 	s->user_data |= EV_BIT_IOU_UDP_RX;
-	get_gcp(gcp);
+	get_gcp_io(gcp, s);
 }
 
 /* Arm a relay sendmsg of @buf[0..len) to @dst (part of the same scratch). */
@@ -1986,7 +2033,7 @@ static void prep_udp_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	io_uring_prep_sendmsg(s, gcp->udp_fd, &u->mh, MSG_NOSIGNAL);
 	io_uring_sqe_set_data(s, gcp);
 	s->user_data |= EV_BIT_IOU_UDP_TX;
-	get_gcp(gcp);
+	get_gcp_io(gcp, s);
 }
 
 /*
@@ -2256,7 +2303,15 @@ static int handle_event(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 	uint64_t ev_bit = GET_EV_BIT(cqe->user_data);
 	struct gwp_ctx *ctx = w->ctx;
 	struct gwp_conn_pair *gcp;
+	uint8_t *nr_ops;
 	int r;
+
+	/* I/O on one of the pair's sockets: it is no longer in flight. */
+	nr_ops = nr_ops_of(udata, ev_bit);
+	if (nr_ops) {
+		assert(*nr_ops);
+		(*nr_ops)--;
+	}
 
 	/*
 	 * A racing connect carries its attempt slot in the selector, so the

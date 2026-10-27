@@ -551,6 +551,14 @@ struct gwp_conn_pair {
 	 * connect timer is armed.
 	 */
 	uint8_t			nr_timers_armed;
+	/*
+	 * Requests in flight on the client, target and UDP relay sockets
+	 * (recv, send, poll; not timeouts or cancels), so that teardown
+	 * cancels only on the sockets that still have any.
+	 */
+	uint8_t			nr_ops_client;
+	uint8_t			nr_ops_target;
+	uint8_t			nr_ops_udp;
 #endif
 };
 
