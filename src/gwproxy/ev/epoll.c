@@ -1405,20 +1405,46 @@ static int handle_ev_attempt_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	return connect_next_candidate(w, gcp, -EINPROGRESS);
 }
 
+/*
+ * EPOLLERR on a target that is not up yet. Only two kinds of pair get here:
+ * plain and transparent forwarding, whose target socket is created directly
+ * at accept time rather than raced through attempt sockets, and a pair in
+ * the upstream proxy handshake. The SOCKS5 and HTTP front-ends connect
+ * through attempts, whose failures handle_ev_target_attempt() answers.
+ *
+ * The connect failed, or the upstream proxy dropped us mid-handshake, so
+ * collect the reason and tear the pair down. Neither case has a reply to
+ * give, and the socket must not be treated as connected: EPOLLERR is
+ * level-triggered and stays raised, so going on with the upstream
+ * handshake on it would come straight back here until the connect timer
+ * fired.
+ */
+static int handle_ev_target_conn_err(struct gwp_wrk *w,
+				     struct gwp_conn_pair *gcp)
+{
+	socklen_t l = sizeof(int);
+	int r, err = 0;
+
+	r = __sys_getsockopt(gcp->target.fd, SOL_SOCKET, SO_ERROR, &err, &l);
+	if (unlikely(r < 0))
+		err = -r;
+	if (!err)
+		err = ECONNRESET;
+
+	pr_dbg(&w->ctx->lh, "Target connect failed: %s (fd=%d, idx=%u, ca=%s)",
+		strerror(err), gcp->target.fd, gcp->idx,
+		ip_to_str(&gcp->client_addr));
+	return -err;
+}
+
 static int handle_ev_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			    struct epoll_event *ev)
 {
 	int r;
 
 	if (unlikely(ev->events & EPOLLERR)) {
-		/*
-		 * A connect() that failed reports EPOLLERR, so bailing out
-		 * here dropped the client without a reply -- a refused target
-		 * is the common case. Hand it to the connect-result path,
-		 * which reads SO_ERROR and answers with the matching REP.
-		 */
 		if (!gcp->is_target_alive)
-			return handle_ev_target_conn_result(w, gcp);
+			return handle_ev_target_conn_err(w, gcp);
 
 		pr_err(&w->ctx->lh, "EPOLLERR on target connection event");
 		return -ECONNRESET;
