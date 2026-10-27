@@ -22,7 +22,6 @@
 #endif
 
 
-static int arm_poll_for_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 #ifdef CONFIG_HTTPS
 static int tls_flush_hs(struct gwp_conn *c);
 #endif
@@ -89,6 +88,10 @@ static int send_dns_payload(struct gwp_dns_resolver *res,
 	return 0;
 }
 
+/*
+ * A lookup is pending. The getaddrinfo() path needs nothing more here: its
+ * result arrives on the worker's DNS completion queue (handle_ev_dns_cq()).
+ */
 static int chk_handle_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_cfg *cfg = &w->ctx->cfg;
@@ -98,7 +101,7 @@ static int chk_handle_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		return send_dns_payload(res, gcp);
 	}
 
-	return arm_poll_for_dns_query(w, gcp);
+	return 0;
 }
 
 static int handle_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
@@ -193,9 +196,10 @@ static int register_dns_to_epoll(struct gwp_wrk __unused *w)
 	return 0;
 }
 
-static int chk_handle_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+static int chk_handle_dns_query(struct gwp_wrk __unused *w,
+				struct gwp_conn_pair __unused *gcp)
 {
-	return arm_poll_for_dns_query(w, gcp);
+	return 0;
 }
 
 static int handle_ev_raw_dns_query(struct gwp_wrk __unused *w)
@@ -289,6 +293,16 @@ int gwp_ctx_init_thread_epoll(struct gwp_wrk *w)
 	r = register_dns_to_epoll(w);
 	if (r)
 		goto out_free_events;
+
+	/* Results of this worker's getaddrinfo() lookups. */
+	if (ctx->dns) {
+		ev.events = EPOLLIN;
+		ev.data.u64 = EV_BIT_DNS_QUERY;
+		r = __sys_epoll_ctl(ep_fd, EPOLL_CTL_ADD,
+				    gwp_dns_cq_fd(ctx->dns, w->idx), &ev);
+		if (unlikely(r))
+			goto out_free_events;
+	}
 
 	/* Scratch for the SOCKS5 UDP relay; only reachable when as_socks5. */
 	if (ctx->cfg.as_socks5) {
@@ -399,18 +413,9 @@ static int credit_fd_closed(struct gwp_wrk *w, int n)
 __hot
 static int __free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
-	struct gwp_dns_entry *gde = gcp->gde;
 	struct gwp_ctx *ctx = w->ctx;
 	int nr_fd_closed = 0;
 	int r;
-
-	if (!w->ctx->cfg.use_raw_dns) {
-		if (gde) {
-			r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_DEL, gde->ev_fd, NULL);
-			if (unlikely(r))
-				return r;
-		}
-	}
 
 	if (gcp->client.fd >= 0)
 		nr_fd_closed++;
@@ -2175,26 +2180,6 @@ static int handle_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	return 0;
 }
 
-static int arm_poll_for_dns_query(struct gwp_wrk *w,
-					struct gwp_conn_pair *gcp)
-{
-	struct gwp_dns_entry *gde = gcp->gde;
-	struct epoll_event ev;
-	int r;
-
-	assert(gde);
-	assert(gde->ev_fd >= 0);
-
-	ev.events = EPOLLIN;
-	ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_DNS_QUERY;
-
-	r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, gde->ev_fd, &ev);
-	if (unlikely(r))
-		return r;
-
-	return 0;
-}
-
 static void log_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			  struct gwp_dns_entry *gde)
 {
@@ -2221,13 +2206,8 @@ static int handle_ev_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	int r;
 
 	assert(gde);
-	assert(gde->ev_fd >= 0);
 	assert(gcp->conn_state == CONN_STATE_SOCKS5_DNS_QUERY ||
 	       gcp->conn_state == CONN_STATE_HTTP_DNS_QUERY);
-
-	r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_DEL, gde->ev_fd, NULL);
-	if (unlikely(r))
-		return r;
 
 	log_dns_query(w, gcp, gde);
 	if (likely(!gde->res)) {
@@ -2250,9 +2230,48 @@ static int handle_ev_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 			r = gde->res ? gde->res : -EIO;
 	}
 
-	gwp_dns_entry_put(gde);
+	gwp_dns_entry_free(gde);
 	gcp->gde = NULL;
 	return r;
+}
+
+/*
+ * Finished getaddrinfo() lookups of this worker. One wakeup may carry many.
+ * A pair torn down earlier in this batch still owns its entry, since the
+ * teardown that cancels it runs after the batch; take it back here.
+ */
+static int handle_ev_dns_cq(struct gwp_wrk *w)
+{
+	struct gwp_dns_entry *e, *next;
+	int r, ret = 0;
+
+	e = gwp_dns_cq_pop(w->ctx->dns, w->idx);
+	for (; e; e = next) {
+		struct gwp_conn_pair *gcp = e->udata;
+
+		next = e->next;
+		/* Its pair was freed while an earlier entry was handled. */
+		if (gwp_dns_entry_cancelled(e)) {
+			gwp_dns_entry_free(e);
+			continue;
+		}
+
+		assert(gcp->gde == e);
+		if (gcp->flags & GWP_CONN_FLAG_IS_DYING) {
+			gcp->gde = NULL;
+			gwp_dns_entry_free(e);
+			continue;
+		}
+
+		r = handle_ev_dns_query(w, gcp);
+		if (r) {
+			r = free_conn_pair(w, gcp);
+			if (unlikely(r) && !ret)
+				ret = r;
+		}
+	}
+
+	return ret;
 }
 
 static int handle_ev_auth_file(struct gwp_wrk *w)
@@ -2323,7 +2342,6 @@ static bool is_ev_bit_conn_pair(uint64_t ev_bit)
 	case EV_BIT_TIMER:
 	case EV_BIT_ATTEMPT_TIMER:
 	case EV_BIT_CLIENT_SOCKS5:
-	case EV_BIT_DNS_QUERY:
 	case EV_BIT_CLIENT_PROT:
 	case EV_BIT_UDP_RELAY:
 		return true;
@@ -2824,7 +2842,7 @@ static int handle_event(struct gwp_wrk *w, struct epoll_event *ev)
 		r = handle_ev_timer(w, udata);
 		break;
 	case EV_BIT_DNS_QUERY:
-		r = handle_ev_dns_query(w, udata);
+		r = handle_ev_dns_cq(w);
 		break;
 	case EV_BIT_SOCKS5_AUTH_FILE:
 		r = handle_ev_auth_file(w);

@@ -23,6 +23,7 @@
 
 #include <pthread.h>
 #include <sys/eventfd.h>
+#include <gwproxy/syscall.h>
 
 /*
  * The resolver threads. @nr_workers of them (--nr-dns-workers) are started
@@ -53,6 +54,16 @@ struct gwp_dns_thr {
 	bool			join;	/* free_threads() only */
 };
 
+/*
+ * A completion queue: a lock-free LIFO the resolver threads push finished
+ * entries onto, drained in one go by the event loop that owns it. The
+ * eventfd is written only when the list goes from empty to non-empty.
+ */
+struct gwp_dns_cq {
+	_Atomic(struct gwp_dns_entry *)	head;
+	int				efd;
+};
+
 struct gwp_dns_ctx {
 	bool			should_stop;
 	pthread_mutex_t		lock;
@@ -65,17 +76,18 @@ struct gwp_dns_ctx {
 	struct gwp_dns_entry	*tail;
 	struct gwp_dns_thr	*threads;	/* @max_threads slots */
 	struct gwp_dns_cache	*cache;
+	struct gwp_dns_cq	*cqs;		/* @cfg.nr_cqs of them */
 	time_t			last_scan;
 	struct gwp_dns_cfg	cfg;
 };
 
-static void put_all_entries(struct gwp_dns_entry *head)
+static void free_all_entries(struct gwp_dns_entry *head)
 {
 	struct gwp_dns_entry *e, *next;
 
 	for (e = head; e; e = next) {
 		next = e->next;
-		gwp_dns_entry_put(e);
+		gwp_dns_entry_free(e);
 	}
 }
 
@@ -228,15 +240,89 @@ int gwp_dns_resolve(struct gwp_dns_ctx *ctx, const char *name,
 	return 0;
 }
 
-static void gwp_dns_entry_free(struct gwp_dns_entry *e)
+void gwp_dns_entry_free(struct gwp_dns_entry *e)
 {
 	if (!e)
 		return;
 
-	assert(e->ev_fd >= 0);
-	__sys_close(e->ev_fd);
 	free(e->name);
 	free(e);
+}
+
+void gwp_dns_entry_cancel(struct gwp_dns_entry *e)
+{
+	if (e)
+		atomic_store_explicit(&e->cancelled, true, memory_order_relaxed);
+}
+
+/*
+ * Hand a finished entry to its event loop, or free it if nobody waits for it
+ * any more. The release CAS publishes the result fields along with it.
+ */
+static void deliver_entry(struct gwp_dns_entry *e)
+{
+	struct gwp_dns_cq *cq = e->cq;
+	struct gwp_dns_entry *old;
+	static const uint64_t one = 1;
+	ssize_t r;
+
+	if (gwp_dns_entry_cancelled(e)) {
+		gwp_dns_entry_free(e);
+		return;
+	}
+
+	old = atomic_load_explicit(&cq->head, memory_order_relaxed);
+	do {
+		e->next = old;
+	} while (!atomic_compare_exchange_weak_explicit(&cq->head, &old, e,
+							memory_order_release,
+							memory_order_relaxed));
+
+	/*
+	 * Only the push onto an empty list signals: until the loop takes the
+	 * list, that one wakeup covers whatever is pushed after it.
+	 */
+	if (!old) {
+		do {
+			r = __sys_write(cq->efd, &one, sizeof(one));
+		} while (r == -EINTR);
+	}
+}
+
+struct gwp_dns_entry *gwp_dns_cq_pop(struct gwp_dns_ctx *ctx, uint32_t cq_idx)
+{
+	struct gwp_dns_cq *cq = &ctx->cqs[cq_idx];
+	struct gwp_dns_entry *e, *next, *head = NULL;
+	uint64_t val;
+	ssize_t r;
+
+	/*
+	 * Clear the eventfd before taking the list: a push that lands after
+	 * the exchange finds the list empty and writes it again.
+	 */
+	do {
+		r = __sys_read(cq->efd, &val, sizeof(val));
+	} while (r == -EINTR);
+
+	e = atomic_exchange_explicit(&cq->head, NULL, memory_order_acquire);
+
+	/* Reverse into completion order, dropping what was cancelled. */
+	for (; e; e = next) {
+		next = e->next;
+		if (gwp_dns_entry_cancelled(e)) {
+			gwp_dns_entry_free(e);
+			continue;
+		}
+		e->next = head;
+		head = e;
+	}
+
+	return head;
+}
+
+int gwp_dns_cq_fd(struct gwp_dns_ctx *ctx, uint32_t cq_idx)
+{
+	return ctx->cqs[cq_idx].efd;
 }
 
 /*
@@ -326,12 +412,10 @@ static void process_queue_entry(struct gwp_dns_ctx *ctx)
 	ctx->nr_entries--;
 	pthread_mutex_unlock(&ctx->lock);
 
-	if (atomic_load(&e->refcnt) == 1) {
+	if (gwp_dns_entry_cancelled(e)) {
 		/*
-		 * If the refcnt is 1, it means we are the last reference
-		 * to this entry. The client no longer cares about the
-		 * result. We can free it immediately. No need to resolve
-		 * the query nor to signal the eventfd.
+		 * The client no longer cares about the result. Free it
+		 * without resolving the name.
 		 */
 		gwp_dns_entry_free(e);
 		goto out;
@@ -341,15 +425,25 @@ static void process_queue_entry(struct gwp_dns_ctx *ctx)
 			 &e->nr_addrs, ctx->cfg.restyp, &res);
 
 	/*
-	 * Wake the client first: the cache insert takes the write lock and
+	 * Deliver first: the cache insert takes the write lock and
 	 * allocates, and the client has no reason to wait for either.
+	 * @e is not ours once delivered, so copy the name to insert; the
+	 * cache refuses names longer than this anyway.
 	 */
-	eventfd_write(e->ev_fd, 1);
 	if (!e->res) {
-		try_pass_result_to_cache(ctx, e->name, res);
+		char name[256];
+		size_t nl = strlen(e->name);
+		bool fits = nl < sizeof(name);
+
+		if (fits)
+			memcpy(name, e->name, nl + 1);
+		deliver_entry(e);
+		if (fits)
+			try_pass_result_to_cache(ctx, name, res);
 		freeaddrinfo(res);
+	} else {
+		deliver_entry(e);
 	}
-	gwp_dns_entry_put(e);
 out:
 	pthread_mutex_lock(&ctx->lock);
 }
@@ -620,6 +714,59 @@ static inline bool validate_restyp(int restyp)
 	}
 }
 
+static void free_cqs(struct gwp_dns_ctx *ctx)
+{
+	uint32_t i;
+
+	if (!ctx->cqs)
+		return;
+
+	for (i = 0; i < ctx->cfg.nr_cqs; i++) {
+		struct gwp_dns_cq *cq = &ctx->cqs[i];
+
+		free_all_entries(atomic_load(&cq->head));
+		if (cq->efd >= 0)
+			__sys_close(cq->efd);
+	}
+
+	free(ctx->cqs);
+	ctx->cqs = NULL;
+}
+
+static int init_cqs(struct gwp_dns_ctx *ctx)
+{
+	uint32_t i;
+	int fd;
+
+	if (!ctx->cfg.nr_cqs)
+		return -EINVAL;
+
+	ctx->cqs = calloc(ctx->cfg.nr_cqs, sizeof(*ctx->cqs));
+	if (!ctx->cqs)
+		return -ENOMEM;
+
+	for (i = 0; i < ctx->cfg.nr_cqs; i++)
+		ctx->cqs[i].efd = -1;
+
+	for (i = 0; i < ctx->cfg.nr_cqs; i++) {
+		atomic_init(&ctx->cqs[i].head, NULL);
+		fd = __sys_eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+		if (fd < 0) {
+			free_cqs(ctx);
+			return fd;
+		}
+		ctx->cqs[i].efd = fd;
+	}
+
+	return 0;
+}
+
+static void free_all_queued_entries(struct gwp_dns_ctx *ctx)
+{
+	free_all_entries(ctx->head);
+	ctx->head = ctx->tail = NULL;
+}
+
 /* The idle timeouts are intervals, so measure them on the monotonic clock. */
 static int init_cond(pthread_cond_t *cond)
 {
@@ -661,9 +808,13 @@ int gwp_dns_ctx_init(struct gwp_dns_ctx **ctx_p, const struct gwp_dns_cfg *cfg)
 	if (r)
 		goto out_destroy_mutex;
 
-	r = init_cache(ctx);
+	r = init_cqs(ctx);
 	if (r)
 		goto out_destroy_cond;
+
+	r = init_cache(ctx);
+	if (r)
+		goto out_free_cqs;
 
 	ctx->nr_sleeping = 0;
 	ctx->nr_entries = 0;
@@ -681,6 +832,8 @@ int gwp_dns_ctx_init(struct gwp_dns_ctx **ctx_p, const struct gwp_dns_cfg *cfg)
 	return 0;
 out_free_cache:
 	free_cache(ctx->cache);
+out_free_cqs:
+	free_cqs(ctx);
 out_destroy_cond:
 	pthread_cond_destroy(&ctx->cond);
 out_destroy_mutex:
@@ -691,18 +844,13 @@ out_free_ctx:
 	return r;
 }
 
-static void put_all_queued_entries(struct gwp_dns_ctx *ctx)
-{
-	put_all_entries(ctx->head);
-	ctx->head = ctx->tail = NULL;
-}
-
 void gwp_dns_ctx_free(struct gwp_dns_ctx *ctx)
 {
 	free_threads(ctx);
 	pthread_mutex_destroy(&ctx->lock);
 	pthread_cond_destroy(&ctx->cond);
-	put_all_queued_entries(ctx);
+	free_all_queued_entries(ctx);
+	free_cqs(ctx);
 	free_cache(ctx->cache);
 	free(ctx);
 }
@@ -724,50 +872,31 @@ static void push_queue(struct gwp_dns_ctx *ctx, struct gwp_dns_entry *e)
 	pthread_mutex_unlock(&ctx->lock);
 }
 
-struct gwp_dns_entry *gwp_dns_queue(struct gwp_dns_ctx *ctx,
-				    const char *name, uint16_t port)
+struct gwp_dns_entry *gwp_dns_queue(struct gwp_dns_ctx *ctx, uint32_t cq_idx,
+				    const char *name, uint16_t port,
+				    void *udata)
 {
 	struct gwp_dns_entry *e;
+
+	if (cq_idx >= ctx->cfg.nr_cqs)
+		return NULL;
 
 	e = malloc(sizeof(*e));
 	if (!e)
 		return NULL;
 
-	e->ev_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-	if (e->ev_fd < 0)
-		goto out_free_e;
-
 	e->name = strdup(name);
-	if (!e->name)
-		goto out_close_ev_fd;
-
-	e->port = port;
-
-	atomic_init(&e->refcnt, 2);
-	e->res = 0;
-	push_queue(ctx, e);
-	return e;
-
-out_close_ev_fd:
-	__sys_close(e->ev_fd);
-out_free_e:
-	free(e);
-	return NULL;
-}
-
-bool gwp_dns_entry_put(struct gwp_dns_entry *e)
-{
-	int x;
-
-	if (!e)
-		return false;
-
-	x = atomic_fetch_sub(&e->refcnt, 1);
-	assert(x > 0);
-	if (x == 1) {
-		gwp_dns_entry_free(e);
-		return true;
+	if (!e->name) {
+		free(e);
+		return NULL;
 	}
 
-	return false;
+	e->port = port;
+	atomic_init(&e->cancelled, false);
+	e->res = 0;
+	e->nr_addrs = 0;
+	e->cq = &ctx->cqs[cq_idx];
+	e->udata = udata;
+	push_queue(ctx, e);
+	return e;
 }

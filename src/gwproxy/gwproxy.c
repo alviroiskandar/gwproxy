@@ -1533,7 +1533,8 @@ static int gwp_ctx_init_dns(struct gwp_ctx *ctx)
 		.max_entries = cfg->dns_cache_max_entries > 0 ?
 			       (uint32_t)cfg->dns_cache_max_entries : 0,
 		.restyp = cfg_dns_restyp(cfg),
-		.nr_workers = cfg->nr_dns_workers
+		.nr_workers = cfg->nr_dns_workers,
+		.nr_cqs = (uint32_t)cfg->nr_workers
 	};
 	int r;
 
@@ -2166,11 +2167,11 @@ int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		gwp_dns_res_drop_query(&w->dns->resolvers[0], gcp, gcp->gdp->txid);
 		gwp_free_dns_packet(gcp);
 	} else if (gcp->gde) {
-		gwp_dns_entry_put(gcp->gde);
+		gwp_dns_entry_cancel(gcp->gde);
 	}
 #else
 	if (gcp->gde)
-		gwp_dns_entry_put(gcp->gde);
+		gwp_dns_entry_cancel(gcp->gde);
 #endif
 
 	switch (gcp->prot_type) {
@@ -2616,7 +2617,7 @@ static int queue_dns_resolution(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	struct gwp_dns_ctx *dns = w->ctx->dns;
 	struct gwp_dns_entry *gde;
 
-	gde = gwp_dns_queue(dns, host, port);
+	gde = gwp_dns_queue(dns, w->idx, host, port, gcp);
 	if (unlikely(!gde)) {
 		pr_err(&w->ctx->lh, "Failed to allocate DNS entry for %s:%hu", host, port);
 		return -ENOMEM;
@@ -3297,8 +3298,8 @@ int gwp_handle_conn_state_socks5(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		   ct == CONN_STATE_SOCKS5_CONNECT) {
 		/*
 		 * The request is parsed; we are waiting on the resolver or on
-		 * connect(), and the client is still armed for input because
-		 * arm_poll_for_dns_query() only adds the resolver's eventfd.
+		 * connect(), and the client is still armed for input: waiting
+		 * on the resolver does not touch the client's registration.
 		 * A client that pipelines data behind its request therefore
 		 * arrives here, which is rude rather than impossible -- it
 		 * used to abort the process.

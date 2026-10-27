@@ -1982,23 +1982,32 @@ static int handle_ev_attempt_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	return connect_next_candidate(w, gcp, -EINPROGRESS);
 }
 
+/*
+ * A lookup is pending; its result arrives on the worker's DNS completion
+ * queue (handle_ev_dns_cq()). Hold a reference for it, as an SQE would, so
+ * the pair outlives the wait.
+ */
 static int prep_domain_resolution(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_dns_entry *gde = gcp->gde;
 	struct gwp_ctx *ctx = w->ctx;
-	struct io_uring_sqe *s;
 
 	assert(gde);
-	s = get_sqe_nofail(w);
-	io_uring_prep_poll_add(s, gde->ev_fd, POLLIN);
-	io_uring_sqe_set_data(s, gcp);
-	s->user_data |= EV_BIT_IOU_DNS_QUERY;
 	get_gcp(gcp);
 	pr_dbg(&ctx->lh,
-		"Prepared DNS query for domain '%s' (fd=%d, idx=%u, ref_cnt=%d)",
-		gde->name, gde->ev_fd, gcp->idx, gcp->ref_cnt);
+		"Queued DNS query for domain '%s' (idx=%u, ref_cnt=%d)",
+		gde->name, gcp->idx, gcp->ref_cnt);
 
 	return 0;
+}
+
+/* Watch the worker's DNS completion queue; one-shot, re-armed per wakeup. */
+static void arm_dns_cq_poll(struct gwp_wrk *w)
+{
+	struct io_uring_sqe *s = get_sqe_nofail(w);
+
+	io_uring_prep_poll_add(s, gwp_dns_cq_fd(w->ctx->dns, w->idx), POLLIN);
+	s->user_data = EV_BIT_IOU_DNS_QUERY;
 }
 
 /* Arm the next relay recvmsg into the front-padded scratch buffer. */
@@ -2224,7 +2233,7 @@ static int handle_ev_dns_query(struct gwp_wrk *w, void *udata)
 
 		pr_info(&ctx->lh, "Failed to resolve domain '%s': %d",
 			gde->name, res);
-		gwp_dns_entry_put(gde);
+		gwp_dns_entry_free(gde);
 		gcp->gde = NULL;
 
 		/*
@@ -2244,9 +2253,46 @@ static int handle_ev_dns_query(struct gwp_wrk *w, void *udata)
 		gde->name, ip_to_str(&gcp->target_addr), gcp->nr_cand,
 		gcp->target.fd, gcp->idx);
 
-	gwp_dns_entry_put(gde);
+	gwp_dns_entry_free(gde);
 	gcp->gde = NULL;
 	return do_prep_connect(w, gcp);
+}
+
+/*
+ * Finished getaddrinfo() lookups of this worker; one wakeup may carry many.
+ * Each pair holds a reference for its lookup (prep_domain_resolution()),
+ * dropped here once the result is used, exactly as an SQE's completion does.
+ */
+static int handle_ev_dns_cq(struct gwp_wrk *w)
+{
+	struct gwp_dns_entry *e, *next;
+	int r;
+
+	e = gwp_dns_cq_pop(w->ctx->dns, w->idx);
+	for (; e; e = next) {
+		struct gwp_conn_pair *gcp = e->udata;
+
+		next = e->next;
+		/* Defensive: the pair holds a reference until we put it. */
+		if (unlikely(gwp_dns_entry_cancelled(e))) {
+			gwp_dns_entry_free(e);
+			continue;
+		}
+
+		assert(gcp->gde == e);
+		if (gcp->flags & GWP_CONN_FLAG_IS_CANCEL) {
+			gcp->gde = NULL;
+			gwp_dns_entry_free(e);
+		} else {
+			r = handle_ev_dns_query(w, gcp);
+			if (r && !(gcp->flags & GWP_CONN_FLAG_IS_CANCEL))
+				shutdown_gcp(w, gcp);
+		}
+		put_gcp(w, gcp);
+	}
+
+	arm_dns_cq_poll(w);
+	return 0;
 }
 
 static void prep_auth_reload(struct gwp_wrk *w)
@@ -2435,9 +2481,8 @@ static int handle_event(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 		r = 0;
 		break;
 	case EV_BIT_IOU_DNS_QUERY:
-		pr_dbg(&ctx->lh, "Handling DNS query event: %d", cqe->res);
-		r = handle_ev_dns_query(w, udata);
-		break;
+		pr_dbg(&ctx->lh, "Handling DNS completion event: %d", cqe->res);
+		return handle_ev_dns_cq(w);
 	case EV_BIT_IOU_STOP:
 		pr_dbg(&ctx->lh, "Handling stop doorbell: %d", cqe->res);
 		return 0;
@@ -2537,6 +2582,8 @@ int gwp_ctx_thread_entry_io_uring(struct gwp_wrk *w)
 
 	io_uring_set_iowait(&w->iou->ring, false);
 	arm_stop_poll(w);
+	if (ctx->dns)
+		arm_dns_cq_poll(w);
 	arm_accept(w);
 	while (!ctx->stop) {
 		r = fish_events(w);

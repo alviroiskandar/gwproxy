@@ -61,12 +61,19 @@ static const struct req_template req_template[] = {
 	{ "::1",		9090,	true },
 };
 
-static int poll_all_in(struct pollfd *pfd, int n, int timeout)
+/*
+ * Wait until all @n entries in @want have come back on completion queue 0,
+ * the way an event loop would: poll the queue's eventfd, then pop.
+ */
+static int wait_entries(struct gwp_dns_ctx *ctx, struct gwp_dns_entry **want,
+			int n, int timeout)
 {
-	int ret, i, t = 0;
+	struct pollfd pfd = { .fd = gwp_dns_cq_fd(ctx, 0), .events = POLLIN };
+	struct gwp_dns_entry *e;
+	int ret, i, got = 0;
 
-	while (1) {
-		ret = poll(pfd, n, timeout);
+	while (got < n) {
+		ret = poll(&pfd, 1, timeout);
 		if (ret < 0) {
 			perror("poll");
 			return -1;
@@ -76,16 +83,19 @@ static int poll_all_in(struct pollfd *pfd, int n, int timeout)
 			return -ETIMEDOUT;
 		}
 
-		for (i = 0; i < n; i++) {
-			if (pfd[i].revents & (POLLIN | POLLERR | POLLHUP)) {
-				pfd[i].events = 0;
-				t++;
+		for (e = gwp_dns_cq_pop(ctx, 0); e; e = e->next) {
+			for (i = 0; i < n; i++) {
+				if (want[i] == e)
+					break;
 			}
+			assert(i < n);
+			/* udata comes back as given. */
+			assert(e->udata == &want[i]);
+			got++;
 		}
-
-		if (t == n)
-			return 0;
 	}
+
+	return 0;
 }
 
 /*
@@ -137,10 +147,9 @@ static bool has_ipv6(void)
 
 static void test_basic_dns_multiple_requests(void)
 {
-	struct gwp_dns_cfg cfg = { .nr_workers = 1 };
+	struct gwp_dns_cfg cfg = { .nr_workers = 1, .nr_cqs = 1 };
 	struct gwp_dns_entry *earr[ARRAY_SIZE(req_template)];
 	uint16_t ports[ARRAY_SIZE(req_template)];
-	struct pollfd pfd[ARRAY_SIZE(req_template)];
 	bool v6 = has_ipv6();
 	struct gwp_dns_ctx *ctx;
 	int i, n, skipped = 0;
@@ -158,12 +167,10 @@ static void test_basic_dns_multiple_requests(void)
 			skipped++;
 			continue;
 		}
-		earr[n] = gwp_dns_queue(ctx, rt->domain, rt->port);
+		earr[n] = gwp_dns_queue(ctx, 0, rt->domain, rt->port,
+					&earr[n]);
 		ports[n] = rt->port;
 		assert(earr[n]);
-		assert(earr[n]->ev_fd >= 0);
-		pfd[n].fd = earr[n]->ev_fd;
-		pfd[n].events = POLLIN;
 		n++;
 	}
 	assert(n > 0);
@@ -176,7 +183,7 @@ static void test_basic_dns_multiple_requests(void)
 		printf("dns: no non-loopback IPv6 on this host, skipped %d of %zu requests\n",
 		       skipped, ARRAY_SIZE(req_template));
 
-	r = poll_all_in(pfd, n, 5000);
+	r = wait_entries(ctx, earr, n, 5000);
 	assert(!r);
 
 	for (i = 0; i < n; i++) {
@@ -188,34 +195,31 @@ static void test_basic_dns_multiple_requests(void)
 	}
 
 	for (i = 0; i < n; i++)
-		gwp_dns_entry_put(earr[i]);
+		gwp_dns_entry_free(earr[i]);
 	gwp_dns_ctx_free(ctx);
 }
 
 static void test_dns_cache(void)
 {
-	struct gwp_dns_cfg cfg = { .nr_workers = 1, .cache_expiry = 10 };
+	struct gwp_dns_cfg cfg = { .nr_workers = 1, .cache_expiry = 10,
+				   .nr_cqs = 1 };
 	struct gwp_sockaddr addr;
 	struct gwp_dns_ctx *ctx;
 	struct gwp_dns_entry *e;
-	struct pollfd pfd;
 	int r;
 
 	r = gwp_dns_ctx_init(&ctx, &cfg);
 	assert(!r);
 	assert(ctx != NULL);
 
-	e = gwp_dns_queue(ctx, "localhost", 80);
+	e = gwp_dns_queue(ctx, 0, "localhost", 80, &e);
 	assert(e != NULL);
-	assert(e->ev_fd >= 0);
-	pfd.fd = e->ev_fd;
-	pfd.events = POLLIN;
-	r = poll_all_in(&pfd, 1, 5000);
+	r = wait_entries(ctx, &e, 1, 5000);
 	assert(r == 0);
 	assert(e->res == 0);
 	r = e->addrs[0].sa.sa_family;
 	assert(r == AF_INET || r == AF_INET6);
-	gwp_dns_entry_put(e);
+	gwp_dns_entry_free(e);
 
 	wait_cached(ctx, "localhost");
 	r = gwp_dns_cache_lookup(ctx, "localhost", 8080, &addr);
@@ -387,22 +391,20 @@ static void test_dns_cache_many_addrs(void)
  */
 static void test_addr_list(void)
 {
-	struct gwp_dns_cfg cfg = { .nr_workers = 1, .cache_expiry = 10 };
+	struct gwp_dns_cfg cfg = { .nr_workers = 1, .cache_expiry = 10,
+				   .nr_cqs = 1 };
 	struct gwp_sockaddr one, list[GWP_DNS_MAX_ADDRS];
 	struct gwp_dns_ctx *ctx;
 	struct gwp_dns_entry *e;
 	uint8_t nr = 0, i;
-	struct pollfd pfd;
 	int r;
 
 	r = gwp_dns_ctx_init(&ctx, &cfg);
 	assert(!r);
 
-	e = gwp_dns_queue(ctx, "localhost", 80);
+	e = gwp_dns_queue(ctx, 0, "localhost", 80, &e);
 	assert(e != NULL);
-	pfd.fd = e->ev_fd;
-	pfd.events = POLLIN;
-	r = poll_all_in(&pfd, 1, 5000);
+	r = wait_entries(ctx, &e, 1, 5000);
 	assert(r == 0);
 	assert(e->res == 0);
 
@@ -434,7 +436,7 @@ static void test_addr_list(void)
 				same_as_cur++;
 		assert(same_as_cur == (uint8_t)(e->nr_addrs - i));
 	}
-	gwp_dns_entry_put(e);
+	gwp_dns_entry_free(e);
 
 	/* The cache stores every record; its list must match the resolver's. */
 	wait_cached(ctx, "localhost");
@@ -455,6 +457,42 @@ static void test_addr_list(void)
 	gwp_dns_ctx_free(ctx);
 }
 
+/*
+ * A cancelled request never comes back from the completion queue, and the
+ * context frees whatever is still queued or undelivered when it goes away
+ * (run under ASan this checks nothing leaks).
+ */
+static void test_cancel(void)
+{
+	struct gwp_dns_cfg cfg = { .nr_workers = 1, .nr_cqs = 2 };
+	struct gwp_dns_entry *c1, *c2, *e;
+	struct gwp_dns_ctx *ctx;
+	int r;
+
+	r = gwp_dns_ctx_init(&ctx, &cfg);
+	assert(!r);
+
+	c1 = gwp_dns_queue(ctx, 0, "localhost", 80, NULL);
+	c2 = gwp_dns_queue(ctx, 0, "127.0.0.1", 80, NULL);
+	assert(c1 && c2);
+	gwp_dns_entry_cancel(c1);
+	gwp_dns_entry_cancel(c2);
+
+	/* Queued after them, so it finishes after them on the one thread. */
+	e = gwp_dns_queue(ctx, 0, "localhost", 81, &e);
+	assert(e);
+	r = wait_entries(ctx, &e, 1, 5000);
+	assert(!r);
+	assert(e->res == 0 && e->addrs[0].i4.sin_port == htons(81));
+	gwp_dns_entry_free(e);
+
+	/* Left for gwp_dns_ctx_free(): one delivered on queue 1, unpopped. */
+	e = gwp_dns_queue(ctx, 1, "localhost", 80, NULL);
+	assert(e);
+	gwp_dns_queue(ctx, 1, "localhost", 80, NULL);
+	gwp_dns_ctx_free(ctx);
+}
+
 int main(void)
 {
 	test_basic_dns_multiple_requests();
@@ -464,6 +502,7 @@ int main(void)
 	test_dns_cache_expiry_replace();
 	test_dns_cache_many_addrs();
 	test_addr_list();
+	test_cancel();
 	printf("All tests passed.\n");
 	return 0;
 }

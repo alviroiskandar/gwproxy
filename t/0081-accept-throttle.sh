@@ -75,11 +75,28 @@ for _ in range(60):
         sys.exit(1)
 
 # Fill the descriptor table with idle clients until one is left waiting.
+# Each client takes two descriptors (socket and protocol timer), so
+# depending on how many the proxy holds otherwise, the table may run out
+# at the timer instead of at accept(). That client is closed, accept
+# stops all the same, and the next one waits. The close reads as a reset
+# when the client's greeting had arrived, and as an end of stream when the
+# proxy got there first: either way, that client is gone, not waiting.
 idle, waiting = [], None
 for _ in range(64):
     c = socket.create_connection(("127.0.0.1", port), timeout=5)
     c.sendall(b"\x05\x01\x00")
-    if greet(c, 0.5):
+    c.settimeout(0.5)
+    try:
+        rep = c.recv(2)
+    except socket.timeout:
+        rep = None
+    except ConnectionResetError:
+        rep = b""
+    if rep == b"":
+        c.close()
+        continue
+    ok = rep == b"\x05\x00"
+    if ok:
         idle.append(c)
         continue
     waiting = c
