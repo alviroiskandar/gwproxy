@@ -97,9 +97,14 @@ for loop in epoll; do
 				fail "[$loop] $mode did not resolve (got '$rep')"
 			;;
 		*)
-			case "$rep" in
-			REP=0x00|NONE)
-				fail "[$loop] $mode was not refused with a reply (got '$rep')" ;;
+			case "$mode:$rep" in
+			*:REP=0x00)
+				fail "[$loop] $mode was used to connect" ;;
+			# A question that is not ours to parse is not an
+			# answer at all: the lookup ignores it and waits.
+			question-label:NONE) ;;
+			*:NONE)
+				fail "[$loop] $mode was not refused with a reply" ;;
 			esac
 			# Anything still being sent would show up by now.
 			sleep 0.5

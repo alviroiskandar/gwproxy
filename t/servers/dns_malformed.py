@@ -84,6 +84,21 @@ while True:
         resp = txid + struct.pack("!HHHHH", 0x8180, 1, 1, 0, 0) + bad_q
         resp += b"\xc0\x0c" + struct.pack("!HHIH", 1, 1, 60, 4) + bytes([127, 0, 0, 1])
 
+    elif mode in ("wrong-name", "wrong-type", "upper-name"):
+        # A well-formed A answer to a question other than the one asked:
+        # its first label's letters shifted, or the QTYPE swapped. The
+        # control echoes the name in upper case, which is the same name.
+        qtype = q[qend:qend + 2]
+        if mode == "wrong-name":
+            name = name[:2] + bytes([ord("z")]) + name[3:]
+        elif mode == "upper-name":
+            name = name.upper()
+        else:
+            qtype = b"\x00\x1c" if qtype == b"\x00\x01" else b"\x00\x01"
+        question = name + qtype + q[qend + 2:qend + 4]
+        rr = b"\xc0\x0c" + struct.pack("!HHIH", 1, 1, 60, 4) + bytes([127, 0, 0, 1])
+        resp = txid + struct.pack("!HHHHH", 0x8180, 1, 1, 0, 0) + question + rr
+
     else:
         raise SystemExit("unknown mode " + mode)
 

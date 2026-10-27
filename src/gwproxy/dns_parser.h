@@ -162,4 +162,12 @@ int gwdns_parse_query(uint16_t txid, uint16_t port, const uint8_t *in,
 		      size_t in_len, struct gwp_sockaddr *addrs, uint8_t cap,
 		      uint8_t *nr_addrs);
 
+/*
+ * Check that the reply @in answers the question of our own @query: one
+ * question, with the same name (letters in any case), QTYPE and QCLASS.
+ * Returns 0 when it does, -EINVAL otherwise (RFC 5452 Section 9.1).
+ */
+int gwdns_check_question(const uint8_t *query, size_t query_len,
+			 const uint8_t *in, size_t in_len);
+
 #endif /* #ifndef GWP_DNS_PARSER_H */

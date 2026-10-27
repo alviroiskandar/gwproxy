@@ -171,13 +171,16 @@ int gwp_dns_res_complete_query(struct gwp_dns_resolver *res,
 
 	/*
 	 * Not an answer to the query in flight: an old reply to the first
-	 * family, or a forgery. Ignore it and keep waiting, as RFC 5452
+	 * family, or a forgery, which has to guess the source port and the
+	 * ID and also name what we asked about. Ignore it and keep waiting, as RFC 5452
 	 * asks, rather than let it end the lookup.
 	 */
 	if (len < 12)
 		return -ESRCH;
 	memcpy(&txid, buf, 2);
 	if (txid != gdp->txid)
+		return -ESRCH;
+	if (gwdns_check_question(gdp->buf, gdp->buf_len, buf, len))
 		return -ESRCH;
 
 	r = gwdns_parse_query(txid, gdp->port, buf, len, addrs, cap, nr_addrs);

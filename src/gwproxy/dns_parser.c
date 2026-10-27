@@ -349,6 +349,48 @@ ssize_t gwdns_build_query(uint16_t txid, const char *name, int family, uint8_t *
 	return construct_question(&q);
 }
 
+static uint8_t ascii_lower(uint8_t c)
+{
+	return (c >= 'A' && c <= 'Z') ? (uint8_t)(c + ('a' - 'A')) : c;
+}
+
+int gwdns_check_question(const uint8_t *query, size_t query_len,
+			 const uint8_t *in, size_t in_len)
+{
+	size_t i, end, hdr = sizeof(gwdns_header_pkt);
+	uint16_t qdcount;
+	int qlen;
+
+	if (query_len <= hdr || in_len <= hdr)
+		return -EINVAL;
+
+	memcpy(&qdcount, &in[4], sizeof(qdcount));
+	if (ntohs(qdcount) != 1)
+		return -EINVAL;
+
+	/* Our own query: a literal name, then QTYPE and QCLASS. */
+	qlen = calculate_question_len(&query[hdr], query_len - hdr);
+	if (qlen <= 0 || hdr + (size_t)qlen > in_len)
+		return -EINVAL;
+
+	end = hdr + (size_t)qlen - 4;
+	for (i = hdr; i < end;) {
+		uint8_t l = query[i];
+		size_t lend = i + 1 + l;
+
+		/* Label lengths as sent; a pointer here is not our name. */
+		if (in[i] != l)
+			return -EINVAL;
+		/* Names compare without regard to case (RFC 4343). */
+		for (i++; i < lend; i++) {
+			if (ascii_lower(in[i]) != ascii_lower(query[i]))
+				return -EINVAL;
+		}
+	}
+
+	return memcmp(&in[end], &query[end], 4) ? -EINVAL : 0;
+}
+
 #ifdef RUNTEST
 
 static void test_parse_ipv4(void)
@@ -528,6 +570,47 @@ static void test_parse_cap_and_truncation(void)
 	}
 }
 
+/*
+ * Only a reply about the name, type and class we asked for is ours; the
+ * name may come back in another case.
+ */
+static void test_check_question(void)
+{
+	uint8_t query[512], reply[512];
+	ssize_t qlen;
+	size_t rlen;
+
+	qlen = gwdns_build_query(0x1234, "ab.Example", AF_INET, query,
+				 sizeof(query));
+	assert(qlen > 12);
+
+	/* The reply echoes the question: header, then name + type + class. */
+	memcpy(reply, query, 12 + 12 + 4);
+	reply[2] = 0x81;
+	reply[3] = 0x80;
+	rlen = 12 + 12 + 4;
+	assert(!gwdns_check_question(query, (size_t)qlen, reply, rlen));
+
+	reply[13] = 'A';		/* "Ab.Example": case only */
+	assert(!gwdns_check_question(query, (size_t)qlen, reply, rlen));
+	reply[18] = 'x';		/* "Ab.Exxmple" */
+	assert(gwdns_check_question(query, (size_t)qlen, reply, rlen));
+	reply[18] = 'A';		/* "Ab.ExAmple": case only */
+	assert(!gwdns_check_question(query, (size_t)qlen, reply, rlen));
+
+	reply[12 + 12 + 1] = 28;	/* QTYPE AAAA */
+	assert(gwdns_check_question(query, (size_t)qlen, reply, rlen));
+	reply[12 + 12 + 1] = 1;
+
+	reply[5] = 2;			/* QDCOUNT 2 */
+	assert(gwdns_check_question(query, (size_t)qlen, reply, rlen));
+	reply[5] = 1;
+
+	/* Cut short anywhere before the class ends. */
+	for (rlen = 0; rlen < 12 + 12 + 4; rlen++)
+		assert(gwdns_check_question(query, (size_t)qlen, reply, rlen));
+}
+
 static void run_all_tests(void)
 {
 	/*
@@ -545,6 +628,7 @@ static void run_all_tests(void)
 	fprintf(stderr, "test parsing DNS standard query packet for TYPE_AAAA!\n");
 	test_parse_ipv6();
 	test_parse_cap_and_truncation();
+	test_check_question();
 	fprintf(stderr, "all tests passed!\n");
 }
 
