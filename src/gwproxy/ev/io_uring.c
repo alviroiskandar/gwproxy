@@ -2270,8 +2270,10 @@ static int handle_ev_auth_file(struct gwp_wrk *w, int res)
 						   ctx->cfg.auth_file))
 		return 0;
 
-	gwp_auth_reload(ctx->auth);
-	pr_info(&ctx->lh, "Reloaded authentication file");
+	if (gwp_auth_reload(ctx->auth))
+		pr_warn(&ctx->lh, "Failed to reload authentication file; keeping current credentials");
+	else
+		pr_info(&ctx->lh, "Reloaded authentication file");
 	return 0;
 }
 

@@ -39,6 +39,9 @@ void gwp_auth_destroy(struct gwp_auth *auth);
 
 /**
  * Re-read the credential file, atomically replacing the in-memory entries.
+ * The path is opened afresh, so a file replaced by rename is picked up. On
+ * any error (unreadable file, malformed line, OOM) the current entries stay
+ * in place.
  *
  * @param auth	The store to reload. Must have been created from a file.
  * @return	0 on success, or a negative error code on failure.

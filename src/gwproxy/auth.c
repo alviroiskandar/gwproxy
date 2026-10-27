@@ -23,12 +23,17 @@ struct auth_entry {
 	uint8_t	ulen, plen;
 };
 
-struct gwp_auth {
-	FILE			*fp;
-	pthread_rwlock_t	lock;
+/* One parsed credential file. Immutable once published in gwp_auth::set. */
+struct auth_set {
 	struct auth_entry	*entries;
 	size_t			nr;
 	size_t			cap;
+};
+
+struct gwp_auth {
+	char			*path;
+	pthread_rwlock_t	lock;
+	struct auth_set		*set;
 };
 
 /*
@@ -66,39 +71,37 @@ static char *trim_str(char *str)
 	return str;
 }
 
-static void free_auth_entries(struct gwp_auth *auth)
+static void free_auth_set(struct auth_set *set)
 {
 	size_t i;
 
-	if (!auth)
+	if (!set)
 		return;
 
-	for (i = 0; i < auth->nr; i++)
-		free(auth->entries[i].u);
+	for (i = 0; i < set->nr; i++)
+		free(set->entries[i].u);
 
-	free(auth->entries);
-	auth->entries = NULL;
-	auth->nr = 0;
-	auth->cap = 0;
+	free(set->entries);
+	free(set);
 }
 
-static int add_auth_entry(struct gwp_auth *auth, const char *line, size_t len)
+static int add_auth_entry(struct auth_set *set, const char *line, size_t len)
 {
 	struct auth_entry *ae;
 	size_t ulen, plen;
 	char *u, *p;
 
-	if (auth->nr >= auth->cap) {
-		size_t new_cap = auth->cap ? auth->cap * 2 : 16;
+	if (set->nr >= set->cap) {
+		size_t new_cap = set->cap ? set->cap * 2 : 16;
 		struct auth_entry *new_entries;
 
-		new_entries = realloc(auth->entries,
+		new_entries = realloc(set->entries,
 				      new_cap * sizeof(*new_entries));
 		if (!new_entries)
 			return -ENOMEM;
 
-		auth->entries = new_entries;
-		auth->cap = new_cap;
+		set->entries = new_entries;
+		set->cap = new_cap;
 	}
 
 	u = malloc(len + 1);
@@ -120,7 +123,7 @@ static int add_auth_entry(struct gwp_auth *auth, const char *line, size_t len)
 	if (plen > 255)
 		goto out_free_u;
 
-	ae = &auth->entries[auth->nr++];
+	ae = &set->entries[set->nr++];
 	ae->u = u;
 	ae->p = p;
 	ae->ulen = ulen;
@@ -130,6 +133,72 @@ static int add_auth_entry(struct gwp_auth *auth, const char *line, size_t len)
 out_free_u:
 	free(u);
 	return -EINVAL;
+}
+
+/*
+ * Read and parse the credential file at @path into a new set. The file is
+ * opened afresh on every call: a file replaced by rename (an editor, mv,
+ * install) is a new inode, and a handle kept from an earlier open would go on
+ * reading the old one.
+ */
+static int load_auth_set(const char *path, struct auth_set **out)
+{
+	struct auth_set *set;
+	char buf[4096], *t;
+	FILE *fp;
+	size_t l;
+	int r = 0;
+
+	set = calloc(1, sizeof(*set));
+	if (!set)
+		return -ENOMEM;
+
+	fp = fopen(path, "rb");
+	if (!fp) {
+		r = -errno;
+		free(set);
+		return r;
+	}
+
+	while ((t = fgets(buf, sizeof(buf), fp))) {
+		t = trim_str(buf);
+		l = strlen(t);
+		if (!l)
+			continue;
+
+		r = add_auth_entry(set, t, l);
+		if (r < 0)
+			break;
+	}
+	if (!r && ferror(fp))
+		r = -EIO;
+	fclose(fp);
+
+	if (r < 0) {
+		free_auth_set(set);
+		return r;
+	}
+
+	*out = set;
+	return 0;
+}
+
+/* Same writer preference as the ACL lock; see acl_lock_init() in acl.c. */
+static int auth_lock_init(pthread_rwlock_t *lock)
+{
+	pthread_rwlockattr_t attr;
+	int r;
+
+	r = pthread_rwlockattr_init(&attr);
+	if (r)
+		return r;
+#ifdef __GLIBC__
+	pthread_rwlockattr_setkind_np(&attr,
+				      PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+#endif
+	r = pthread_rwlock_init(lock, &attr);
+	pthread_rwlockattr_destroy(&attr);
+	return r;
 }
 
 /*
@@ -155,6 +224,7 @@ static bool ct_bytes_eq(const void *a, const void *b, size_t len)
 bool gwp_auth_check(struct gwp_auth *auth, const char *u, size_t ulen,
 		    const char *p, size_t plen)
 {
+	const struct auth_set *set;
 	bool ret = false;
 	size_t i;
 
@@ -163,12 +233,13 @@ bool gwp_auth_check(struct gwp_auth *auth, const char *u, size_t ulen,
 
 	/*
 	 * Read the entry set under the lock; a concurrent gwp_auth_reload()
-	 * frees and rebuilds it under the write lock. When there are no
-	 * entries nr is 0 and the loop simply does not run.
+	 * swaps in a new set under the write lock and frees the old one after
+	 * dropping it.
 	 */
 	pthread_rwlock_rdlock(&auth->lock);
-	for (i = 0; i < auth->nr; i++) {
-		const struct auth_entry *ae = &auth->entries[i];
+	set = auth->set;
+	for (i = 0; i < set->nr; i++) {
+		const struct auth_entry *ae = &set->entries[i];
 		if (ulen != ae->ulen)
 			continue;
 		if (plen != ae->plen)
@@ -186,38 +257,33 @@ bool gwp_auth_check(struct gwp_auth *auth, const char *u, size_t ulen,
 
 int gwp_auth_reload(struct gwp_auth *auth)
 {
-	char buf[4096], *t;
-	size_t l;
-	int r = 0;
+	struct auth_set *set, *old;
+	int r;
 
-	if (!auth || !auth->fp)
+	if (!auth || !auth->path)
 		return -ENOSYS;
 
+	/*
+	 * Read and parse without the lock, so no credential check on any
+	 * worker waits for file I/O, and keep the current set on any error
+	 * instead of publishing a partial one.
+	 */
+	r = load_auth_set(auth->path, &set);
+	if (r < 0)
+		return r;
+
 	pthread_rwlock_wrlock(&auth->lock);
-	free_auth_entries(auth);
-	while (1) {
-		t = fgets(buf, sizeof(buf), auth->fp);
-		if (!t)
-			break;
-
-		t = trim_str(buf);
-		l = strlen(t);
-		if (!l)
-			continue;
-
-		r = add_auth_entry(auth, t, l);
-		if (r < 0)
-			break;
-	}
-	rewind(auth->fp);
+	old = auth->set;
+	auth->set = set;
 	pthread_rwlock_unlock(&auth->lock);
-	return r;
+
+	free_auth_set(old);
+	return 0;
 }
 
 int gwp_auth_create(struct gwp_auth **out, const char *path)
 {
 	struct gwp_auth *auth;
-	FILE *fp;
 	int r;
 
 	if (!path || !*path) {
@@ -229,29 +295,27 @@ int gwp_auth_create(struct gwp_auth **out, const char *path)
 	if (!auth)
 		return -ENOMEM;
 
-	r = pthread_rwlock_init(&auth->lock, NULL);
+	r = auth_lock_init(&auth->lock);
 	if (r) {
 		free(auth);
 		return -r;
 	}
 
-	fp = fopen(path, "rb");
-	if (!fp) {
-		r = -errno;
+	auth->path = strdup(path);
+	if (!auth->path) {
+		r = -ENOMEM;
 		goto out_destroy_lock;
 	}
 
-	auth->fp = fp;
-	r = gwp_auth_reload(auth);
+	r = load_auth_set(path, &auth->set);
 	if (r < 0)
-		goto out_free_ent;
+		goto out_free_path;
 
 	*out = auth;
 	return 0;
 
-out_free_ent:
-	free_auth_entries(auth);
-	fclose(auth->fp);
+out_free_path:
+	free(auth->path);
 out_destroy_lock:
 	pthread_rwlock_destroy(&auth->lock);
 	free(auth);
@@ -264,8 +328,8 @@ void gwp_auth_destroy(struct gwp_auth *auth)
 		return;
 
 	pthread_rwlock_destroy(&auth->lock);
-	free_auth_entries(auth);
-	fclose(auth->fp);
+	free_auth_set(auth->set);
+	free(auth->path);
 	free(auth);
 }
 
