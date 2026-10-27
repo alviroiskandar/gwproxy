@@ -123,10 +123,9 @@ static const struct gwp_cfg default_opts = {
 	.nr_dns_workers		= 4,
 	.connect_timeout	= 5,
 	.connect_attempt_delay	= 250,
-	.target_buf_size	= 16384,
-	.client_buf_size	= 16384,
+	.target_buf_size	= 65536,
+	.client_buf_size	= 65536,
 	.tcp_nodelay		= 1,
-	.tcp_quickack		= 1,
 	.tcp_keepalive		= 1,
 	.tcp_keepidle		= 60,
 	.tcp_keepintvl		= 10,
@@ -177,7 +176,6 @@ static void show_help(const char *app)
 	printf("  -T, --target-buf-size=nr        Target buffer size in bytes (default: %d)\n", default_opts.target_buf_size);
 	printf("  -C, --client-buf-size=nr        Client buffer size in bytes (default: %d)\n", default_opts.client_buf_size);
 	printf("  -d, --tcp-nodelay=0|1           Enable/disable TCP_NODELAY (default: %d)\n", default_opts.tcp_nodelay);
-	printf("  -K, --tcp-quickack=0|1          Enable/disable TCP_QUICKACK (default: %d)\n", default_opts.tcp_quickack);
 	printf("  -k, --tcp-keepalive=0|1         Enable/disable TCP_KEEPALIVE (default: %d)\n", default_opts.tcp_keepalive);
 	printf("  -i, --tcp-keepidle=sec          TCP_KEEPIDLE in seconds (default: %d)\n", default_opts.tcp_keepidle);
 	printf("  -l, --tcp-keepintvl=sec         TCP_KEEPINTVL in seconds (default: %d)\n", default_opts.tcp_keepintvl);
@@ -325,7 +323,13 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 			cfg->tcp_nodelay = !!atoi(optarg);
 			break;
 		case 'K':
-			cfg->tcp_quickack = !!atoi(optarg);
+			/*
+			 * --tcp-quickack never did anything: no TCP_QUICKACK was
+			 * ever set, and a one-shot set would not stick anyway,
+			 * since the kernel leaves quickack mode on its own.
+			 * Accepted so existing command lines still start.
+			 */
+			fprintf(stderr, "Warning: --tcp-quickack has no effect and is ignored\n");
 			break;
 		case 'k':
 			cfg->tcp_keepalive = !!atoi(optarg);
@@ -598,14 +602,17 @@ static int gwp_raw_dns_resolve(struct gwp_wrk __unused *w,
 
 #define FULL_ADDRSTRLEN (INET6_ADDRSTRLEN + sizeof(":65535[]") - 1)
 
-__hot
+/*
+ * Never NULL: the result goes straight to "%s". An address that is not set
+ * yet (the target of a pair closed during its handshake) prints as "-".
+ */
 const char *ip_to_str(const struct gwp_sockaddr *gs)
 {
 	static __thread char buf[8][FULL_ADDRSTRLEN];
 	static __thread uint8_t idx = 0;
 	char *bp = buf[idx++ % 8];
 
-	return convert_ssaddr_to_str(bp, gs) ? NULL : bp;
+	return convert_ssaddr_to_str(bp, gs) ? "-" : bp;
 }
 
 __cold
@@ -688,8 +695,8 @@ static int gwp_ctx_init_thread_sock(struct gwp_wrk *w,
 
 	fd = __sys_socket(r, type, 0);
 	if (fd < 0) {
-		pr_err(&w->ctx->lh, "Failed to create socket: %s", strerror(-r));
-		return r;
+		pr_err(&w->ctx->lh, "Failed to create socket: %s", strerror(-fd));
+		return fd;
 	}
 
 	v = 1;
@@ -948,9 +955,10 @@ static int gwp_ctx_init_threads(struct gwp_ctx *ctx)
 		return r;
 	}
 
-	workers = calloc(cfg->nr_workers, sizeof(*workers));
-	if (!workers)
+	if (posix_memalign((void **)&workers, GWP_CACHELINE,
+			   (size_t)cfg->nr_workers * sizeof(*workers)))
 		return -ENOMEM;
+	memset(workers, 0, (size_t)cfg->nr_workers * sizeof(*workers));
 
 	ctx->workers = workers;
 	for (i = 0; i < cfg->nr_workers; i++) {
@@ -1977,9 +1985,15 @@ static int init_conn(struct gwp_conn *conn, uint32_t buf_size)
 	conn->fd = -1;
 	conn->len = 0;
 	conn->cap = buf_size;
+	conn->off = 0;
 	conn->ep_mask = 0;
-	conn->buf = NULL;
-	return posix_memalign((void **)&conn->buf, 4096, buf_size) ? -ENOMEM : 0;
+	/*
+	 * Nothing needs these page aligned (no registered buffers, O_DIRECT or
+	 * zero-copy send), and an aligned allocation makes glibc over-allocate
+	 * and split chunks, which fragments the heap.
+	 */
+	conn->buf = malloc(buf_size);
+	return conn->buf ? 0 : -ENOMEM;
 }
 
 static void free_conn(struct gwp_conn *conn)
@@ -1988,13 +2002,15 @@ static void free_conn(struct gwp_conn *conn)
 		return;
 
 	if (conn->buf)
-		free(conn->buf);
+		free(conn->buf - conn->off);
 
 	if (conn->fd >= 0)
 		__sys_close(conn->fd);
 
+	conn->buf = NULL;
 	conn->len = 0;
 	conn->cap = 0;
+	conn->off = 0;
 	conn->ep_mask = 0;
 }
 
@@ -2078,6 +2094,14 @@ out_free_gcp:
 	return NULL;
 }
 
+/*
+ * Shrink with hysteresis: only once the array is less than a quarter used,
+ * and then only to half its size, so it never ends up exactly full. Shrinking
+ * to exactly @nr (and freeing it at zero) made the next accept double it
+ * again: two reallocs per connection at a steady load, each an mremap()
+ * syscall once the array outgrows the mmap threshold. The array itself is
+ * only walked at teardown, which frees it.
+ */
 static int shrink_conn_slot(struct gwp_wrk *w)
 {
 	struct gwp_conn_slot *gcs = &w->conn_slot;
@@ -2085,21 +2109,10 @@ static int shrink_conn_slot(struct gwp_wrk *w)
 	struct gwp_ctx *ctx = w->ctx;
 	uint32_t new_cap;
 
-	if (!gcs->pairs)
+	if (gcs->cap <= 16 || gcs->nr >= gcs->cap / 4)
 		return 0;
 
-	if (!gcs->nr) {
-		free(gcs->pairs);
-		gcs->pairs = NULL;
-		gcs->cap = 0;
-		pr_dbg(&ctx->lh, "Connection slot capacity shrunk to 0");
-		return 0;
-	}
-
-	if (gcs->cap <= 16 || (gcs->cap - gcs->nr) < 16)
-		return 0;
-
-	new_cap = gcs->nr;
+	new_cap = gcs->cap / 2;
 	new_pairs = realloc(gcs->pairs, new_cap * sizeof(*new_pairs));
 	if (!new_pairs) {
 		pr_err(&ctx->lh, "Failed to shrink connection slot!");
@@ -3450,6 +3463,8 @@ static int http_fwd_res_fail(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		err == -EACCES ? "it asked for proxy authentication" :
 				 strerror(-err), gcp->idx);
 
+	/* The cap below counts from the start of the buffer. */
+	gwp_conn_buf_compact(t);
 	t->cap = (uint32_t)w->ctx->cfg.target_buf_size;
 	t->len = from;
 	r = gwp_http_build_bad_gateway_reply(t->buf + t->len, t->cap - t->len);
@@ -3482,6 +3497,12 @@ static int http_fwd_target_in(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	if (t->len == from && !t->rd_eof)
 		return 0;
 
+	/*
+	 * The header is rewritten in place and the caps set below count from
+	 * the start of the buffer, so put the data back there first. @from
+	 * is relative to t->buf and stays valid.
+	 */
+	gwp_conn_buf_compact(t);
 	r = gwp_http_fwd_res_input(hc, t->buf + from, t->len - from, t->rd_eof,
 				   t->buf + from, cap - from, &out_len);
 	if (r < 0)
@@ -3556,6 +3577,7 @@ int gwp_http_fwd_begin(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	r = gwp_http_fwd_res_init(gcp->http_conn, cap - HTTP_FWD_RES_SLACK);
 	if (r)
 		return r;
+	gwp_conn_buf_compact(&gcp->target);
 	gcp->target.cap = cap - HTTP_FWD_RES_SLACK;
 
 	/*

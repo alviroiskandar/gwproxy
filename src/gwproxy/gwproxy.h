@@ -17,6 +17,7 @@
 #include <gwproxy/acl.h>
 #include <gwproxy/log.h>
 #include <assert.h>
+#include <stdatomic.h>
 #ifdef CONFIG_IO_URING
 #include <liburing.h>
 #endif
@@ -78,7 +79,6 @@ struct gwp_cfg {
 	int		target_buf_size;
 	int		client_buf_size;
 	bool		tcp_nodelay;
-	bool		tcp_quickack;
 	bool		tcp_keepalive;
 	int		tcp_keepidle;
 	int		tcp_keepintvl;
@@ -333,8 +333,17 @@ enum {
 
 struct gwp_conn {
 	int		fd;
+	/*
+	 * @buf points at the first byte not consumed yet and holds @len bytes
+	 * of data, with room for @cap bytes from @buf. @off bytes in front of
+	 * @buf were already consumed (the allocation starts at buf - off).
+	 * gwp_conn_buf_consume() only moves @buf forward, so a partial send
+	 * does not shift the rest of the data down; gwp_conn_buf_compact()
+	 * moves it back to the start of the allocation.
+	 */
 	uint32_t	len;
 	uint32_t	cap;
+	uint32_t	off;
 	char		*buf;
 	uint32_t	ep_mask;
 
@@ -596,6 +605,14 @@ struct gwp_wrk_dns {
 	uint32_t			nr;
 };
 
+/*
+ * Each worker owns its own cache lines: the conn slot fields are written on
+ * every accept and close, and the loop fields next to them are read on every
+ * iteration, so a worker must not share a line with its neighbour in the
+ * workers array (which is allocated GWP_CACHELINE aligned).
+ */
+#define GWP_CACHELINE	64
+
 struct gwp_wrk {
 	int			tcp_fd;
 	struct gwp_conn_slot	conn_slot;
@@ -644,7 +661,7 @@ struct gwp_wrk {
 #ifdef CONFIG_NEW_DNS_RESOLVER
 	struct gwp_wrk_dns	*dns;
 #endif
-};
+} __attribute__((__aligned__(GWP_CACHELINE)));
 
 enum {
 	GWP_EV_EPOLL,
@@ -652,7 +669,12 @@ enum {
 };
 
 struct gwp_ctx {
-	volatile bool			stop;
+	/*
+	 * Set from the signal handler and from any worker that exits, read by
+	 * every worker loop: an atomic, which volatile is not. Lock-free, so it
+	 * is also safe to store from a signal handler.
+	 */
+	_Atomic(bool)			stop;
 	uint8_t				ev_used;
 	struct log_handle		lh;
 	struct gwp_wrk			*workers;
@@ -815,19 +837,62 @@ const char *ip_to_str(const struct gwp_sockaddr *gs);
  * the reload handlers use this to reload only for their own file. */
 bool gwp_inotify_event_matches(const void *buf, size_t len, const char *path);
 
-static inline void gwp_conn_buf_advance(struct gwp_conn *conn, size_t len)
+/* Move the data back to the start of the buffer, regaining the room in front. */
+static inline void gwp_conn_buf_compact(struct gwp_conn *conn)
 {
-	assert(len <= conn->len);
-	conn->len -= len;
+	if (!conn->off)
+		return;
 	if (conn->len)
-		memmove(conn->buf, conn->buf + len, conn->len);
+		memmove(conn->buf - conn->off, conn->buf, conn->len);
+	conn->buf -= conn->off;
+	conn->cap += conn->off;
+	conn->off = 0;
 }
 
+static inline void __gwp_conn_buf_skip(struct gwp_conn *conn, size_t len)
+{
+	assert(len <= conn->len);
+	conn->buf += len;
+	conn->len -= (uint32_t)len;
+	conn->cap -= (uint32_t)len;
+	conn->off += (uint32_t)len;
+}
+
+/*
+ * Drop @len bytes from the front and keep the rest at the start of the
+ * buffer. For the protocol parsers, which want the next message at the start
+ * and the whole buffer behind it.
+ */
+static inline void gwp_conn_buf_advance(struct gwp_conn *conn, size_t len)
+{
+	__gwp_conn_buf_skip(conn, len);
+	gwp_conn_buf_compact(conn);
+}
+
+/*
+ * Drop @len bytes from the front after they were sent. The rest stays where
+ * it is: it is compacted only once the buffer is empty (which costs nothing)
+ * or once at least half of it lies consumed in front of the data, so the
+ * bytes moved never exceed the bytes sent. Moving the rest down on every
+ * partial send copied up to a whole buffer each time.
+ */
+static inline void gwp_conn_buf_consume(struct gwp_conn *conn, size_t len)
+{
+	__gwp_conn_buf_skip(conn, len);
+	if (!conn->len || conn->off >= conn->cap)
+		gwp_conn_buf_compact(conn);
+}
+
+/*
+ * Debug, not info: at the default level every connection already logs
+ * "Target socket connected" (fds, both addresses) and "Closing connection
+ * pair" (idx, fds, both addresses), so this line only repeated them.
+ */
 static inline
 void log_conn_pair_created(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_ctx *ctx = w->ctx;
-	pr_info(&ctx->lh, "New connection pair created (idx=%u, cfd=%d, tfd=%d, ca=%s, ta=%s)",
+	pr_dbg(&ctx->lh, "New connection pair created (idx=%u, cfd=%d, tfd=%d, ca=%s, ta=%s)",
 		gcp->idx, gcp->client.fd, gcp->target.fd,
 		ip_to_str(&gcp->client_addr), ip_to_str(&gcp->target_addr));
 }
