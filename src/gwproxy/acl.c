@@ -158,8 +158,13 @@ struct gwp_acl {
  *
  * Patterns are matched raw/unanchored -- the user writes ^...$ if they want a
  * full-string match. Matching runs against attacker-influenced hostnames and
- * usernames, so a shared match context caps the work (match + backtracking
- * depth limits) to keep a pathological pattern from becoming a ReDoS.
+ * usernames, so a shared match context caps the work to keep a pathological
+ * pattern from becoming a ReDoS. The match limit bounds both the interpreter
+ * and JIT-compiled code. The depth limit only bounds the interpreter: JIT
+ * ignores it (pcre2api(3)), and a JIT match is bounded instead by JIT's own
+ * default 32 KiB machine stack, whose exhaustion fails the match like any
+ * other limit does. Every pattern is JIT-compiled when JIT is available, so
+ * in practice that stack, not the depth limit, is the recursion bound.
  */
 static pthread_once_t g_regex_once = PTHREAD_ONCE_INIT;
 static pcre2_match_context *g_regex_mctx;
@@ -173,7 +178,11 @@ static void regex_ctx_init(void)
 	}
 }
 
-/* Compile @pat, JIT-compiling it when supported. Returns NULL on error. */
+/*
+ * Compile @pat, JIT-compiling it when supported. Returns NULL on error,
+ * including when the limit-carrying match context could not be allocated:
+ * matching would fall back to PCRE2's far larger default limits.
+ */
 static pcre2_code *regex_compile(const char *pat, bool caseless)
 {
 	uint32_t opts = caseless ? PCRE2_CASELESS : 0;
@@ -182,6 +191,8 @@ static pcre2_code *regex_compile(const char *pat, bool caseless)
 	int errcode;
 
 	pthread_once(&g_regex_once, regex_ctx_init);
+	if (!g_regex_mctx)
+		return NULL;
 	re = pcre2_compile((PCRE2_SPTR)pat, PCRE2_ZERO_TERMINATED, opts,
 			   &errcode, &erroff, NULL);
 	if (!re)
