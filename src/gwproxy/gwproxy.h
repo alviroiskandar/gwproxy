@@ -400,6 +400,17 @@ struct gwp_conn_sockopt {
 	struct gwp_acl_bind	bind;		/* -j BIND: bind.set when present */
 };
 
+/*
+ * A UDP association's last client->target ACL verdict: @ok for @dst, valid
+ * while @valid and the ACL is still at generation @gen.
+ */
+struct gwp_udp_acl_cache {
+	struct gwp_sockaddr	dst;
+	uint32_t		gen;
+	bool			valid;
+	bool			ok;
+};
+
 struct gwp_conn_pair {
 	/*
 	 * Field order here is deliberate: members are grouped by alignment,
@@ -491,6 +502,8 @@ struct gwp_conn_pair {
 	 * replies from targets.
 	 */
 	struct gwp_sockaddr	udp_peer;
+	/* Last client->target datagram's ACL verdict; see udp_target_allowed(). */
+	struct gwp_udp_acl_cache	udp_acl;
 	struct gwp_sockaddr	client_addr;
 	struct gwp_sockaddr	target_addr;
 
@@ -780,17 +793,10 @@ enum gwp_udp_act gwp_udp_relay_classify(struct gwp_wrk *w,
 					struct gwp_udp_out *out);
 
 /* True if the ACL OUTPUT chain permits a @proto connection from @client to
- * @target (allow-all when no ACL is loaded or @target has no resolved IP).
- * @user is the authenticated username for "-m user", or NULL when the
- * connection is unauthenticated. */
-bool gwp_ctx_acl_output_allowed(struct gwp_ctx *ctx,
-				const struct gwp_sockaddr *client,
-				const struct gwp_sockaddr *target,
-				const char *user, enum gwp_acl_proto proto);
-
-/* As gwp_ctx_acl_output_allowed(), but a matching -j DNAT rewrites *@target and
- * any -j MARK/-j BIND modifiers are written to *@so (ignored when @so is NULL).
- * For the accept-time plain/transparent path, which has no gwp_conn_pair. */
+ * @target (allow-all when no ACL is loaded). A matching -j DNAT rewrites
+ * *@target and any -j MARK/-j BIND modifiers are written to *@so (ignored when
+ * @so is NULL). For the accept-time plain/transparent path, which has no
+ * gwp_conn_pair. */
 bool gwp_ctx_acl_output_dnat(struct gwp_ctx *ctx,
 			     const struct gwp_sockaddr *client,
 			     struct gwp_sockaddr *target,

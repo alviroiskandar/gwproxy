@@ -987,6 +987,64 @@ static void test_reload_under_readers(void)
 	free(path);
 }
 
+/*
+ * Callers cache OUTPUT verdicts keyed on the ruleset generation: it must move
+ * on every successful reload and only then, and a chain with a -m statistic
+ * rule must mark its verdicts uncacheable.
+ */
+static void test_generation(void)
+{
+	struct gwp_sockaddr t = sa4("93.184.216.34", 53);
+	struct gwp_acl_req req = {
+		.target = &t, .dport = 53, .proto = GWP_ACL_PROTO_UDP,
+	};
+	struct gwp_acl *a;
+	uint32_t g0;
+	char *path;
+	int fd;
+
+	assert(gwp_acl_generation(NULL) == 0);
+	path = write_tmp_rules("-A OUTPUT --dports 53 -j REJECT\n");
+	assert(!gwp_acl_create(&a, path));
+	g0 = gwp_acl_generation(a);
+	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_REJECT);
+	assert(req.gen == g0 && req.cacheable);
+
+	/* A good reload moves the generation and the verdict with it. */
+	fd = open(path, O_WRONLY | O_TRUNC);
+	assert(fd >= 0);
+	assert(write(fd, "-P OUTPUT REJECT\n-A OUTPUT --dports 53 -j ACCEPT\n",
+		     49) == 49);
+	close(fd);
+	assert(!gwp_acl_reload(a));
+	assert(gwp_acl_generation(a) != g0);
+	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_ACCEPT);
+	assert(req.gen == gwp_acl_generation(a) && req.cacheable);
+	g0 = req.gen;
+
+	/* A failed reload keeps both the rules and the generation. */
+	fd = open(path, O_WRONLY | O_TRUNC);
+	assert(fd >= 0);
+	assert(write(fd, "-A OUTPUT -j BOGUS\n", 19) == 19);
+	close(fd);
+	assert(gwp_acl_reload(a) < 0);
+	assert(gwp_acl_generation(a) == g0);
+
+	/* A statistic rule anywhere in OUTPUT makes verdicts uncacheable. */
+	fd = open(path, O_WRONLY | O_TRUNC);
+	assert(fd >= 0);
+	assert(write(fd, "-A OUTPUT --dports 80 -m statistic --mode nth --every 2 -j REJECT\n",
+		     66) == 66);
+	close(fd);
+	assert(!gwp_acl_reload(a));
+	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_ACCEPT);
+	assert(!req.cacheable);
+
+	gwp_acl_destroy(a);
+	unlink(path);
+	free(path);
+}
+
 static void run_tests(void)
 {
 	size_t i;
@@ -994,6 +1052,7 @@ static void run_tests(void)
 	/* Negative cases print the offending line to stderr; run them once. */
 	test_parse_errors();
 	test_reload_under_readers();
+	test_generation();
 
 	for (i = 0; i < 200; i++) {
 		test_default_ruleset();

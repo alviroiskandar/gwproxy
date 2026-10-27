@@ -105,6 +105,11 @@ void gwp_acl_destroy(struct gwp_acl *acl);
  *   @bind    the source/interface from the last matched -j BIND rule (also a
  *            composable modifier, and likewise terminal with --accept);
  *            @bind.set is false when none matched.
+ *   @gen     the ruleset generation the verdict was computed against (see
+ *            gwp_acl_generation()).
+ *   @cacheable  false when the verdict must not be reused for an identical
+ *            request: the chain has a -m statistic rule, whose answer
+ *            changes from one evaluation to the next.
  */
 struct gwp_acl_req {
 	/* Inputs (pointer-sized members first). */
@@ -122,6 +127,7 @@ struct gwp_acl_req {
 	struct gwp_sockaddr		dnat;	/* rewrite; valid iff @dnat_applied */
 	struct gwp_acl_bind		bind;	/* bind spec; valid iff @bind.set */
 	uint32_t			mark;	/* fwmark; valid iff @mark_set */
+	uint32_t			gen;
 
 	/* Small scalars: inputs, then output flags, grouped to pack tightly. */
 	uint16_t			sport;
@@ -129,6 +135,7 @@ struct gwp_acl_req {
 	uint8_t				proto;	/* enum gwp_acl_proto */
 	bool				dnat_applied;
 	bool				mark_set;
+	bool				cacheable;
 };
 
 /*
@@ -137,6 +144,13 @@ struct gwp_acl_req {
  */
 enum gwp_acl_verdict gwp_acl_eval_output(struct gwp_acl *acl,
 					 struct gwp_acl_req *req);
+
+/*
+ * The ACL's ruleset generation: it changes with every successful reload, so a
+ * caller that caches an OUTPUT verdict (with the @gen and @cacheable it came
+ * with) can tell whether the verdict is still current. 0 for a NULL @acl.
+ */
+uint32_t gwp_acl_generation(struct gwp_acl *acl);
 
 /*
  * Evaluate the INPUT chain (incoming client) for @req. Returns GWP_ACL_ACCEPT

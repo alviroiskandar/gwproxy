@@ -140,12 +140,16 @@ struct gwp_acl_ruleset {
 	struct gwp_acl_rule	*in_head, **in_tail;
 	struct gwp_acl_rule	*out_head, **out_tail;
 	enum gwp_acl_verdict	in_policy, out_policy;
+	/* OUTPUT has a -m statistic rule: its verdicts must not be cached. */
+	bool			out_has_stat;
 };
 
 struct gwp_acl {
 	struct gwp_acl_ruleset	rs;
 	char			*path;
 	pthread_rwlock_t	lock;
+	/* Bumped by every successful reload; see gwp_acl_generation(). */
+	_Atomic(uint32_t)	gen;
 };
 
 #define ACL_MAX_TOKENS	32
@@ -555,6 +559,7 @@ static void ruleset_init(struct gwp_acl_ruleset *rs)
 	rs->out_tail = &rs->out_head;
 	rs->in_policy = GWP_ACL_ACCEPT;
 	rs->out_policy = GWP_ACL_ACCEPT;
+	rs->out_has_stat = false;
 }
 
 static void ruleset_free(struct gwp_acl_ruleset *rs)
@@ -1052,6 +1057,8 @@ static int parse_rule(struct gwp_acl_ruleset *rs, char **tok, int n)
 	} else {
 		*rs->out_tail = r;
 		rs->out_tail = &r->next;
+		if (r->has_statistic)
+			rs->out_has_stat = true;
 	}
 	return 0;
 
@@ -1256,6 +1263,10 @@ int gwp_acl_reload(struct gwp_acl *acl)
 	pthread_rwlock_wrlock(&acl->lock);
 	old = acl->rs;
 	acl->rs = rs;
+	atomic_store_explicit(&acl->gen,
+			      atomic_load_explicit(&acl->gen,
+						   memory_order_relaxed) + 1,
+			      memory_order_release);
 	/* The tail pointers in @rs point at @rs's stack head slots when a chain
 	 * is empty; re-anchor them to the live struct. */
 	if (!acl->rs.in_head)
@@ -1508,13 +1519,24 @@ enum gwp_acl_verdict gwp_acl_eval_output(struct gwp_acl *acl,
 	req->dnat_applied = false;
 	req->mark_set = false;
 	req->bind.set = false;
+	req->gen = 0;
+	req->cacheable = true;
 	if (!acl)
 		return GWP_ACL_ACCEPT;
 
 	pthread_rwlock_rdlock(&acl->lock);
+	req->gen = atomic_load_explicit(&acl->gen, memory_order_relaxed);
+	req->cacheable = !acl->rs.out_has_stat;
 	verdict = eval_chain(acl->rs.out_head, acl->rs.out_policy, req);
 	pthread_rwlock_unlock(&acl->lock);
 	return verdict;
+}
+
+uint32_t gwp_acl_generation(struct gwp_acl *acl)
+{
+	if (!acl)
+		return 0;
+	return atomic_load_explicit(&acl->gen, memory_order_acquire);
 }
 
 enum gwp_acl_verdict gwp_acl_eval_input(struct gwp_acl *acl,

@@ -1330,13 +1330,33 @@ static int upstream_dst_from_sockaddr(const struct gwp_sockaddr *sa,
 				      struct gwp_socks5_addr *out);
 
 /*
+ * Fill the inputs of an OUTPUT request for @target (NULL when only a domain is
+ * known) from @client, with the optional requested @domain / @user.
+ */
+static void acl_out_req(struct gwp_acl_req *req,
+			const struct gwp_sockaddr *client,
+			const struct gwp_sockaddr *target,
+			const char *domain, const char *user,
+			enum gwp_acl_proto proto)
+{
+	memset(req, 0, sizeof(*req));
+	req->client = client;
+	req->target = target;
+	req->domain = domain;
+	req->user = user;
+	req->proto = proto;
+	req->dport = target ? sa_port_h(target) : 0;
+	req->sport = client ? sa_port_h(client) : 0;
+}
+
+/*
  * Evaluate the ACL OUTPUT chain for a connection to @target from @client (with
  * an optional requested @domain / @user). Returns the verdict; allows (with no
- * eval) when there is no ACL, or nothing to match on. When @do_dnat is set and a
- * matching -j DNAT rule produced a concrete address, the rewritten destination
- * is written back to *@target (for the direct connection and, via the caller,
- * the upstream) and *@dnat_out (when non-NULL) is set true. Composable -j MARK /
- * -j BIND modifiers are surfaced in *@so_out.
+ * eval) when there is no ACL, or nothing to match on. When a matching -j DNAT
+ * rule produced a concrete address, the rewritten destination is written back
+ * to *@target (for the direct connection and, via the caller, the upstream)
+ * and *@dnat_out (when non-NULL) is set true. Composable -j MARK / -j BIND
+ * modifiers are surfaced in *@so_out.
  */
 static enum gwp_acl_verdict acl_out(struct gwp_ctx *ctx,
 				    const struct gwp_sockaddr *client,
@@ -1344,7 +1364,7 @@ static enum gwp_acl_verdict acl_out(struct gwp_ctx *ctx,
 				    const char *domain, const char *user,
 				    struct gwp_conn_sockopt *so_out,
 				    bool *dnat_out,
-				    enum gwp_acl_proto proto, bool do_dnat)
+				    enum gwp_acl_proto proto)
 {
 	int fam = target ? target->sa.sa_family : 0;
 	bool have_ip = (fam == AF_INET || fam == AF_INET6);
@@ -1362,15 +1382,7 @@ static enum gwp_acl_verdict acl_out(struct gwp_ctx *ctx,
 	if (!have_ip && !domain)
 		return GWP_ACL_ACCEPT;
 
-	memset(&req, 0, sizeof(req));
-	req.client = client;
-	req.target = have_ip ? target : NULL;
-	req.domain = domain;
-	req.user = user;
-	req.proto = proto;
-	req.dport = have_ip ? sa_port_h(target) : 0;
-	req.sport = client ? sa_port_h(client) : 0;
-
+	acl_out_req(&req, client, have_ip ? target : NULL, domain, user, proto);
 	v = gwp_acl_eval_output(ctx->acl, &req);
 	if (v != GWP_ACL_ACCEPT)
 		return v;
@@ -1381,7 +1393,7 @@ static enum gwp_acl_verdict acl_out(struct gwp_ctx *ctx,
 	 * caller, the upstream destination. A port-only DNAT with no base IP
 	 * (e.g. a socks5h domain request) yields no address and is skipped.
 	 */
-	if (do_dnat && req.dnat_applied && req.dnat.sa.sa_family) {
+	if (req.dnat_applied && req.dnat.sa.sa_family) {
 		if (have_ip)
 			pr_info(&ctx->lh, "ACL DNAT %s -> %s",
 				ip_to_str(target), ip_to_str(&req.dnat));
@@ -1402,18 +1414,6 @@ static enum gwp_acl_verdict acl_out(struct gwp_ctx *ctx,
 	return v;
 }
 
-/* Verdict only (no DNAT), for the UDP relay's per-datagram target. */
-bool gwp_ctx_acl_output_allowed(struct gwp_ctx *ctx,
-				const struct gwp_sockaddr *client,
-				const struct gwp_sockaddr *target,
-				const char *user, enum gwp_acl_proto proto)
-{
-	struct gwp_sockaddr tmp = *target;
-
-	return acl_out(ctx, client, &tmp, NULL, user, NULL, NULL, proto,
-		       false) == GWP_ACL_ACCEPT;
-}
-
 /* Verdict + DNAT rewrite of *@target, for the accept-time plain/transparent
  * forwarding path (which has no gwp_conn_pair yet, hence no username). */
 bool gwp_ctx_acl_output_dnat(struct gwp_ctx *ctx,
@@ -1422,8 +1422,8 @@ bool gwp_ctx_acl_output_dnat(struct gwp_ctx *ctx,
 			     struct gwp_conn_sockopt *so,
 			     enum gwp_acl_proto proto)
 {
-	return acl_out(ctx, client, target, NULL, NULL, so, NULL, proto,
-		       true) == GWP_ACL_ACCEPT;
+	return acl_out(ctx, client, target, NULL, NULL, so, NULL,
+		       proto) == GWP_ACL_ACCEPT;
 }
 
 /* The authenticated username for an ACL "-m user" match, or NULL when the
@@ -1437,6 +1437,39 @@ static const char *gcp_req_user(const struct gwp_conn_pair *gcp)
 	return NULL;
 }
 
+/*
+ * OUTPUT verdict for a UDP ASSOCIATE datagram to @target. Only the verdict
+ * applies to UDP (no DNAT, MARK or BIND), and every input but the target is
+ * fixed for the association (pinned peer, username), so the last target's
+ * verdict is reused while the target and the ruleset generation stay the
+ * same: a client streaming to one peer costs one evaluation, not one per
+ * datagram. A chain with a -m statistic rule is evaluated every time, as its
+ * answer changes per evaluation.
+ */
+static bool udp_target_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
+			       const struct gwp_sockaddr *target)
+{
+	struct gwp_udp_acl_cache *c = &gcp->udp_acl;
+	struct gwp_acl_req req;
+	bool ok;
+
+	if (!ctx->acl)
+		return true;
+	if (c->valid && c->gen == gwp_acl_generation(ctx->acl) &&
+	    gwp_sockaddr_eq(&c->dst, target))
+		return c->ok;
+
+	acl_out_req(&req, &gcp->udp_peer, target, NULL, gcp_req_user(gcp),
+		    GWP_ACL_PROTO_UDP);
+	ok = gwp_acl_eval_output(ctx->acl, &req) == GWP_ACL_ACCEPT;
+
+	c->valid = req.cacheable;
+	c->gen = req.gen;
+	c->dst = *target;
+	c->ok = ok;
+	return ok;
+}
+
 bool gwp_ctx_acl_target_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp)
 {
 	bool dnat = false;
@@ -1444,7 +1477,7 @@ bool gwp_ctx_acl_target_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp)
 
 	v = acl_out(ctx, &gcp->client_addr, &gcp->target_addr, gcp->req_domain,
 		    gcp_req_user(gcp), &gcp->acl_sockopt, &dnat,
-		    GWP_ACL_PROTO_TCP, true);
+		    GWP_ACL_PROTO_TCP);
 	if (v != GWP_ACL_ACCEPT)
 		return false;
 
@@ -3124,9 +3157,7 @@ enum gwp_udp_act gwp_udp_relay_classify(struct gwp_wrk *w,
 		 */
 		if (!gwp_ctx_outgoing_family_ok(w->ctx, &tsa))
 			return GWP_UDP_DROP;	/* wrong family for this proxy */
-		if (!gwp_ctx_acl_output_allowed(w->ctx, &gcp->udp_peer, &tsa,
-						gcp_req_user(gcp),
-						GWP_ACL_PROTO_UDP))
+		if (!udp_target_allowed(w->ctx, gcp, &tsa))
 			return GWP_UDP_DROP;	/* ACL denied this datagram */
 		out->buf = base + hdr_len;
 		out->len = n - hdr_len;
