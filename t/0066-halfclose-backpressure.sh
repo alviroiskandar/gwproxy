@@ -8,6 +8,12 @@
 # no room for yet. The proxy may only act on that FIN once the buffered data
 # has gone out, so until then it has to wait without burning CPU.
 #
+# Each download is done twice: once with the client keeping its side open,
+# so the proxy's target socket sees just the origin's FIN (EPOLLRDHUP), and
+# once with the client half-closing after its request, so that the origin's
+# close leaves the target socket fully hung up (EPOLLHUP) while unread data
+# is still queued on it.
+#
 # The client clamps its MSS so the proxy's send queue towards it stays small
 # and predictable; otherwise loopback's 64 KiB MSS lets that queue grow to
 # megabytes and the FIN only arrives once nearly everything has been read.
@@ -45,13 +51,16 @@ for loop in epoll io_uring; do
 
 	conns = []
 	for kib in range(48, 257, 16):
-	    c = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-	    c.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
-	    c.setsockopt(socket.IPPROTO_TCP, socket.TCP_MAXSEG, 1000)
-	    c.settimeout(20)
-	    c.connect(("127.0.0.1", port))
-	    c.sendall(b"%d\n" % (kib * 1024))
-	    conns.append((c, kib * 1024))
+	    for half in (False, True):
+	        c = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+	        c.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+	        c.setsockopt(socket.IPPROTO_TCP, socket.TCP_MAXSEG, 1000)
+	        c.settimeout(20)
+	        c.connect(("127.0.0.1", port))
+	        c.sendall(b"%d\n" % (kib * 1024))
+	        if half:
+	            c.shutdown(socket.SHUT_WR)
+	        conns.append((c, kib * 1024))
 
 	t0 = ticks()
 	time.sleep(idle)

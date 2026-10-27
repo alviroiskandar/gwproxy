@@ -732,14 +732,26 @@ static bool adj_epl_in(struct gwp_conn *src)
 	 * lost by not watching: EPOLLERR and EPOLLHUP are always reported,
 	 * and the FIN is read as recv() == 0 once there is room again, which
 	 * is also the only point at which data ordering lets us act on it.
+	 *
+	 * EPOLLHUP cannot be masked, though, and a socket that hangs up with
+	 * unread data (its write side shut, then the peer's FIN) would spin
+	 * the same way while the buffer is full. So a full buffer parks the
+	 * fd edge-triggered: the hangup is reported once, and the switch
+	 * back to level-triggered EPOLLIN when room appears reports it again
+	 * together with the data still to be read. An EPOLLOUT armed on the
+	 * same fd is not lost by this: every EPOLLOUT event leads to a send,
+	 * and a socket that is still full wakes us again when it drains.
 	 */
-	if (!src->rd_eof && src->cap - src->len)
+	if (src->rd_eof)
+		desired = 0;
+	else if (src->cap - src->len)
 		desired = EPOLLIN | EPOLLRDHUP;
 	else
-		desired = 0;
+		desired = EPOLLET;
 
-	if ((src->ep_mask & (EPOLLIN | EPOLLRDHUP)) != desired) {
-		src->ep_mask = (src->ep_mask & ~(EPOLLIN | EPOLLRDHUP)) | desired;
+	if ((src->ep_mask & (EPOLLIN | EPOLLRDHUP | EPOLLET)) != desired) {
+		src->ep_mask &= ~(EPOLLIN | EPOLLRDHUP | EPOLLET);
+		src->ep_mask |= desired;
 		return true;
 	}
 
