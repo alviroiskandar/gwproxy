@@ -893,42 +893,15 @@ static int adjust_epl_mask(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 #ifdef CONFIG_HTTPS
 /*
- * TLS receive: pull a chunk of ciphertext from the socket into the read BIO,
- * then decrypt as much as fits into src->buf. Any ciphertext left on the socket
- * (a record we only partially read, or more than one chunk's worth) keeps the
- * level-triggered EPOLLIN live so the rest is read on the next wakeup. Returns
- * the number of plaintext bytes produced, or <0 on error.
+ * Decrypt as much of what the TLS engine holds as fits into src->buf, without
+ * touching the socket. Returns the number of plaintext bytes produced, or <0
+ * on error.
  */
-static ssize_t do_recv_tls(struct gwp_conn *src)
+static ssize_t tls_decrypt(struct gwp_conn *src)
 {
-	/*
-	 * Ciphertext scratch. Kept on the stack and modestly sized: it must
-	 * fit the -Wstack-usage budget, and a static __thread buffer passed to
-	 * the inline-asm syscall miscompiles under gcc -O2. A partial TLS
-	 * record simply stays queued in the socket and is read on the next
-	 * (level-triggered) EPOLLIN, so a small buffer is only a throughput,
-	 * not a correctness, matter.
-	 */
-	unsigned char cbuf[4096];
-	size_t space, got;
-	ssize_t n;
+	size_t space = src->cap - src->len, got = 0;
 	int sr;
 
-	space = src->cap - src->len;
-	if (unlikely(space == 0))
-		return 0;
-
-	n = __sys_recv(src->fd, cbuf, sizeof(cbuf), MSG_NOSIGNAL);
-	if (n > 0) {
-		if (gwp_ssl_bio_write(src->tls, cbuf, (size_t)n) < 0)
-			return -EIO;
-	} else if (n == 0) {
-		src->rd_eof = true;
-	} else if (n != -EAGAIN && n != -EINTR) {
-		return n;
-	}
-
-	got = 0;
 	while (space) {
 		size_t out = 0;
 
@@ -952,21 +925,80 @@ static ssize_t do_recv_tls(struct gwp_conn *src)
 }
 
 /*
- * TLS send: encrypt as much of src->buf as the engine will take, then flush the
- * resulting ciphertext to dst->fd, consuming only what the socket accepts (a
- * memory BIO cannot push read bytes back). Unflushed ciphertext stays queued in
- * the BIO; adj_epl_out() keeps EPOLLOUT armed on a TLS peer while bytes remain.
+ * TLS receive: decrypt into src->buf, reading more ciphertext from the socket
+ * only once the engine has used up what it already holds, so its input stays
+ * within about two records. The ciphertext goes straight into the engine's
+ * input queue, at least one whole record's worth per call, with no bounce
+ * buffer. Anything left on the socket keeps the level-triggered EPOLLIN live.
+ * Returns the number of plaintext bytes produced, or <0 on error.
+ */
+static ssize_t do_recv_tls(struct gwp_conn *src)
+{
+	ssize_t got = 0, n;
+	size_t len;
+	void *p;
+
+	if (unlikely(src->len == src->cap))
+		return 0;
+
+	if (gwp_ssl_rx_more(src->tls)) {
+		got = tls_decrypt(src);
+		if (got < 0 || src->len == src->cap)
+			return got;
+	}
+
+	if (src->rd_eof)
+		return got;
+
+	p = gwp_ssl_rx_space(src->tls, GWP_SSL_RECORD_MAX, &len);
+	if (unlikely(!p))
+		return -ENOMEM;
+
+	n = __sys_recv(src->fd, p, len, MSG_NOSIGNAL);
+	if (n > 0) {
+		gwp_ssl_rx_commit(src->tls, (size_t)n);
+	} else if (n == 0) {
+		src->rd_eof = true;
+	} else if (n != -EAGAIN && n != -EINTR) {
+		return n;
+	}
+
+	n = tls_decrypt(src);
+	if (n < 0)
+		return n;
+	return got + n;
+}
+
+/*
+ * TLS send: encrypt src->buf into the send queue and flush the ciphertext to
+ * dst->fd straight from the queue, consuming only what the socket accepts.
+ * Unflushed ciphertext stays queued; adj_epl_out() keeps EPOLLOUT armed on a
+ * TLS peer while bytes remain.
+ *
+ * The send queue takes any amount, so encrypt only while less than one source
+ * buffer of ciphertext is queued. Past that the plaintext stays in src->buf,
+ * whose full buffer stops adj_epl_in() reading from the source, and the queue
+ * stays bounded when the peer does not read.
+ *
  * Returns the number of ciphertext bytes flushed, or <0 on a fatal error.
  */
 static ssize_t do_send_tls(struct gwp_conn *src, struct gwp_conn *dst)
 {
 	size_t sent = 0, plen;
 	const void *p;
+	bool capped;
 	ssize_t n;
 	int sr;
 
+again:
+	capped = false;
 	while (src->len) {
 		size_t consumed = 0;
+
+		if (gwp_ssl_bio_pending(dst->tls) >= src->cap) {
+			capped = true;
+			break;
+		}
 
 		sr = gwp_ssl_write(dst->tls, src->buf, src->len, &consumed);
 		if (sr == GWP_SSL_OK) {
@@ -986,15 +1018,19 @@ static ssize_t do_send_tls(struct gwp_conn *src, struct gwp_conn *dst)
 			gwp_ssl_bio_consume(dst->tls, (size_t)n);
 			sent += (size_t)n;
 			if ((size_t)n < plen)
-				break;	/* socket full */
+				return (ssize_t)sent;	/* socket full */
 		} else if (n == -EAGAIN || n == -EINTR) {
-			break;
+			return (ssize_t)sent;
 		} else if (n == 0) {
 			return -ECONNRESET;
 		} else {
 			return n;
 		}
 	}
+
+	/* The queue drained with plaintext held back by the cap: go on. */
+	if (capped)
+		goto again;
 
 	return (ssize_t)sent;
 }
@@ -1068,33 +1104,68 @@ static ssize_t __do_send(struct gwp_conn *src, struct gwp_conn *dst)
 	return ret;
 }
 
+/*
+ * Receive into src->buf. The first pass of do_splice() reads the socket. A TLS
+ * source decrypts only as much as src->buf has room for, so when it filled up,
+ * the engine may still hold plaintext, or whole records, whose ciphertext has
+ * already left the socket, and no EPOLLIN would ever bring them back. Later
+ * passes decrypt only those, once the send has made room; they never read the
+ * socket, so a busy client cannot keep the worker here.
+ */
+static ssize_t splice_recv(struct gwp_conn *src, bool first)
+{
+#ifdef CONFIG_HTTPS
+	if (!first)
+		return tls_decrypt(src);
+#else
+	(void)first;
+#endif
+	return __do_recv(src);
+}
+
+static bool splice_again(const struct gwp_conn __unused *src,
+			 bool __unused was_full)
+{
+#ifdef CONFIG_HTTPS
+	return src->tls && was_full && src->len < src->cap;
+#else
+	return false;
+#endif
+}
+
 __hot
 static int do_splice(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		     struct gwp_conn *src, struct gwp_conn *dst, bool do_recv,
 		     bool do_send)
 {
+	bool first = true, full;
 	ssize_t ret;
 
-	if (do_recv) {
-		uint32_t from = src->len;
+	do {
+		full = false;
+		if (do_recv) {
+			uint32_t from = src->len;
 
-		ret = __do_recv(src);
-		if (unlikely(ret < 0))
-			return (int)ret;
+			ret = splice_recv(src, first);
+			if (unlikely(ret < 0))
+				return (int)ret;
 
-		if (gwp_http_fwd_active(gcp)) {
-			int r = gwp_http_fwd_in(w, gcp, src, from);
+			if (gwp_http_fwd_active(gcp)) {
+				int r = gwp_http_fwd_in(w, gcp, src, from);
 
-			if (unlikely(r))
-				return r;
+				if (unlikely(r))
+					return r;
+			}
+			full = src->len == src->cap;
 		}
-	}
 
-	if (do_send) {
-		ret = __do_send(src, dst);
-		if (unlikely(ret < 0))
-			return (int)ret;
-	}
+		if (do_send) {
+			ret = __do_send(src, dst);
+			if (unlikely(ret < 0))
+				return (int)ret;
+		}
+		first = false;
+	} while (splice_again(src, full));
 
 	return 0;
 }
@@ -1480,6 +1551,32 @@ static int handle_ev_target_attempt(struct gwp_wrk *w,
 }
 
 /*
+ * The target is done and its data has been handed to the client side. Before
+ * the client's write side can be shut, a TLS client is owed a close_notify,
+ * and all of the ciphertext must have left: a slow client may not have taken
+ * it yet, and adj_epl_out() keeps EPOLLOUT armed to flush the rest and come
+ * back here. Returns 1 when the write side can be shut, 0 to wait, or <0 on
+ * error.
+ */
+static int client_wr_flushed(struct gwp_conn_pair __unused *gcp)
+{
+#ifdef CONFIG_HTTPS
+	struct gwp_conn *c = &gcp->client;
+	int r;
+
+	if (c->tls) {
+		gwp_ssl_shutdown(c->tls);
+		r = tls_flush_hs(c);
+		if (r)
+			return r;
+		if (gwp_ssl_bio_pending(c->tls) > 0)
+			return 0;
+	}
+#endif
+	return 1;
+}
+
+/*
  * After a forwarding splice, propagate half-closes and decide whether the
  * pair is done. Once a direction's source has reached EOF and everything it
  * sent has been flushed to the peer, shut the peer's write side so it sees the
@@ -1496,15 +1593,19 @@ static int forward_progress(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	bool shut_client = false, shut_target = false, done;
 
 	if (gcp->target.rd_eof && gcp->target.len == 0 && !gcp->client.wr_shut) {
-#ifdef CONFIG_HTTPS
-		/* Best-effort close_notify before closing the write side. */
-		if (gcp->client.tls) {
-			gwp_ssl_shutdown(gcp->client.tls);
-			tls_flush_hs(&gcp->client);
+		int r = client_wr_flushed(gcp);
+
+		if (r < 0)
+			return r;
+		/*
+		 * Only once a TLS client's ciphertext, close_notify included,
+		 * has gone out; the shutdown() itself is issued below, where
+		 * it is skipped if the pair is torn down anyway.
+		 */
+		if (r) {
+			shut_client = true;
+			gcp->client.wr_shut = true;
 		}
-#endif
-		shut_client = true;
-		gcp->client.wr_shut = true;
 	}
 
 	if (gcp->client.rd_eof && gcp->client.len == 0 && !gcp->target.wr_shut) {
@@ -2513,15 +2614,19 @@ static int tls_flush_hs(struct gwp_conn *c)
 static int handle_ev_tls_handshake(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_conn *c = &gcp->client;
-	unsigned char cbuf[4096];	/* see do_recv_tls() on the sizing */
 	uint32_t mask;
+	size_t len;
 	ssize_t n;
 	int hs, r;
+	void *p;
 
-	n = __sys_recv(c->fd, cbuf, sizeof(cbuf), MSG_NOSIGNAL);
+	p = gwp_ssl_rx_space(c->tls, GWP_SSL_RECORD_MAX, &len);
+	if (unlikely(!p))
+		return -ENOMEM;
+
+	n = __sys_recv(c->fd, p, len, MSG_NOSIGNAL);
 	if (n > 0) {
-		if (gwp_ssl_bio_write(c->tls, cbuf, (size_t)n) < 0)
-			return -EIO;
+		gwp_ssl_rx_commit(c->tls, (size_t)n);
 	} else if (n == 0) {
 		return -ECONNRESET;		/* peer closed mid-handshake */
 	} else if (n != -EAGAIN && n != -EINTR) {
@@ -2630,14 +2735,14 @@ static int handle_ev_client_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 
 #ifdef CONFIG_HTTPS
 		/*
-		 * Application data already decrypted and buffered in the engine
-		 * would not be surfaced by another EPOLLIN (its ciphertext is
-		 * already off the socket), so drain it here while the protocol
-		 * buffer still has room.
+		 * Application data the engine holds, decrypted or not, would
+		 * not be surfaced by another EPOLLIN (its ciphertext is already
+		 * off the socket), so drain it here while the protocol buffer
+		 * still has room.
 		 */
 		while (gcp->client.tls && gcp->conn_state == CONN_STATE_PROT &&
 		       gcp->client.len < gcp->client.cap &&
-		       gwp_ssl_pending(gcp->client.tls) > 0) {
+		       gwp_ssl_rx_more(gcp->client.tls)) {
 			r = handle_ev_client_prot_in(w, gcp);
 			if (r)
 				return r;
