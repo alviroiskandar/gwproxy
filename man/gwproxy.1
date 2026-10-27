@@ -470,18 +470,42 @@ When neither
 .B \-\-acl\-file
 nor
 .B \-\-acl\-allow\-all
-is given, gwproxy applies a built\-in default ACL that rejects outgoing
-connections to loopback and private address ranges (SSRF hardening) while
-accepting all clients:
+is given, gwproxy applies a built\-in default ACL (SSRF hardening) that
+accepts all clients but rejects outgoing connections to anything other than
+public unicast addresses: the unspecified addresses (on Linux a connection to
+0.0.0.0 or :: reaches the local host), loopback, private and shared (CGNAT)
+space, link\-local (including the cloud metadata service at 169.254.169.254),
+benchmarking, multicast, reserved and broadcast addresses, and the IPv6
+prefixes that embed an IPv4 address (IPv4\-compatible, NAT64, 6to4). An
+IPv4\-mapped target (::ffff:a.b.c.d) is matched as the IPv4 address it
+carries, so the IPv4 rules cover it too. A hostname is checked per resolved
+address, so a name such as
+.B localhost
+is refused for both its 127.0.0.1 and its ::1 address:
 .RS
 .nf
 \-P INPUT ACCEPT
+\-A OUTPUT \-d 0.0.0.0/8 \-j REJECT
 \-A OUTPUT \-d 10.0.0.0/8 \-j REJECT
+\-A OUTPUT \-d 100.64.0.0/10 \-j REJECT
 \-A OUTPUT \-d 127.0.0.0/8 \-j REJECT
-\-A OUTPUT \-d 192.168.0.0/16 \-j REJECT
+\-A OUTPUT \-d 169.254.0.0/16 \-j REJECT
 \-A OUTPUT \-d 172.16.0.0/12 \-j REJECT
-\-A OUTPUT \-d fe80::/10 \-j REJECT
+\-A OUTPUT \-d 192.0.0.0/24 \-j REJECT
+\-A OUTPUT \-d 192.168.0.0/16 \-j REJECT
+\-A OUTPUT \-d 198.18.0.0/15 \-j REJECT
+\-A OUTPUT \-d 224.0.0.0/4 \-j REJECT
+\-A OUTPUT \-d 240.0.0.0/4 \-j REJECT
+\-A OUTPUT \-d ::/128 \-j REJECT
+\-A OUTPUT \-d ::1/128 \-j REJECT
+\-A OUTPUT \-d ::/96 \-j REJECT
+\-A OUTPUT \-d 64:ff9b::/96 \-j REJECT
+\-A OUTPUT \-d 64:ff9b:1::/48 \-j REJECT
+\-A OUTPUT \-d 2002::/16 \-j REJECT
 \-A OUTPUT \-d fc00::/7 \-j REJECT
+\-A OUTPUT \-d fe80::/10 \-j REJECT
+\-A OUTPUT \-d fec0::/10 \-j REJECT
+\-A OUTPUT \-d ff00::/8 \-j REJECT
 \-P OUTPUT ACCEPT
 .fi
 .RE

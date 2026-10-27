@@ -1147,18 +1147,47 @@ static void gwp_ctx_free_auth(struct gwp_ctx *ctx)
 
 /*
  * Applied when no --acl-file is given (and --acl-allow-all is not set): an
- * SSRF-hardening default that rejects outgoing connections to loopback and
- * private address ranges while accepting all clients. --acl-file overrides it
- * wholesale; --acl-allow-all disables it (allow everything).
+ * SSRF-hardening default that rejects outgoing connections to every address
+ * that is not ordinary public unicast, while accepting all clients.
+ * --acl-file overrides it wholesale; --acl-allow-all disables it (allow
+ * everything).
+ *
+ * "Local" is wider than 127/8: on Linux a connect() to the unspecified address
+ * (0.0.0.0, ::) lands on the local host, ::1 is loopback, and a name such as
+ * "localhost" resolves to both families, so leaving any of these out lets a
+ * client reach loopback-only services anyway. 169.254/16 holds the cloud
+ * metadata endpoint. The IPv6 transition prefixes (IPv4-compatible ::/96,
+ * NAT64, 6to4) can embed any of the IPv4 ranges above. ::ffff:a.b.c.d needs no
+ * rule of its own: the matcher folds it into IPv4 before comparing.
+ *
+ * ::/128 and ::1/128 are listed even though ::/96 covers them, so that each
+ * of them is rejected by a rule of its own.
  */
 static const char gwp_acl_default_rules[] =
 	"-P INPUT ACCEPT\n"
+	/* IPv4 */
+	"-A OUTPUT -d 0.0.0.0/8 -j REJECT\n"
 	"-A OUTPUT -d 10.0.0.0/8 -j REJECT\n"
+	"-A OUTPUT -d 100.64.0.0/10 -j REJECT\n"
 	"-A OUTPUT -d 127.0.0.0/8 -j REJECT\n"
-	"-A OUTPUT -d 192.168.0.0/16 -j REJECT\n"
+	"-A OUTPUT -d 169.254.0.0/16 -j REJECT\n"
 	"-A OUTPUT -d 172.16.0.0/12 -j REJECT\n"
-	"-A OUTPUT -d fe80::/10 -j REJECT\n"
+	"-A OUTPUT -d 192.0.0.0/24 -j REJECT\n"
+	"-A OUTPUT -d 192.168.0.0/16 -j REJECT\n"
+	"-A OUTPUT -d 198.18.0.0/15 -j REJECT\n"
+	"-A OUTPUT -d 224.0.0.0/4 -j REJECT\n"
+	"-A OUTPUT -d 240.0.0.0/4 -j REJECT\n"
+	/* IPv6 */
+	"-A OUTPUT -d ::/128 -j REJECT\n"
+	"-A OUTPUT -d ::1/128 -j REJECT\n"
+	"-A OUTPUT -d ::/96 -j REJECT\n"
+	"-A OUTPUT -d 64:ff9b::/96 -j REJECT\n"
+	"-A OUTPUT -d 64:ff9b:1::/48 -j REJECT\n"
+	"-A OUTPUT -d 2002::/16 -j REJECT\n"
 	"-A OUTPUT -d fc00::/7 -j REJECT\n"
+	"-A OUTPUT -d fe80::/10 -j REJECT\n"
+	"-A OUTPUT -d fec0::/10 -j REJECT\n"
+	"-A OUTPUT -d ff00::/8 -j REJECT\n"
 	"-P OUTPUT ACCEPT\n";
 
 /*
