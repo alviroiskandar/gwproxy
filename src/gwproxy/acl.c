@@ -203,6 +203,8 @@ static pcre2_match_context *g_regex_mctx;
 static pthread_key_t g_regex_md_key;
 static bool g_regex_md_key_ok;
 static __thread pcre2_match_data *t_regex_md;
+/* A match in this thread's current evaluation failed; see eval_chain(). */
+static __thread bool t_regex_err;
 
 static void regex_md_free(void *md)
 {
@@ -261,9 +263,11 @@ static pcre2_match_data *regex_md(void)
 }
 
 /*
- * True if @re matches @subj. Fails closed (no match) on OOM or if the match hits
- * the configured limits (a would-be ReDoS is treated as a non-match, not an
- * accept).
+ * True if @re matches @subj. A match that could not be decided -- out of
+ * memory, or the configured limits hit, which is what a backtracking-prone
+ * pattern does on a crafted subject -- is not a non-match: it sets
+ * t_regex_err, and eval_chain() turns the whole evaluation into a REJECT.
+ * Read as "no match", it let such a subject straight past a REJECT rule.
  */
 static bool regex_match(const pcre2_code *re, const char *subj)
 {
@@ -273,13 +277,36 @@ static bool regex_match(const pcre2_code *re, const char *subj)
 	if (!subj)
 		return false;
 	md = regex_md();
-	if (!md)
+	if (!md) {
+		t_regex_err = true;
 		return false;
+	}
 	rc = pcre2_match(re, (PCRE2_SPTR)subj, PCRE2_ZERO_TERMINATED, 0, 0,
 			 md, g_regex_mctx);
 	if (md != t_regex_md)
 		pcre2_match_data_free(md);
+	if (rc < 0 && rc != PCRE2_ERROR_NOMATCH)
+		t_regex_err = true;
 	return rc >= 0;
+}
+
+static bool regex_failed(void)
+{
+	return t_regex_err;
+}
+
+static void regex_err_clear(void)
+{
+	t_regex_err = false;
+}
+#else
+static bool regex_failed(void)
+{
+	return false;
+}
+
+static void regex_err_clear(void)
+{
 }
 #endif /* CONFIG_PCRE */
 
@@ -1435,7 +1462,8 @@ static bool name_crit_ok(const struct gwp_acl_rule *r,
 	ok = !CRIT_FAILS(r, has_user, neg_user, user_match(r, q->user)) &&
 	     !CRIT_FAILS(r, has_domain, neg_domain, domain_match(r, q->domain));
 
-	if (bit) {
+	/* An undecided match is no answer to remember for the next candidate. */
+	if (bit && !regex_failed()) {
 		m->known |= bit;
 		if (ok)
 			m->ok |= bit;
@@ -1545,9 +1573,9 @@ static void apply_dnat(struct gwp_acl_req *req, const struct gwp_acl_dnat *d)
  * Walk @head, returning the first terminal verdict. DNAT rewrites @req->dnat;
  * MARK is a composable modifier that records @req->mark and keeps matching.
  */
-static enum gwp_acl_verdict eval_chain(struct gwp_acl_rule *head,
-				       enum gwp_acl_verdict policy,
-				       struct gwp_acl_req *req)
+static enum gwp_acl_verdict __eval_chain(struct gwp_acl_rule *head,
+					 enum gwp_acl_verdict policy,
+					 struct gwp_acl_req *req)
 {
 	struct gwp_acl_rule *r;
 
@@ -1589,6 +1617,29 @@ static enum gwp_acl_verdict eval_chain(struct gwp_acl_rule *head,
 		}
 	}
 	return policy;
+}
+
+/*
+ * __eval_chain(), failing closed: if any regexp along the way could not be
+ * decided (regex_match()), the rules this request met are not known, so it
+ * is refused, whatever they would have said, and the verdict is not cached.
+ */
+static enum gwp_acl_verdict eval_chain(struct gwp_acl_rule *head,
+				       enum gwp_acl_verdict policy,
+				       struct gwp_acl_req *req)
+{
+	enum gwp_acl_verdict v;
+
+	regex_err_clear();
+	v = __eval_chain(head, policy, req);
+	if (!regex_failed())
+		return v;
+
+	req->dnat_applied = false;
+	req->mark_set = false;
+	req->bind.set = false;
+	req->cacheable = false;
+	return GWP_ACL_REJECT;
 }
 
 enum gwp_acl_verdict gwp_acl_eval_output(struct gwp_acl *acl,

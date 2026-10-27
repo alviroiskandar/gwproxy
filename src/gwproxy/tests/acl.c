@@ -245,6 +245,39 @@ static noinline void test_domain_regexp(void)
 #endif
 }
 
+/*
+ * A regexp that cannot be decided -- a backtracking-prone pattern meeting a
+ * subject crafted to exhaust the match limit -- refuses the request rather
+ * than reading as "no match", which let it past a REJECT rule.
+ */
+static enum gwp_acl_verdict out_memo(struct gwp_acl *a, struct gwp_acl_memo *m,
+				     const char *dom, const char *ip,
+				     uint16_t port);
+
+static noinline void test_regexp_limit(void)
+{
+#ifdef CONFIG_PCRE
+	struct gwp_acl_memo memo = { 0 };
+	struct gwp_acl *a = NULL;
+	char host[64];
+
+	memset(host, 'a', 30);
+	strcpy(host + 30, "!internal.example");
+
+	assert(!gwp_acl_parse_str(&a,
+		"-A OUTPUT -m domain --domain-regexp (\\w+\\.?)+internal\\.example$ -j REJECT\n"
+		"-P OUTPUT ACCEPT\n"));
+	assert(out(a, NULL, host, 443, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+	assert(out(a, NULL, "a.b.internal.example", 443, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+	assert(out(a, NULL, "other.org", 443, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
+
+	/* Undecided is not remembered as "no match" for the next candidate. */
+	assert(out_memo(a, &memo, host, "1.2.3.4", 443) == GWP_ACL_REJECT);
+	assert(out_memo(a, &memo, host, "1.2.3.5", 443) == GWP_ACL_REJECT);
+	gwp_acl_destroy(a);
+#endif
+}
+
 static noinline void test_user(void)
 {
 	struct gwp_acl *a = NULL;
@@ -1174,6 +1207,7 @@ static void run_tests(void)
 		test_input_and_proto();
 		test_domain();
 		test_domain_regexp();
+		test_regexp_limit();
 		test_domain_only_target_criteria();
 		test_user();
 		test_mark();
