@@ -322,6 +322,10 @@ int gwp_ssl_shutdown(struct gwp_ssl *s)
 {
 	int r;
 
+	/* Queue our close_notify only once; callers may retry the close. */
+	if (SSL_get_shutdown(s->ssl) & SSL_SENT_SHUTDOWN)
+		return GWP_SSL_OK;
+
 	ERR_clear_error();
 	r = SSL_shutdown(s->ssl);
 	/*

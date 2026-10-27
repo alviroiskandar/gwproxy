@@ -11,6 +11,10 @@
 #       Check that the tunnel echoes, let a second client fail its TLS
 #       handshake on the same proxy, then check that the tunnel still echoes.
 #       A failed handshake must not affect any other session.
+#   slowread <nbytes>
+#       The origin sends <nbytes> bytes and closes. This client waits a
+#       while before it starts reading, then must get all <nbytes> bytes and
+#       a clean end of stream.
 #
 # Exits 0 on success, 1 on failure (with a message on stderr).
 
@@ -36,6 +40,21 @@ def echo_origin(lsock):
     while True:
         c, _ = lsock.accept()
         threading.Thread(target=serve, args=(c,), daemon=True).start()
+
+
+def sized_origin(nbytes):
+    def fn(lsock):
+        c, _ = lsock.accept()
+        left = nbytes
+        try:
+            while left:
+                n = min(left, 65536)
+                c.sendall(b"z" * n)
+                left -= n
+        except OSError:
+            pass
+        c.close()
+    return fn
 
 
 def start_origin(fn):
@@ -108,11 +127,30 @@ def scen_isolation(pport):
             % (got,))
 
 
+def scen_slowread(pport, nbytes):
+    oport = start_origin(sized_origin(nbytes))
+    a = tunnel(pport, oport)
+    time.sleep(2)
+    got = 0
+    try:
+        while True:
+            d = a.recv(65536)
+            if not d:
+                break
+            got += len(d)
+    except (OSError, ssl.SSLError) as e:
+        die("read failed after %d of %d bytes: %r" % (got, nbytes, e))
+    if got != nbytes:
+        die("got %d of %d bytes" % (got, nbytes))
+
+
 def main():
     scen = sys.argv[1]
     pport = int(sys.argv[2])
     if scen == "isolation":
         scen_isolation(pport)
+    elif scen == "slowread":
+        scen_slowread(pport, int(sys.argv[3]))
     else:
         die("unknown scenario %s" % scen)
 

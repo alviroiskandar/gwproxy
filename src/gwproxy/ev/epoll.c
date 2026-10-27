@@ -1313,6 +1313,32 @@ static int handle_ev_target_attempt(struct gwp_wrk *w,
 }
 
 /*
+ * The target is done and its data has been handed to the client side. Before
+ * the client's write side can be shut, a TLS client is owed a close_notify,
+ * and all of the ciphertext must have left: a slow client may not have taken
+ * it yet, and adj_epl_out() keeps EPOLLOUT armed to flush the rest and come
+ * back here. Returns 1 when the write side can be shut, 0 to wait, or <0 on
+ * error.
+ */
+static int client_wr_flushed(struct gwp_conn_pair __unused *gcp)
+{
+#ifdef CONFIG_HTTPS
+	struct gwp_conn *c = &gcp->client;
+	int r;
+
+	if (c->tls) {
+		gwp_ssl_shutdown(c->tls);
+		r = tls_flush_hs(c);
+		if (r)
+			return r;
+		if (gwp_ssl_bio_pending(c->tls) > 0)
+			return 0;
+	}
+#endif
+	return 1;
+}
+
+/*
  * After a forwarding splice, propagate half-closes and decide whether the
  * pair is done. Once a direction's source has reached EOF and everything it
  * sent has been flushed to the peer, shut the peer's write side so it sees the
@@ -1322,15 +1348,14 @@ static int handle_ev_target_attempt(struct gwp_wrk *w,
 static int forward_progress(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	if (gcp->target.rd_eof && gcp->target.len == 0 && !gcp->client.wr_shut) {
-#ifdef CONFIG_HTTPS
-		/* Best-effort close_notify before closing the write side. */
-		if (gcp->client.tls) {
-			gwp_ssl_shutdown(gcp->client.tls);
-			tls_flush_hs(&gcp->client);
+		int r = client_wr_flushed(gcp);
+
+		if (r < 0)
+			return r;
+		if (r) {
+			__sys_shutdown(gcp->client.fd, SHUT_WR);
+			gcp->client.wr_shut = true;
 		}
-#endif
-		__sys_shutdown(gcp->client.fd, SHUT_WR);
-		gcp->client.wr_shut = true;
 	}
 
 	if (gcp->client.rd_eof && gcp->client.len == 0 && !gcp->target.wr_shut) {

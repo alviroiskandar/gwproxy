@@ -87,7 +87,10 @@ int gwp_ssl_read(struct gwp_ssl *s, void *buf, size_t len, size_t *out_len);
 int gwp_ssl_write(struct gwp_ssl *s, const void *buf, size_t len,
 		  size_t *consumed);
 
-/* Queue a close_notify into the send BIO (best effort). */
+/*
+ * Queue a close_notify into the send BIO (best effort). Only the first call
+ * queues one, so a caller waiting for the BIO to drain may call it again.
+ */
 int gwp_ssl_shutdown(struct gwp_ssl *s);
 
 /*
