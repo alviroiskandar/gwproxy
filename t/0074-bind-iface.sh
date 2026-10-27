@@ -348,13 +348,23 @@ for loop in epoll io_uring; do
 		fail "[$loop] -j BIND did not replace the global bind wholesale (saw '${src:-<none>}')"
 
 	# A device that does not exist yet is accepted at startup but is strict
-	# per connection.
+	# per connection. Dropping the connection must be all it does: the
+	# failed bind belongs to that one client, so the proxy has to keep
+	# listening and drop the next one the same way.
 	p="$(pick_port)"
 	start_gwp "$p" --acl-allow-all --bind-iface="$NODEV"
 	src="$(peer_src 127.0.0.1 "$p")"
+	sleep 0.3
+	alive=0
+	ss -ltnH "sport = :$p" 2>/dev/null | grep -q . && alive=1
+	src2="$(peer_src 127.0.0.1 "$p")"
 	stop_gwp
 	[ -z "$src" ] || \
 		fail "[$loop] a nonexistent --bind-iface was not strict (saw '$src')"
+	[ "$alive" = 1 ] || \
+		fail "[$loop] a failed --bind-iface bind stopped the proxy"
+	[ -z "$src2" ] || \
+		fail "[$loop] a nonexistent --bind-iface was not strict on reuse (saw '$src2')"
 done
 
 finish
