@@ -461,6 +461,7 @@ static struct io_uring_sqe *prep_timer_target(struct gwp_wrk *w,
 	io_uring_sqe_set_data(s, gcp);
 	s->user_data |= EV_BIT_IOU_TIMER;
 	get_gcp(gcp);
+	gcp->nr_timers_armed++;
 	pr_dbg(&w->ctx->lh,
 		"Prepared timer for target fd=%d, ts=%lld.%09lld, ref_cnt=%d",
 		gcp->target.fd, gcp->ts.tv_sec, gcp->ts.tv_nsec, gcp->ref_cnt);
@@ -578,6 +579,17 @@ static void shutdown_gcp(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 			cancel_attempt(w, gcp, i);
 	}
 	prep_attempt_timer_del(w, gcp);
+
+	/*
+	 * The protocol and connect timeouts hold a reference too. Left armed,
+	 * they keep the pair -- and the client socket -- open until they
+	 * expire, so a client that was just sent an error reply (a 407, say)
+	 * would sit on an open connection for the whole protocol timeout. A
+	 * removal that finds the timeout already gone completes with -ENOENT,
+	 * which handle_ev_timer() ignores.
+	 */
+	for (i = 0; i < gcp->nr_timers_armed; i++)
+		prep_timer_del_target(w, gcp);
 
 	/*
 	 * IORING_ASYNC_CANCEL_ALL: an fd can carry more than one in-flight
@@ -1473,6 +1485,10 @@ static int handle_ev_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 {
 	struct gwp_ctx *ctx = w->ctx;
 	int r = 0;
+
+	/* The timeout's own completion: it fired or was removed. */
+	if (!is_timer_del && gcp->nr_timers_armed)
+		gcp->nr_timers_armed--;
 
 	if (!gcp->is_target_alive && res == -ETIME) {
 		assert(is_timer_del == false);
