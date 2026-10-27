@@ -10,7 +10,6 @@
 
 #include <stdio.h>
 #include <errno.h>
-#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stddef.h>
@@ -446,6 +445,12 @@ free_path:
 	return -ENOMEM;
 }
 
+/*
+ * The response-header and chunked-body parsers below are only exercised by
+ * the self-tests at the end of this file: gwproxy rewrites responses and
+ * frames request bodies itself (http.c), so they are not built into it.
+ */
+#ifdef GWNET_HTTP1_TESTS
 /**
  * Parse the first line of an HTTP/1.x response header, also known as
  * the status line. According to RFC 7230 Section 3.1.2, the status
@@ -630,6 +635,8 @@ static int parse_hdr_res_first_line(struct gwnet_http_hdr_pctx *ctx,
 	ctx->tot_len += off;
 	return 0;
 }
+
+#endif /* #ifdef GWNET_HTTP1_TESTS */
 
 /**
  * Parse HTTP header fields from the provided parsing context.
@@ -838,6 +845,7 @@ static int __gwnet_http_req_hdr_parse(struct gwnet_http_hdr_pctx *ctx,
 	return r;
 }
 
+#ifdef GWNET_HTTP1_TESTS
 static int __gwnet_http_res_hdr_parse(struct gwnet_http_hdr_pctx *ctx,
 				      struct gwnet_http_res_hdr *hdr)
 {
@@ -865,6 +873,8 @@ static int __gwnet_http_res_hdr_parse(struct gwnet_http_hdr_pctx *ctx,
 
 	return r;
 }
+
+#endif /* #ifdef GWNET_HTTP1_TESTS */
 
 static int hdr_translate_ret_err(struct gwnet_http_hdr_pctx *ctx, int r)
 {
@@ -896,12 +906,15 @@ int gwnet_http_req_hdr_parse(struct gwnet_http_hdr_pctx *ctx,
 	return hdr_translate_ret_err(ctx, __gwnet_http_req_hdr_parse(ctx, hdr));
 }
 
+#ifdef GWNET_HTTP1_TESTS
 __hot
 int gwnet_http_res_hdr_parse(struct gwnet_http_hdr_pctx *ctx,
 			     struct gwnet_http_res_hdr *hdr)
 {
 	return hdr_translate_ret_err(ctx, __gwnet_http_res_hdr_parse(ctx, hdr));
 }
+
+#endif /* #ifdef GWNET_HTTP1_TESTS */
 
 __hot
 void gwnet_http_req_hdr_free(struct gwnet_http_req_hdr *hdr)
@@ -916,6 +929,7 @@ void gwnet_http_req_hdr_free(struct gwnet_http_req_hdr *hdr)
 	memset(hdr, 0, sizeof(*hdr));
 }
 
+#ifdef GWNET_HTTP1_TESTS
 __hot
 void gwnet_http_res_hdr_free(struct gwnet_http_res_hdr *hdr)
 {
@@ -926,6 +940,8 @@ void gwnet_http_res_hdr_free(struct gwnet_http_res_hdr *hdr)
 	gwnet_http_hdr_fields_free(&hdr->fields);
 	memset(hdr, 0, sizeof(*hdr));
 }
+
+#endif /* #ifdef GWNET_HTTP1_TESTS */
 
 __hot
 void gwnet_http_hdr_fields_free(struct gwnet_http_hdr_fields *ff)
@@ -942,42 +958,6 @@ void gwnet_http_hdr_fields_free(struct gwnet_http_hdr_fields *ff)
 
 	free(ff->ff);
 	memset(ff, 0, sizeof(*ff));
-}
-
-__hot
-int gwnet_http_hdr_fields_add(struct gwnet_http_hdr_fields *ff, const char *k,
-			      const char *v)
-{
-	return gwnet_http_hdr_fields_addl(ff, k, strlen(k), v, strlen(v));
-}
-
-__hot
-int gwnet_http_hdr_fields_addf(struct gwnet_http_hdr_fields *ff,
-			       const char *k, const char *fmt, ...)
-{
-	va_list args1, args2;
-	size_t vlen;
-	char *v;
-	int r;
-
-	va_start(args1, fmt);
-	va_copy(args2, args1);
-	r = vsnprintf(NULL, 0, fmt, args1);
-	va_end(args1);
-
-	v = malloc(r + 1);
-	if (!v) {
-		r = -ENOMEM;
-		goto out;
-	}
-
-	vlen = (size_t)r;
-	vsnprintf(v, vlen + 1, fmt, args2);
-	r = gwnet_http_hdr_fields_addl(ff, k, strlen(k), v, vlen);
-	free(v);
-out:
-	va_end(args2);
-	return r;
 }
 
 static ssize_t find_hdr_field_idx(const struct gwnet_http_hdr_fields *ff,
@@ -1091,6 +1071,7 @@ const char *gwnet_http_hdr_fields_getl(const struct gwnet_http_hdr_fields *ff,
 	return ff->ff[idx].val;
 }
 
+#ifdef GWNET_HTTP1_TESTS
 int gwnet_http_body_pctx_init(struct gwnet_http_body_pctx *ctx)
 {
 	memset(ctx, 0, sizeof(*ctx));
@@ -1340,7 +1321,7 @@ int gwnet_http_body_parse_chunked(struct gwnet_http_body_pctx *ctx,
 	return r;
 }
 
-#ifdef GWNET_HTTP1_TESTS
+/* Self-tests. */
 #ifdef NDEBUG
 #undef NDEBUG
 #endif

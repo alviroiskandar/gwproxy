@@ -269,6 +269,7 @@ void gwnet_http_hdr_pctx_free(struct gwnet_http_hdr_pctx *ctx);
 int gwnet_http_req_hdr_parse(struct gwnet_http_hdr_pctx *ctx,
 			     struct gwnet_http_req_hdr *hdr);
 
+#ifdef GWNET_HTTP1_TESTS
 /**
  * Parses an HTTP response header from the given parsing context.
  *
@@ -283,8 +284,12 @@ int gwnet_http_req_hdr_parse(struct gwnet_http_hdr_pctx *ctx,
 int gwnet_http_res_hdr_parse(struct gwnet_http_hdr_pctx *ctx,
 			     struct gwnet_http_res_hdr *hdr);
 
+#endif
+
 void gwnet_http_req_hdr_free(struct gwnet_http_req_hdr *hdr);
+#ifdef GWNET_HTTP1_TESTS
 void gwnet_http_res_hdr_free(struct gwnet_http_res_hdr *hdr);
+#endif
 
 /**
  * Free all memory associated with the given HTTP header fields
@@ -293,32 +298,6 @@ void gwnet_http_res_hdr_free(struct gwnet_http_res_hdr *hdr);
  * @param ff Pointer to the HTTP header fields structure to free.
  */
 void gwnet_http_hdr_fields_free(struct gwnet_http_hdr_fields *ff);
-
-/**
- * Add a header field with the specified key and value to the HTTP
- * header fields structure.
- *
- * @param ff Pointer to the HTTP header fields structure.
- * @param k  Null-terminated string containing the header key.
- * @param v  Null-terminated string containing the header value.
- * @return   0 on success, or a negative value on error.
- */
-int gwnet_http_hdr_fields_add(struct gwnet_http_hdr_fields *ff, const char *k,
-			      const char *v);
-
-/**
- * Add a header field with the specified key and a formatted value to
- * the HTTP header fields structure.
- *
- * @param ff  Pointer to the HTTP header fields structure.
- * @param k   Null-terminated string containing the header key.
- * @param fmt printf-style format string for the header value.
- * @param ... Arguments for the format string.
- * @return    0 on success, or a negative value on error.
- */
-__attribute__((__format__(printf, 3, 4)))
-int gwnet_http_hdr_fields_addf(struct gwnet_http_hdr_fields *ff,
-			       const char *k, const char *fmt, ...);
 
 /**
  * Add a header field with the specified key and value, using explicit
@@ -359,6 +338,11 @@ const char *gwnet_http_hdr_fields_getl(const struct gwnet_http_hdr_fields *ff,
 				       const char *k, size_t klen);
 
 
+/*
+ * The response-header and chunked-body parsers are built only into the
+ * self-tests (GWNET_HTTP1_TESTS); gwproxy does not use them.
+ */
+#ifdef GWNET_HTTP1_TESTS
 /**
  * Initialize the HTTP body processing context.
  *
@@ -395,5 +379,6 @@ int gwnet_http_body_parse_chunked(struct gwnet_http_body_pctx *ctx,
 void gwnet_http_run_tests(void);
 
 void gwnet_http_body_pctx_free(struct gwnet_http_body_pctx *ctx);
+#endif /* #ifdef GWNET_HTTP1_TESTS */
 
 #endif /* #ifndef GWNET_HTTP1_H */
