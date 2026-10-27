@@ -596,6 +596,20 @@ static int __handle_ev_accept(struct gwp_wrk *w)
 	if (fd < 0)
 		return handle_accept_error(w, fd);
 
+	pr_dbg(&ctx->lh, "New connection from %s (fd=%d)", ip_to_str(&addr),
+		fd);
+
+	/*
+	 * Evaluate the INPUT chain before allocating anything, as the
+	 * io_uring loop does: when it is used to shed unwanted clients, a
+	 * flood of them should cost no more than an accept and a close.
+	 */
+	if (!gwp_ctx_acl_client_allowed(ctx, &addr, GWP_ACL_PROTO_TCP)) {
+		pr_info(&ctx->lh, "ACL denied client %s", ip_to_str(&addr));
+		__sys_close(fd);
+		return 0;
+	}
+
 	gcp = gwp_alloc_conn_pair(w);
 	if (unlikely(!gcp)) {
 		pr_err(&ctx->lh, "Failed to allocate connection pair on accept");
@@ -605,16 +619,6 @@ static int __handle_ev_accept(struct gwp_wrk *w)
 
 	gcp->client_addr = addr;
 	gcp->client.fd = fd;
-	pr_dbg(&ctx->lh, "New connection from %s (fd=%d)",
-		ip_to_str(&gcp->client_addr), fd);
-
-	if (!gwp_ctx_acl_client_allowed(ctx, &gcp->client_addr,
-					GWP_ACL_PROTO_TCP)) {
-		pr_info(&ctx->lh, "ACL denied client %s",
-			ip_to_str(&gcp->client_addr));
-		free_conn_pair(w, gcp);
-		return 0;
-	}
 
 	if (cfg->as_transparent) {
 		r = gwp_get_orig_dst(fd, &gcp->client_addr, &gcp->target_addr);
