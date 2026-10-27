@@ -483,6 +483,8 @@ int gwp_http_conn_process(struct gwp_http_conn *hc, struct gwp_auth *auth,
 	 */
 	if (r == -EEXIST)
 		return GWP_HTTP_BAD_REQUEST;
+	if (r == -E2BIG)
+		return GWP_HTTP_TOO_LARGE;
 	if (r < 0)
 		return GWP_HTTP_ERR;
 

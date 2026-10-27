@@ -627,6 +627,56 @@ static void test_duplicate_field(void)
 	PRTEST_OK();
 }
 
+/*
+ * A request header may hold at most GWNET_HTTP_HDR_MAX_FIELDS (128) field
+ * lines and 16 KiB; past either it is refused with 431 instead of being
+ * parsed at a cost that grows with the square of the field count.
+ */
+static void test_header_limits(void)
+{
+	static char buf[20000];
+	struct gwp_http_conn *hc;
+	char *host, *port;
+	const char *req = NULL;
+	size_t req_len = 0, n, in_len;
+	int i, r;
+
+	/* Exactly at the limit: accepted. */
+	n = (size_t)sprintf(buf, "GET http://example.com/ HTTP/1.1\r\n");
+	for (i = 0; i < 128; i++)
+		n += (size_t)sprintf(buf + n, "X-%d: v\r\n", i);
+	n += (size_t)sprintf(buf + n, "\r\n");
+	hc = gwp_http_conn_alloc();
+	assert(hc);
+	assert(run(hc, NULL, buf, &host, &port, &req, &req_len) ==
+	       GWP_HTTP_FORWARD);
+	gwp_http_conn_free(hc);
+
+	/* One more field line, even a merged list field: refused. */
+	sprintf(buf + n - 2, "Accept: a\r\n\r\n");
+	hc = gwp_http_conn_alloc();
+	assert(hc);
+	in_len = strlen(buf);
+	r = gwp_http_conn_process(hc, NULL, buf, &in_len, &host, &port, &req,
+				  &req_len);
+	assert(r == GWP_HTTP_TOO_LARGE);
+	gwp_http_conn_free(hc);
+
+	/* A single field longer than 16 KiB: refused, not dropped. */
+	n = (size_t)sprintf(buf, "GET http://example.com/ HTTP/1.1\r\nX: ");
+	memset(buf + n, 'a', 17000);
+	n += 17000;
+	sprintf(buf + n, "\r\n\r\n");
+	hc = gwp_http_conn_alloc();
+	assert(hc);
+	in_len = strlen(buf);
+	r = gwp_http_conn_process(hc, NULL, buf, &in_len, &host, &port, &req,
+				  &req_len);
+	assert(r == GWP_HTTP_TOO_LARGE);
+	gwp_http_conn_free(hc);
+	PRTEST_OK();
+}
+
 static void test_auth(void)
 {
 	static const char no_cred[] =
@@ -705,6 +755,7 @@ int main(void)
 		test_need_more();
 		test_errors();
 		test_duplicate_field();
+		test_header_limits();
 		test_auth();
 	}
 

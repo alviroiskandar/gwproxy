@@ -3357,8 +3357,9 @@ static int http_reject_unauthorized(struct gwp_conn_pair *gcp)
 
 /*
  * Queue the HTTP 431 reply for a request header that will not fit in the
- * client buffer, so the client is told its header is too large instead of just
- * having the connection reset. Same mechanism as the 407 above: written to the
+ * client buffer or breaks the parser's length or field-count limit, so the
+ * client is told its header is too large instead of just having the
+ * connection reset. Same mechanism as the 407 above: written to the
  * client-bound buffer, flushed by the event loop before teardown. Returns a
  * negative error so the caller drops the connection.
  */
@@ -3631,6 +3632,10 @@ int gwp_handle_conn_state_http(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	case GWP_HTTP_BAD_REQUEST:
 		pr_dbg(&ctx->lh, "Refusing HTTP request (fd=%d)", gcp->client.fd);
 		return http_reject_bad_request(gcp);
+	case GWP_HTTP_TOO_LARGE:
+		pr_dbg(&ctx->lh, "HTTP request header too large (fd=%d)",
+		       gcp->client.fd);
+		return http_reject_too_large(gcp);
 	default:	/* GWP_HTTP_ERR */
 		pr_dbg(&ctx->lh, "Invalid HTTP request (fd=%d)", gcp->client.fd);
 		return -EINVAL;

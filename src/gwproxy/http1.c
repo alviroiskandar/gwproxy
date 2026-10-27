@@ -767,10 +767,14 @@ static int parse_hdr_fields(struct gwnet_http_hdr_pctx *ctx,
 			}
 		}
 
+		if (ctx->nr_fields >= ctx->max_fields)
+			return -E2BIG;
+
 		r = gwnet_http_hdr_fields_addl(ff, k, kl, v, vl);
 		if (r)
 			return r;
 
+		ctx->nr_fields++;
 		ctx->tot_len += off;
 		ctx->off += off;
 		if (off >= len)
@@ -799,6 +803,9 @@ void gwnet_http_hdr_pctx_free(struct gwnet_http_hdr_pctx *ctx)
 static void prepare_parser(struct gwnet_http_hdr_pctx *ctx)
 {
 	ctx->tot_len = 0;
+	ctx->nr_fields = 0;
+	if (!ctx->max_fields)
+		ctx->max_fields = GWNET_HTTP_HDR_MAX_FIELDS;
 	if (!ctx->max_len)
 		ctx->max_len = (1024ull*16ull) + 1ull;
 	else

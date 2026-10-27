@@ -143,7 +143,19 @@ struct gwnet_http_hdr_pctx {
 	 * will be set to default by the parser (16384 bytes).
 	 */
 	uint64_t	max_len;
+
+	/*
+	 * Field lines accepted so far, and the most that are accepted
+	 * (filled by the caller; 0 means GWNET_HTTP_HDR_MAX_FIELDS). One
+	 * more makes the parser fail with -E2BIG. Every field line costs a
+	 * lookup among those already stored, so without a limit a header of
+	 * many small fields costs time quadratic in its size.
+	 */
+	uint32_t	nr_fields;
+	uint32_t	max_fields;
 };
+
+#define GWNET_HTTP_HDR_MAX_FIELDS	128
 
 enum {
 	GWNET_HTTP_BODY_ERR_NONE		= 0,
@@ -274,7 +286,8 @@ void gwnet_http_hdr_pctx_free(struct gwnet_http_hdr_pctx *ctx);
  *             -EAGAIN if more data is needed,
  *             -EINVAL if the request line is malformed,
  *             -EEXIST if a field that may appear only once is repeated,
- *             -E2BIG if the header is too long,
+ *             -E2BIG if the header is too long or has too many
+ *                    field lines,
  *             -ENOMEM if memory allocation fails.
  */
 int gwnet_http_req_hdr_parse(struct gwnet_http_hdr_pctx *ctx,

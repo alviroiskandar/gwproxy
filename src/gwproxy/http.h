@@ -33,6 +33,7 @@ enum gwp_http_result {
 	GWP_HTTP_BAD_REQUEST,	/* Well-formed but unacceptable (e.g. a field
 				 * that may appear once is repeated); reply
 				 * 400. */
+	GWP_HTTP_TOO_LARGE,	/* Header too long or too many fields; 431. */
 };
 
 /* Allocate/free a per-connection HTTP proxy state. */
@@ -184,7 +185,8 @@ int gwp_http_build_gateway_timeout_reply(void *out, size_t out_cap);
 
 /**
  * Build a "431 Request Header Fields Too Large" reply (RFC 6585 Section 5),
- * for a request header that does not fit in the client buffer.
+ * for a request header that does not fit in the client buffer or has too
+ * many fields (GWP_HTTP_TOO_LARGE).
  *
  * @return	Number of bytes written to @out, or -ENOBUFS if too small.
  */
