@@ -698,7 +698,7 @@ static void send_client_tls(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 	if (t->tx_len)
 		prep_send_client_cipher(w, gcp, EV_BIT_IOU_CLIENT_SEND);
-	else if (gcp->target.fd >= 0)
+	else if (gcp->target.fd >= 0 && !gcp->target.rd_eof)
 		prep_recv_target(w, gcp);
 }
 
@@ -712,6 +712,7 @@ static int tls_forward_pump(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_conn *c = &gcp->client;
 	size_t space = c->cap - c->len, got = 0;
+	uint32_t from = c->len;
 	int sr;
 
 	if (space) {
@@ -723,6 +724,12 @@ static int tls_forward_pump(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 			return iou_forward_progress(gcp);
 		}
 		c->len += (uint32_t)got;
+	}
+
+	if (gwp_http_fwd_active(gcp)) {
+		sr = gwp_http_fwd_in(w, gcp, c, from);
+		if (sr)
+			return sr;
 	}
 
 	if (c->len)
@@ -1170,11 +1177,16 @@ static struct io_uring_sqe *prep_upstream_recv(struct gwp_wrk *w,
 static int upstream_iou_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_ctx *ctx = w->ctx;
+	int r;
 
 	prep_timer_del_target(w, gcp);
 	gcp->up_tx = false;
 	gcp->is_target_alive = true;
 	gcp->conn_state = CONN_STATE_FORWARDING;
+
+	r = gwp_http_fwd_begin(w, gcp);
+	if (r)
+		return r;
 
 	pr_info(&ctx->lh, "Upstream tunnel established (idx=%u, ca=%s)",
 		gcp->idx, ip_to_str(&gcp->client_addr));
@@ -1340,6 +1352,9 @@ static int finish_target_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			 * and read the response.
 			 */
 			gcp->conn_state = CONN_STATE_FORWARDING;
+			r = gwp_http_fwd_begin(w, gcp);
+			if (r)
+				return r;
 			prep_send_target(w, gcp);
 			prep_recv_target(w, gcp);
 			return 0;
@@ -1493,6 +1508,7 @@ static int handle_ev_client_recv(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				 struct io_uring_cqe *cqe)
 {
 	int r = cqe->res;
+	uint32_t from;
 
 	if (r < 0) {
 		if (r == -EAGAIN || r == -EINTR) {
@@ -1525,8 +1541,19 @@ static int handle_ev_client_recv(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		return iou_forward_progress(gcp);
 	}
 
+	from = gcp->client.len;
 	gcp->client.len += (uint32_t)r;
-	prep_send_target(w, gcp);
+	if (gwp_http_fwd_active(gcp)) {
+		r = gwp_http_fwd_in(w, gcp, &gcp->client, from);
+		if (r)
+			return r;
+	}
+
+	/* An HTTP forwarding filter may have dropped all of it. */
+	if (gcp->client.len)
+		prep_send_target(w, gcp);
+	else
+		prep_recv_client(w, gcp);
 	return 0;
 }
 
@@ -1534,6 +1561,7 @@ static int handle_ev_target_recv(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				 struct io_uring_cqe *cqe)
 {
 	int r = cqe->res;
+	uint32_t from;
 
 	if (r < 0) {
 		if (r == -EAGAIN || r == -EINTR) {
@@ -1543,13 +1571,30 @@ static int handle_ev_target_recv(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		return r;
 	}
 
-	if (r == 0) {
+	from = gcp->target.len;
+	if (r == 0)
 		gcp->target.rd_eof = true;
-		return iou_forward_progress(gcp);
+	else
+		gcp->target.len += (uint32_t)r;
+
+	if (gwp_http_fwd_active(gcp)) {
+		r = gwp_http_fwd_in(w, gcp, &gcp->target, from);
+		if (r)
+			return r;
 	}
 
-	gcp->target.len += (uint32_t)r;
-	prep_send_client(w, gcp);
+	/*
+	 * Usually what was read is sent on, but an HTTP forwarding filter may
+	 * have held all of it back, and at EOF it may have a reply to deliver.
+	 */
+	if (gcp->target.len) {
+		prep_send_client(w, gcp);
+		return 0;
+	}
+	if (gcp->target.rd_eof)
+		return iou_forward_progress(gcp);
+
+	prep_recv_target(w, gcp);
 	return 0;
 }
 
@@ -1575,6 +1620,8 @@ static int handle_ev_client_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		if (gcp->target.len > 0 ||
 		    gwp_ssl_bio_pending(gcp->client.tls) > 0)
 			send_client_tls(w, gcp);
+		else if (gcp->target.rd_eof)
+			return iou_forward_progress(gcp);
 		else if (gcp->target.fd >= 0)
 			prep_recv_target(w, gcp);
 		return 0;
@@ -1593,6 +1640,13 @@ static int handle_ev_client_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		prep_send_client(w, gcp);
 		return 0;
 	}
+
+	/*
+	 * The target may have finished while this send was in flight: the HTTP
+	 * forwarding filter delivers its own reply after the origin's EOF.
+	 */
+	if (gcp->target.rd_eof)
+		return iou_forward_progress(gcp);
 
 	if (gcp->target.fd >= 0)
 		prep_recv_target(w, gcp);

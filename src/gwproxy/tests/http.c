@@ -14,6 +14,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <errno.h>
 #include <unistd.h>
 
@@ -230,6 +231,295 @@ static void test_forward_hop_by_hop(void)
 	PRTEST_OK();
 }
 
+static void test_forward_conn_lists_framing(void)
+{
+	/*
+	 * A Connection header naming a framing field (or Host) would make the
+	 * rewrite drop it while the body is still relayed, so the origin would
+	 * read the body as a second request. Such a request is refused with
+	 * 400 rather than rewritten.
+	 */
+	static const char *const bad[] = {
+		("POST http://example.com/a HTTP/1.1\r\n"
+		 "Connection: Content-Length\r\n"
+		 "Content-Length: 4\r\n\r\n"),
+		("POST http://example.com/a HTTP/1.1\r\n"
+		 "Connection: keep-alive, transfer-encoding\r\n"
+		 "Transfer-Encoding: chunked\r\n\r\n"),
+		("GET http://example.com/a HTTP/1.1\r\n"
+		 "Connection: Host\r\n\r\n"),
+	};
+	struct gwp_http_conn *hc;
+	char *host, *port;
+	const char *req = NULL;
+	size_t req_len = 0, i;
+	uint8_t out[128];
+	int r;
+
+	for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+		hc = gwp_http_conn_alloc();
+		assert(hc);
+		r = run(hc, NULL, bad[i], &host, &port, &req, &req_len);
+		assert(r == GWP_HTTP_BAD_REQUEST);
+		gwp_http_conn_free(hc);
+	}
+
+	r = gwp_http_build_bad_request_reply(out, sizeof(out));
+	assert(r > 0 && !strncmp((char *)out, "HTTP/1.1 400 ", 13));
+	assert(gwp_http_build_bad_request_reply(out, 5) == -ENOBUFS);
+	PRTEST_OK();
+}
+
+/*
+ * Classify @hdr as a forwarding request, then pass @body through the request
+ * body filter @step bytes at a time. Returns the filter's first error, or 0
+ * with *@fwd set to how many body bytes it let through.
+ */
+static int req_body(const char *hdr, const char *body, size_t step,
+		    size_t *fwd)
+{
+	struct gwp_http_conn *hc = gwp_http_conn_alloc();
+	size_t len = strlen(body), i, n, f;
+	char *host, *port;
+	const char *req;
+	size_t req_len;
+	bool held = false;
+	int r = 0;
+
+	assert(hc);
+	assert(run(hc, NULL, hdr, &host, &port, &req, &req_len) ==
+	       GWP_HTTP_FORWARD);
+	*fwd = 0;
+	for (i = 0; i < len; i += n) {
+		n = (len - i < step) ? len - i : step;
+		r = gwp_http_fwd_req_body(hc, body + i, n, &f);
+		if (r)
+			break;
+		/* Once something is held back, nothing more gets through. */
+		assert(!held || !f);
+		held = f < n;
+		*fwd += f;
+	}
+	gwp_http_conn_free(hc);
+	return r;
+}
+
+static void test_req_framing(void)
+{
+	static const char next[] = "GET http://other/ HTTP/1.1\r\n\r\n";
+	static const char chunked[] =
+		"5\r\nhello\r\n"
+		"1A;ext=\"v\"\r\nabcdefghijklmnopqrstuvwxyz\r\n"
+		"0003 ;x\r\nabc\r\n"
+		"0\r\nX-Trailer: t\r\nX-T: v\r\n\r\n";
+	static const char *const bad_hdr[] = {
+		"POST http://h/ HTTP/1.1\r\nContent-Length: 1\r\n"
+		"Transfer-Encoding: chunked\r\n\r\n",
+		"POST http://h/ HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n",
+		"POST http://h/ HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n",
+		"POST http://h/ HTTP/1.1\r\nContent-Length: 1x\r\n\r\n",
+		"POST http://h/ HTTP/1.1\r\nContent-Length: -1\r\n\r\n",
+		"POST http://h/ HTTP/1.1\r\n"
+		"Content-Length: 99999999999999999999\r\n\r\n",
+	};
+	static const char *const bad_chunked[] = {
+		"5\nhello\r\n0\r\n\r\n",	/* bare LF */
+		"5\r\nhelloX\r\n0\r\n\r\n",	/* data longer than its size */
+		"g\r\n",
+		"\r\n",
+		"11111111111111111\r\n",	/* more than 64 bits */
+		"0\r\nX: a\nb\r\n\r\n",
+		/* A request smuggled in as "trailers". */
+		"0\r\nGET /admin HTTP/1.1\r\nHost: internal\r\n\r\n",
+		"0\r\nX\r\n\r\n",		/* no colon */
+		"0\r\nX : v\r\n\r\n",	/* space before colon */
+		"80000000\r\n",		/* chunk of 2 GiB */
+		"100000005\r\nhello\r\n0\r\n\r\n",
+		"5 6\r\nhello\r\n0\r\n\r\n",	/* bare-space extension */
+		"5 \r\nhello\r\n0\r\n\r\n",
+	};
+	char body[256];
+	size_t fwd, step, i;
+	struct gwp_http_conn *hc;
+	char *host, *port;
+	const char *req;
+	size_t req_len;
+
+	for (step = 1; step <= 64; step *= 4) {
+		/* Content-Length: exactly that many bytes, the rest dropped. */
+		snprintf(body, sizeof(body), "hello%s", next);
+		assert(!req_body("POST http://h/ HTTP/1.1\r\n"
+				 "Content-Length: 5\r\n\r\n", body, step, &fwd));
+		assert(fwd == 5);
+
+		/* No framing: no body; a pipelined request goes nowhere. */
+		assert(!req_body("GET http://h/ HTTP/1.1\r\n\r\n", next, step,
+				 &fwd));
+		assert(fwd == 0);
+
+		/* Chunked, extensions and trailers included. */
+		snprintf(body, sizeof(body), "%s%s", chunked, next);
+		assert(!req_body("POST http://h/ HTTP/1.1\r\n"
+				 "Transfer-Encoding: Chunked\r\n\r\n", body,
+				 step, &fwd));
+		assert(fwd == strlen(chunked));
+
+		for (i = 0; i < sizeof(bad_chunked) / sizeof(bad_chunked[0]);
+		     i++)
+			assert(req_body("POST http://h/ HTTP/1.1\r\n"
+					"Transfer-Encoding: chunked\r\n\r\n",
+					bad_chunked[i], step, &fwd) == -EBADMSG);
+	}
+
+	for (i = 0; i < sizeof(bad_hdr) / sizeof(bad_hdr[0]); i++) {
+		hc = gwp_http_conn_alloc();
+		assert(hc);
+		assert(run(hc, NULL, bad_hdr[i], &host, &port, &req,
+			   &req_len) == GWP_HTTP_BAD_REQUEST);
+		gwp_http_conn_free(hc);
+	}
+	PRTEST_OK();
+}
+
+/* Feed @in to a fresh response filter in one go; returns its result. */
+static int res_feed(struct gwp_http_conn *hc, const char *in, bool eof,
+		    char *out, size_t out_cap, size_t *out_len)
+{
+	assert(!gwp_http_fwd_res_init(hc, 1024));
+	return gwp_http_fwd_res_input(hc, in, strlen(in), eof, out, out_cap,
+				      out_len);
+}
+
+static void test_res_rewrite(void)
+{
+	/*
+	 * The client must learn that the connection closes, whatever the
+	 * origin claims, and must not see the origin's hop-by-hop fields. The
+	 * framing fields stay even when Connection names them (the body is
+	 * relayed as is), and so do duplicates such as Set-Cookie.
+	 */
+	static const char in[] =
+		"HTTP/1.1 200 OK\r\n"
+		"Connection: keep-alive, X-Drop, Content-Length\r\n"
+		"Keep-Alive: timeout=100\r\n"
+		"Proxy-Authenticate: Basic realm=\"evil\"\r\n"
+		"X-Drop: 1\r\n"
+		"Set-Cookie: a=1\r\n"
+		"Set-Cookie: b=2\r\n"
+		"Content-Length: 5\r\n"
+		"\r\n"
+		"hello";
+	static const char want[] =
+		"HTTP/1.1 200 OK\r\n"
+		"Set-Cookie: a=1\r\n"
+		"Set-Cookie: b=2\r\n"
+		"Content-Length: 5\r\n"
+		"Connection: close\r\n"
+		"Proxy-Connection: close\r\n"
+		"\r\n"
+		"hello";
+	struct gwp_http_conn *hc = gwp_http_conn_alloc();
+	char out[1024];
+	size_t out_len, i;
+
+	assert(hc);
+	assert(res_feed(hc, in, false, out, sizeof(out), &out_len) == 0);
+	assert(gwp_http_fwd_res_state(hc) == GWP_HTTP_RES_BODY);
+	assert(out_len == strlen(want) && !memcmp(out, want, out_len));
+
+	/* Same, dribbled in a byte at a time, with LF-only line ends. */
+	assert(!gwp_http_fwd_res_init(hc, 1024));
+	{
+		static const char lf[] =
+			"HTTP/1.0 200 OK\nKeep-Alive: x\nA: b\n\nbody";
+		static const char lf_want[] =
+			"HTTP/1.0 200 OK\r\nA: b\r\n"
+			"Connection: close\r\nProxy-Connection: close\r\n\r\n"
+			"body";
+		size_t o = 0;
+
+		/* Nothing comes out until the blank line is in. */
+		for (i = 0; gwp_http_fwd_res_state(hc) == GWP_HTTP_RES_HDR; i++) {
+			assert(gwp_http_fwd_res_input(hc, lf + i, 1, false,
+						      out, sizeof(out),
+						      &out_len) == 0);
+			if (i < strlen(lf) - 5)
+				assert(!out_len);
+		}
+		/* From there on the body is the caller's to relay. */
+		memcpy(out + out_len, lf + i, strlen(lf) - i);
+		o = out_len + strlen(lf) - i;
+		assert(o == strlen(lf_want) && !memcmp(out, lf_want, o));
+	}
+
+	gwp_http_conn_free(hc);
+	PRTEST_OK();
+}
+
+static void test_res_interim(void)
+{
+	/* A 100 Continue is passed on at once, without "Connection: close". */
+	static const char in[] = "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 20";
+	static const char rest[] = "4 No Content\r\n\r\n";
+	struct gwp_http_conn *hc = gwp_http_conn_alloc();
+	char out[1024];
+	size_t out_len;
+
+	assert(hc);
+	assert(res_feed(hc, in, false, out, sizeof(out), &out_len) == 0);
+	assert(gwp_http_fwd_res_state(hc) == GWP_HTTP_RES_HDR);
+	assert(out_len == 25 && !memcmp(out, "HTTP/1.1 100 Continue\r\n\r\n", 25));
+	assert(gwp_http_fwd_res_pending(hc) == 11);
+
+	assert(gwp_http_fwd_res_input(hc, rest, strlen(rest), false, out,
+				      sizeof(out), &out_len) == 0);
+	assert(gwp_http_fwd_res_state(hc) == GWP_HTTP_RES_BODY);
+	assert(strstr(out, "HTTP/1.1 204 No Content\r\nConnection: close\r\n"));
+
+	gwp_http_conn_free(hc);
+	PRTEST_OK();
+}
+
+static void test_res_reject(void)
+{
+	static const char *const bad[] = {
+		("HTTP/1.1 407 Proxy Authentication Required\r\n"
+		 "Proxy-Authenticate: Basic realm=\"x\"\r\n\r\n"),
+		"HTTP/1.1 101 Switching Protocols\r\nUpgrade: x\r\n\r\n",
+		"SSH-2.0-OpenSSH\r\n\r\n",
+		"HTTP/1.1 200 OK\r\nX: a\rb\r\n\r\n",	/* bare CR */
+		"HTTP/1.1 200 OK\r\nX: a\r\n b\r\n\r\n",	/* obs-fold */
+		"HTTP/1.1 200 OK\r\nX : a\r\n\r\n",
+		"HTTP/1.1 600 OK\r\n\r\n",
+	};
+	struct gwp_http_conn *hc = gwp_http_conn_alloc();
+	char out[1024], big[1100];
+	size_t out_len, i;
+
+	assert(hc);
+	for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+		assert(res_feed(hc, bad[i], false, out, sizeof(out),
+				&out_len) < 0);
+		assert(gwp_http_fwd_res_state(hc) == GWP_HTTP_RES_FAILED);
+		assert(!out_len);
+	}
+	assert(res_feed(hc, bad[0], false, out, sizeof(out), &out_len) ==
+	       -EACCES);
+
+	/* The origin closing before the header is complete. */
+	assert(res_feed(hc, "HTTP/1.1 200 OK\r\n", true, out, sizeof(out),
+			&out_len) == -EBADMSG);
+
+	/* A header that cannot fit in what the filter may hold back. */
+	memset(big, 'a', sizeof(big) - 1);
+	big[sizeof(big) - 1] = '\0';
+	memcpy(big, "HTTP/1.1 200 OK\r\nX: ", 20);
+	assert(res_feed(hc, big, false, out, sizeof(out), &out_len) == -E2BIG);
+
+	gwp_http_conn_free(hc);
+	PRTEST_OK();
+}
+
 static void test_need_more(void)
 {
 	/* Request line complete, header fields not yet terminated. */
@@ -360,6 +650,11 @@ int main(void)
 		test_forward_get();
 		test_forward_default_port();
 		test_forward_hop_by_hop();
+		test_forward_conn_lists_framing();
+		test_req_framing();
+		test_res_rewrite();
+		test_res_interim();
+		test_res_reject();
 		test_need_more();
 		test_errors();
 		test_auth();

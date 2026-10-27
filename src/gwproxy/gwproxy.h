@@ -873,4 +873,29 @@ int gwp_handle_conn_state_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 int gwp_handle_conn_state_socks5(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 int gwp_handle_conn_state_http(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 
+/*
+ * HTTP forwarding-proxy requests (absolute-form "GET http://..."), unlike
+ * every other mode, are not relayed blindly once the target is up: what
+ * passes between client and origin is filtered by gwp_http_fwd_in(). Both
+ * event loops call gwp_http_fwd_begin() when such a pair starts forwarding,
+ * and gwp_http_fwd_in() after every read into either buffer while
+ * gwp_http_fwd_active() holds.
+ */
+static inline bool gwp_http_fwd_active(const struct gwp_conn_pair *gcp)
+{
+	return gcp->prot_type == GWP_PROT_TYPE_HTTP && gcp->http_conn &&
+	       gwp_http_conn_is_forward(gcp->http_conn);
+}
+
+int gwp_http_fwd_begin(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
+
+/*
+ * @c (&gcp->client or &gcp->target) has just had bytes appended at
+ * c->buf[@from..c->len), or reached EOF (c->rd_eof). The bytes may be
+ * rewritten, held back or dropped, so c->len and c->cap can change. Returns
+ * 0 or a negative errno that tears the pair down.
+ */
+int gwp_http_fwd_in(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+		    struct gwp_conn *c, uint32_t from);
+
 #endif /* #ifndef GWPROXY_H */

@@ -30,6 +30,7 @@ enum gwp_http_result {
 	GWP_HTTP_FORWARD,	/* Forward request; host/port + rewritten req set. */
 	GWP_HTTP_NEED_AUTH,	/* Proxy auth required/failed; reply 407. */
 	GWP_HTTP_ERR,		/* Malformed or unsupported; tear the conn down. */
+	GWP_HTTP_BAD_REQUEST,	/* Well-formed but unacceptable; reply 400. */
 };
 
 /* Allocate/free a per-connection HTTP proxy state. */
@@ -67,6 +68,70 @@ int gwp_http_conn_process(struct gwp_http_conn *hc, struct gwp_auth *auth,
 			  const char **req_p, size_t *req_len_p);
 
 /**
+ * Delimit the body of a forwarding request. Called with each run of client
+ * bytes that follows the request header; returns in *@fwd_len how many of the
+ * @len bytes at @in still belong to the request and go to the origin. The
+ * rest, and everything after it, is not part of the request: this proxy
+ * serves one request per connection, and whatever the client sends next is
+ * meant for a server it has not been checked against.
+ *
+ * @return	0, or -EBADMSG for a malformed chunked body.
+ */
+int gwp_http_fwd_req_body(struct gwp_http_conn *hc, const void *in,
+			  size_t len, size_t *fwd_len);
+
+/*
+ * Where the response to a forwarding request stands (gwp_http_fwd_res_state()).
+ */
+enum gwp_http_res_state {
+	GWP_HTTP_RES_NONE = 0,	/* Not forwarding yet. */
+	GWP_HTTP_RES_HDR,	/* Header still being collected. */
+	GWP_HTTP_RES_BODY,	/* Header passed on; the rest is relayed as is. */
+	GWP_HTTP_RES_FAILED,	/* Unusable; the client got a 502 instead. */
+};
+
+/**
+ * Prepare to receive the origin's response to a forwarding request. Its
+ * header, interim ones included, may take at most @max_hdr bytes.
+ *
+ * @return	0, or -ENOMEM.
+ */
+int gwp_http_fwd_res_init(struct gwp_http_conn *hc, size_t max_hdr);
+
+/* One of enum gwp_http_res_state. */
+int gwp_http_fwd_res_state(const struct gwp_http_conn *hc);
+
+/* Origin bytes held back while the response header is incomplete. */
+size_t gwp_http_fwd_res_pending(const struct gwp_http_conn *hc);
+
+/**
+ * Consume origin bytes while the response header is being collected
+ * (GWP_HTTP_RES_HDR). Nothing is released until a header is complete; then it
+ * is written to @out rewritten for the client: hop-by-hop fields and fields
+ * named by Connection are dropped and a final response gains "Connection:
+ * close". An interim (1xx) response is passed on the same way and the next
+ * header awaited; after the final header, any body bytes that arrived with it
+ * follow it in @out and the state moves to GWP_HTTP_RES_BODY.
+ *
+ * @hc		Per-connection state.
+ * @in		Origin bytes; may alias @out (they are taken before @out is
+ *		written).
+ * @len		Number of bytes in @in.
+ * @eof		The origin has closed; an incomplete header is an error.
+ * @out		Where the bytes for the client go.
+ * @out_cap	Capacity of @out.
+ * @out_len	Out: number of bytes written to @out.
+ * @return	0; or, with the state moved to GWP_HTTP_RES_FAILED and nothing
+ *		written, a negative error the caller answers with 502:
+ *		-EBADMSG (not a valid HTTP/1.x header, a 101, or the origin
+ *		closed early), -E2BIG (header too large), -EACCES (the origin
+ *		answered 407), -ENOMEM.
+ */
+int gwp_http_fwd_res_input(struct gwp_http_conn *hc, const void *in,
+			   size_t len, bool eof, void *out, size_t out_cap,
+			   size_t *out_len);
+
+/**
  * Build the client-bound reply written once the target is connected:
  * "HTTP/1.1 200 OK" for a CONNECT tunnel, nothing for a forwarding request.
  *
@@ -82,6 +147,15 @@ int gwp_http_build_connect_reply(const struct gwp_http_conn *hc, void *out,
  * @return	Number of bytes written to @out, or -ENOBUFS if too small.
  */
 int gwp_http_build_auth_required_reply(void *out, size_t out_cap);
+
+/**
+ * Build a "400 Bad Request" reply, for a request the forwarding proxy refuses
+ * to relay because the origin could frame it differently (see
+ * GWP_HTTP_BAD_REQUEST).
+ *
+ * @return	Number of bytes written to @out, or -ENOBUFS if too small.
+ */
+int gwp_http_build_bad_request_reply(void *out, size_t out_cap);
 
 /**
  * Build a "403 Forbidden" reply (used when an ACL rejects the target).

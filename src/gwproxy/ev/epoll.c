@@ -765,7 +765,12 @@ static int adjust_epl_mask(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 			return r;
 	}
 
-	if (target_need_ctl) {
+	/*
+	 * No target socket yet: connect attempts live in attempt_fd[] until
+	 * one wins, and adopt_winning_attempt() sets the mask it registers the
+	 * winner with. Client data arriving meanwhile must not be fatal.
+	 */
+	if (target_need_ctl && gcp->target.fd >= 0) {
 		ev.events = gcp->target.ep_mask;
 		ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_TARGET;
 
@@ -955,15 +960,25 @@ static ssize_t __do_send(struct gwp_conn *src, struct gwp_conn *dst)
 }
 
 __hot
-static int do_splice(struct gwp_conn *src, struct gwp_conn *dst, bool do_recv,
+static int do_splice(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+		     struct gwp_conn *src, struct gwp_conn *dst, bool do_recv,
 		     bool do_send)
 {
 	ssize_t ret;
 
 	if (do_recv) {
+		uint32_t from = src->len;
+
 		ret = __do_recv(src);
 		if (unlikely(ret < 0))
 			return (int)ret;
+
+		if (gwp_http_fwd_active(gcp)) {
+			int r = gwp_http_fwd_in(w, gcp, src, from);
+
+			if (unlikely(r))
+				return r;
+		}
 	}
 
 	if (do_send) {
@@ -1047,6 +1062,7 @@ static int upstream_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_ctx *ctx = w->ctx;
 	ssize_t sr;
+	int r;
 
 	if (gcp->timer_fd >= 0) {
 		__sys_close(gcp->timer_fd);
@@ -1057,6 +1073,10 @@ static int upstream_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	gcp->is_target_alive = true;
 	gcp->conn_state = CONN_STATE_FORWARDING;
 	gcp->target.ep_mask = EPOLLOUT | EPOLLIN | EPOLLRDHUP;
+
+	r = gwp_http_fwd_begin(w, gcp);
+	if (unlikely(r))
+		return r;
 
 	pr_info(&ctx->lh, "Upstream tunnel established (idx=%u, ca=%s, dst=%s)",
 		gcp->idx, ip_to_str(&gcp->client_addr),
@@ -1213,6 +1233,10 @@ static int handle_ev_target_conn_result(struct gwp_wrk *w,
 
 	gcp->is_target_alive = true;
 	gcp->conn_state = CONN_STATE_FORWARDING;
+
+	r = gwp_http_fwd_begin(w, gcp);
+	if (unlikely(r))
+		return r;
 
 	if (gcp->client.len) {
 		sr = __do_send(&gcp->client, &gcp->target);
@@ -1403,13 +1427,13 @@ static int handle_ev_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	 * triggered) until recv() returns 0 and sets rd_eof.
 	 */
 	if (ev->events & (EPOLLIN | EPOLLHUP)) {
-		r = do_splice(&gcp->target, &gcp->client, true, true);
+		r = do_splice(w, gcp, &gcp->target, &gcp->client, true, true);
 		if (r)
 			return r;
 	}
 
 	if (ev->events & EPOLLOUT) {
-		r = do_splice(&gcp->client, &gcp->target, true, true);
+		r = do_splice(w, gcp, &gcp->client, &gcp->target, true, true);
 		if (r)
 			return r;
 	}
@@ -1432,13 +1456,14 @@ static int handle_ev_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	}
 
 	if (ev->events & (EPOLLIN | EPOLLHUP)) {
-		r = do_splice(&gcp->client, &gcp->target, true, gcp->is_target_alive);
+		r = do_splice(w, gcp, &gcp->client, &gcp->target, true,
+			      gcp->is_target_alive);
 		if (r)
 			return r;
 	}
 
 	if (ev->events & EPOLLOUT) {
-		r = do_splice(&gcp->target, &gcp->client, true, true);
+		r = do_splice(w, gcp, &gcp->target, &gcp->client, true, true);
 		if (r)
 			return r;
 	}
@@ -2099,6 +2124,7 @@ static int handle_conn_state_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 static int handle_ev_client_prot_in(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
+	uint32_t from = gcp->client.len;
 	ssize_t ret;
 	int r, ct;
 
@@ -2109,6 +2135,16 @@ static int handle_ev_client_prot_in(struct gwp_wrk *w, struct gwp_conn_pair *gcp
 		return -ECONNRESET;
 	if (!ret)
 		return 0;
+
+	/*
+	 * More of a forwarding request's body (or what follows it) arriving
+	 * while the origin is still being resolved.
+	 */
+	if (gwp_http_fwd_active(gcp)) {
+		r = gwp_http_fwd_in(w, gcp, &gcp->client, from);
+		if (unlikely(r))
+			return r;
+	}
 
 	ct = gcp->conn_state;
 	if (ct == CONN_STATE_SOCKS5_UDP_ASSOCIATE) {

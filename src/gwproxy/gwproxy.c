@@ -3366,6 +3366,22 @@ static int http_reject_too_large(struct gwp_conn_pair *gcp)
 }
 
 /*
+ * Queue the HTTP 400 reply for a request the forwarding proxy refuses to relay
+ * (GWP_HTTP_BAD_REQUEST). Same mechanism as the 407 above. Returns a negative
+ * error so the caller drops the connection.
+ */
+static int http_reject_bad_request(struct gwp_conn_pair *gcp)
+{
+	int r = gwp_http_build_bad_request_reply(gcp->target.buf + gcp->target.len,
+						 gcp->target.cap - gcp->target.len);
+	if (r < 0)
+		return -ENOBUFS;
+
+	gcp->target.len += (uint32_t)r;
+	return -EBADMSG;
+}
+
+/*
  * Prepend a rewritten origin-form forward request to any request-body bytes
  * already buffered in client.buf, so the forwarding path streams it to the
  * origin.
@@ -3395,6 +3411,149 @@ static int http_connect_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		gcp->conn_state = CONN_STATE_HTTP_CONNECT;
 
 	return r;
+}
+
+/*
+ * Room kept free in the target buffer while the response header is held back:
+ * enough for the "Connection: close" and "Proxy-Connection: close" lines the
+ * rewrite adds. A header therefore gets at most target-buf-size minus this,
+ * counted together with any interim (1xx) responses still queued for the
+ * client. That is enough for any CRLF header that fits, but the rewrite also
+ * turns bare LF line ends into CRLF, so an LF-only header near the limit can
+ * still outgrow the buffer; the rewrite is bounds-checked and answers 502.
+ */
+#define HTTP_FWD_RES_SLACK	64
+
+/*
+ * The origin's response is unusable (see gwp_http_fwd_res_input()). Throw
+ * away whatever it sent that the client has not seen, answer 502 in its
+ * place, and treat the origin as finished: the normal forwarding path then
+ * delivers the 502 and closes towards the client.
+ */
+static int http_fwd_res_fail(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			     uint32_t from, int err)
+{
+	struct gwp_conn *t = &gcp->target;
+	int r;
+
+	pr_info(&w->ctx->lh, "Rejecting response from origin %s: %s (idx=%u)",
+		ip_to_str(&gcp->target_addr),
+		err == -EACCES ? "it asked for proxy authentication" :
+				 strerror(-err), gcp->idx);
+
+	t->cap = (uint32_t)w->ctx->cfg.target_buf_size;
+	t->len = from;
+	r = gwp_http_build_bad_gateway_reply(t->buf + t->len, t->cap - t->len);
+	if (r < 0)
+		return r;
+	t->len += (uint32_t)r;
+	t->rd_eof = true;
+	return 0;
+}
+
+static int http_fwd_target_in(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			      uint32_t from)
+{
+	struct gwp_http_conn *hc = gcp->http_conn;
+	uint32_t cap = (uint32_t)w->ctx->cfg.target_buf_size;
+	struct gwp_conn *t = &gcp->target;
+	size_t out_len, pending;
+	int r;
+
+	switch (gwp_http_fwd_res_state(hc)) {
+	case GWP_HTTP_RES_NONE:
+	case GWP_HTTP_RES_BODY:
+		return 0;
+	case GWP_HTTP_RES_FAILED:
+		/* Already answered 502; whatever else it says is dropped. */
+		t->len = from;
+		return 0;
+	}
+
+	if (t->len == from && !t->rd_eof)
+		return 0;
+
+	r = gwp_http_fwd_res_input(hc, t->buf + from, t->len - from, t->rd_eof,
+				   t->buf + from, cap - from, &out_len);
+	if (r < 0)
+		return http_fwd_res_fail(w, gcp, from, r);
+
+	t->len = from + (uint32_t)out_len;
+	if (gwp_http_fwd_res_state(hc) != GWP_HTTP_RES_HDR) {
+		t->cap = cap;
+		return 0;
+	}
+
+	/*
+	 * Still collecting the header. Shrink the buffer the event loop reads
+	 * into, so that what is held back, what is still queued for the
+	 * client (an interim response) and the next read can never add up to
+	 * more than the rewritten header and the body behind it can occupy.
+	 */
+	pending = gwp_http_fwd_res_pending(hc);
+	if (t->len + pending + HTTP_FWD_RES_SLACK >= cap)
+		return http_fwd_res_fail(w, gcp, from, -E2BIG);
+	t->cap = cap - HTTP_FWD_RES_SLACK - (uint32_t)pending;
+	return 0;
+}
+
+/*
+ * Client bytes: only the rest of the request's body goes to the origin. What
+ * follows it -- typically the client's next request, for whatever host, with
+ * its Proxy-Authorization -- was never checked against the ACL and is meant
+ * for somebody else, so it is dropped.
+ */
+static int http_fwd_client_in(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			      uint32_t from)
+{
+	struct gwp_conn *c = &gcp->client;
+	size_t fwd;
+	int r;
+
+	if (c->len == from)
+		return 0;
+
+	r = gwp_http_fwd_req_body(gcp->http_conn, c->buf + from, c->len - from,
+				  &fwd);
+	if (r < 0) {
+		pr_dbg(&w->ctx->lh, "Malformed request body (idx=%u)", gcp->idx);
+		return r;
+	}
+
+	if (fwd < c->len - from)
+		pr_dbg(&w->ctx->lh,
+			"Dropping %zu client bytes after the request (idx=%u)",
+			c->len - from - fwd, gcp->idx);
+	c->len = from + (uint32_t)fwd;
+	return 0;
+}
+
+int gwp_http_fwd_in(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+		    struct gwp_conn *c, uint32_t from)
+{
+	if (c == &gcp->target)
+		return http_fwd_target_in(w, gcp, from);
+	return http_fwd_client_in(w, gcp, from);
+}
+
+int gwp_http_fwd_begin(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	uint32_t cap = (uint32_t)w->ctx->cfg.target_buf_size;
+	int r;
+
+	if (!gwp_http_fwd_active(gcp))
+		return 0;
+
+	r = gwp_http_fwd_res_init(gcp->http_conn, cap - HTTP_FWD_RES_SLACK);
+	if (r)
+		return r;
+	gcp->target.cap = cap - HTTP_FWD_RES_SLACK;
+
+	/*
+	 * Bytes may already be waiting: an upstream proxy can deliver some
+	 * behind its CONNECT reply. They are the start of the response.
+	 */
+	return http_fwd_target_in(w, gcp, 0);
 }
 
 int gwp_handle_conn_state_http(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
@@ -3454,7 +3613,16 @@ int gwp_handle_conn_state_http(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 			return http_reject_too_large(gcp);
 		if (r < 0)
 			return r;
+		/* Whatever came in behind the header is the body, or not. */
+		r = http_fwd_client_in(w, gcp, (uint32_t)req_len);
+		if (r == -EBADMSG)
+			return http_reject_bad_request(gcp);
+		if (r < 0)
+			return r;
 		return http_connect_target(w, gcp, host, port);
+	case GWP_HTTP_BAD_REQUEST:
+		pr_dbg(&ctx->lh, "Refusing HTTP request (fd=%d)", gcp->client.fd);
+		return http_reject_bad_request(gcp);
 	default:	/* GWP_HTTP_ERR */
 		pr_dbg(&ctx->lh, "Invalid HTTP request (fd=%d)", gcp->client.fd);
 		return -EINVAL;
