@@ -957,6 +957,49 @@ static void test_header_limits(void)
 	PRTEST_OK();
 }
 
+/*
+ * The upstream proxy's CONNECT reply follows the same rules as an origin's
+ * response: HTTP/1.0 or 1.1 only, a three-digit code ending at a space or
+ * the line end, LF or CRLF line ends; bytes after the header are left alone.
+ */
+static void test_upstream_reply(void)
+{
+	static const struct {
+		const char	*in;
+		int		ret;
+		int		status;
+		size_t		consumed;
+	} cases[] = {
+		{ "HTTP/1.1 200 Connection established\r\n\r\n", 0, 200, 39 },
+		{ "HTTP/1.0 200 OK\r\nVia: x\r\n\r\ntunnel", 0, 200, 27 },
+		{ "HTTP/1.1 200\n\n", 0, 200, 14 },
+		{ "HTTP/1.1 407 Auth\nX: y\r\n\r\n", 0, 407, 26 },
+		{ "HTTP/1.1 200 OK\r\n", -EAGAIN, 0, 0 },
+		{ "HTTP/1.1 200 OK\r\n\r", -EAGAIN, 0, 0 },
+		{ "HTTP/1.x 200 OK\r\n\r\n", -EINVAL, 0, 0 },
+		{ "HTTP/1.2 200 OK\r\n\r\n", -EINVAL, 0, 0 },
+		{ "HTTP/1.1 2000 OK\r\n\r\n", -EINVAL, 0, 0 },
+		{ "HTTP/1.1 20\r\n\r\n", -EINVAL, 0, 0 },
+		{ "SSH-2.0-x\r\n\r\n", -EINVAL, 0, 0 },
+	};
+	size_t i, consumed;
+	int status, r;
+
+	for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+		consumed = 0;
+		status = 0;
+		r = gwp_http_cli_parse_connect_reply(cases[i].in,
+						     strlen(cases[i].in),
+						     &status, &consumed);
+		assert(r == cases[i].ret);
+		if (r)
+			continue;
+		assert(status == cases[i].status);
+		assert(consumed == cases[i].consumed);
+	}
+	PRTEST_OK();
+}
+
 static void test_auth(void)
 {
 	static const char no_cred[] =
@@ -1040,6 +1083,7 @@ int main(void)
 		test_duplicate_field();
 		test_header_limits();
 		test_auth();
+		test_upstream_reply();
 	}
 
 	/* Byte-by-byte feeding of 17 KiB headers: once is enough. */

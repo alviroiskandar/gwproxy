@@ -1422,34 +1422,36 @@ int gwp_http_cli_build_connect(const char *authority, const char *user,
 }
 
 /*
- * Parse an upstream HTTP CONNECT reply. Returns -EAGAIN until the status line
- * and header terminator ("\r\n\r\n") have both arrived. On completion it sets
- * *status to the HTTP status code and *consumed to the number of bytes up to and
- * including the blank line (any bytes after that are early tunnel data), and
- * returns 0. Returns -EINVAL on a malformed status line.
+ * Parse an upstream HTTP CONNECT reply. Returns -EAGAIN until the header,
+ * up to and including the blank line that ends it, has arrived. On
+ * completion it sets *status to the HTTP status code and *consumed to the
+ * number of bytes of the header (any bytes after that are early tunnel data),
+ * and returns 0. Returns -EINVAL on a malformed status line.
+ *
+ * The status line and the line ends are held to the same rules as an
+ * origin's response in forwarding mode (rewrite_res_hdr(), find_hdr_end()):
+ * "HTTP/1.0" or "HTTP/1.1", a three-digit code followed by a space or the
+ * end of the line, LF or CRLF line ends.
  */
 int gwp_http_cli_parse_connect_reply(const void *buf, size_t len, int *status,
 				     size_t *consumed)
 {
-	const char *p = buf, *end;
-	int code;
+	const char *p = buf;
+	size_t scan = 0, end, n;
 
 	/* Need the full header block. */
-	end = memmem(p, len, "\r\n\r\n", 4);
+	end = find_hdr_end(p, len, &scan);
 	if (!end)
 		return -EAGAIN;
 
-	/* Status line: "HTTP/1.x SSS ...". */
-	if (len < 12 || memcmp(p, "HTTP/1.", 7))
-		return -EINVAL;
-	if (p[8] != ' ')
-		return -EINVAL;
-	if (p[9] < '0' || p[9] > '9' || p[10] < '0' || p[10] > '9' ||
-	    p[11] < '0' || p[11] > '9')
+	next_line(p, p + end, &n);
+	if (n < 12 || memcmp(p, "HTTP/1.", 7) || (p[7] != '0' && p[7] != '1') ||
+	    p[8] != ' ' || p[9] < '0' || p[9] > '9' || p[10] < '0' ||
+	    p[10] > '9' || p[11] < '0' || p[11] > '9' ||
+	    (n > 12 && p[12] != ' '))
 		return -EINVAL;
 
-	code = (p[9] - '0') * 100 + (p[10] - '0') * 10 + (p[11] - '0');
-	*status = code;
-	*consumed = (size_t)(end - p) + 4;
+	*status = (p[9] - '0') * 100 + (p[10] - '0') * 10 + (p[11] - '0');
+	*consumed = end;
 	return 0;
 }

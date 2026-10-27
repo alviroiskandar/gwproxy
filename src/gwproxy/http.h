@@ -216,8 +216,9 @@ int gwp_http_cli_build_connect(const char *authority, const char *user,
  * Parse an upstream HTTP CONNECT reply.
  *
  * @return	0 with *status (HTTP code) and *consumed (bytes through the
- *		"\r\n\r\n") set once the header block has arrived; -EAGAIN if
- *		more data is needed; -EINVAL on a malformed status line.
+ *		blank line, CRLF or LF) set once the header block has arrived;
+ *		-EAGAIN if more data is needed; -EINVAL on a malformed status
+ *		line (not "HTTP/1.0" or "HTTP/1.1" SP 3DIGIT).
  */
 int gwp_http_cli_parse_connect_reply(const void *buf, size_t len, int *status,
 				     size_t *consumed);
