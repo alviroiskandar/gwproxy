@@ -10,6 +10,7 @@
 #include <gwproxy/dns.h>
 #include <gwproxy/dns_cache.h>
 #include <poll.h>
+#include <unistd.h>
 #include <errno.h>
 #include <string.h>
 #include <time.h>
@@ -85,6 +86,24 @@ static int poll_all_in(struct pollfd *pfd, int n, int timeout)
 		if (t == n)
 			return 0;
 	}
+}
+
+/*
+ * The resolver hands a result to its client before it inserts it into the
+ * cache, so a lookup right after the result arrived may still miss. Wait for
+ * the insert, giving up after a second.
+ */
+static void wait_cached(struct gwp_dns_ctx *ctx, const char *name)
+{
+	struct gwp_sockaddr addr;
+	int i;
+
+	for (i = 0; i < 1000; i++) {
+		if (!gwp_dns_cache_lookup(ctx, name, 0, &addr))
+			return;
+		usleep(1000);
+	}
+	assert(0 && "the result never reached the cache");
 }
 
 /*
@@ -198,6 +217,7 @@ static void test_dns_cache(void)
 	assert(r == AF_INET || r == AF_INET6);
 	gwp_dns_entry_put(e);
 
+	wait_cached(ctx, "localhost");
 	r = gwp_dns_cache_lookup(ctx, "localhost", 8080, &addr);
 	assert(!r);
 	r = addr.sa.sa_family;
@@ -417,6 +437,7 @@ static void test_addr_list(void)
 	gwp_dns_entry_put(e);
 
 	/* The cache stores every record; its list must match the resolver's. */
+	wait_cached(ctx, "localhost");
 	r = gwp_dns_cache_lookup_list(ctx, "localhost", 80, list,
 				      GWP_DNS_MAX_ADDRS, &nr);
 	assert(!r);

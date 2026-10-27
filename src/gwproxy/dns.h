@@ -12,8 +12,6 @@
 #include <gwproxy/net.h>
 #include <gwproxy/syscall.h>
 
-struct gwp_dns_wrk;
-
 /*
  * How many addresses a single name may contribute. A resolver can return far
  * more; the connect path only ever tries a handful before giving up, so the

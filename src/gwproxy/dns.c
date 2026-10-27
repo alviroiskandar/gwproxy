@@ -19,28 +19,51 @@
 #include <sys/socket.h>
 #include <netdb.h>
 #include <arpa/inet.h>
-#include <signal.h>
+#include <time.h>
 
 #include <pthread.h>
 #include <sys/eventfd.h>
 
+/*
+ * The resolver threads. @nr_workers of them (--nr-dns-workers) are started
+ * with the context and stay; more are started when lookups queue up with no
+ * thread free to take them, up to GWP_DNS_MAX_THREADS, and those exit again
+ * after GWP_DNS_IDLE_SECS without work.
+ *
+ * Each thread runs one blocking getaddrinfo() at a time and hands its result
+ * to the waiting client as soon as it returns, so how many lookups are in
+ * flight follows the load, and a slow name delays nobody but its own client.
+ */
+#define GWP_DNS_MAX_THREADS	64u
+#define GWP_DNS_IDLE_SECS	10
+
+enum {
+	GWP_DNS_THR_FREE	= 0,	/* slot unused */
+	GWP_DNS_THR_RUNNING	= 1,
+	GWP_DNS_THR_EXITED	= 2,	/* exited on idle, not joined yet */
+};
+
 struct gwp_dns_ctx;
 
-struct gwp_dns_wrk {
+struct gwp_dns_thr {
 	struct gwp_dns_ctx	*ctx;
-	uint32_t		id;
 	pthread_t		thread;
+	uint32_t		id;
+	uint8_t			state;
+	bool			join;	/* free_threads() only */
 };
 
 struct gwp_dns_ctx {
-	volatile bool		should_stop;
+	bool			should_stop;
 	pthread_mutex_t		lock;
 	pthread_cond_t		cond;
 	uint32_t		nr_sleeping;
 	uint32_t		nr_entries;
+	uint32_t		nr_threads;	/* RUNNING slots */
+	uint32_t		max_threads;
 	struct gwp_dns_entry	*head;
 	struct gwp_dns_entry	*tail;
-	struct gwp_dns_wrk	*workers;
+	struct gwp_dns_thr	*threads;	/* @max_threads slots */
 	struct gwp_dns_cache	*cache;
 	time_t			last_scan;
 	struct gwp_dns_cfg	cfg;
@@ -159,28 +182,50 @@ static void try_pass_result_to_cache(struct gwp_dns_ctx *ctx, const char *name,
 	gwp_dns_cache_insert(ctx->cache, name, ai, time(NULL) + x);
 }
 
-int gwp_dns_resolve(struct gwp_dns_ctx *ctx, const char *name,
-		    uint16_t port, struct gwp_sockaddr *addrs,
-		    uint8_t cap, uint8_t *nr_addrs, uint32_t restyp)
+/*
+ * Resolve @name into @addrs/@nr_addrs. On success *@res_p holds the
+ * getaddrinfo() result, which the caller passes to the cache and frees.
+ */
+static int resolve(const char *name, uint16_t port, struct gwp_sockaddr *addrs,
+		   uint8_t cap, uint8_t *nr_addrs, uint32_t restyp,
+		   struct addrinfo **res_p)
 {
 	struct addrinfo *res = NULL, hints;
 	uint8_t n;
 	int r;
 
+	*res_p = NULL;
+	*nr_addrs = 0;
 	prep_hints(&hints, restyp);
 	r = getaddrinfo(name, NULL, &hints, &res);
 	if (r)
 		return -EHOSTUNREACH;
 
 	n = collect_addr_list(res, addrs, cap, restyp, port);
-	if (n)
-		try_pass_result_to_cache(ctx, name, res);
-
-	if (res)
+	if (!n) {
 		freeaddrinfo(res);
+		return -EHOSTUNREACH;
+	}
 
+	*res_p = res;
 	*nr_addrs = n;
-	return n ? 0 : -EHOSTUNREACH;
+	return 0;
+}
+
+int gwp_dns_resolve(struct gwp_dns_ctx *ctx, const char *name,
+		    uint16_t port, struct gwp_sockaddr *addrs,
+		    uint8_t cap, uint8_t *nr_addrs, uint32_t restyp)
+{
+	struct addrinfo *res;
+	int r;
+
+	r = resolve(name, port, addrs, cap, nr_addrs, restyp, &res);
+	if (r)
+		return r;
+
+	try_pass_result_to_cache(ctx, name, res);
+	freeaddrinfo(res);
+	return 0;
 }
 
 static void gwp_dns_entry_free(struct gwp_dns_entry *e)
@@ -212,6 +257,8 @@ static void cond_scan_cache(struct gwp_dns_ctx *ctx)
 	if (time(NULL) - ctx->last_scan < ctx->cfg.cache_expiry)
 		return;
 
+	/* Claim this round, so no other thread starts one meanwhile. */
+	ctx->last_scan = time(NULL);
 	pthread_mutex_unlock(&ctx->lock);
 	gwp_dns_cache_housekeep(ctx->cache);
 	pthread_mutex_lock(&ctx->lock);
@@ -224,253 +271,52 @@ static void cond_scan_cache(struct gwp_dns_ctx *ctx)
 	ctx->last_scan = time(NULL);
 }
 
-/*
- * Must be called with ctx->lock held.
- */
-static void wait_for_queue_entry(struct gwp_dns_ctx *ctx)
+static bool is_persistent(const struct gwp_dns_thr *t)
 {
+	return t->id < t->ctx->cfg.nr_workers;
+}
+
+/*
+ * Must be called with ctx->lock held. Sleep until there is work or a stop.
+ * Returns false when the calling thread should exit because it was idle for
+ * too long; only the threads started on demand do.
+ *
+ * With the cache on, the persistent threads also wake on their own to sweep
+ * it (cond_scan_cache()), so expired entries are reclaimed without traffic.
+ */
+static bool wait_for_queue_entry(struct gwp_dns_thr *t)
+{
+	struct gwp_dns_ctx *ctx = t->ctx;
+	bool persistent = is_persistent(t);
+	struct timespec ts;
+	int r = 0;
+
 	ctx->nr_sleeping++;
-	pthread_cond_wait(&ctx->cond, &ctx->lock);
-	ctx->nr_sleeping--;
-	cond_scan_cache(ctx);
-}
-
-#ifdef CONFIG_HAVE_GETADDRINFO_A
-/*
- * Must be called with ctx->lock held.
- */
-static struct gwp_dns_entry *unplug_queue_list(struct gwp_dns_ctx *ctx)
-{
-	struct gwp_dns_entry *head = ctx->head;
-
-	ctx->head = ctx->tail = NULL;
-	ctx->nr_entries = 0;
-	return head;
-}
-
-struct dbq_entry {
-	struct gwp_dns_entry	*e;
-	struct gaicb		cb;
-};
-
-struct dns_batch_query {
-	struct dbq_entry	*entries;
-	struct gaicb		**reqs;
-	struct addrinfo		hints;
-	uint32_t		nr_entries;
-	uint32_t		cap;
-};
-
-static void dbq_free(struct dns_batch_query *dbq)
-{
-	uint32_t i;
-
-	if (!dbq)
-		return;
-
-	if (dbq->reqs) {
-		for (i = 0; i < dbq->nr_entries; i++) {
-			if (dbq->reqs[i]->ar_result)
-				freeaddrinfo(dbq->reqs[i]->ar_result);
-		}
-	}
-
-	free(dbq->entries);
-	free(dbq->reqs);
-	free(dbq);
-}
-
-static int dbq_add_entry(struct dns_batch_query *dbq, struct gwp_dns_entry *e)
-{
-	struct dbq_entry *de;
-
-	if (dbq->nr_entries >= dbq->cap) {
-		uint32_t new_cap = dbq->cap ? dbq->cap * 2 : 16;
-		struct dbq_entry *nentries;
-
-		nentries = realloc(dbq->entries, new_cap * sizeof(*nentries));
-		if (!nentries)
-			return -ENOMEM;
-		dbq->entries = nentries;
-		dbq->cap = new_cap;
-	}
-
-	de = &dbq->entries[dbq->nr_entries];
-	de->e = e;
-	memset(&de->cb, 0, sizeof(de->cb));
-	de->cb.ar_name = e->name;
-	de->cb.ar_service = NULL;
-	de->cb.ar_request = &dbq->hints;
-	de->cb.ar_result = NULL;
-	dbq->nr_entries++;
-
-	return 0;
-}
-
-static int collect_active_queries(struct gwp_dns_ctx *ctx,
-				  struct gwp_dns_entry **head_p,
-				  struct dns_batch_query **dbq_p)
-{
-	struct gwp_dns_entry *e, *next, *prev = NULL, *head = *head_p;
-	struct dns_batch_query *dbq;
-
-	dbq = calloc(1, sizeof(*dbq));
-	if (!dbq)
-		return -ENOMEM;
-
-	assert(head);
-	prep_hints(&dbq->hints, ctx->cfg.restyp);
-	for (e = head; e; e = next) {
-		int x = atomic_load(&e->refcnt);
-		next = e->next;
-		if (x > 1) {
-
-			if (dbq_add_entry(dbq, e)) {
-				dbq_free(dbq);
-				/*
-				 * Hand back the partially-processed list: some
-				 * dead entries may already have been unlinked and
-				 * freed, so the caller must not keep the original
-				 * head (which could point at freed memory).
-				 */
-				*head_p = head;
-				return -ENOMEM;
-			}
-
-			prev = e;
-			continue;
-		}
-
-		assert(x == 1);
-		/*
-		 * If the refcnt is 1, it means we are the last reference
-		 * to this entry. The client no longer cares about the
-		 * result. We can free it immediately. No need to resolve
-		 * the query nor to signal the eventfd.
-		 */
-		if (prev)
-			prev->next = next;
-		else
-			head = next;
-
-		gwp_dns_entry_free(e);
-	}
-
-	*head_p = head;
-	*dbq_p = dbq;
-	return 0;
-}
-
-static void dispatch_batch_result(int r, struct gwp_dns_ctx *ctx,
-				  struct dns_batch_query *dbq,
-				  uint32_t restyp)
-{
-	struct gwp_dns_entry *e;
-	struct addrinfo *ai;
-	uint32_t i;
-
-	for (i = 0; i < dbq->nr_entries; i++) {
-		e = dbq->entries[i].e;
-		ai = dbq->reqs[i]->ar_result;
-
-		if (r || gai_error(dbq->reqs[i])) {
-			e->res = -EHOSTUNREACH;
-		} else if (!(e->nr_addrs = collect_addr_list(ai, e->addrs,
-							     GWP_DNS_MAX_ADDRS,
-							     restyp, e->port))) {
-			e->res = -EHOSTUNREACH;
-		} else {
-			e->res = 0;
-		}
-
-		eventfd_write(e->ev_fd, 1);
-		if (!e->res)
-			try_pass_result_to_cache(ctx, e->name, ai);
-	}
-}
-
-/*
- * Filling dbq->reqs[n] cannot be done in dbq_add_entry() because
- * the reallocation of dbq->entries may change the address of
- * dbq->entries[n].cb.
- */
-static int prep_reqs(struct dns_batch_query *dbq)
-{
-	uint32_t i;
-
-	dbq->reqs = malloc(dbq->nr_entries * sizeof(*dbq->reqs));
-	if (!dbq->reqs)
-		return -ENOMEM;
-
-	for (i = 0; i < dbq->nr_entries; i++)
-		dbq->reqs[i] = &dbq->entries[i].cb;
-
-	return 0;
-}
-
-/*
- * Signal every still-active entry (a client is still waiting) with an error so
- * it wakes up instead of hanging until its timeout. Used on the batch error
- * paths where the queries are never handed to getaddrinfo_a().
- */
-static void fail_active_entries(struct gwp_dns_entry *head, int err)
-{
-	struct gwp_dns_entry *e;
-
-	for (e = head; e; e = e->next) {
-		if (atomic_load(&e->refcnt) > 1) {
-			e->res = err;
-			eventfd_write(e->ev_fd, 1);
-		}
-	}
-}
-
-/*
- * Must be called with ctx->lock held. May release the lock, but
- * it will reacquire it before returning.
- */
-static void process_queue_entry_batch(struct gwp_dns_ctx *ctx)
-{
-	struct gwp_dns_entry *head = unplug_queue_list(ctx);
-	struct dns_batch_query *dbq = NULL;
-
-	if (!head)
-		return;
-
-	pthread_mutex_unlock(&ctx->lock);
-
-	if (collect_active_queries(ctx, &head, &dbq)) {
-		fail_active_entries(head, -EHOSTUNREACH);
-	} else if (prep_reqs(dbq)) {
-		fail_active_entries(head, -EHOSTUNREACH);
+	if (persistent && !ctx->cache) {
+		pthread_cond_wait(&ctx->cond, &ctx->lock);
 	} else {
-		struct sigevent ev;
-		int r;
-
-		memset(&ev, 0, sizeof(ev));
-		ev.sigev_notify = SIGEV_NONE;
-		r = getaddrinfo_a(GAI_WAIT, dbq->reqs, dbq->nr_entries, &ev);
-		dispatch_batch_result(r, ctx, dbq, ctx->cfg.restyp);
+		clock_gettime(CLOCK_MONOTONIC, &ts);
+		ts.tv_sec += persistent ? ctx->cfg.cache_expiry : GWP_DNS_IDLE_SECS;
+		r = pthread_cond_timedwait(&ctx->cond, &ctx->lock, &ts);
 	}
+	ctx->nr_sleeping--;
 
-	dbq_free(dbq);
-	put_all_entries(head);
-	pthread_mutex_lock(&ctx->lock);
+	if (r == ETIMEDOUT && !persistent && !ctx->head)
+		return false;
+
+	cond_scan_cache(ctx);
+	return true;
 }
-#endif /* #ifdef CONFIG_HAVE_GETADDRINFO_A */
 
 /*
  * Must be called with ctx->lock held. May release the lock, but
  * it will reacquire it before returning.
  */
-static void process_queue_entry_single(struct gwp_dns_ctx *ctx)
+static void process_queue_entry(struct gwp_dns_ctx *ctx)
 {
 	struct gwp_dns_entry *e = ctx->head;
+	struct addrinfo *res;
 
-	if (!e)
-		return;
-
-	e = ctx->head;
 	ctx->head = e->next;
 	if (!ctx->head) {
 		ctx->tail = NULL;
@@ -491,124 +337,154 @@ static void process_queue_entry_single(struct gwp_dns_ctx *ctx)
 		goto out;
 	}
 
-	e->res = gwp_dns_resolve(ctx, e->name, e->port, e->addrs,
-				 GWP_DNS_MAX_ADDRS, &e->nr_addrs,
-				 ctx->cfg.restyp);
+	e->res = resolve(e->name, e->port, e->addrs, GWP_DNS_MAX_ADDRS,
+			 &e->nr_addrs, ctx->cfg.restyp, &res);
+
+	/*
+	 * Wake the client first: the cache insert takes the write lock and
+	 * allocates, and the client has no reason to wait for either.
+	 */
 	eventfd_write(e->ev_fd, 1);
+	if (!e->res) {
+		try_pass_result_to_cache(ctx, e->name, res);
+		freeaddrinfo(res);
+	}
 	gwp_dns_entry_put(e);
 out:
 	pthread_mutex_lock(&ctx->lock);
 }
 
-/*
- * Must be called with ctx->lock held. May release the lock, but
- * it will reacquire it before returning.
- */
-static void process_queue_entry(struct gwp_dns_ctx *ctx)
-{
-	/*
-	 * There are two cases here:
-	 *
-	 * 1. All of the DNS threads are busy, and there are still a lot
-	 *    of queued entries. Process them in batch via getaddrinfo_a().
-	 *
-	 * 2. The number of threads is sufficient to handle the queued
-	 *    entries, so process them one by one.
-	 *
-	 * Why not always getaddrinfo_a()? Because getaddrinfo_a() has
-	 * a higher overhead than processing entries individually as it
-	 * will spawn a new thread for each query. Don't bother invoking
-	 * clone() for each entry if we can process them in the current
-	 * thread.
-	 */
-#ifdef CONFIG_HAVE_GETADDRINFO_A
-	if (ctx->nr_entries > (ctx->nr_sleeping + 16)) {
-		process_queue_entry_batch(ctx);
-		return;
-	}
-#endif
-
-	process_queue_entry_single(ctx);
-}
-
 static void *gwp_dns_thread_entry(void *arg)
 {
-	struct gwp_dns_wrk *w = arg;
-	struct gwp_dns_ctx *ctx = w->ctx;
+	struct gwp_dns_thr *t = arg;
+	struct gwp_dns_ctx *ctx = t->ctx;
 
 	pthread_mutex_lock(&ctx->lock);
 	while (!ctx->should_stop) {
-		if (ctx->head)
+		if (ctx->head) {
 			process_queue_entry(ctx);
-		else
-			wait_for_queue_entry(ctx);
+			continue;
+		}
+
+		if (!wait_for_queue_entry(t)) {
+			t->state = GWP_DNS_THR_EXITED;
+			break;
+		}
 	}
+	ctx->nr_threads--;
 	pthread_mutex_unlock(&ctx->lock);
 
 	return NULL;
 }
 
-static void free_worker(struct gwp_dns_wrk *w)
+/*
+ * Must be called with ctx->lock held. Start a thread in slot @t, reaping the
+ * one that exited there before.
+ */
+static int start_thread(struct gwp_dns_ctx *ctx, struct gwp_dns_thr *t)
 {
-	struct gwp_dns_ctx *ctx;
+	int r;
 
-	if (!w)
+	/*
+	 * It marked itself EXITED under the lock and only has to return,
+	 * which needs no lock, so this does not wait for long.
+	 */
+	if (t->state == GWP_DNS_THR_EXITED) {
+		pthread_join(t->thread, NULL);
+		t->state = GWP_DNS_THR_FREE;
+	}
+
+	t->ctx = ctx;
+	r = pthread_create(&t->thread, NULL, gwp_dns_thread_entry, t);
+	if (r)
+		return -r;
+
+	t->state = GWP_DNS_THR_RUNNING;
+	ctx->nr_threads++;
+	return 0;
+}
+
+/*
+ * Must be called with ctx->lock held. More lookups are queued than threads
+ * are free to take them: start one more thread, unless all are running. A
+ * failure is not fatal; the threads already running serve the queue.
+ */
+static void maybe_grow(struct gwp_dns_ctx *ctx)
+{
+	uint32_t i;
+
+	if (ctx->nr_entries <= ctx->nr_sleeping)
+		return;
+	if (ctx->nr_threads >= ctx->max_threads)
 		return;
 
-	ctx = w->ctx;
+	for (i = ctx->cfg.nr_workers; i < ctx->max_threads; i++) {
+		struct gwp_dns_thr *t = &ctx->threads[i];
+
+		if (t->state != GWP_DNS_THR_RUNNING) {
+			start_thread(ctx, t);
+			return;
+		}
+	}
+}
+
+static void free_threads(struct gwp_dns_ctx *ctx)
+{
+	uint32_t i;
+
+	if (!ctx->threads)
+		return;
+
+	/*
+	 * Nothing queues lookups any more, so no slot leaves FREE from here
+	 * on; a RUNNING one may still turn EXITED, which needs joining too.
+	 */
 	pthread_mutex_lock(&ctx->lock);
 	ctx->should_stop = true;
 	pthread_cond_broadcast(&ctx->cond);
+	for (i = 0; i < ctx->max_threads; i++)
+		ctx->threads[i].join = ctx->threads[i].state != GWP_DNS_THR_FREE;
 	pthread_mutex_unlock(&ctx->lock);
-	pthread_join(w->thread, NULL);
+
+	for (i = 0; i < ctx->max_threads; i++) {
+		if (ctx->threads[i].join)
+			pthread_join(ctx->threads[i].thread, NULL);
+	}
+
+	free(ctx->threads);
+	ctx->threads = NULL;
 }
 
-static void free_workers(struct gwp_dns_ctx *ctx)
+static int init_threads(struct gwp_dns_ctx *ctx)
 {
 	uint32_t i;
-
-	if (!ctx->workers)
-		return;
-
-	for (i = 0; i < ctx->cfg.nr_workers; i++)
-		free_worker(&ctx->workers[i]);
-
-	free(ctx->workers);
-	ctx->workers = NULL;
-}
-
-static int init_workers(struct gwp_dns_ctx *ctx)
-{
-	struct gwp_dns_wrk *workers, *w;
-	uint32_t i;
-	int r;
+	int r = 0;
 
 	if (ctx->cfg.nr_workers == 0)
 		return -EINVAL;
 
-	workers = calloc(ctx->cfg.nr_workers, sizeof(*workers));
-	if (!workers)
+	ctx->max_threads = ctx->cfg.nr_workers;
+	if (ctx->max_threads < GWP_DNS_MAX_THREADS)
+		ctx->max_threads = GWP_DNS_MAX_THREADS;
+
+	ctx->threads = calloc(ctx->max_threads, sizeof(*ctx->threads));
+	if (!ctx->threads)
 		return -ENOMEM;
 
-	ctx->workers = workers;
+	for (i = 0; i < ctx->max_threads; i++)
+		ctx->threads[i].id = i;
+
+	pthread_mutex_lock(&ctx->lock);
 	for (i = 0; i < ctx->cfg.nr_workers; i++) {
-		w = &workers[i];
-		w->ctx = ctx;
-		w->id = i;
-		r = pthread_create(&w->thread, NULL, gwp_dns_thread_entry, w);
-		if (r) {
-			r = -r;
-			goto out_err;
-		}
+		r = start_thread(ctx, &ctx->threads[i]);
+		if (r)
+			break;
 	}
+	pthread_mutex_unlock(&ctx->lock);
 
-	return 0;
+	if (r)
+		free_threads(ctx);
 
-out_err:
-	while (i--)
-		free_worker(&workers[i]);
-	free(workers);
-	ctx->workers = NULL;
 	return r;
 }
 
@@ -744,6 +620,24 @@ static inline bool validate_restyp(int restyp)
 	}
 }
 
+/* The idle timeouts are intervals, so measure them on the monotonic clock. */
+static int init_cond(pthread_cond_t *cond)
+{
+	pthread_condattr_t attr;
+	int r;
+
+	r = pthread_condattr_init(&attr);
+	if (r)
+		return -r;
+
+	r = pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+	if (!r)
+		r = pthread_cond_init(cond, &attr);
+
+	pthread_condattr_destroy(&attr);
+	return -r;
+}
+
 int gwp_dns_ctx_init(struct gwp_dns_ctx **ctx_p, const struct gwp_dns_cfg *cfg)
 {
 	struct gwp_dns_ctx *ctx;
@@ -763,11 +657,9 @@ int gwp_dns_ctx_init(struct gwp_dns_ctx **ctx_p, const struct gwp_dns_cfg *cfg)
 		goto out_free_ctx;
 	}
 
-	r = pthread_cond_init(&ctx->cond, NULL);
-	if (r) {
-		r = -r;
+	r = init_cond(&ctx->cond);
+	if (r)
 		goto out_destroy_mutex;
-	}
 
 	r = init_cache(ctx);
 	if (r)
@@ -775,12 +667,13 @@ int gwp_dns_ctx_init(struct gwp_dns_ctx **ctx_p, const struct gwp_dns_cfg *cfg)
 
 	ctx->nr_sleeping = 0;
 	ctx->nr_entries = 0;
-	ctx->workers = NULL;
+	ctx->nr_threads = 0;
+	ctx->threads = NULL;
 	ctx->head = NULL;
 	ctx->tail = NULL;
 	ctx->should_stop = false;
 	ctx->last_scan = time(NULL);
-	r = init_workers(ctx);
+	r = init_threads(ctx);
 	if (r)
 		goto out_free_cache;
 
@@ -806,7 +699,7 @@ static void put_all_queued_entries(struct gwp_dns_ctx *ctx)
 
 void gwp_dns_ctx_free(struct gwp_dns_ctx *ctx)
 {
-	free_workers(ctx);
+	free_threads(ctx);
 	pthread_mutex_destroy(&ctx->lock);
 	pthread_cond_destroy(&ctx->cond);
 	put_all_queued_entries(ctx);
@@ -827,6 +720,7 @@ static void push_queue(struct gwp_dns_ctx *ctx, struct gwp_dns_entry *e)
 	ctx->nr_entries++;
 	if (ctx->nr_sleeping)
 		pthread_cond_signal(&ctx->cond);
+	maybe_grow(ctx);
 	pthread_mutex_unlock(&ctx->lock);
 }
 
