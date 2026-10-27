@@ -38,6 +38,11 @@ struct gwp_ssl_q {
 	size_t		head;
 	size_t		tail;
 	size_t		cap;
+	/*
+	 * Space past @tail was handed out by gwp_ssl_rx_space() and may be
+	 * filled behind our back: keep @tail where it is until the commit.
+	 */
+	bool		pinned;
 };
 
 struct gwp_ssl {
@@ -97,7 +102,7 @@ static void q_consume(struct gwp_ssl_q *q, size_t n)
 	if (n > q_len(q))
 		n = q_len(q);
 	q->head += n;
-	if (q->head == q->tail)
+	if (q->head == q->tail && !q->pinned)
 		q->head = q->tail = 0;
 }
 
@@ -385,11 +390,13 @@ void *gwp_ssl_rx_space(struct gwp_ssl *s, size_t want, size_t *len)
 	unsigned char *p = q_reserve(&s->rq, want);
 
 	*len = p ? s->rq.cap - s->rq.tail : 0;
+	s->rq.pinned = p != NULL;
 	return p;
 }
 
 void gwp_ssl_rx_commit(struct gwp_ssl *s, size_t len)
 {
+	s->rq.pinned = false;
 	s->rq.tail += len;
 	if (len)
 		s->rx_starved = false;

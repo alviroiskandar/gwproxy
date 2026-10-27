@@ -62,8 +62,10 @@ int gwp_ssl_bio_write(struct gwp_ssl *s, const void *buf, size_t len);
  * Receive ciphertext without a copy: return a pointer to at least @want bytes
  * of free space at the end of the engine's input queue, with *len set to all
  * the space there (NULL on allocation failure). Read from the socket into it,
- * then hand the bytes over with gwp_ssl_rx_commit(). The pointer is valid until
- * the next call on this connection.
+ * then hand the bytes over with gwp_ssl_rx_commit(), or commit 0 to give the
+ * space back. Until then the space stays put whatever the engine does, so it can
+ * back an asynchronous receive; only another gwp_ssl_rx_space() or
+ * gwp_ssl_bio_write() may move it, and gwp_ssl_free() frees it.
  */
 void *gwp_ssl_rx_space(struct gwp_ssl *s, size_t want, size_t *len);
 void gwp_ssl_rx_commit(struct gwp_ssl *s, size_t len);
