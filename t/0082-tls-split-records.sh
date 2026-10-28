@@ -17,7 +17,8 @@
 # Nor may records holding tunnel bytes pipelined behind a SOCKS5 CONNECT
 # be left in the engine: with a 256-byte client buffer, most of 1000
 # such bytes are still there when the connect completes, and must be
-# forwarded then.
+# forwarded then. Through an upstream proxy, they are forwarded once the
+# upstream handshake has completed instead.
 
 . "$(dirname "$0")/lib.sh"
 require python3
@@ -61,6 +62,22 @@ for loop in epoll io_uring; do
 	timeout 30 python3 "$SERVERS_DIR/tls_tunnel_client.py" splitearly "$pp" \
 		|| fail "[$loop] tunnel bytes pipelined behind a SOCKS5 CONNECT were not all forwarded"
 	kill "$GWP_PID" 2>/dev/null
+
+	# The same through an upstream SOCKS5 proxy: the records are still
+	# held when the upstream handshake completes, and must be forwarded
+	# then.
+	up="$(pick_port)"
+	gwp_start "127.0.0.1:$up" --as-socks5=1 --event-loop="$loop" \
+		--nr-workers=1
+	up_pid="$GWP_PID"
+	pp="$(pick_port)"
+	gwp_start "127.0.0.1:$pp" --as-socks5=1 --client-buf-size=256 \
+		--upstream-proxy="socks5://127.0.0.1:$up" \
+		--event-loop="$loop" --tls-cert="$WORK/cert.pem" \
+		--tls-key="$WORK/key.pem" --nr-workers=1
+	timeout 30 python3 "$SERVERS_DIR/tls_tunnel_client.py" splitearly "$pp" \
+		|| fail "[$loop] tunnel bytes pipelined behind a SOCKS5 CONNECT were not all forwarded through an upstream proxy"
+	kill "$GWP_PID" "$up_pid" 2>/dev/null
 done
 
 pass
