@@ -55,6 +55,7 @@ enum {
 	OPT_BIND_IPV6_ONLY,
 	OPT_DNS_CACHE_MAX_ENTRIES,
 	OPT_IDLE_TIMEOUT,
+	OPT_UPSTREAM_AUTH_FILE,
 };
 
 /*
@@ -97,6 +98,7 @@ static const struct option long_opts[] = {
 	{ "log-file",		required_argument,	NULL,	'f' },
 	{ "pid-file",		required_argument,	NULL,	'p' },
 	{ "upstream-proxy",	required_argument,	NULL,	'x' },
+	{ "upstream-proxy-auth-file", required_argument, NULL,	OPT_UPSTREAM_AUTH_FILE },
 	{ "mark",		required_argument,	NULL,	'M' },
 	{ "bind-source",	required_argument,	NULL,	'B' },
 	{ "bind-iface",		required_argument,	NULL,	'I' },
@@ -198,6 +200,8 @@ static void show_help(const char *app)
 	printf("                                  URL: socks5://[user:pass@]host:port  (local DNS)\n");
 	printf("                                       socks5h://[user:pass@]host:port (proxy resolves the host)\n");
 	printf("                                       http://[user:pass@]host:port    (HTTP CONNECT)\n");
+	printf("      --upstream-proxy-auth-file=file  Read the upstream proxy's user:pass from the first line of file\n");
+	printf("                                  instead of the URL, where other local users can see it\n");
 	printf("  -M, --mark=nr                   Set SO_MARK (fwmark) on outgoing connections (needs CAP_NET_ADMIN or CAP_NET_RAW; 0 = off)\n");
 	printf("  -B, --bind-source=ip[:port]     Bind outgoing connections to this source address (default -j BIND --to-source)\n");
 	printf("                                  Skipped for targets of the other address family; omit the port for an ephemeral one\n");
@@ -478,6 +482,9 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 		case 'x':
 			cfg->upstream_proxy = optarg;
 			break;
+		case OPT_UPSTREAM_AUTH_FILE:
+			cfg->upstream_auth_file = optarg;
+			break;
 		case 'M':
 			if (opt_num(c, optarg, 0, UINT32_MAX, 0, &v))
 				goto einval;
@@ -545,6 +552,11 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 
 	if (!cfg->as_socks5 && !cfg->as_http && !cfg->as_transparent && !cfg->target) {
 		fprintf(stderr, ERR_WRAP "Error: --target is required unless --as-socks5=1, --as-http=1 or --as-transparent=1\n" ERR_WRAP);
+		goto einval;
+	}
+
+	if (cfg->upstream_auth_file && !cfg->upstream_proxy) {
+		fprintf(stderr, ERR_WRAP "Error: --upstream-proxy-auth-file needs --upstream-proxy\n" ERR_WRAP);
 		goto einval;
 	}
 
@@ -2121,6 +2133,71 @@ int gwp_parse_upstream(const char *url, struct gwp_upstream *up)
 }
 
 /*
+ * Read the upstream proxy credentials for --upstream-proxy-auth-file: the
+ * first line of @path, "user:pass" or a bare "user", split at the first ':'
+ * and with the same limits as in the URL (user 1..255 bytes, password up to
+ * 255). Unlike the URL, which sits in argv where every local user can read
+ * it, the file can be kept private, and the password may contain any byte
+ * but NUL, CR and LF ('@' and ':' included). Read with read(2) rather than
+ * stdio, so no buffer outside this function ever holds the password.
+ */
+__cold
+static int upstream_read_auth(const char *path, struct gwp_upstream *up)
+{
+	/* "user:pass", CRLF, and one byte more to tell an overlong line. */
+	char buf[255 + 1 + 255 + 3], *line_end, *colon;
+	size_t n = 0, len, ul, pl;
+	ssize_t rd;
+	int fd, r = -EINVAL;
+
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -errno;
+
+	while (n < sizeof(buf)) {
+		rd = read(fd, buf + n, sizeof(buf) - n);
+		if (rd < 0) {
+			if (errno == EINTR)
+				continue;
+			r = -errno;
+			goto out;
+		}
+		if (!rd)
+			break;
+		n += (size_t)rd;
+	}
+
+	line_end = memchr(buf, '\n', n);
+	if (!line_end && n == sizeof(buf))
+		goto out;
+	len = line_end ? (size_t)(line_end - buf) : n;
+	if (len && buf[len - 1] == '\r')
+		len--;
+	if (!len || memchr(buf, '\0', len) || memchr(buf, '\r', len))
+		goto out;
+
+	colon = memchr(buf, ':', len);
+	ul = colon ? (size_t)(colon - buf) : len;
+	pl = colon ? len - ul - 1 : 0;
+	if (ul == 0 || ul > 255 || pl > 255)
+		goto out;
+
+	up->has_auth = true;
+	up->ulen = (uint8_t)ul;
+	up->plen = (uint8_t)pl;
+	memcpy(up->user, buf, ul);
+	up->user[ul] = '\0';
+	if (pl)
+		memcpy(up->pass, colon + 1, pl);
+	up->pass[pl] = '\0';
+	r = 0;
+out:
+	explicit_bzero(buf, sizeof(buf));
+	close(fd);
+	return r;
+}
+
+/*
  * Turn --bind-source/--bind-iface into the ready-made bind spec the connect
  * path applies when no ACL -j BIND rule claimed the connection. Done once here
  * rather than per connection, and validated here so a typo (a malformed
@@ -2255,6 +2332,26 @@ static int gwp_ctx_init(struct gwp_ctx *ctx)
 			pr_err(&ctx->lh, "Invalid --upstream-proxy value '%.*s%s%s'",
 			       (int)off, url, len ? "***" : "", url + off + len);
 			goto out_free_log;
+		}
+		if (ctx->cfg.upstream_auth_file) {
+			const char *path = ctx->cfg.upstream_auth_file;
+
+			/* Two sources for one secret: refuse to guess. */
+			if (ctx->upstream.has_auth) {
+				pr_err(&ctx->lh, "--upstream-proxy carries credentials and --upstream-proxy-auth-file is given; use one of them");
+				r = -EINVAL;
+				goto out_free_log;
+			}
+			r = upstream_read_auth(path, &ctx->upstream);
+			if (r == -EINVAL) {
+				pr_err(&ctx->lh, "Invalid --upstream-proxy-auth-file '%s': want one line of user:password, each 1..255 bytes (password may be empty)",
+				       path);
+				goto out_free_log;
+			} else if (r) {
+				pr_err(&ctx->lh, "Cannot read --upstream-proxy-auth-file '%s': %s",
+				       path, strerror(-r));
+				goto out_free_log;
+			}
 		}
 		if (ctx->upstream.use_tls) {
 			pr_err(&ctx->lh, "An https:// (TLS) upstream proxy is not supported yet; use http:// or socks5[h]://");

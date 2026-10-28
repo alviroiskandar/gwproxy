@@ -716,6 +716,24 @@ an HTTP proxy reached with an HTTP CONNECT request. Optional
 supplies username/password authentication to the upstream (RFC\ 1929 for
 SOCKS5, HTTP Basic for HTTP). The port defaults to 1080 for SOCKS5 and 8080
 for HTTP.
+.TP
+.BR \-\-upstream\-proxy\-auth\-file=\fIfile\fR
+Read the upstream credentials from the first line of
+.I file
+instead of the
+.B \-\-upstream\-proxy
+URL, as
+.B user:pass
+(split at the first colon) or a bare
+.BR user ,
+each part at most 255 bytes. The command line is readable by every local
+user (\fBps\fR(1), \fI/proc/<pid>/cmdline\fR), so this keeps the password
+out of it; make the file readable only by the user gwproxy runs as. The
+password may contain any character except a line break, including
+.B @
+and
+.BR : .
+The URL must not carry credentials of its own when this option is given.
 .SS Networking
 .TP
 .BR \-M ", " \-\-mark=\fInr\fR

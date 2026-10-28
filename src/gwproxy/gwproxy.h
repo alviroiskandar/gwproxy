@@ -94,6 +94,7 @@ struct gwp_cfg {
 	const char	*pid_file;
 	const char	*dns_servers;
 	const char	*upstream_proxy;
+	const char	*upstream_auth_file;	/* user:pass for the upstream */
 	uint32_t	mark;
 	/*
 	 * Global default for the ACL's -j BIND: the source address
