@@ -2561,6 +2561,43 @@ static int handle_ev_client_prot_out(struct gwp_wrk *w, struct gwp_conn_pair *gc
 	return 0;
 }
 
+/*
+ * Has the client's handshake handed over to the connect? handle_connect()
+ * does not retag the client fd, so a client still registered under
+ * EV_BIT_CLIENT_PROT belongs to handle_ev_client() from then on: it buffers
+ * what the client sends until the target is up, and then forwards.
+ */
+static bool client_past_handshake(const struct gwp_conn_pair *gcp)
+{
+	int cs = gcp->conn_state;
+
+	return cs == CONN_STATE_SOCKS5_CONNECT ||
+	       cs == CONN_STATE_HTTP_CONNECT ||
+	       cs == CONN_STATE_FORWARDING || gwp_in_upstream_hs(gcp);
+}
+
+/*
+ * Take in what the client sends during the handshake, and act on it. A TLS
+ * client's records may already be off the socket, held by the engine: no
+ * EPOLLIN brings them back, so work through them for as long as
+ * client.buf has room and the handshake still owns the client. That goes
+ * on past CONN_STATE_PROT: the client buffer may fill in the middle of a
+ * SOCKS5 or HTTP handshake (a greeting followed by a long authentication
+ * request, say), and the rest is only taken once that has been parsed.
+ */
+static int client_prot_in(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	int r = handle_ev_client_prot_in(w, gcp);
+
+#ifdef CONFIG_HTTPS
+	while (!r && gcp->client.tls && !client_past_handshake(gcp) &&
+	       gcp->client.len < gcp->client.cap &&
+	       gwp_ssl_rx_more(gcp->client.tls))
+		r = handle_ev_client_prot_in(w, gcp);
+#endif
+	return r;
+}
+
 #ifdef CONFIG_HTTPS
 /* Re-arm the client fd under EV_BIT_CLIENT_PROT with @mask. */
 static int tls_arm_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
@@ -2653,7 +2690,7 @@ static int handle_ev_tls_handshake(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	if (r)
 		return r;
 
-	return handle_ev_client_prot_in(w, gcp);
+	return client_prot_in(w, gcp);
 }
 
 /*
@@ -2721,25 +2758,9 @@ static int handle_ev_client_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	}
 
 	if (ev->events & EPOLLIN) {
-		r = handle_ev_client_prot_in(w, gcp);
+		r = client_prot_in(w, gcp);
 		if (r)
 			return r;
-
-#ifdef CONFIG_HTTPS
-		/*
-		 * Application data the engine holds, decrypted or not, would
-		 * not be surfaced by another EPOLLIN (its ciphertext is already
-		 * off the socket), so drain it here while the protocol buffer
-		 * still has room.
-		 */
-		while (gcp->client.tls && gcp->conn_state == CONN_STATE_PROT &&
-		       gcp->client.len < gcp->client.cap &&
-		       gwp_ssl_rx_more(gcp->client.tls)) {
-			r = handle_ev_client_prot_in(w, gcp);
-			if (r)
-				return r;
-		}
-#endif
 	}
 
 	/*
@@ -2761,21 +2782,6 @@ static int handle_ev_client_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	}
 
 	return 0;
-}
-
-/*
- * Has the client's handshake handed over to the connect? handle_connect()
- * does not retag the client fd, so a client still registered under
- * EV_BIT_CLIENT_PROT belongs to handle_ev_client() from then on: it buffers
- * what the client sends until the target is up, and then forwards.
- */
-static bool client_past_handshake(const struct gwp_conn_pair *gcp)
-{
-	int cs = gcp->conn_state;
-
-	return cs == CONN_STATE_SOCKS5_CONNECT ||
-	       cs == CONN_STATE_HTTP_CONNECT ||
-	       cs == CONN_STATE_FORWARDING || gwp_in_upstream_hs(gcp);
 }
 
 static int handle_event(struct gwp_wrk *w, struct epoll_event *ev)
