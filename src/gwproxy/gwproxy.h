@@ -702,6 +702,21 @@ struct gwp_wrk {
 			 * its timer. -1 while there is none.
 			 */
 			int			spare_timer_fd;
+			/*
+			 * When to retry what is waiting on a timed pause
+			 * (accept, see handle_accept_error(), or a target
+			 * socket, see wait_for_target()), in CLOCK_MONOTONIC
+			 * milliseconds; 0 while nothing is.
+			 */
+			uint64_t		retry_at_ms;
+			/*
+			 * Plain and transparent forwarding clients whose
+			 * target socket could not be created for want of
+			 * descriptors, retried by run_retries().
+			 */
+			struct gwp_conn_pair	**tgt_wait;
+			uint32_t		nr_tgt_wait;
+			uint32_t		tgt_wait_cap;
 			uint16_t		evsz;
 			uint16_t		nr_dead;
 			uint16_t		dead_cap;
@@ -711,6 +726,15 @@ struct gwp_wrk {
 			 * when @dead is full and a pair had to be freed at once.
 			 */
 			bool			ev_need_reload;
+			/*
+			 * accept() failed for a reason that closing
+			 * descriptors does not cure: the listener is out of
+			 * the epoll set until retry_at_ms (accept_retry),
+			 * and the pause is logged once, until a connection
+			 * is accepted again (accept_paused).
+			 */
+			bool			accept_retry;
+			bool			accept_paused;
 		};
 #ifdef CONFIG_IO_URING
 		struct iou	*iou;

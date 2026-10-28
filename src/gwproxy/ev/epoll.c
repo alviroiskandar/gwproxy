@@ -186,6 +186,11 @@ int gwp_ctx_init_thread_epoll(struct gwp_wrk *w)
 	int ep_fd, ev_fd, r;
 
 	w->spare_timer_fd = -1;
+	w->retry_at_ms = 0;
+	w->accept_retry = false;
+	w->accept_paused = false;
+	w->tgt_wait = NULL;
+	w->nr_tgt_wait = w->tgt_wait_cap = 0;
 	ep_fd = __sys_epoll_create1(EPOLL_CLOEXEC);
 	if (ep_fd < 0) {
 		r = ep_fd;
@@ -311,6 +316,9 @@ void gwp_ctx_free_thread_epoll(struct gwp_wrk *w)
 	w->events = NULL;
 	free(w->dead);
 	w->dead = NULL;
+	free(w->tgt_wait);
+	w->tgt_wait = NULL;
+	w->nr_tgt_wait = w->tgt_wait_cap = 0;
 	free(w->udp_buf);
 	w->udp_buf = NULL;
 }
@@ -428,8 +436,18 @@ static int __free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
  */
 static int free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
+	uint32_t i;
+
 	if (gcp->flags & GWP_CONN_FLAG_IS_DYING)
 		return 0;
+
+	/* A client waiting for its target socket (see wait_for_target()). */
+	for (i = 0; unlikely(i < w->nr_tgt_wait); i++) {
+		if (w->tgt_wait[i] == gcp) {
+			w->tgt_wait[i] = w->tgt_wait[--w->nr_tgt_wait];
+			break;
+		}
+	}
 
 	if (unlikely(w->nr_dead >= w->dead_cap)) {
 		w->ev_need_reload = true;
@@ -512,89 +530,21 @@ static void log_target_connected(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		ip_to_str(&gcp->target_addr));
 }
 
-__hot
-static int handle_new_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+/*
+ * Register a new client's descriptors: its target socket, if it has one by
+ * now, the client socket under @cl_ev_bit, and its timer unless @has_timer
+ * says it is registered already (see wait_for_target()).
+ */
+static int register_new_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			       uint64_t cl_ev_bit, bool has_timer)
 {
-	int target_fd, timer_fd, timeout, r;
-	struct gwp_ctx *ctx = w->ctx;
-	struct gwp_cfg *cfg = &ctx->cfg;
 	struct epoll_event ev;
-	uint64_t cl_ev_bit;
-
-	/*
-	 * If we are running as a SOCKS5 proxy or an HTTP proxy, the initial
-	 * connection does not have a target socket. We will create the target
-	 * socket later.
-	 */
-	timeout = new_client_timeout(cfg);
-	if (cfg->as_http || cfg->as_socks5) {
-		gcp->is_target_alive = false;
-		gcp->conn_state = CONN_STATE_PROT;
-#ifdef CONFIG_HTTPS
-		/*
-		 * With a TLS listener, defer to a per-connection first-byte
-		 * probe so plaintext SOCKS5/HTTP clients still work on the same
-		 * port (see handle_ev_tls_detect()).
-		 */
-		if (ctx->ssl_ctx)
-			gcp->conn_state = CONN_STATE_TLS_DETECT;
-#endif
-		cl_ev_bit = EV_BIT_CLIENT_PROT;
-		target_fd = -1;
-	} else {
-		bool *p = &gcp->is_target_alive;
-		struct gwp_sockaddr *ca = &gcp->target_addr;
-
-		/*
-		 * Plain and transparent forwarding connect at accept time (no
-		 * SOCKS5/HTTP handshake, hence no reply): enforce the OUTPUT
-		 * chain here and drop the connection if the target is denied.
-		 */
-		if (!gwp_ctx_acl_target_allowed(ctx, gcp)) {
-			pr_info(&ctx->lh, "ACL denied target %s for client %s",
-				ip_to_str(&gcp->target_addr),
-				ip_to_str(&gcp->client_addr));
-			return -EACCES;
-		}
-
-		/* With an upstream proxy, connect to the proxy instead. */
-		if (ctx->upstream.enabled)
-			ca = &ctx->upstream.addr;
-
-		target_fd = gwp_create_sock_target(w, ca, &gcp->acl_sockopt, p,
-						   true);
-		if (target_fd < 0) {
-			pr_err(&ctx->lh, "Failed to create target socket: %s",
-				strerror(-target_fd));
-			return target_fd;
-		}
-		gcp->conn_state = CONN_STATE_FORWARDING;
-		cl_ev_bit = EV_BIT_CLIENT;
-
-		/*
-		 * Force the connect-result path so the upstream handshake runs
-		 * (see handle_ev_target_conn_result).
-		 */
-		if (ctx->upstream.enabled)
-			gcp->is_target_alive = false;
-	}
-
-	if (timeout > 0) {
-		timer_fd = take_spare_timer(w, timeout);
-		if (unlikely(timer_fd < 0)) {
-			__sys_close(target_fd);
-			return timer_fd;
-		}
-		gcp->timer_fd = timer_fd;
-	} else {
-		gcp->timer_fd = -1;
-	}
+	int r;
 
 	/*
 	 * If epoll_ctl() fails, don't bother closing the target socket
 	 * because it will be closed in free_conn_pair() anyway.
 	 */
-	gcp->target.fd = target_fd;
 	gcp->client.ep_mask = EPOLLIN | EPOLLRDHUP;
 
 	if (gcp->target.fd >= 0) {
@@ -614,7 +564,7 @@ static int handle_new_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	if (unlikely(r))
 		return r;
 
-	if (gcp->timer_fd >= 0) {
+	if (gcp->timer_fd >= 0 && !has_timer) {
 		ev.events = EPOLLIN;
 		ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_TIMER;
 		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, gcp->timer_fd, &ev);
@@ -632,12 +582,256 @@ static int handle_new_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	return 0;
 }
 
+/*
+ * Plain and transparent forwarding: create the target socket, start its
+ * connect, and register the pair (@has_timer as for register_new_client()).
+ * -EMFILE or -ENFILE leaves the pair as it was, to be tried again (see
+ * wait_for_target()).
+ */
+static int start_new_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			    bool has_timer)
+{
+	struct gwp_sockaddr *ca = &gcp->target_addr;
+	struct gwp_ctx *ctx = w->ctx;
+	int target_fd;
+
+	/* With an upstream proxy, connect to the proxy instead. */
+	if (ctx->upstream.enabled)
+		ca = &ctx->upstream.addr;
+
+	target_fd = gwp_create_sock_target(w, ca, &gcp->acl_sockopt,
+					   &gcp->is_target_alive, true);
+	if (target_fd < 0) {
+		if (target_fd != -EMFILE && target_fd != -ENFILE)
+			pr_err(&ctx->lh, "Failed to create target socket: %s",
+				strerror(-target_fd));
+		return target_fd;
+	}
+	gcp->target.fd = target_fd;
+	gcp->conn_state = CONN_STATE_FORWARDING;
+
+	/*
+	 * Force the connect-result path so the upstream handshake runs
+	 * (see handle_ev_target_conn_result).
+	 */
+	if (ctx->upstream.enabled)
+		gcp->is_target_alive = false;
+
+	return register_new_client(w, gcp, EV_BIT_CLIENT, has_timer);
+}
+
+static void arm_retry(struct gwp_wrk *w);
+
+/*
+ * The descriptor table is full, and an accepted client has no target socket
+ * yet. Closing the client would turn a passing shortage into a reset seen by
+ * the client, so keep it and try again every 100 ms (RETRY_DELAY_MS), as the
+ * io_uring loop does, for as long as its connect timeout allows. Only its
+ * timer is registered meanwhile: what the client sends waits in its socket.
+ */
+static int wait_for_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			   int e)
+{
+	struct epoll_event ev;
+	int r;
+
+	if (w->nr_tgt_wait == w->tgt_wait_cap) {
+		uint32_t cap = w->tgt_wait_cap ? w->tgt_wait_cap * 2 : 16;
+		struct gwp_conn_pair **p;
+
+		p = realloc(w->tgt_wait, cap * sizeof(*p));
+		if (unlikely(!p))
+			return e;
+		w->tgt_wait = p;
+		w->tgt_wait_cap = cap;
+	}
+
+	if (gcp->timer_fd >= 0) {
+		ev.events = EPOLLIN;
+		ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_TIMER;
+		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, gcp->timer_fd, &ev);
+		if (unlikely(r))
+			return r;
+	}
+
+	pr_warn(&w->ctx->lh,
+		"Too many open files, retrying the target connect (idx=%u, ca=%s)",
+		gcp->idx, ip_to_str(&gcp->client_addr));
+	w->tgt_wait[w->nr_tgt_wait++] = gcp;
+	arm_retry(w);
+	return 0;
+}
+
+/* Try the waiting clients' target sockets again. */
+static void retry_new_targets(struct gwp_wrk *w)
+{
+	uint32_t i, n = w->nr_tgt_wait;
+	struct gwp_conn_pair *gcp;
+	int r;
+
+	w->nr_tgt_wait = 0;
+	for (i = 0; i < n; i++) {
+		gcp = w->tgt_wait[i];
+		r = start_new_target(w, gcp, true);
+		if (r == -EMFILE || r == -ENFILE) {
+			/* Still waiting; the list only shrinks here. */
+			w->tgt_wait[w->nr_tgt_wait++] = gcp;
+			continue;
+		}
+		if (r)
+			free_conn_pair(w, gcp);
+	}
+
+	if (w->nr_tgt_wait)
+		arm_retry(w);
+}
+
+__hot
+static int handle_new_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	int timer_fd, timeout, r;
+	struct gwp_ctx *ctx = w->ctx;
+	struct gwp_cfg *cfg = &ctx->cfg;
+
+	/*
+	 * Plain and transparent forwarding connect at accept time (no
+	 * SOCKS5/HTTP handshake, hence no reply): enforce the OUTPUT chain
+	 * here and drop the connection if the target is denied.
+	 */
+	if (!cfg->as_http && !cfg->as_socks5 &&
+	    !gwp_ctx_acl_target_allowed(ctx, gcp)) {
+		pr_info(&ctx->lh, "ACL denied target %s for client %s",
+			ip_to_str(&gcp->target_addr),
+			ip_to_str(&gcp->client_addr));
+		return -EACCES;
+	}
+
+	timeout = new_client_timeout(cfg);
+	if (timeout > 0) {
+		timer_fd = take_spare_timer(w, timeout);
+		if (unlikely(timer_fd < 0))
+			return timer_fd;
+		gcp->timer_fd = timer_fd;
+	} else {
+		gcp->timer_fd = -1;
+	}
+
+	/*
+	 * If we are running as a SOCKS5 proxy or an HTTP proxy, the initial
+	 * connection does not have a target socket. We will create the target
+	 * socket later.
+	 */
+	if (cfg->as_http || cfg->as_socks5) {
+		gcp->is_target_alive = false;
+		gcp->conn_state = CONN_STATE_PROT;
+#ifdef CONFIG_HTTPS
+		/*
+		 * With a TLS listener, defer to a per-connection first-byte
+		 * probe so plaintext SOCKS5/HTTP clients still work on the same
+		 * port (see handle_ev_tls_detect()).
+		 */
+		if (ctx->ssl_ctx)
+			gcp->conn_state = CONN_STATE_TLS_DETECT;
+#endif
+		gcp->target.fd = -1;
+		return register_new_client(w, gcp, EV_BIT_CLIENT_PROT, false);
+	}
+
+	r = start_new_target(w, gcp, false);
+	if (r == -EMFILE || r == -ENFILE)
+		r = wait_for_target(w, gcp, r);
+	return r;
+}
+
+/* How long a timed pause lasts, in milliseconds; the io_uring loop's too. */
+#define RETRY_DELAY_MS	100
+
+static uint64_t now_ms(void)
+{
+	struct timespec t;
+
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return (uint64_t)t.tv_sec * 1000 + (uint64_t)t.tv_nsec / 1000000;
+}
+
+/* Have fish_events() wake up for run_retries() RETRY_DELAY_MS from now. */
+static void arm_retry(struct gwp_wrk *w)
+{
+	if (!w->retry_at_ms)
+		w->retry_at_ms = now_ms() + RETRY_DELAY_MS;
+}
+
+/*
+ * The epoll_wait() timeout: until the next timed retry is due, or for ever
+ * when none is.
+ */
+static int retry_timeout(const struct gwp_wrk *w)
+{
+	uint64_t now;
+
+	if (likely(!w->retry_at_ms))
+		return -1;
+
+	now = now_ms();
+	if (now >= w->retry_at_ms)
+		return 0;
+	return (int)(w->retry_at_ms - now);
+}
+
+/* Do what a timed pause has been holding back, once it is due. */
+static int run_retries(struct gwp_wrk *w)
+{
+	struct epoll_event ev;
+	int r;
+
+	if (likely(!w->retry_at_ms) || now_ms() < w->retry_at_ms)
+		return 0;
+
+	w->retry_at_ms = 0;
+	if (w->accept_retry) {
+		ev.events = EPOLLIN;
+		ev.data.u64 = EV_BIT_ACCEPT;
+		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, w->tcp_fd, &ev);
+		if (unlikely(r))
+			return r;
+		w->accept_retry = false;
+	}
+
+	if (w->nr_tgt_wait)
+		retry_new_targets(w);
+
+	return 0;
+}
+
 static int handle_accept_error(struct gwp_wrk *w, int e)
 {
 	int r;
 
 	if (likely(e == -EAGAIN || e == -EINTR))
 		return e;
+
+	if (e == -ENOBUFS || e == -EPERM || e == -EACCES) {
+		/*
+		 * Out of socket memory, or a security module refusing the
+		 * connection at the head of the backlog. The listener stays
+		 * readable, so trying again at once would only fail again,
+		 * as fast as the worker can loop, and freeing descriptors
+		 * does not help either. Take it out of the epoll set and try
+		 * again a little later, until a connection is accepted.
+		 */
+		if (!w->accept_paused) {
+			w->accept_paused = true;
+			pr_warn(&w->ctx->lh,
+				"Failed to accept new connection: %s, pausing accept (tidx=%u)",
+				strerror(-e), w->idx);
+		}
+		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_DEL, w->tcp_fd, NULL);
+		if (unlikely(r))
+			return r;
+		w->accept_retry = true;
+		arm_retry(w);
+		return -EAGAIN;
+	}
 
 	if (likely(e == -EMFILE || e == -ENFILE || e == -ENOMEM)) {
 		/*
@@ -696,6 +890,12 @@ static int __handle_ev_accept(struct gwp_wrk *w)
 	fd = __sys_accept4(w->tcp_fd, &addr.sa, &addr_len, flags);
 	if (fd < 0)
 		return handle_accept_error(w, fd);
+
+	if (unlikely(w->accept_paused)) {
+		w->accept_paused = false;
+		pr_info(&ctx->lh, "Resumed accepting new connections (tidx=%u)",
+			w->idx);
+	}
 
 	pr_dbg(&ctx->lh, "New connection from %s (fd=%d)", ip_to_str(&addr),
 		fd);
@@ -2582,6 +2782,41 @@ static int handle_conn_state_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	}
 }
 
+/*
+ * Has the client's handshake handed over to the connect? handle_connect()
+ * does not retag the client fd, so a client still registered under
+ * EV_BIT_CLIENT_PROT belongs to handle_ev_client() from then on: it buffers
+ * what the client sends until the target is up, and then forwards.
+ */
+static bool client_past_handshake(const struct gwp_conn_pair *gcp)
+{
+	int cs = gcp->conn_state;
+
+	return cs == CONN_STATE_SOCKS5_CONNECT ||
+	       cs == CONN_STATE_HTTP_CONNECT ||
+	       cs == CONN_STATE_FORWARDING || gwp_in_upstream_hs(gcp);
+}
+
+/*
+ * A FIN from the client during the handshake. Before its request is complete
+ * the client has given up, and the pair goes. Once the request is complete and
+ * only the lookup of its target's name is outstanding, the client has merely
+ * finished sending: a client may well close its write side right after the
+ * request and wait for the answer. The connect goes ahead and the FIN is
+ * passed on once the target is up, as for a FIN during the connect (see
+ * handle_ev_target_conn_result()); handle_ev_client_prot() stops watching
+ * for input meanwhile, as there is no more of it.
+ */
+static int client_prot_eof(const struct gwp_conn_pair *gcp)
+{
+	int cs = gcp->conn_state;
+
+	if (cs == CONN_STATE_SOCKS5_DNS_QUERY || cs == CONN_STATE_HTTP_DNS_QUERY ||
+	    client_past_handshake(gcp))
+		return 0;
+	return -ECONNRESET;
+}
+
 static int handle_ev_client_prot_in(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	uint32_t from = gcp->client.len;
@@ -2591,10 +2826,8 @@ static int handle_ev_client_prot_in(struct gwp_wrk *w, struct gwp_conn_pair *gcp
 	ret = __do_recv(&gcp->client);
 	if (unlikely(ret < 0))
 		return (int)ret;
-	if (unlikely(gcp->client.rd_eof))
-		return -ECONNRESET;
 	if (!ret)
-		return 0;
+		return gcp->client.rd_eof ? client_prot_eof(gcp) : 0;
 
 	/*
 	 * More of a forwarding request's body (or what follows it) arriving
@@ -2611,11 +2844,11 @@ static int handle_ev_client_prot_in(struct gwp_wrk *w, struct gwp_conn_pair *gcp
 		/*
 		 * The TCP control connection is idle once the UDP association is
 		 * up (the relay runs on gcp->udp_fd). Discard any stray bytes;
-		 * a peer close was already turned into -ECONNRESET above and
-		 * tears the association down.
+		 * a peer close is turned into -ECONNRESET and tears the
+		 * association down.
 		 */
 		gcp->client.len = 0;
-		return 0;
+		return gcp->client.rd_eof ? -ECONNRESET : 0;
 	}
 	if (ct == CONN_STATE_PROT) {
 		r = handle_conn_state_prot(w, gcp);
@@ -2639,6 +2872,9 @@ static int handle_ev_client_prot_in(struct gwp_wrk *w, struct gwp_conn_pair *gcp
 			return (int)ret;
 	}
 
+	/* A TLS client's last records and its FIN can come in one recv(). */
+	if (!r && unlikely(gcp->client.rd_eof))
+		r = client_prot_eof(gcp);
 	return r;
 }
 
@@ -2663,21 +2899,6 @@ static int handle_ev_client_prot_out(struct gwp_wrk *w, struct gwp_conn_pair *gc
 		return r;
 
 	return 0;
-}
-
-/*
- * Has the client's handshake handed over to the connect? handle_connect()
- * does not retag the client fd, so a client still registered under
- * EV_BIT_CLIENT_PROT belongs to handle_ev_client() from then on: it buffers
- * what the client sends until the target is up, and then forwards.
- */
-static bool client_past_handshake(const struct gwp_conn_pair *gcp)
-{
-	int cs = gcp->conn_state;
-
-	return cs == CONN_STATE_SOCKS5_CONNECT ||
-	       cs == CONN_STATE_HTTP_CONNECT ||
-	       cs == CONN_STATE_FORWARDING || gwp_in_upstream_hs(gcp);
 }
 
 /*
@@ -2992,6 +3213,12 @@ static int handle_events(struct gwp_wrk *w, int nr_events)
 			break;
 	}
 
+	if (r >= 0) {
+		x = run_retries(w);
+		if (unlikely(x))
+			r = x;
+	}
+
 	x = reap_dead_pairs(w);
 	if (unlikely(x) && r >= 0)
 		r = x;
@@ -3004,7 +3231,7 @@ static int fish_events(struct gwp_wrk *w)
 	int r;
 
 	w->ev_need_reload = false;
-	r = __sys_epoll_wait(w->ep_fd, w->events, w->evsz, -1);
+	r = __sys_epoll_wait(w->ep_fd, w->events, w->evsz, retry_timeout(w));
 	w->now = gwp_now_sec();
 	if (unlikely(r < 0)) {
 		if (r != -EINTR)
