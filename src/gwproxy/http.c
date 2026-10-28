@@ -328,9 +328,10 @@ static bool buf_add(char *buf, size_t cap, size_t *n, const char *p,
 
 /*
  * Rebuild the request in origin-form into hc->fwd_req: the absolute-form
- * request-target is replaced by @path, hop-by-hop / connection-specific
- * headers are dropped and "Connection: close" is appended (this proxy handles
- * one request per connection). @authority is the URI's authority, passed as
+ * request-target is replaced by @path (a bare "?query" gets the "/" its empty
+ * path stands for), hop-by-hop / connection-specific headers are dropped and
+ * "Connection: close" is appended (this proxy handles one request per
+ * connection). @authority is the URI's authority, passed as
  * pointer+length because at this point it is still part of the request line
  * and not NUL-terminated. @hdr_len is the length of the parsed request
  * header, used to size the scratch buffer (the rewrite is never materially
@@ -382,6 +383,7 @@ static int build_forward_request(struct gwp_http_conn *hc, const char *path,
 
 	ok = buf_add(buf, cap, &n, method, strlen(method)) &&
 	     buf_add(buf, cap, &n, " ", 1) &&
+	     (*path == '/' || buf_add(buf, cap, &n, "/", 1)) &&
 	     buf_add(buf, cap, &n, path, strlen(path)) &&
 	     buf_add(buf, cap, &n, ver, 11);
 	if (!ok)
@@ -521,13 +523,20 @@ static int classify_forward(struct gwp_http_conn *hc, size_t hdr_len,
 
 	authority = uri + 7;
 
-	/* The origin-form path is everything from the first '/', else "/". */
+	/*
+	 * RFC 3986 s3.2: the authority ends at the first '/', '?' or '#'. Ending
+	 * it only at '/' made "http://a?@b/" or "http://a#@b/" connect to "b",
+	 * which any other URL parser reads as host "a". The origin-form target
+	 * is the path and query from there, with "/" for an empty path (RFC
+	 * 9112 s3.2.1). A fragment is never part of a request-target, and one
+	 * right after the authority leaves no path to send: refuse it.
+	 */
 	slash = authority;
-	while (*slash && *slash != '/')
+	while (*slash && *slash != '/' && *slash != '?' && *slash != '#')
 		slash++;
-	if (slash == authority)
-		return GWP_HTTP_ERR;		/* empty authority */
-	path = (*slash == '/') ? slash : "/";
+	if (slash == authority || *slash == '#')
+		return GWP_HTTP_ERR;		/* empty authority, fragment */
+	path = *slash ? slash : "/";
 
 	/*
 	 * Build the rewritten request now, while @path is still intact; the
@@ -543,8 +552,7 @@ static int classify_forward(struct gwp_http_conn *hc, size_t hdr_len,
 	if (r < 0)
 		return GWP_HTTP_ERR;
 
-	if (*slash == '/')
-		*slash = '\0';
+	*slash = '\0';
 	if (split_authority(authority, host_p, port_p, default_port) < 0)
 		return GWP_HTTP_ERR;
 

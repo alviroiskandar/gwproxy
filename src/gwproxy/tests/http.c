@@ -179,6 +179,62 @@ static void test_forward_default_port(void)
 	PRTEST_OK();
 }
 
+/*
+ * The authority of an absolute-form target ends at the first '/', '?' or
+ * '#': what follows a '?' or '#' is never the host, even past an '@'.
+ */
+static void test_forward_authority_end(void)
+{
+	static const char query[] =
+		"GET http://example.com:8080?q=1 HTTP/1.1\r\n\r\n";
+	static const char query_at[] =
+		"GET http://evil.example?@127.0.0.1/ HTTP/1.1\r\n\r\n";
+	static const char frag_at[] =
+		"GET http://evil.example#@127.0.0.1/ HTTP/1.1\r\n\r\n";
+	static const char path_at[] =
+		"GET http://example.com/a@127.0.0.1/ HTTP/1.1\r\n\r\n";
+	struct gwp_http_conn *hc;
+	char *host, *port;
+	const char *req = NULL;
+	size_t req_len = 0;
+
+	/* A query with an empty path: the path becomes "/". */
+	hc = gwp_http_conn_alloc();
+	assert(hc);
+	assert(run(hc, NULL, query, &host, &port, &req, &req_len) == GWP_HTTP_FORWARD);
+	assert(!strcmp(host, "example.com"));
+	assert(!strcmp(port, "8080"));
+	assert(!strncmp(req, "GET /?q=1 HTTP/1.1\r\n", 20));
+	assert(strstr(req, "\r\nHost: example.com:8080\r\n"));
+	gwp_http_conn_free(hc);
+
+	/* An '@' in the query is not userinfo. */
+	hc = gwp_http_conn_alloc();
+	assert(hc);
+	assert(run(hc, NULL, query_at, &host, &port, &req, &req_len) == GWP_HTTP_FORWARD);
+	assert(!strcmp(host, "evil.example"));
+	assert(!strcmp(port, "80"));
+	assert(!strncmp(req, "GET /?@127.0.0.1/ HTTP/1.1\r\n", 28));
+	assert(strstr(req, "\r\nHost: evil.example\r\n"));
+	gwp_http_conn_free(hc);
+
+	/* Nor is one in the path. */
+	hc = gwp_http_conn_alloc();
+	assert(hc);
+	assert(run(hc, NULL, path_at, &host, &port, &req, &req_len) == GWP_HTTP_FORWARD);
+	assert(!strcmp(host, "example.com"));
+	assert(!strncmp(req, "GET /a@127.0.0.1/ HTTP/1.1\r\n", 28));
+	gwp_http_conn_free(hc);
+
+	/* A fragment straight after the authority leaves nothing to send. */
+	hc = gwp_http_conn_alloc();
+	assert(hc);
+	assert(run(hc, NULL, frag_at, &host, &port, &req, &req_len) == GWP_HTTP_ERR);
+	gwp_http_conn_free(hc);
+
+	PRTEST_OK();
+}
+
 static void test_forward_hop_by_hop(void)
 {
 	/*
@@ -1165,6 +1221,7 @@ int main(void)
 		test_connect_ipv6();
 		test_forward_get();
 		test_forward_default_port();
+		test_forward_authority_end();
 		test_forward_hop_by_hop();
 		test_forward_conn_lists_framing();
 		test_forward_conn_limit();
