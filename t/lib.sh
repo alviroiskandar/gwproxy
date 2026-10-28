@@ -246,17 +246,47 @@ _release_ports()
 	return 0
 }
 
-# wait_listen <port> [pid]: wait until something is listening on <port>, or
-# until <pid> (if given) exits. Returns 0 on success, 1 on timeout/exit.
+# _pid_tree <pid>: print <pid> and all its descendants, one per line.
+_pid_tree()
+{
+	local c
+
+	echo "$1"
+	for c in $(ps -o pid= --ppid "$1" 2>/dev/null); do
+		_pid_tree "$c"
+	done
+}
+
+# wait_listen <port> <pid>: wait until <pid>, or a process below it (a server
+# started through a shell function or a wrapper), listens on TCP <port>.
+# Returns 0 once it does, 1 when <pid> exits or after 10s.
+#
+# Something listening on <port> is not enough: if the server failed to bind
+# because another socket holds the port, that socket would satisfy the wait
+# and the test would go on to talk to it. So the listener has to be <pid>'s,
+# as ss -p reports it. ss can name the owner only of our own processes (or
+# of any, as root); for one we cannot see into -- a server started through
+# "sudo -n" -- any listener is taken, as before.
 wait_listen()
 {
-	local port="$1" pid="${2:-}" i
+	local port="$1" pid="${2:-}" i p owned users
+
+	[ -n "$pid" ] || fail "wait_listen: no pid given for port $port"
 	for i in $(seq 1 100); do
-		if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
-			return 1
-		fi
-		if ss -ltnH "sport = :$port" 2>/dev/null | grep -q .; then
-			return 0
+		# Not kill -0 alone: where sudo runs the command with the real
+		# uid set to root, it fails with EPERM while the server runs.
+		kill -0 "$pid" 2>/dev/null || [ -e "/proc/$pid" ] || return 1
+		# Asked each time: right after "sudo ... &" the pid is still our
+		# own forked shell, until it execs sudo and becomes root's.
+		owned=1
+		[ "$(id -u)" = 0 ] || [ -O "/proc/$pid" ] || owned=0
+		if [ "$owned" = 0 ]; then
+			ss -ltnH "sport = :$port" 2>/dev/null | grep -q . && return 0
+		else
+			users="$(ss -ltnpH "sport = :$port" 2>/dev/null)"
+			for p in $(_pid_tree "$pid"); do
+				case "$users" in *"pid=$p,"*) return 0 ;; esac
+			done
 		fi
 		sleep 0.1
 	done

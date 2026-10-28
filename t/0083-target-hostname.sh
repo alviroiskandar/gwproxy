@@ -23,7 +23,7 @@ rlog="$WORK/rec.log"
 python3 "$SERVERS_DIR/recording_proxy.py" http 127.0.0.1 "$rp" "$rlog" \
 	>"$WORK/rec.err" 2>&1 &
 _PIDS+=("$!")
-wait_listen "$rp" || fail "recording upstream did not listen"
+wait_listen "$rp" "$!" || fail "recording upstream did not listen"
 
 probe() {
 	python3 "$SERVERS_DIR/socks5_probe.py" --host 127.0.0.1 --atyp domain \

@@ -157,7 +157,7 @@ if [ "${1:-}" != "--inner" ]; then
 			--target="$NET.2:$pa" --nr-workers=1 --log-level=3 \
 			--event-loop="$loop" "$@" >"$WORK/gwp.log" 2>&1 &
 		PRIV_PID=$!
-		wait_listen "$port" || {
+		wait_listen "$port" "$PRIV_PID" || {
 			sed 's/^/# gwp: /' "$WORK/gwp.log" >&2
 			fail "[$loop] gwproxy did not listen on $port (args: $*)"
 		}

@@ -34,7 +34,7 @@ while True:
     threading.Thread(target=h, args=(c,), daemon=True).start()
 PY
 _PIDS+=("$!")
-wait_listen "$up" || fail "upstream did not listen"
+wait_listen "$up" "$!" || fail "upstream did not listen"
 
 # ask <port> <socks5|http>: the first reply the client gets, and how long
 # it took; "TIMEOUT" when nothing came within 4 s.

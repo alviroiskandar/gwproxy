@@ -21,7 +21,7 @@ require ss
 op="$(pick_port)"
 python3 "$SERVERS_DIR/close_origin.py" "$op" >"$WORK/origin.log" 2>&1 &
 _PIDS+=("$!")
-wait_listen "$op" || fail "close-delimited origin did not start on $op"
+wait_listen "$op" "$!" || fail "close-delimited origin did not start on $op"
 
 have_tls=0
 if "$GWPROXY" --help 2>&1 | grep -q -- --tls-cert && command -v openssl >/dev/null &&

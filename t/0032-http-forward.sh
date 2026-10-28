@@ -21,7 +21,7 @@ hlog="$WORK/host.log"
 python3 "$SERVERS_DIR/header_origin.py" "$op" "$hlog" Host \
 	>"$WORK/header_origin.log" 2>&1 &
 _PIDS+=("$!")
-wait_listen "$op" || fail "header origin did not listen on $op"
+wait_listen "$op" "$!" || fail "header origin did not listen on $op"
 
 # About the size of an ordinary browser's cookie jar: too big for a 2 KiB
 # client buffer, comfortably inside the 64 KiB default.
