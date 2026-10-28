@@ -76,6 +76,8 @@ Features
   - Per-socket tuning: TCP_NODELAY and TCP keepalive.
   - Optional idle timeout (--idle-timeout) that closes tunnels and UDP
     associations which have moved no data for that long.
+  - Optional per-client connection cap (--max-conns-per-ip), counted per
+    IPv4 address or IPv6 /64 across all workers.
   - Dual-stack IPv4/IPv6 listening.
   - Configurable log level and log file, and an optional PID file.
 

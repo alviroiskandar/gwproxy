@@ -1253,6 +1253,13 @@ static int __handle_ev_accept(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 		return 0;
 	}
 
+	/* --max-conns-per-ip: before anything is read or set up. */
+	if (unlikely(ctx->iplim) &&
+	    !gwp_ctx_iplim_get(w, &w->iou->accept_addr)) {
+		prep_close(w, fd);
+		return 0;
+	}
+
 	/* Transparent proxy: take the target from SO_ORIGINAL_DST. */
 	if (transparent) {
 		r = gwp_get_orig_dst(fd, &w->iou->accept_addr, &tdst);
@@ -1260,8 +1267,8 @@ static int __handle_ev_accept(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 			pr_warn(&ctx->lh, "No original destination for %s: %s (not a redirected connection?)",
 				ip_to_str(&w->iou->accept_addr),
 				r == -ELOOP ? "it is this proxy" : strerror(-r));
-			prep_close(w, fd);
-			return 0;
+			r = 0;
+			goto out_uncount;
 		}
 	}
 
@@ -1278,13 +1285,16 @@ static int __handle_ev_accept(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 	if (unlikely(!gcp)) {
 		pr_err(&ctx->lh, "Allocate connection pair: %s", strerror(ENOMEM));
 		r = -ENOMEM;
-		goto out_close;
+		goto out_uncount;
 	}
 
 	gcp->ref_cnt = 0;
 
 	gcp->client.fd = fd;
 	gcp->client_addr = w->iou->accept_addr;
+	/* From here on, freeing the pair uncounts the client. */
+	if (ctx->iplim)
+		gcp->flags |= GWP_CONN_FLAG_IPLIM;
 	gwp_conn_set_single_candidate(gcp, &fwd_target);
 	gcp->is_target_alive = false;
 	r = arm_gcp(w, gcp);
@@ -1318,10 +1328,13 @@ static int __handle_ev_accept(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 out_free_pair:
 	gcp->client.fd = gcp->target.fd = gcp->timer_fd = -1;
 	gwp_free_conn_pair(w, gcp);
+	goto out_close;
+out_uncount:
+	if (ctx->iplim)
+		gwp_ctx_iplim_put(ctx, &w->iou->accept_addr);
 out_close:
-	if (fd >= 0)
-		prep_close(w, fd);
-	return r ? r : -ENOMEM;
+	prep_close(w, fd);
+	return r;
 }
 
 /*
