@@ -294,6 +294,39 @@ start_udp_echo()
 	fail "UDP echo server on $addr did not start"
 }
 
+# closed_port: set CLOSED_PORT to a TCP port on 127.0.0.1 that refuses
+# connections for the rest of the test. A port that was free when probed is
+# not enough: under `make -jN` another test can be handed the same number
+# and listen on it, and the "refused" connect then succeeds. So keep it
+# bound, never listening and without SO_REUSEADDR, in a helper process: no
+# one else can bind it, and a connect to it is refused. Not $(closed_port):
+# the helper must be recorded in _PIDS of this shell to be stopped.
+closed_port()
+{
+	local log pid port i
+
+	_CLOSED_N=$((${_CLOSED_N:-0} + 1))
+	log="$WORK/closed_port.$_CLOSED_N"
+	python3 -c '
+import socket, time
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1], flush=True)
+time.sleep(3600)' >"$log" 2>&1 &
+	pid=$!
+	_PIDS+=("$pid")
+	for i in $(seq 1 100); do
+		port="$(head -n 1 "$log" 2>/dev/null)"
+		case "$port" in
+		""|*[!0-9]*) ;;
+		*) CLOSED_PORT="$port"; return 0 ;;
+		esac
+		kill -0 "$pid" 2>/dev/null || break
+		sleep 0.05
+	done
+	fail "could not reserve a closed port"
+}
+
 # start_httpd <port> <docroot> [http_version]: start the dual-stack test HTTP
 # server serving <docroot>. It is reachable via 127.0.0.1, [::1] or localhost.
 # http_version is "1.0" (closes after each response) or "1.1" (keep-alive).

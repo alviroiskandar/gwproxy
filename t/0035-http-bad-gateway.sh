@@ -19,9 +19,8 @@ make_payload "$WORK/payload.bin" 1024
 start_httpd "$hp" "$WORK" "1.1"
 
 # A port with nothing listening: connect() is refused rather than timing out.
-closed="$(python3 -c 'import socket
-s = socket.socket(); s.bind(("127.0.0.1", 0))
-print(s.getsockname()[1]); s.close()')"
+closed_port
+closed="$CLOSED_PORT"
 
 # Status line the proxy returns for a CONNECT. curl cannot report the status of
 # a failed CONNECT tunnel (it is not the final response), so this reads the wire
