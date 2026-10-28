@@ -3165,6 +3165,8 @@ int gwp_socks5_handle_data(struct gwp_conn_pair *gcp)
 	out = gcp->target.buf + gcp->target.len;
 	out_len = gcp->target.cap - gcp->target.len;
 	r = gwp_socks5_conn_handle_data(sc, in, &in_len, out, &out_len);
+	if (r == -ENOBUFS)
+		return r;
 	gwp_conn_buf_advance(&gcp->client, in_len);
 	gcp->target.len += out_len;
 	return (r == -EAGAIN) ? 0 : r;

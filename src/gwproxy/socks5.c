@@ -93,12 +93,16 @@ static int append_out_buf(struct data_arg *d, const void *buf, size_t len)
 	size_t old_len = d->tot_out_len;
 	uint8_t *dst;
 
-	d->tot_out_len += len;
-	if (d->tot_out_len > *d->out_len)
+	/*
+	 * Check before counting: a length that ran past the buffer would
+	 * reach the caller as bytes written that never were.
+	 */
+	if (len > *d->out_len - old_len)
 		return -ENOBUFS;
 
 	dst = (uint8_t *)d->out_buf + old_len;
 	memcpy(dst, buf, len);
+	d->tot_out_len += len;
 	return 0;
 }
 
@@ -715,14 +719,18 @@ out:
 		 * The caller will eventually get the proper state
 		 * after it calls this function again with enough
 		 * output buffer space.
+		 *
+		 * The replies of the states we went through are dropped
+		 * along with them: that call produces them again.
 		 */
 		conn->state = orig_state;
 		*in_len = 0;
+		*out_len = 0;
 	} else {
 		*in_len = arg.tot_advance;
+		*out_len = arg.tot_out_len;
 	}
 
-	*out_len = arg.tot_out_len;
 	return r;
 }
 

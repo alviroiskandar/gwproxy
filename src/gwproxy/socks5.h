@@ -149,8 +149,7 @@ const char *gwp_socks5_conn_username(const struct gwp_socks5_conn *conn);
  * @param out_buf	Buffer to store outgoing data.
  * @param out_len	Pointer to the size of the outgoing data buffer.
  * 			After return, it will contain the size of the data
- * 			written to `out_buf` or the required size if there
- * 			is not enough space.
+ * 			written to `out_buf`, never more than its size.
  * @return		0 on success, or a negative error code on failure.
  *
  * Error values:
@@ -161,8 +160,9 @@ const char *gwp_socks5_conn_username(const struct gwp_socks5_conn *conn);
  *
  * -EAGAIN:	More data is needed to complete the request.
  *
- * -ENOBUFS:	Not enough space in the outgoing buffer. *out_len will
- * 		contain the required size.
+ * -ENOBUFS:	Not enough space in the outgoing buffer. Nothing was
+ * 		consumed or produced: *in_len and *out_len are 0 and the
+ * 		state is unchanged.
  */
 int gwp_socks5_conn_handle_data(struct gwp_socks5_conn *conn,
 				const void *in_buf, size_t *in_len,
@@ -183,15 +183,14 @@ int gwp_socks5_conn_handle_data(struct gwp_socks5_conn *conn,
  * @param out_buf	Buffer to store the outgoing data.
  * @param out_len	Pointer to the size of the outgoing data buffer.
  * 			After return, it will contain the size of the data
- * 			written to `out_buf` or the required size if there
- * 			is not enough space.
+ * 			written to `out_buf`, never more than its size.
  * @return		0 on success, or a negative error code on failure.
  *
  * Error values:
  * -EINVAL:	Invalid input parameters.
  *
- * -ENOBUFS:	Not enough space in the outgoing buffer. *out_len will
- * 		contain the required size.
+ * -ENOBUFS:	Not enough space in the outgoing buffer. *out_len is 0
+ * 		and the state is unchanged.
  */
 int gwp_socks5_conn_cmd_connect_res(struct gwp_socks5_conn *conn,
 				    const struct gwp_socks5_addr *bind_addr,

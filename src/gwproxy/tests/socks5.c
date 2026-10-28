@@ -858,7 +858,7 @@ static void test_enobufs(void)
 	r = gwp_socks5_conn_handle_data(conn, inb, &in_len, out, &out_len);
 	assert(r == -ENOBUFS);
 	assert(in_len == 0);
-	assert(out_len == 2);
+	assert(out_len == 0);
 
 	in_len = 3;
 	out_len = 2;
@@ -891,7 +891,7 @@ static void test_enobufs(void)
 						    GWP_SOCKS5_REP_SUCCESS, out,
 						    &out_len);
 		assert(r == -ENOBUFS);
-		assert(out_len == 10);
+		assert(out_len == 0);
 		assert(conn->state == GWP_SOCKS5_ST_CMD_CONNECT);
 	}
 
@@ -949,10 +949,8 @@ static void test_enobufs_combined_with_multi_state_at_once(void)
 		r = gwp_socks5_conn_handle_data(conn, in, &in_len, out, &out_len);
 		assert(r == -ENOBUFS);
 		assert(in_len == 0);
-		if (i < 2)
-			assert(out_len == 2);
-		else
-			assert(out_len == 4);
+		/* Nothing is consumed, so nothing is reported written. */
+		assert(out_len == 0);
 		assert(conn->state == GWP_SOCKS5_ST_INIT);
 	}
 
@@ -976,7 +974,7 @@ static void test_enobufs_combined_with_multi_state_at_once(void)
 						    GWP_SOCKS5_REP_SUCCESS, out,
 						    &out_len);
 		assert(r == -ENOBUFS);
-		assert(out_len == 10);
+		assert(out_len == 0);
 		assert(conn->state == GWP_SOCKS5_ST_CMD_CONNECT);
 	}
 
