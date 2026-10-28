@@ -3294,13 +3294,54 @@ int gwp_socks5_handle_data(struct gwp_conn_pair *gcp)
 	out = gcp->target.buf + gcp->target.len;
 	out_len = gcp->target.cap - gcp->target.len;
 	r = gwp_socks5_conn_handle_data(sc, in, &in_len, out, &out_len);
+	if (r == -ENOBUFS)
+		return r;
 	gwp_conn_buf_advance(&gcp->client, in_len);
 	gcp->target.len += out_len;
 	return (r == -EAGAIN) ? 0 : r;
 }
 
+/*
+ * Log a SOCKS5 username/password failure, so that failed guesses show up
+ * in the log and a tool watching it can block the source. The username
+ * comes from the client and may hold any byte; escape everything outside
+ * printable ASCII, and the quote and backslash that delimit it, so the
+ * client cannot forge or break log lines.
+ */
+static void socks5_log_auth_failure(struct gwp_wrk *w,
+				    struct gwp_conn_pair *gcp)
+{
+	static const char hex[] = "0123456789abcdef";
+	char user[255 * 4 + 1], *d = user;
+	const unsigned char *u;
+	size_t len, i;
+
+	u = (const unsigned char *)gwp_socks5_conn_rejected_user(gcp->s5_conn,
+								 &len);
+	if (!u)
+		return;
+
+	for (i = 0; i < len && i < 255; i++) {
+		unsigned char c = u[i];
+
+		if (c >= 0x20 && c < 0x7f && c != '"' && c != '\\') {
+			*d++ = (char)c;
+			continue;
+		}
+		*d++ = '\\';
+		*d++ = 'x';
+		*d++ = hex[c >> 4];
+		*d++ = hex[c & 0xf];
+	}
+	*d = '\0';
+
+	pr_info(&w->ctx->lh, "SOCKS5 authentication failed (ca=%s, user=\"%s\")",
+		ip_to_str(&gcp->client_addr), user);
+}
+
 static int handle_socks5_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
+	uint32_t clen = gcp->client.len, tlen = gcp->target.len;
 	struct gwp_ctx *ctx = w->ctx;
 	int r;
 
@@ -3326,11 +3367,23 @@ static int handle_socks5_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	}
 
 	r = gwp_socks5_handle_data(gcp);
+	socks5_log_auth_failure(w, gcp);
 	if (r < 0) {
 		gwp_socks5_conn_free(gcp->s5_conn);
 		gcp->s5_conn = NULL;
 		/* Unclaim it, so an HTTP fallback can take the union over. */
 		gcp->prot_type = GWP_PROT_TYPE_NONE;
+		/*
+		 * Only a first byte that is not SOCKS5 leaves both buffers
+		 * as they were. Once the parser took a greeting and queued
+		 * its reply, the client spoke SOCKS5: a later failure
+		 * (wrong password, bad request) is final, or the HTTP parser
+		 * would get the rest of the bytes, answer behind the SOCKS5
+		 * replies and give the client another password guess.
+		 */
+		if (r == -EINVAL &&
+		    (gcp->client.len != clen || gcp->target.len != tlen))
+			r = -EPROTO;
 		return r;
 	}
 
@@ -3697,6 +3750,7 @@ int gwp_handle_conn_state_socks5(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		decided = true;
 	} else if (ct == CONN_STATE_SOCKS5_DATA) {
 		r = gwp_socks5_handle_data(gcp);
+		socks5_log_auth_failure(w, gcp);
 		if (r)
 			return r;
 	} else if (ct == CONN_STATE_SOCKS5_DNS_QUERY ||
@@ -3717,6 +3771,18 @@ int gwp_handle_conn_state_socks5(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	} else {
 		assert(0 && "Invalid SOCKS5 connection state");
 		return -EINVAL;
+	}
+
+	if (gcp->s5_conn->state == GWP_SOCKS5_ST_ERR) {
+		/*
+		 * The parser answered with a failure (no acceptable method,
+		 * wrong password) and took nothing after it. RFC 1928 and
+		 * RFC 1929 have the server close the connection then; a
+		 * client that waits for the close would otherwise hold the
+		 * slot until the protocol timeout. The reply is flushed
+		 * before the teardown, as for any other error.
+		 */
+		return -EPROTO;
 	}
 
 	if (gcp->s5_conn->state == GWP_SOCKS5_ST_CMD_CONNECT) {
