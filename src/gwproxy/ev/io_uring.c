@@ -1513,6 +1513,32 @@ static int upstream_iou_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	return r;	/* negative errno */
 }
 
+/*
+ * Whether a send to the client is still on its way. The plaintext send reads
+ * target.buf, a TLS client's the tx scratch; either way its completion
+ * (handle_ev_client_send()) goes on to work on target.buf.
+ */
+static bool client_send_busy(struct gwp_conn_pair *gcp)
+{
+#ifdef CONFIG_HTTPS
+	if (client_is_tls(gcp))
+		return gcp->tls_io->tx_sent < gcp->tls_io->tx_len;
+#endif
+	return gcp->client_tx;
+}
+
+/*
+ * Connected to the upstream proxy, but the handshake with it has not begun:
+ * finish_target_connect() left that to the completion of a client send.
+ */
+static bool upstream_start_held(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	int cs = gcp->conn_state;
+
+	return w->ctx->upstream.enabled && gcp->target.fd >= 0 &&
+	       (cs == CONN_STATE_SOCKS5_CONNECT || cs == CONN_STATE_HTTP_CONNECT);
+}
+
 static int handle_ev_upstream_s5(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				 struct io_uring_cqe *cqe)
 {
@@ -1607,9 +1633,19 @@ static int finish_target_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	 * Connected to the upstream proxy: run the client handshake before
 	 * forwarding. The connect timer is kept to bound the handshake, and the
 	 * normal recv/send SQEs stay unarmed so they cannot collide with it.
+	 *
+	 * The handshake builds its requests in target.buf, which a SOCKS5
+	 * method or auth reply to the client may still be sent from: the
+	 * client was answered and asked to connect in one go, and the send
+	 * has not completed (out of socket memory, say). Its completion would
+	 * also take the request for what is left of the reply. Leave the
+	 * handshake to that completion (handle_ev_client_send()).
 	 */
-	if (w->ctx->upstream.enabled)
+	if (w->ctx->upstream.enabled) {
+		if (client_send_busy(gcp))
+			return 0;
 		return upstream_iou_start(w, gcp);
+	}
 
 	prep_timer_del_target(w, gcp);
 	arm_idle_timer(w, gcp);
@@ -2011,6 +2047,8 @@ static int handle_ev_client_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		if (gcp->target.len > 0 ||
 		    gwp_ssl_bio_pending(gcp->client.tls) > 0) {
 			send_client_tls(w, gcp);
+		} else if (upstream_start_held(w, gcp)) {
+			return upstream_iou_start(w, gcp);
 		} else if (t->prot_resume) {
 			t->prot_resume = false;
 			return tls_prot_pump(w, gcp);
@@ -2035,6 +2073,10 @@ static int handle_ev_client_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		prep_send_client(w, gcp);
 		return 0;
 	}
+
+	/* The reply is out; the upstream handshake may use target.buf now. */
+	if (upstream_start_held(w, gcp))
+		return upstream_iou_start(w, gcp);
 
 	/*
 	 * The target may have finished while this send was in flight: the HTTP
