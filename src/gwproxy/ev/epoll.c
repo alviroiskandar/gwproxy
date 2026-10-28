@@ -2332,8 +2332,9 @@ static bool is_ev_bit_conn_pair(uint64_t ev_bit)
 /*
  * SOCKS5 UDP relay: drain the per-connection relay socket. A datagram whose
  * source is (or, for the first one, becomes) the pinned client is unwrapped and
- * forwarded to its encapsulated target; any other source is a target's reply,
- * which is wrapped with a SOCKS5 UDP header and sent back to the client. UDP is
+ * forwarded to its encapsulated target; one from a target the client has sent
+ * to is a reply, which is wrapped with a SOCKS5 UDP header and sent back to the
+ * client, and anything else is dropped (see gwp_udp_relay_classify()). UDP is
  * lossy, so individual datagram errors are dropped rather than failing the
  * association; only the TCP control connection's close tears it down.
  *
@@ -2342,16 +2343,10 @@ static bool is_ev_bit_conn_pair(uint64_t ev_bit)
  * reply header (see gwp_socks5_addr_to_sockaddr / reply_addr_from_sockaddr).
  *
  * Known limitations, each a follow-up:
- *   - The relay is stateless: it forwards to any encapsulated target and
- *     accepts a reply from any non-client source, without tracking which
- *     targets the client contacted. An off-path host that guesses the
- *     ephemeral relay port can thus inject a forged "target reply" to the
- *     client. Pinning validates the client's IP against the TCP control
- *     connection, so this is bounded to injection (not association hijack);
- *     restricting replies to previously-contacted targets is the fix.
  *   - Domain-name (ATYP=0x03) encapsulated targets need DNS in the datagram
  *     path and are dropped for now.
- *   - There is no target ACL, so this shares the SSRF exposure of any proxy.
+ *   - Only the last GWP_UDP_MAX_PEERS targets the client sent to may reply;
+ *     a reply from one evicted since is dropped like any other stranger's.
  */
 static int handle_ev_udp_relay(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {

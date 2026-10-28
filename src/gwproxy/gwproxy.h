@@ -417,6 +417,24 @@ struct gwp_udp_acl_cache {
 	bool			ok;
 };
 
+/*
+ * The targets a UDP association's client has sent to, the only sources the
+ * relay accepts replies from. Each entry is an exact address and port whose
+ * last datagram the ACL accepted at generation @gen[i]; @seq[i] records when
+ * the client last sent to it, so a full table evicts the least recently
+ * used. Allocated on the association's first relayed datagram.
+ */
+#define GWP_UDP_MAX_PEERS	32
+
+struct gwp_udp_peers {
+	struct gwp_sockaddr	addr[GWP_UDP_MAX_PEERS];
+	uint32_t		gen[GWP_UDP_MAX_PEERS];
+	uint32_t		seq[GWP_UDP_MAX_PEERS];
+	uint32_t		next_seq;
+	uint8_t			nr;
+	uint8_t			last;	/* index of the last hit */
+};
+
 struct gwp_conn_pair {
 	/*
 	 * Field order here is deliberate: members are grouped by alignment,
@@ -466,6 +484,8 @@ struct gwp_conn_pair {
 	 * into the per-worker udp_buf.
 	 */
 	struct gwp_iou_udp	*udp_iou;
+	/* Targets a UDP association may hear from; NULL until it sends. */
+	struct gwp_udp_peers	*udp_peers;
 
 	/*
 	 * The hostname the client asked for, when it used a domain target
@@ -504,8 +524,8 @@ struct gwp_conn_pair {
 
 	/*
 	 * @udp_peer is the UDP client's source address, pinned from its first
-	 * datagram (@udp_pinned); datagrams from other sources are treated as
-	 * replies from targets.
+	 * datagram (@udp_pinned); datagrams from other sources are replies,
+	 * relayed only from a target in @udp_peers.
 	 */
 	struct gwp_sockaddr	udp_peer;
 	/* Last client->target datagram's ACL verdict; see udp_target_allowed(). */
@@ -804,8 +824,9 @@ struct gwp_udp_out {
  *                       to the encapsulated target.
  *   GWP_UDP_TO_CLIENT - target reply: prepend a SOCKS5 header in the slack, send
  *                       @out back to the pinned client.
- *   GWP_UDP_DROP      - unpinned/wrong source, bad header, domain target, or ACL
- *                       denial.
+ *   GWP_UDP_DROP      - unpinned/wrong source, bad header, domain target, ACL
+ *                       denial, or a "reply" from a source the client has not
+ *                       sent to (or that the ACL no longer accepts).
  * On a forward verdict @out holds the buffer + destination; each loop performs
  * the send with its own I/O primitive.
  */
