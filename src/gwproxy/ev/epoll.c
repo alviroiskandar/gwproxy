@@ -173,6 +173,10 @@ static int handle_ev_raw_dns_query(struct gwp_wrk __unused *w,
 static int connect_next_candidate(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				  int err);
 static bool has_inflight_attempt(const struct gwp_conn_pair *gcp);
+static int __forward_progress(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			      struct gwp_conn *hup, bool force_target);
+static int forward_progress(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			    struct gwp_conn *hup);
 
 __cold
 int gwp_ctx_init_thread_epoll(struct gwp_wrk *w)
@@ -825,9 +829,21 @@ static int __adjust_epl_mask(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	int r;
 
 	client_need_ctl |= adj_epl_out(&gcp->target, &gcp->client);
-	target_need_ctl |= adj_epl_out(&gcp->client, &gcp->target);
 	client_need_ctl |= adj_epl_in(&gcp->client);
-	target_need_ctl |= adj_epl_in(&gcp->target);
+
+	/*
+	 * Until the target is connected, its registration belongs to the
+	 * connect, and client events must leave it alone. There may be no
+	 * target socket yet: connect attempts live in attempt_fd[] until one
+	 * wins, and adopt_winning_attempt() sets the mask it registers the
+	 * winner with. A target socket created at accept time waits for
+	 * EPOLLOUT to learn that its connect completed, which taking it away
+	 * for want of client data to send would leave unreported.
+	 */
+	if (gcp->is_target_alive) {
+		target_need_ctl |= adj_epl_out(&gcp->client, &gcp->target);
+		target_need_ctl |= adj_epl_in(&gcp->target);
+	}
 
 	if (client_need_ctl) {
 		ev.events = gcp->client.ep_mask;
@@ -838,12 +854,7 @@ static int __adjust_epl_mask(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			return r;
 	}
 
-	/*
-	 * No target socket yet: connect attempts live in attempt_fd[] until
-	 * one wins, and adopt_winning_attempt() sets the mask it registers the
-	 * winner with. Client data arriving meanwhile must not be fatal.
-	 */
-	if (target_need_ctl && gcp->target.fd >= 0) {
+	if (target_need_ctl) {
 		ev.events = gcp->target.ep_mask;
 		ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_TARGET;
 
@@ -853,11 +864,6 @@ static int __adjust_epl_mask(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	}
 
 	return 0;
-}
-
-static int adjust_epl_mask(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
-{
-	return __adjust_epl_mask(w, gcp, false);
 }
 
 #ifdef CONFIG_HTTPS
@@ -1263,7 +1269,7 @@ static int upstream_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 	/*
 	 * target.ep_mask is left as upstream_arm() registered it, so that
-	 * adjust_epl_mask() below changes only what actually differs.
+	 * forward_progress() below changes only what actually differs.
 	 */
 	gcp->up_tx = false;
 	gcp->is_target_alive = true;
@@ -1291,7 +1297,8 @@ static int upstream_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 			return (int)sr;
 	}
 
-	return adjust_epl_mask(w, gcp);
+	/* And a FIN the client sent meanwhile. */
+	return forward_progress(w, gcp, NULL);
 }
 
 /*
@@ -1463,8 +1470,11 @@ static int handle_ev_target_conn_result(struct gwp_wrk *w,
 			return (int)sr;
 	}
 
-	/* Forced: the target may still carry its attempt tag. */
-	return __adjust_epl_mask(w, gcp, true);
+	/*
+	 * Pass on a FIN the client sent during the connect. Forced: the
+	 * target may still carry its attempt tag.
+	 */
+	return __forward_progress(w, gcp, NULL, true);
 }
 
 /*
@@ -1572,8 +1582,8 @@ static int client_wr_flushed(struct gwp_conn_pair __unused *gcp)
  * drained (see handle_ev_hup()); it stops being monitored here unless the pair
  * is torn down anyway.
  */
-static int forward_progress(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
-			    struct gwp_conn *hup)
+static int __forward_progress(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			      struct gwp_conn *hup, bool force_target)
 {
 	bool shut_client = false, shut_target = false, done;
 
@@ -1594,8 +1604,20 @@ static int forward_progress(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	}
 
 	if (gcp->client.rd_eof && gcp->client.len == 0 && !gcp->target.wr_shut) {
-		shut_target = true;
-		gcp->target.wr_shut = true;
+		/*
+		 * The client may finish before the target is even connected.
+		 * There is no target socket yet, or only one still in
+		 * SYN_SENT, which shutdown() would abort: hold the FIN back
+		 * until handle_ev_target_conn_result() or upstream_finish()
+		 * comes back here. A client that hung up altogether is owed
+		 * nothing, though, so the pair goes now.
+		 */
+		if (gcp->is_target_alive) {
+			shut_target = true;
+			gcp->target.wr_shut = true;
+		} else if (gcp->client.wr_shut) {
+			return -ECONNRESET;
+		}
 	}
 
 	/*
@@ -1620,7 +1642,13 @@ static int forward_progress(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		hup->ep_mask = 0;
 	}
 
-	return adjust_epl_mask(w, gcp);
+	return __adjust_epl_mask(w, gcp, force_target);
+}
+
+static int forward_progress(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			    struct gwp_conn *hup)
+{
+	return __forward_progress(w, gcp, hup, false);
 }
 
 /*
