@@ -3598,6 +3598,18 @@ int gwp_handle_conn_state_socks5(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		return -EINVAL;
 	}
 
+	if (gcp->s5_conn->state == GWP_SOCKS5_ST_ERR) {
+		/*
+		 * The parser answered with a failure (no acceptable method,
+		 * wrong password) and took nothing after it. RFC 1928 and
+		 * RFC 1929 have the server close the connection then; a
+		 * client that waits for the close would otherwise hold the
+		 * slot until the protocol timeout. The reply is flushed
+		 * before the teardown, as for any other error.
+		 */
+		return -EPROTO;
+	}
+
 	if (gcp->s5_conn->state == GWP_SOCKS5_ST_CMD_CONNECT) {
 		r = gwp_socks5_prepare_target_addr(w, gcp);
 		if (r == -EINPROGRESS) {

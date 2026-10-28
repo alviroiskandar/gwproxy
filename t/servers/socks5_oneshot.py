@@ -5,21 +5,42 @@
 # closes the connection (or the timeout runs out) and print what came back
 # as hex, followed by " CLOSED" or " OPEN" for how the read ended.
 #
-# Usage: socks5_oneshot.py [--timeout S] port hexbytes
+# With --split, each further hex argument is sent in a write of its own
+# once the proxy answered the one before; the answers are printed in
+# order, separated by spaces.
+#
+# Usage: socks5_oneshot.py [--timeout S] [--split] port hexbytes...
 import socket, sys
 
 argv = sys.argv[1:]
 timeout = 3.0
-if argv and argv[0] == '--timeout':
-    timeout = float(argv[1])
-    argv = argv[2:]
+split = False
+while argv and argv[0].startswith('--'):
+    if argv[0] == '--timeout':
+        timeout = float(argv[1])
+        argv = argv[2:]
+    elif argv[0] == '--split':
+        split = True
+        argv = argv[1:]
+    else:
+        sys.exit('unknown option ' + argv[0])
 
 port = int(argv[0])
-data = bytes.fromhex(argv[1])
+chunks = [bytes.fromhex(a) for a in argv[1:]]
+if not split:
+    chunks = [b''.join(chunks)]
 
 s = socket.create_connection(('127.0.0.1', port), timeout=10)
-s.sendall(data)
 s.settimeout(timeout)
+out = []
+for c in chunks[:-1]:
+    s.sendall(c)
+    try:
+        out.append(s.recv(4096).hex())
+    except socket.timeout:
+        out.append('-')
+
+s.sendall(chunks[-1])
 got = b''
 end = 'CLOSED'
 try:
@@ -31,6 +52,7 @@ try:
 except socket.timeout:
     end = 'OPEN'
 except ConnectionResetError:
-    end = 'CLOSED'
+    pass
 s.close()
-print(got.hex(), end)
+out.append(got.hex())
+print(' '.join(out), end)
