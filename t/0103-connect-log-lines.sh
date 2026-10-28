@@ -4,9 +4,9 @@
 # Both event loops log a connection to the target the same way: one
 # "Target socket connected" line at info level for plain forwarding
 # (--target) and for a SOCKS5 CONNECT alike, and through an upstream proxy
-# one "Upstream tunnel established" line instead. The epoll loop used to log
-# nothing for plain forwarding, and logged the connection to the upstream
-# proxy as one to the target when chaining.
+# one "Upstream tunnel established" line naming the destination instead.
+# The epoll loop used to log nothing for plain forwarding, and named the
+# upstream proxy's address as the target when chaining.
 
 . "$(dirname "$0")/lib.sh"
 require curl
@@ -70,7 +70,7 @@ for loop in epoll io_uring; do
 		n="$(count "$log" 'Target socket connected')"
 		[ "$n" = 0 ] ||
 			fail "[$loop] upstream $host: $n target connect lines"
-		n="$(count "$log" 'Upstream tunnel established')"
+		n="$(count "$log" "Upstream tunnel established (idx=[0-9]*, ca=127\.0\.0\.1:[0-9]*, dst=${host//./\\.}:$hp)\$")"
 		[ "$n" = 1 ] || fail "[$loop] upstream $host: $n tunnel lines"
 	done
 done
