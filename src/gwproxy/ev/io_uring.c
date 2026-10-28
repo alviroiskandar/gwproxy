@@ -45,6 +45,7 @@ struct gwp_iou_tls {
 	uint32_t	tx_len;		/* ciphertext bytes queued in @tx  */
 	uint32_t	tx_sent;	/* of those, already written       */
 	bool		closing;	/* close_notify queued             */
+	bool		prot_resume;	/* pump the protocol once tx is out */
 	unsigned char	tx[GWP_TLS_CIPHER_CAP];
 };
 
@@ -834,13 +835,25 @@ static int tls_forward_pump(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
  * together are all off the socket already: take every one of them now, as a
  * plaintext recv of the same segment would, since no completion will come
  * for them later.
+ *
+ * Not while a reply is on its way to the client, though: a protocol pass
+ * may queue another reply, and the tx scratch it would be encrypted into is
+ * still being sent. Neither is a recv armed then, since the records the
+ * engine may hold would not complete one. handle_ev_client_send() picks the
+ * pump up again once the reply is out.
  */
 static int tls_prot_pump(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_conn *c = &gcp->client;
+	struct gwp_iou_tls *t = gcp->tls_io;
 	uint32_t from = c->len;
 	size_t got;
 	int sr;
+
+	if (t->tx_sent < t->tx_len) {
+		t->prot_resume = true;
+		return 0;
+	}
 
 	while (c->len < c->cap) {
 		got = 0;
@@ -863,16 +876,15 @@ static int tls_prot_pump(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 /*
  * Whether the protocol should be fed from the engine rather than the socket:
- * it still holds records, client.buf has room for them, and no reply is on
- * its way to the client, which a second pass could overwrite.
+ * it still holds records and client.buf has room for them. With a reply
+ * still being sent, tls_prot_pump() waits for that send to complete.
  */
 static bool tls_prot_more(struct gwp_conn_pair *gcp)
 {
 	struct gwp_conn *c = &gcp->client;
-	struct gwp_iou_tls *t = gcp->tls_io;
 
 	return client_is_tls(gcp) && c->len < c->cap &&
-	       t->tx_sent >= t->tx_len && gwp_ssl_rx_more(c->tls);
+	       gwp_ssl_rx_more(c->tls);
 }
 
 /* Handshake done: switch to the plaintext protocol path on the decrypted stream. */
@@ -1001,6 +1013,7 @@ static int handle_ev_tls_detect(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	gcp->tls_io->tx_len = 0;
 	gcp->tls_io->tx_sent = 0;
 	gcp->tls_io->closing = false;
+	gcp->tls_io->prot_resume = false;
 
 	gcp->client.tls = gwp_ssl_server_new(ctx->ssl_ctx);
 	if (unlikely(!gcp->client.tls))
@@ -1843,14 +1856,21 @@ static int handle_ev_client_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			prep_send_client_cipher(w, gcp, EV_BIT_IOU_CLIENT_SEND);
 			return 0;
 		}
-		/* Ciphertext flushed; encrypt/queue more, else read the target. */
+		/*
+		 * Ciphertext flushed; encrypt/queue more, else go back to the
+		 * protocol pass this reply held up, else read the target.
+		 */
 		if (gcp->target.len > 0 ||
-		    gwp_ssl_bio_pending(gcp->client.tls) > 0)
+		    gwp_ssl_bio_pending(gcp->client.tls) > 0) {
 			send_client_tls(w, gcp);
-		else if (gcp->target.rd_eof)
+		} else if (t->prot_resume) {
+			t->prot_resume = false;
+			return tls_prot_pump(w, gcp);
+		} else if (gcp->target.rd_eof) {
 			return iou_forward_progress(w, gcp);
-		else if (gcp->target.fd >= 0)
+		} else if (gcp->target.fd >= 0) {
 			prep_recv_target(w, gcp);
+		}
 		return 0;
 	}
 #endif

@@ -32,6 +32,16 @@
 #       send, and expect them echoed back. A proxy that waits for the
 #       socket while its TLS engine still holds whole records never
 #       answers.
+#   splitauth <user> <password>
+#       SOCKS5 over TLS against a proxy with a small --client-buf-size and
+#       an --auth-file holding <user>:<password>. Send the greeting, the
+#       username/password request and the CONNECT request as many small
+#       TLS records in a single TCP send, and expect the method reply, the
+#       auth reply, the CONNECT reply and then an echo through the tunnel.
+#       The records do not all fit in the client buffer, so some are still
+#       held by the proxy's TLS engine while the method reply is being
+#       sent. A proxy that then waits for the socket instead of working
+#       through them once the reply is out never answers.
 #
 # Exits 0 on success, 1 on failure (with a message on stderr).
 
@@ -307,6 +317,32 @@ def scen_splitrec(pport):
         die("bytes pipelined after the CONNECT came back as %r" % data)
 
 
+def chunks(b, n):
+    return [b[i:i + n] for i in range(0, len(b), n)]
+
+
+def scen_splitauth(pport, user, pw):
+    oport = start_origin(echo_origin)
+    greet = b"\x05\x01\x02"
+    auth = (b"\x01" + bytes([len(user)]) + user + bytes([len(pw)]) + pw)
+    conn = b"\x05\x01\x00\x01" + socket.inet_aton("127.0.0.1") + \
+        oport.to_bytes(2, "big")
+
+    c = RecordClient(pport)
+    c.send_records([greet] + chunks(auth, 16) + chunks(conn, 4))
+    got = c.recv_until(lambda g: len(g) >= 2 + 2 + 10)
+    if got[:2] != b"\x05\x02":
+        die("method reply %r, want username/password" % got[:2])
+    if got[2:4] != b"\x01\x00":
+        die("auth reply %r, want success" % got[2:4])
+    if got[4:6] != b"\x05\x00" or len(got) != 14:
+        die("CONNECT reply %r, want success" % got[4:])
+    c.send_records([b"ping3"])
+    got = c.recv_until(lambda g: len(g) >= 5)
+    if got != b"ping3":
+        die("tunnel after a split SOCKS5 handshake echoed %r" % got)
+
+
 def main():
     scen = sys.argv[1]
     pport = int(sys.argv[2])
@@ -320,6 +356,8 @@ def main():
         scen_upload(pport, int(sys.argv[3]))
     elif scen == "splitrec":
         scen_splitrec(pport)
+    elif scen == "splitauth":
+        scen_splitauth(pport, sys.argv[3].encode(), sys.argv[4].encode())
     else:
         die("unknown scenario %s" % scen)
 
