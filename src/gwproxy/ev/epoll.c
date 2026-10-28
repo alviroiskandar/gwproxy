@@ -3053,9 +3053,16 @@ void gwp_ctx_signal_all_epoll(struct gwp_ctx *ctx)
 		/*
 		 * __sys_write() returns -errno, so the EINTR retry works;
 		 * glibc's eventfd_write() returns -1 and never matched it.
+		 *
+		 * The write needs no handling beyond that retry. Adding 1 to
+		 * an eventfd fails only with EAGAIN, when the counter would
+		 * pass 2^64 - 2, and here it counts stop requests, which the
+		 * worker's read resets. Anything else (EBADF, EINVAL) would be
+		 * a bug: ev_fd is -1 whenever the eventfd is not open.
 		 */
 		do {
 			r = __sys_write(w->ev_fd, &one, sizeof(one));
 		} while (r == -EINTR);
+		assert(r == (ssize_t)sizeof(one));
 	}
 }
