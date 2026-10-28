@@ -3311,30 +3311,15 @@ int gwp_socks5_handle_data(struct gwp_conn_pair *gcp)
 static void socks5_log_auth_failure(struct gwp_wrk *w,
 				    struct gwp_conn_pair *gcp)
 {
-	static const char hex[] = "0123456789abcdef";
-	char user[255 * 4 + 1], *d = user;
-	const unsigned char *u;
-	size_t len, i;
+	char user[GWP_LOG_ESC_SIZE(255)];
+	const char *u;
+	size_t len;
 
-	u = (const unsigned char *)gwp_socks5_conn_rejected_user(gcp->s5_conn,
-								 &len);
+	u = gwp_socks5_conn_rejected_user(gcp->s5_conn, &len);
 	if (!u)
 		return;
 
-	for (i = 0; i < len && i < 255; i++) {
-		unsigned char c = u[i];
-
-		if (c >= 0x20 && c < 0x7f && c != '"' && c != '\\') {
-			*d++ = (char)c;
-			continue;
-		}
-		*d++ = '\\';
-		*d++ = 'x';
-		*d++ = hex[c >> 4];
-		*d++ = hex[c & 0xf];
-	}
-	*d = '\0';
-
+	gwp_log_escape(user, u, len < 255 ? len : 255);
 	pr_info(&w->ctx->lh, "SOCKS5 authentication failed (ca=%s, user=\"%s\")",
 		ip_to_str(&gcp->client_addr), user);
 }

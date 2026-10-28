@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Unit tests for the logger: whatever a message carries, one call writes
- * exactly one line, with control bytes escaped.
+ * exactly one line, with control bytes escaped; and for gwp_log_escape().
  */
 #ifdef NDEBUG
 #undef NDEBUG
@@ -98,6 +98,24 @@ static void test_long(void)
 	}
 }
 
+static void test_escape(void)
+{
+	char buf[GWP_LOG_ESC_SIZE(16)];
+
+	assert(!strcmp(gwp_log_escape(buf, "user", 4), "user"));
+	assert(!strcmp(gwp_log_escape(buf, "", 0), ""));
+	assert(!strcmp(gwp_log_escape(buf, "a b~", 4), "a b~"));
+	/* NUL is a byte like any other; the length says where it ends. */
+	assert(!strcmp(gwp_log_escape(buf, "u\0s", 3), "u\\x00s"));
+	assert(!strcmp(gwp_log_escape(buf, "\r\n\x7f", 3), "\\x0d\\x0a\\x7f"));
+	assert(!strcmp(gwp_log_escape(buf, "\"\\", 2), "\\x22\\x5c"));
+	assert(!strcmp(gwp_log_escape(buf, "\xc3\xa9\xff", 3), "\\xc3\\xa9\\xff"));
+	/* Every byte escaped: the worst case fills the buffer exactly. */
+	memset(buf, 'z', sizeof(buf));
+	gwp_log_escape(buf, "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n", 16);
+	assert(strlen(buf) == sizeof(buf) - 1);
+}
+
 int main(void)
 {
 	int fds[2];
@@ -110,6 +128,7 @@ int main(void)
 	test_plain();
 	test_ctl();
 	test_long();
+	test_escape();
 
 	fclose(wf);
 	close(rfd);

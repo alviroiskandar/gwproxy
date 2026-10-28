@@ -50,6 +50,29 @@ static void log_write(int fd, const char *buf, size_t len)
 	}
 }
 
+char *gwp_log_escape(char *dst, const void *src, size_t len)
+{
+	static const char hex[] = "0123456789abcdef";
+	const unsigned char *s = src;
+	char *d = dst;
+	size_t i;
+
+	for (i = 0; i < len; i++) {
+		unsigned char c = s[i];
+
+		if (c >= 0x20 && c < 0x7f && c != '"' && c != '\\') {
+			*d++ = (char)c;
+			continue;
+		}
+		*d++ = '\\';
+		*d++ = 'x';
+		*d++ = hex[c >> 4];
+		*d++ = hex[c & 0xf];
+	}
+	*d = '\0';
+	return dst;
+}
+
 static inline bool log_is_ctl(unsigned char c)
 {
 	return c < 0x20 || c == 0x7f;
