@@ -2939,6 +2939,24 @@ static int client_prot_eof(const struct gwp_conn_pair *gcp)
 	return -ECONNRESET;
 }
 
+/*
+ * Keep EPOLLOUT on the client exactly while part of a reply to it is still
+ * pending, so a short send is finished by handle_ev_client_prot_out() (or,
+ * past the handshake, by handle_ev_client()).
+ */
+static int arm_client_prot_out(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	struct epoll_event evl;
+
+	if (likely(!adj_epl_out(&gcp->target, &gcp->client)))
+		return 0;
+
+	pr_dbg(&w->ctx->lh, "Handling short send on client prot data");
+	evl.events = gcp->client.ep_mask;
+	evl.data.u64 = PTR_TO_U64(gcp) | EV_BIT_CLIENT_PROT;
+	return __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_MOD, gcp->client.fd, &evl);
+}
+
 static int handle_ev_client_prot_in(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	uint32_t from = gcp->client.len;
@@ -2994,6 +3012,16 @@ static int handle_ev_client_prot_in(struct gwp_wrk *w, struct gwp_conn_pair *gcp
 			return (int)ret;
 	}
 
+	/*
+	 * A reply the socket did not take whole must not wait for the client
+	 * to send again: it is likely waiting for that very reply.
+	 */
+	if (!r) {
+		r = arm_client_prot_out(w, gcp);
+		if (unlikely(r))
+			return r;
+	}
+
 	/* A TLS client's last records and its FIN can come in one recv(). */
 	if (!r && unlikely(gcp->client.rd_eof))
 		r = client_prot_eof(gcp);
@@ -3002,25 +3030,13 @@ static int handle_ev_client_prot_in(struct gwp_wrk *w, struct gwp_conn_pair *gcp
 
 static int handle_ev_client_prot_out(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
-	struct epoll_event evl;
 	ssize_t ret;
-	int r;
 
 	ret = __do_send(&gcp->target, &gcp->client);
 	if (ret < 0)
 		return (int)ret;
 
-	if (likely(!adj_epl_out(&gcp->target, &gcp->client)))
-		return 0;
-
-	pr_dbg(&w->ctx->lh, "Handling short send on client prot data");
-	evl.events = gcp->client.ep_mask;
-	evl.data.u64 = PTR_TO_U64(gcp) | EV_BIT_CLIENT_PROT;
-	r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_MOD, gcp->client.fd, &evl);
-	if (unlikely(r))
-		return r;
-
-	return 0;
+	return arm_client_prot_out(w, gcp);
 }
 
 /*
