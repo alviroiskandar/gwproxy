@@ -164,6 +164,17 @@ _reap_stale_ports()
 
 # Print a free TCP port that is bindable on the IPv4/IPv6 dual stack, so it is
 # also free for a plain 127.0.0.1 or [::1] bind, and reserve it for this test.
+#
+# The number is drawn from outside the kernel's ephemeral port range
+# (net.ipv4.ip_local_port_range), never from bind(0). A reservation only
+# keeps other pick_port() callers off the number: the port itself stays
+# unbound until its test binds it. Everything that lets the kernel choose a
+# port -- the helpers that bind port 0 (start_udp_echo, closed_port, many of
+# t/servers/) and every outgoing connection -- gets one from the ephemeral
+# range, unaware of the reservations. Were the reserved number from that
+# range too, such a socket could take it before its test binds it, and the
+# test would fail to bind its server or end up talking to the other socket.
+# Outside that range the kernel never hands the number out on its own.
 pick_port()
 {
 	local port owner i
@@ -175,14 +186,33 @@ pick_port()
 
 	for i in $(seq 1 100); do
 		port="$(python3 - <<-'PY'
-		import socket
+		import random, socket
+		lo, hi = 32768, 60999
+		try:
+		    with open("/proc/sys/net/ipv4/ip_local_port_range") as f:
+		        lo, hi = map(int, f.read().split())
+		except (OSError, ValueError):
+		    pass
+		# Below the ephemeral range, clear of the low ports services
+		# tend to use, else above it; with no room on either side, let
+		# the kernel choose, racy as that is.
+		if lo - 10000 >= 1000:
+		    port = random.randint(10000, lo - 1)
+		elif 65535 - hi >= 1000:
+		    port = random.randint(hi + 1, 65535)
+		else:
+		    port = 0
 		s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
 		s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
-		s.bind(("", 0))
+		try:
+		    s.bind(("", port))
+		except OSError:
+		    raise SystemExit	# taken: print nothing, try another
 		print(s.getsockname()[1])
 		s.close()
 		PY
 		)"
+		[ -n "$port" ] || continue
 		# No usable reservation directory: fall back to the bare probe.
 		if [ ! -w "$_PORT_DIR" ]; then
 			echo "$port"
