@@ -29,7 +29,7 @@ require python3
 op="$(pick_port)"
 python3 "$SERVERS_DIR/sized_close_origin.py" "$op" >"$WORK/origin.log" 2>&1 &
 _PIDS+=("$!")
-wait_listen "$op" || fail "origin did not start on $op"
+wait_listen "$op" "$!" || fail "origin did not start on $op"
 
 for loop in epoll io_uring; do
 	[ "$loop" = io_uring ] && ! grep -q CONFIG_IO_URING "$ROOT/config.h" 2>/dev/null && continue

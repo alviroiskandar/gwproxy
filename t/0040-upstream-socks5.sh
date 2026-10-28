@@ -54,7 +54,7 @@ for scheme in socks5 socks5h; do
 	python3 "$SERVERS_DIR/recording_proxy.py" socks5 127.0.0.1 "$rp" "$rlog" \
 		>"$WORK/rec.$scheme.err" 2>&1 &
 	_PIDS+=("$!")
-	wait_listen "$rp" || fail "recording upstream did not listen"
+	wait_listen "$rp" "$!" || fail "recording upstream did not listen"
 
 	fp="$(pick_port)"
 	gwp_start "127.0.0.1:$fp" --as-socks5=1 --nr-workers=2 \

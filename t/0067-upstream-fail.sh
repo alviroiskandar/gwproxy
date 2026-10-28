@@ -79,19 +79,19 @@ upstream()
 stp="$(pick_port)"
 upstream "$stp" stall >"$WORK/stall.log" 2>&1 &
 _PIDS+=("$!")
-wait_listen "$stp" || fail "stalling upstream did not start on $stp"
+wait_listen "$stp" "$!" || fail "stalling upstream did not start on $stp"
 slp="$(pick_port)"
 upstream "$slp" silent >"$WORK/silent.log" 2>&1 &
 _PIDS+=("$!")
-wait_listen "$slp" || fail "silent upstream did not start on $slp"
+wait_listen "$slp" "$!" || fail "silent upstream did not start on $slp"
 hsp="$(pick_port)"
 upstream "$hsp" hstall >"$WORK/hstall.log" 2>&1 &
 _PIDS+=("$!")
-wait_listen "$hsp" || fail "stalling HTTP upstream did not start on $hsp"
+wait_listen "$hsp" "$!" || fail "stalling HTTP upstream did not start on $hsp"
 rfp="$(pick_port)"
 upstream "$rfp" refuse >"$WORK/refuse.log" 2>&1 &
 _PIDS+=("$!")
-wait_listen "$rfp" || fail "refusing upstream did not start on $rfp"
+wait_listen "$rfp" "$!" || fail "refusing upstream did not start on $rfp"
 
 # probe <port> <pid> [socks5]: connect, with "socks5" also make a SOCKS5
 # CONNECT request, and wait for the proxy to close us. Prints

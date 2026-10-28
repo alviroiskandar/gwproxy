@@ -164,6 +164,17 @@ _reap_stale_ports()
 
 # Print a free TCP port that is bindable on the IPv4/IPv6 dual stack, so it is
 # also free for a plain 127.0.0.1 or [::1] bind, and reserve it for this test.
+#
+# The number is drawn from outside the kernel's ephemeral port range
+# (net.ipv4.ip_local_port_range), never from bind(0). A reservation only
+# keeps other pick_port() callers off the number: the port itself stays
+# unbound until its test binds it. Everything that lets the kernel choose a
+# port -- the helpers that bind port 0 (start_udp_echo, closed_port, many of
+# t/servers/) and every outgoing connection -- gets one from the ephemeral
+# range, unaware of the reservations. Were the reserved number from that
+# range too, such a socket could take it before its test binds it, and the
+# test would fail to bind its server or end up talking to the other socket.
+# Outside that range the kernel never hands the number out on its own.
 pick_port()
 {
 	local port owner i
@@ -175,14 +186,33 @@ pick_port()
 
 	for i in $(seq 1 100); do
 		port="$(python3 - <<-'PY'
-		import socket
+		import random, socket
+		lo, hi = 32768, 60999
+		try:
+		    with open("/proc/sys/net/ipv4/ip_local_port_range") as f:
+		        lo, hi = map(int, f.read().split())
+		except (OSError, ValueError):
+		    pass
+		# Below the ephemeral range, clear of the low ports services
+		# tend to use, else above it; with no room on either side, let
+		# the kernel choose, racy as that is.
+		if lo - 10000 >= 1000:
+		    port = random.randint(10000, lo - 1)
+		elif 65535 - hi >= 1000:
+		    port = random.randint(hi + 1, 65535)
+		else:
+		    port = 0
 		s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
 		s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
-		s.bind(("", 0))
+		try:
+		    s.bind(("", port))
+		except OSError:
+		    raise SystemExit	# taken: print nothing, try another
 		print(s.getsockname()[1])
 		s.close()
 		PY
 		)"
+		[ -n "$port" ] || continue
 		# No usable reservation directory: fall back to the bare probe.
 		if [ ! -w "$_PORT_DIR" ]; then
 			echo "$port"
@@ -216,17 +246,47 @@ _release_ports()
 	return 0
 }
 
-# wait_listen <port> [pid]: wait until something is listening on <port>, or
-# until <pid> (if given) exits. Returns 0 on success, 1 on timeout/exit.
+# _pid_tree <pid>: print <pid> and all its descendants, one per line.
+_pid_tree()
+{
+	local c
+
+	echo "$1"
+	for c in $(ps -o pid= --ppid "$1" 2>/dev/null); do
+		_pid_tree "$c"
+	done
+}
+
+# wait_listen <port> <pid>: wait until <pid>, or a process below it (a server
+# started through a shell function or a wrapper), listens on TCP <port>.
+# Returns 0 once it does, 1 when <pid> exits or after 10s.
+#
+# Something listening on <port> is not enough: if the server failed to bind
+# because another socket holds the port, that socket would satisfy the wait
+# and the test would go on to talk to it. So the listener has to be <pid>'s,
+# as ss -p reports it. ss can name the owner only of our own processes (or
+# of any, as root); for one we cannot see into -- a server started through
+# "sudo -n" -- any listener is taken, as before.
 wait_listen()
 {
-	local port="$1" pid="${2:-}" i
+	local port="$1" pid="${2:-}" i p owned users
+
+	[ -n "$pid" ] || fail "wait_listen: no pid given for port $port"
 	for i in $(seq 1 100); do
-		if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
-			return 1
-		fi
-		if ss -ltnH "sport = :$port" 2>/dev/null | grep -q .; then
-			return 0
+		# Not kill -0 alone: where sudo runs the command with the real
+		# uid set to root, it fails with EPERM while the server runs.
+		kill -0 "$pid" 2>/dev/null || [ -e "/proc/$pid" ] || return 1
+		# Asked each time: right after "sudo ... &" the pid is still our
+		# own forked shell, until it execs sudo and becomes root's.
+		owned=1
+		[ "$(id -u)" = 0 ] || [ -O "/proc/$pid" ] || owned=0
+		if [ "$owned" = 0 ]; then
+			ss -ltnH "sport = :$port" 2>/dev/null | grep -q . && return 0
+		else
+			users="$(ss -ltnpH "sport = :$port" 2>/dev/null)"
+			for p in $(_pid_tree "$pid"); do
+				case "$users" in *"pid=$p,"*) return 0 ;; esac
+			done
 		fi
 		sleep 0.1
 	done

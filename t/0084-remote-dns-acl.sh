@@ -24,7 +24,7 @@ rlog="$WORK/rec.log"
 python3 "$SERVERS_DIR/recording_proxy.py" socks5 127.0.0.1 "$rp" "$rlog" \
 	>"$WORK/rec.err" 2>&1 &
 _PIDS+=("$!")
-wait_listen "$rp" || fail "recording upstream did not listen"
+wait_listen "$rp" "$!" || fail "recording upstream did not listen"
 
 # probe <proxy_port> <name> [dst_port]
 probe() {

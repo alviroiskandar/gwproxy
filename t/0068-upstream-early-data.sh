@@ -36,7 +36,7 @@ while True:
     threading.Thread(target=h, args=(c,), daemon=True).start()
 PY
 _PIDS+=("$!")
-wait_listen "$op" || fail "origin did not start on $op"
+wait_listen "$op" "$!" || fail "origin did not start on $op"
 
 # A slow SOCKS5 upstream: every reply arrives in two halves, 0.3 s apart.
 up="$(pick_port)"
@@ -90,7 +90,7 @@ while True:
     threading.Thread(target=h, args=(c,), daemon=True).start()
 PY
 _PIDS+=("$!")
-wait_listen "$up" || fail "upstream did not start on $up"
+wait_listen "$up" "$!" || fail "upstream did not start on $up"
 
 # probe <port> <half>: send "hel" at once and "lo" 0.15 s later, in the middle
 # of the upstream's first pause (then SHUT_WR when <half> is 1), and print

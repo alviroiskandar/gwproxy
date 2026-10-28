@@ -61,7 +61,7 @@ count_redirect()
 $SUDO "$GWPROXY" --as-transparent=1 --mark="$MARK" --bind="127.0.0.1:$pp" \
 	--acl-allow-all --nr-workers=1 --log-level=3 >"$WORK/gwp.log" 2>&1 &
 PRIV_PID=$!
-wait_listen "$pp" \
+wait_listen "$pp" "$PRIV_PID" \
 	|| { sed 's/^/# gwp: /' "$WORK/gwp.log" >&2; fail "gwproxy did not listen on $pp"; }
 
 before="$(count_redirect)"
@@ -93,7 +93,7 @@ for loop in epoll io_uring; do
 		--event-loop="$loop" --acl-allow-all --nr-workers=1 \
 		--log-level=3 >"$WORK/direct.$loop.log" 2>&1 &
 	PRIV_PID=$!
-	wait_listen "$dp" \
+	wait_listen "$dp" "$PRIV_PID" \
 		|| { sed 's/^/# gwp: /' "$WORK/direct.$loop.log" >&2; fail "[$loop] gwproxy did not listen on $dp"; }
 
 	got="$(python3 - "$dp" <<'PY'

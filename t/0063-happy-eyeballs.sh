@@ -83,6 +83,7 @@ class H(http.server.BaseHTTPRequestHandler):
     def log_message(*a): pass
 socketserver.TCPServer.allow_reuse_address = True
 socketserver.TCPServer(('127.0.0.9', $op), H).serve_forever()" >/dev/null 2>&1 &
+origin_pid=$!
 
 # The black hole: smallest backlog, then fill the accept queue so further SYNs
 # are dropped and connect() sits in SYN_SENT instead of being refused.
@@ -96,8 +97,19 @@ for _ in range(16):
     try: c.connect_ex(('127.0.0.8', $op))
     except OSError: pass
     f.append(c)
-while True: time.sleep(3600)" >/dev/null 2>&1 &
-sleep 1.5
+print('READY', flush=True)
+while True: time.sleep(3600)" >"$WORK/blackhole.out" 2>&1 &
+bh_pid=$!
+
+# Both listen on port $op, so only the pid tells whose listener ss sees. The
+# black hole is ready once its queue is full, which it reports.
+wait_listen "$op" "$origin_pid" || { echo "origin did not listen"; exit 1; }
+for i in $(seq 1 100); do
+	grep -q '^READY' "$WORK/blackhole.out" 2>/dev/null && break
+	kill -0 "$bh_pid" 2>/dev/null || break
+	sleep 0.1
+done
+grep -q '^READY' "$WORK/blackhole.out" || { echo "black hole did not start"; exit 1; }
 
 # The resolver decides the order (RFC 6724), so only run the cases whose bad
 # address really is tried first -- otherwise the test proves nothing.
@@ -129,7 +141,7 @@ for loop in epoll io_uring; do
 			--acl-allow-all --event-loop="$loop" --connect-timeout=10 \
 			>/dev/null 2>&1 &
 		gwp_pid=$!
-		sleep 1
+		wait_listen "$pp" "$gwp_pid" || { echo "[$loop] gwproxy did not listen on $pp"; exit 1; }
 		set -- $(fetch "$pp" he-refused)
 		echo "[$loop] refused-first: code=$1 elapsed=$2"
 		kill "$gwp_pid" 2>/dev/null
@@ -146,7 +158,7 @@ for loop in epoll io_uring; do
 			--acl-allow-all --event-loop="$loop" --connect-timeout=10 \
 			--connect-attempt-delay=250 >/dev/null 2>&1 &
 		gwp_pid=$!
-		sleep 1
+		wait_listen "$pp" "$gwp_pid" || { echo "[$loop] gwproxy did not listen on $pp"; exit 1; }
 		set -- $(fetch "$pp" he-blackhole)
 		echo "[$loop] blackhole-first: code=$1 elapsed=$2"
 		kill "$gwp_pid" 2>/dev/null
@@ -174,7 +186,7 @@ for loop in epoll io_uring; do
 			--acl-file="$WORK/mixed.acl" --event-loop="$loop" \
 			--connect-timeout=10 >/dev/null 2>&1 &
 		gwp_pid=$!
-		sleep 1
+		wait_listen "$pp" "$gwp_pid" || { echo "[$loop] gwproxy did not listen on $pp"; exit 1; }
 		rep=$(python3 "$ROOT/t/servers/socks5_probe.py" \
 			--atyp domain --dst he-refused "$pp" "$op")
 		echo "[$loop] refused-then-denied: $rep"

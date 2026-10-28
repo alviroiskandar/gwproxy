@@ -237,7 +237,7 @@ for loop in epoll io_uring; do
 	python3 "$SERVERS_DIR/peer_addr.py" 127.0.0.1 "$pa" \
 		>"$WORK/peer.log" 2>&1 &
 	_PIDS+=("$!")
-	wait_listen "$pa" || fail "$loop peer_addr server did not listen"
+	wait_listen "$pa" "$!" || fail "$loop peer_addr server did not listen"
 	printf -- '%s\n' '-A OUTPUT -j BIND --to-source 127.0.0.2' \
 		'-P OUTPUT ACCEPT' >"$WORK/bind.acl"
 	bpp="$(pick_port)"
