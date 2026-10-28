@@ -223,8 +223,9 @@ static void arm_stop_poll(struct gwp_wrk *w)
 }
 
 /*
- * accept() is paused because of fd exhaustion (EMFILE/ENFILE): arm a short
- * one-shot timer and retry the accept when it fires (see handle_ev_accept()).
+ * accept() is paused because of fd exhaustion (EMFILE/ENFILE), or because it
+ * keeps failing the same way (see handle_ev_accept()): arm a short one-shot
+ * timer and retry the accept when it fires.
  * Polling this way decouples recovery from connection-teardown timing, so the
  * worker can never get permanently stuck with accepting disabled.
  */
@@ -1277,6 +1278,27 @@ static int handle_ev_accept(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 				pr_warn(&w->ctx->lh,
 					"Too many open files, pausing accept (tidx=%u)",
 					w->idx);
+			}
+			arm_accept_retry(w);
+			return 0;
+		}
+
+		/*
+		 * Errors that come back the same at once if accept is simply
+		 * re-armed: the kernel is short of socket memory (ENOBUFS), or
+		 * a security module refuses the connection (EPERM, EACCES),
+		 * which leaves it at the head of the backlog for the next
+		 * accept to be refused again. Re-arming at once spins the
+		 * worker and floods the log; pause on the retry timer instead,
+		 * logged once until an accept succeeds.
+		 */
+		if (cqe->res < 0 &&
+		    (r == -ENOBUFS || r == -EPERM || r == -EACCES)) {
+			if (!w->accept_is_stopped) {
+				w->accept_is_stopped = true;
+				pr_warn(&w->ctx->lh,
+					"Failed to accept new connection: %s, pausing accept (tidx=%u)",
+					strerror(-r), w->idx);
 			}
 			arm_accept_retry(w);
 			return 0;
