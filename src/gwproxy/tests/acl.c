@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <errno.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
@@ -1255,6 +1256,50 @@ static void test_empty_chain_policy(void)
 	free(path);
 }
 
+/*
+ * A NUL byte in the rule file must refuse the file, at creation and on
+ * reload, rather than end it there and drop every rule after it.
+ */
+static void test_file_nul(void)
+{
+	static const char nul_rules[] =
+		"-A OUTPUT -d 192.0.2.1 -j ACCEPT\n"
+		"\0"
+		"-P OUTPUT REJECT\n";
+	struct gwp_sockaddr t = sa4("93.184.216.34", 80);
+	struct gwp_acl *a;
+	char *path;
+	int fd;
+
+	path = write_tmp_rules("");
+	fd = open(path, O_WRONLY | O_TRUNC);
+	assert(fd >= 0);
+	assert(write(fd, nul_rules, sizeof(nul_rules) - 1) ==
+	       (ssize_t)sizeof(nul_rules) - 1);
+	close(fd);
+	assert(gwp_acl_create(&a, path) == -EINVAL);
+
+	fd = open(path, O_WRONLY | O_TRUNC);
+	assert(fd >= 0);
+	assert(write(fd, "-P OUTPUT REJECT\n", 17) == 17);
+	close(fd);
+	assert(!gwp_acl_create(&a, path));
+	assert(out(a, &t, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+
+	/* A reload that meets a NUL keeps the old rules. */
+	fd = open(path, O_WRONLY | O_TRUNC);
+	assert(fd >= 0);
+	assert(write(fd, nul_rules, sizeof(nul_rules) - 1) ==
+	       (ssize_t)sizeof(nul_rules) - 1);
+	close(fd);
+	assert(gwp_acl_reload(a) == -EINVAL);
+	assert(out(a, &t, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+
+	gwp_acl_destroy(a);
+	unlink(path);
+	free(path);
+}
+
 static void run_tests(void)
 {
 	size_t i;
@@ -1264,6 +1309,7 @@ static void run_tests(void)
 	test_reload_under_readers();
 	test_generation();
 	test_empty_chain_policy();
+	test_file_nul();
 
 	for (i = 0; i < 200; i++) {
 		test_default_ruleset();

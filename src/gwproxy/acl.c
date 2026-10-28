@@ -1220,9 +1220,28 @@ static int read_file(const char *path, char **out)
 		return -ENOMEM;
 	}
 
-	rd = fread(buf, 1, (size_t)sz, fp);
-	buf[rd] = '\0';
+	/*
+	 * The text is parsed as a C string, so a NUL byte would silently end
+	 * the file there and drop every rule after it. And a file that is
+	 * shorter or longer than its size said was changed while being read:
+	 * what was read is not the whole of any version of it. Refuse both
+	 * rather than load a partial rule set. Asking for one byte more than
+	 * the size is what notices a file that grew.
+	 */
+	rd = fread(buf, 1, (size_t)sz + 1, fp);
+	if (ferror(fp) || rd != (size_t)sz) {
+		fprintf(stderr, "acl: %s: changed while being read\n", path);
+		free(buf);
+		fclose(fp);
+		return -EIO;
+	}
 	fclose(fp);
+	if (memchr(buf, '\0', rd)) {
+		fprintf(stderr, "acl: %s: contains a NUL byte\n", path);
+		free(buf);
+		return -EINVAL;
+	}
+	buf[rd] = '\0';
 	*out = buf;
 	return 0;
 }
