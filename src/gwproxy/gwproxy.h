@@ -15,6 +15,7 @@
 #include <gwproxy/http.h>
 #include <gwproxy/dns.h>
 #include <gwproxy/acl.h>
+#include <gwproxy/iplimit.h>
 #include <gwproxy/log.h>
 #include <assert.h>
 #include <stdatomic.h>
@@ -76,6 +77,11 @@ struct gwp_cfg {
 	 * many seconds; 0 keeps them for as long as both ends do.
 	 */
 	int		idle_timeout;
+	/*
+	 * Most client connections held at once per client address (IPv4) or
+	 * /64 (IPv6), see iplimit.h; 0 for no cap.
+	 */
+	int		max_conns_per_ip;
 	/*
 	 * Happy Eyeballs Connection Attempt Delay in milliseconds (RFC 8305
 	 * Section 5): how long before the next candidate address joins the
@@ -393,6 +399,11 @@ enum {
 	 * retries from that list, so it never logs a retry and needs no flag.
 	 */
 	GWP_CONN_FLAG_FD_WAIT		= (1ull << 4ull),
+	/*
+	 * The client is counted in gwp_ctx::iplim, so freeing the pair must
+	 * uncount it (gwp_ctx_iplim_put()).
+	 */
+	GWP_CONN_FLAG_IPLIM		= (1ull << 5ull),
 };
 
 enum {
@@ -813,6 +824,9 @@ struct gwp_ctx {
 	 * not the built-in default rules. */
 	struct gwp_acl			*acl;
 	bool				acl_watched;
+	/* Client connections per address, for --max-conns-per-ip; NULL when
+	 * there is no cap, so the accept path costs nothing then. */
+	struct gwp_iplim		*iplim;
 	_Atomic(int32_t)		nr_fd_closed;
 	_Atomic(int32_t)		nr_accept_stopped;
 	/* The workers' stop doorbells have been rung (io_uring). */
@@ -820,6 +834,8 @@ struct gwp_ctx {
 };
 
 struct gwp_conn_pair *gwp_alloc_conn_pair(struct gwp_wrk *w);
+bool gwp_ctx_iplim_get(struct gwp_wrk *w, const struct gwp_sockaddr *addr);
+void gwp_ctx_iplim_put(struct gwp_ctx *ctx, const struct gwp_sockaddr *addr);
 int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 int gwp_create_sock_target(struct gwp_wrk *w, struct gwp_sockaddr *addr,
 			   const struct gwp_conn_sockopt *so,

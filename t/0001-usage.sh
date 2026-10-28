@@ -51,7 +51,8 @@ expect_reject "missing --target and proxy mode" --bind="127.0.0.1:$(pick_port)"
 for bad in --nr-workers=2x --nr-workers=1025 --nr-dns-workers=-1 \
 	   --protocol-timeout=99999999999 --connect-timeout= \
 	   --tcp-nodelay=yes --idle-timeout=10s --mark=-1 \
-	   --mark=0x100000000 --client-buf-size=64k; do
+	   --mark=0x100000000 --client-buf-size=64k \
+	   --max-conns-per-ip=-1 --max-conns-per-ip=3x; do
 	expect_reject "bad numeric argument $bad" --as-socks5=1 \
 		--bind="127.0.0.1:$(pick_port)" --nr-workers=1 "$bad"
 done

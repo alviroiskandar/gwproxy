@@ -56,6 +56,7 @@ enum {
 	OPT_DNS_CACHE_MAX_ENTRIES,
 	OPT_IDLE_TIMEOUT,
 	OPT_UPSTREAM_AUTH_FILE,
+	OPT_MAX_CONNS_PER_IP,
 };
 
 /*
@@ -85,6 +86,7 @@ static const struct option long_opts[] = {
 	{ "nr-dns-workers",	required_argument,	NULL,	'W' },
 	{ "connect-timeout",	required_argument,	NULL,	'c' },
 	{ "idle-timeout",	required_argument,	NULL,	OPT_IDLE_TIMEOUT },
+	{ "max-conns-per-ip",	required_argument,	NULL,	OPT_MAX_CONNS_PER_IP },
 	{ "connect-attempt-delay", required_argument,	NULL,	'D' },
 	{ "target-buf-size",	required_argument,	NULL,	'T' },
 	{ "client-buf-size",	required_argument,	NULL,	'C' },
@@ -185,6 +187,8 @@ static void show_help(const char *app)
 	printf("                                  More are started while lookups queue up, up to 64.\n");
 	printf("  -c, --connect-timeout=sec       Connection to target timeout in seconds (default: %d)\n", default_opts.connect_timeout);
 	printf("      --idle-timeout=sec          Close a tunnel or UDP association idle this long; 0 = never (default: %d)\n", default_opts.idle_timeout);
+	printf("      --max-conns-per-ip=nr       Most client connections at once per IPv4 address or IPv6 /64; 0 = no cap (default: %d)\n", default_opts.max_conns_per_ip);
+	printf("                                  One more is closed as soon as it is accepted.\n");
 	printf("  -D, --connect-attempt-delay=ms  Delay before racing the next target address (Happy Eyeballs); 0 disables racing (default: %d)\n", default_opts.connect_attempt_delay);
 	printf("  -T, --target-buf-size=nr        Target buffer size in bytes (default: %d)\n", default_opts.target_buf_size);
 	printf("  -C, --client-buf-size=nr        Client buffer size in bytes (default: %d)\n", default_opts.client_buf_size);
@@ -458,6 +462,10 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 				goto einval;
 			if (cfg->idle_timeout < 0)
 				cfg->idle_timeout = 0;
+			break;
+		case OPT_MAX_CONNS_PER_IP:
+			if (opt_int(c, optarg, 0, INT_MAX, &cfg->max_conns_per_ip))
+				goto einval;
 			break;
 		case 'D':
 			if (opt_int(c, optarg, INT_MIN, INT_MAX, &cfg->connect_attempt_delay))
@@ -1109,6 +1117,8 @@ static void gwp_ctx_free_thread_sock_pairs(struct gwp_wrk *w)
 			continue;
 
 		log_conn_pair_close(w, gcp);
+		if (gcp->flags & GWP_CONN_FLAG_IPLIM)
+			gwp_ctx_iplim_put(w->ctx, &gcp->client_addr);
 		free_conn(&gcp->target);
 		free_conn(&gcp->client);
 		if (gcp->timer_fd >= 0)
@@ -1602,6 +1612,83 @@ static void gwp_ctx_free_acl(struct gwp_ctx *ctx)
 	gwp_acl_destroy(ctx->acl);
 	ctx->acl = NULL;
 	ctx->acl_watched = false;
+}
+
+/*
+ * --max-conns-per-ip: the count of client connections per address, shared by
+ * every worker. Left NULL without a cap, which is what the accept paths test.
+ */
+static int gwp_ctx_init_iplim(struct gwp_ctx *ctx)
+{
+	int max = ctx->cfg.max_conns_per_ip;
+
+	ctx->iplim = NULL;
+	if (max <= 0)
+		return 0;
+
+	ctx->iplim = gwp_iplim_create((uint32_t)max);
+	if (!ctx->iplim) {
+		pr_err(&ctx->lh, "Failed to allocate the --max-conns-per-ip table");
+		return -ENOMEM;
+	}
+	pr_info(&ctx->lh, "Allowing at most %d connections per client IPv4 address or IPv6 /64",
+		max);
+	return 0;
+}
+
+static void gwp_ctx_free_iplim(struct gwp_ctx *ctx)
+{
+	gwp_iplim_destroy(ctx->iplim);
+	ctx->iplim = NULL;
+}
+
+/*
+ * Count a client just accepted from @addr against --max-conns-per-ip, before
+ * anything is read from it or set up for it. Returns false when it is over
+ * the cap (logged at most once a second per address, so a flood of them
+ * cannot flood the log) or cannot be counted, and must be closed; true when
+ * it was counted, and its pair must then carry GWP_CONN_FLAG_IPLIM. Only
+ * called with a cap (gwp_ctx::iplim set).
+ */
+bool gwp_ctx_iplim_get(struct gwp_wrk *w, const struct gwp_sockaddr *addr)
+{
+	struct gwp_ctx *ctx = w->ctx;
+	struct gwp_iplim_key key;
+	uint32_t quiet = 0;
+	int r;
+
+	gwp_iplim_key(addr, &key);
+	r = gwp_iplim_get(ctx->iplim, &key, w->now, &quiet);
+	if (likely(r == GWP_IPLIM_ADMIT))
+		return true;
+
+	if (r == GWP_IPLIM_REFUSE_LOG) {
+		const char *grp = addr->sa.sa_family == AF_INET6 &&
+			!IN6_IS_ADDR_V4MAPPED(&addr->i6.sin6_addr) ?
+			"/64" : "address";
+
+		if (quiet)
+			pr_warn(&ctx->lh, "Refused client %s: its %s is at the --max-conns-per-ip limit of %d (and %u more refused since the last such line)",
+				ip_to_str(addr), grp,
+				ctx->cfg.max_conns_per_ip, quiet);
+		else
+			pr_warn(&ctx->lh, "Refused client %s: its %s is at the --max-conns-per-ip limit of %d",
+				ip_to_str(addr), grp,
+				ctx->cfg.max_conns_per_ip);
+	} else if (r < 0) {
+		pr_err(&ctx->lh, "Refused client %s: no memory to count its connections",
+		       ip_to_str(addr));
+	}
+	return false;
+}
+
+/* Uncount a client gwp_ctx_iplim_get() admitted. */
+void gwp_ctx_iplim_put(struct gwp_ctx *ctx, const struct gwp_sockaddr *addr)
+{
+	struct gwp_iplim_key key;
+
+	gwp_iplim_key(addr, &key);
+	gwp_iplim_put(ctx->iplim, &key);
 }
 
 /*
@@ -2500,9 +2587,13 @@ static int gwp_ctx_init(struct gwp_ctx *ctx)
 	if (r < 0)
 		goto out_free_prot;
 
-	r = gwp_ctx_init_reload(ctx);
+	r = gwp_ctx_init_iplim(ctx);
 	if (r < 0)
 		goto out_free_acl;
+
+	r = gwp_ctx_init_reload(ctx);
+	if (r < 0)
+		goto out_free_iplim;
 
 	r = gwp_ctx_init_dns(ctx);
 	if (r < 0)
@@ -2520,6 +2611,8 @@ out_free_dns:
 	gwp_ctx_free_dns(ctx);
 out_free_reload:
 	gwp_ctx_free_reload(ctx);
+out_free_iplim:
+	gwp_ctx_free_iplim(ctx);
 out_free_acl:
 	gwp_ctx_free_acl(ctx);
 out_free_prot:
@@ -2546,6 +2639,7 @@ static void gwp_ctx_free(struct gwp_ctx *ctx)
 	gwp_ctx_free_threads(ctx);
 	gwp_ctx_free_dns(ctx);
 	gwp_ctx_free_reload(ctx);
+	gwp_ctx_free_iplim(ctx);
 	gwp_ctx_free_acl(ctx);
 	gwp_ctx_free_prot(ctx);
 	gwp_ctx_free_tls(ctx);
@@ -2711,6 +2805,13 @@ int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		return -EINVAL;
 
 	log_conn_pair_close(w, gcp);
+
+	/*
+	 * Every way a client goes away ends here (or, at shutdown, in
+	 * gwp_ctx_free_thread_sock_pairs()), so the count cannot leak.
+	 */
+	if (gcp->flags & GWP_CONN_FLAG_IPLIM)
+		gwp_ctx_iplim_put(w->ctx, &gcp->client_addr);
 
 	if (gcp->flags & GWP_CONN_FLAG_NO_CLOSE_FD)
 		gcp->target.fd = gcp->client.fd = gcp->timer_fd = gcp->udp_fd = -1;

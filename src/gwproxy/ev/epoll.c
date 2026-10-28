@@ -919,15 +919,25 @@ static int __handle_ev_accept(struct gwp_wrk *w)
 		return 0;
 	}
 
+	/* --max-conns-per-ip: likewise before anything is read or set up. */
+	if (unlikely(ctx->iplim) && !gwp_ctx_iplim_get(w, &addr)) {
+		__sys_close(fd);
+		return 0;
+	}
+
 	gcp = gwp_alloc_conn_pair(w);
 	if (unlikely(!gcp)) {
 		pr_err(&ctx->lh, "Failed to allocate connection pair on accept");
+		if (ctx->iplim)
+			gwp_ctx_iplim_put(ctx, &addr);
 		__sys_close(fd);
 		return handle_accept_error(w, -ENOMEM);
 	}
 
 	gcp->client_addr = addr;
 	gcp->client.fd = fd;
+	if (ctx->iplim)
+		gcp->flags |= GWP_CONN_FLAG_IPLIM;
 
 	if (cfg->as_transparent) {
 		r = gwp_get_orig_dst(fd, &gcp->client_addr, &gcp->target_addr);
