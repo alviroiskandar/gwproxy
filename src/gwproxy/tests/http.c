@@ -1056,6 +1056,48 @@ static void test_upstream_reply(void)
 	PRTEST_OK();
 }
 
+/*
+ * The upstream CONNECT request carries the credentials as a Basic
+ * Proxy-Authorization header. The URL parser accepts up to 255 bytes each
+ * of user and password, so the longest pair must still build.
+ */
+static void test_upstream_connect(void)
+{
+	static const char hdr[] = "Proxy-Authorization: Basic ";
+	static const char small[] =
+		"CONNECT example.com:443 HTTP/1.1\r\n"
+		"Host: example.com:443\r\n"
+		"Proxy-Authorization: Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==\r\n"
+		"\r\n";
+	char user[255], pass[255], out[2048];
+	const char *p;
+	size_t len, i;
+	int r;
+
+	r = gwp_http_cli_build_connect("example.com:443", "Aladdin", 7,
+				       "open sesame", 11, out, sizeof(out),
+				       &len);
+	assert(r == 0);
+	assert(len == strlen(small));
+	assert(!memcmp(out, small, len));
+
+	memset(user, 'u', sizeof(user));
+	memset(pass, 'p', sizeof(pass));
+	r = gwp_http_cli_build_connect("h:1", user, sizeof(user), pass,
+				       sizeof(pass), out, sizeof(out), &len);
+	assert(r == 0);
+	/* base64 of 255 + 1 + 255 = 511 bytes is 684 characters. */
+	assert(len == strlen("CONNECT h:1 HTTP/1.1\r\nHost: h:1\r\n") +
+		      strlen(hdr) + 684 + 2 + 2);
+	p = memmem(out, len, hdr, strlen(hdr));
+	assert(p);
+	p += strlen(hdr);
+	for (i = 0; i < 684; i++)
+		assert(p[i] != '\r' && p[i] != '\n');
+	assert(!memcmp(p + 684, "\r\n\r\n", 4));
+	PRTEST_OK();
+}
+
 static void test_auth(void)
 {
 	static const char no_cred[] =
@@ -1237,6 +1279,7 @@ int main(void)
 		test_header_limits();
 		test_auth();
 		test_upstream_reply();
+		test_upstream_connect();
 	}
 
 	/* Byte-by-byte feeding of 17 KiB headers: once is enough. */
