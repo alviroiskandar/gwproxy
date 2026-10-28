@@ -2122,11 +2122,11 @@ static void prep_udp_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 /*
  * A relay recvmsg completed. Decide direction by source (the same logic as the
  * epoll handle_ev_udp_relay): a datagram from the pinned client is unwrapped
- * and forwarded to its target; any other source is a target reply, wrapped and
- * sent to the client. A forwarded datagram issues one sendmsg and the relay
- * re-arms the recv only once that completes (handle_ev_udp_tx); a dropped
- * datagram re-arms the recv immediately. See the epoll handler for the design
- * limitations (stateless replies, same-family targets, no domain targets).
+ * and forwarded to its target; one from a target the client has sent to is a
+ * reply, wrapped and sent to the client. A forwarded datagram issues one sendmsg
+ * and the relay re-arms the recv only once that completes (handle_ev_udp_tx); a
+ * dropped datagram re-arms the recv immediately. See the epoll handler for the
+ * design limitations.
  */
 static int handle_ev_udp_relay(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			       struct io_uring_cqe *cqe)

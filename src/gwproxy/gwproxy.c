@@ -958,6 +958,7 @@ static void gwp_ctx_free_thread_sock_pairs(struct gwp_wrk *w)
 		gwp_conn_close_attempts(gcp);
 		gwp_conn_pair_drop_dns(w, gcp);
 		free(gcp->udp_iou);	/* io_uring relay scratch, else NULL */
+		free(gcp->udp_peers);
 
 		/*
 		 * s5_conn and http_conn share a union, so the protocol object
@@ -1565,6 +1566,121 @@ static bool udp_target_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 	c->dst = *target;
 	c->ok = ok;
 	return ok;
+}
+
+/*
+ * A UDP association relays replies only from targets its client has sent to,
+ * so a host that learns the relay port cannot inject datagrams the client
+ * never asked for. Each target goes into gcp->udp_peers once a datagram to
+ * it passes the OUTPUT chain, tagged with the ruleset generation of that
+ * verdict. Matching is by exact address and port, as a UDP "connection" is.
+ */
+static int udp_peer_find(const struct gwp_udp_peers *p,
+			 const struct gwp_sockaddr *a)
+{
+	uint8_t i;
+
+	/* Most associations talk to one target: try the last hit first. */
+	if (p->last < p->nr && gwp_sockaddr_eq(&p->addr[p->last], a))
+		return p->last;
+	for (i = 0; i < p->nr; i++) {
+		if (gwp_sockaddr_eq(&p->addr[i], a))
+			return i;
+	}
+	return -1;
+}
+
+/*
+ * The address a reply to a datagram sent to @a comes from. A datagram to the
+ * unspecified address (0.0.0.0 or ::) goes to the local host over loopback,
+ * so its answer comes from 127.0.0.1 or ::1. (Replies to a broadcast or
+ * multicast send come from unicast addresses and are not recognised.)
+ */
+static void udp_peer_canon(struct gwp_sockaddr *a)
+{
+	static const uint8_t v4_lo[4] = { 127, 0, 0, 1 };
+	static const uint8_t v4_any[4];
+	uint8_t *b = a->i6.sin6_addr.s6_addr;
+
+	if (a->sa.sa_family != AF_INET6)
+		return;
+	if (IN6_IS_ADDR_UNSPECIFIED(&a->i6.sin6_addr))
+		a->i6.sin6_addr = in6addr_loopback;
+	else if (IN6_IS_ADDR_V4MAPPED(&a->i6.sin6_addr) &&
+		 !memcmp(b + 12, v4_any, 4))
+		memcpy(b + 12, v4_lo, 4);
+}
+
+/* Record that the client sent to @dst, accepted at ACL generation @gen. */
+static bool udp_peer_note(struct gwp_conn_pair *gcp,
+			  const struct gwp_sockaddr *dst, uint32_t gen)
+{
+	struct gwp_udp_peers *p = gcp->udp_peers;
+	struct gwp_sockaddr ca = *dst, *a = &ca;
+	uint32_t age, oldest = 0;
+	uint8_t j;
+	int i;
+
+	udp_peer_canon(a);
+	if (unlikely(!p)) {
+		p = calloc(1, sizeof(*p));
+		if (unlikely(!p))
+			return false;
+		gcp->udp_peers = p;
+	}
+
+	i = udp_peer_find(p, a);
+	if (i < 0) {
+		if (p->nr < GWP_UDP_MAX_PEERS) {
+			i = p->nr++;
+		} else {
+			/* Full: reuse the least recently sent-to entry. */
+			for (i = 0, j = 0; j < p->nr; j++) {
+				age = p->next_seq - p->seq[j];
+				if (age > oldest) {
+					oldest = age;
+					i = j;
+				}
+			}
+		}
+		p->addr[i] = *a;
+	}
+	p->gen[i] = gen;
+	p->seq[i] = p->next_seq++;
+	p->last = (uint8_t)i;
+	return true;
+}
+
+/*
+ * May a datagram from @src be relayed to the client as a target's reply?
+ * Only if the client sent to @src, and the ACL still lets it do so: after a
+ * reload the OUTPUT verdict for @src is checked again (through the same
+ * per-association cache as the client's datagrams) before its replies flow.
+ */
+static bool udp_reply_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
+			      const struct gwp_sockaddr *src)
+{
+	struct gwp_udp_peers *p = gcp->udp_peers;
+	int i;
+
+	if (!p)
+		return false;
+	i = udp_peer_find(p, src);
+	if (i < 0)
+		return false;
+	p->last = (uint8_t)i;
+	if (ctx->acl && p->gen[i] != gwp_acl_generation(ctx->acl)) {
+		if (!udp_target_allowed(ctx, gcp, src)) {
+			/* Denied now: forget it until the client is let through. */
+			p->addr[i] = p->addr[p->nr - 1];
+			p->gen[i] = p->gen[p->nr - 1];
+			p->seq[i] = p->seq[p->nr - 1];
+			p->nr--;
+			return false;
+		}
+		p->gen[i] = gcp->udp_acl.gen;
+	}
+	return true;
 }
 
 bool gwp_ctx_acl_target_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp)
@@ -2318,6 +2434,7 @@ int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	if (gcp->udp_fd >= 0)
 		__sys_close(gcp->udp_fd);
 	gwp_conn_close_attempts(gcp);
+	free(gcp->udp_peers);
 
 	gwp_conn_pair_drop_dns(w, gcp);
 
@@ -3365,6 +3482,10 @@ enum gwp_udp_act gwp_udp_relay_classify(struct gwp_wrk *w,
 			return GWP_UDP_DROP;	/* wrong family for this proxy */
 		if (!udp_target_allowed(w->ctx, gcp, &tsa))
 			return GWP_UDP_DROP;	/* ACL denied this datagram */
+		/* Only a target the client has sent to may answer it. */
+		if (!udp_peer_note(gcp, &tsa,
+				   w->ctx->acl ? gcp->udp_acl.gen : 0))
+			return GWP_UDP_DROP;
 		out->buf = base + hdr_len;
 		out->len = n - hdr_len;
 		out->dst = tsa;
@@ -3375,6 +3496,8 @@ enum gwp_udp_act gwp_udp_relay_classify(struct gwp_wrk *w,
 		struct gwp_socks5_addr sa;
 		size_t h, hlen;
 
+		if (!udp_reply_allowed(w->ctx, gcp, src))
+			return GWP_UDP_DROP;	/* not a target of this client */
 		gwp_socks5_reply_addr_from_sockaddr(src, &sa);
 		h = (sa.ver == GWP_SOCKS5_ATYP_IPV4) ? 3 + 1 + 4 + 2
 						     : 3 + 1 + 16 + 2;

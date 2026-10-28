@@ -14,6 +14,8 @@ Features
         the epoll and io_uring loops). Datagrams to domain-name targets
         are dropped (no per-datagram DNS yet), and the command is refused
         when an upstream proxy is configured (UDP is not chained).
+        Replies are relayed only from an address and port the client
+        has sent to (and the ACL still allows).
       - Username/password authentication (RFC 1929), or no authentication.
   - HTTP proxy:
       - CONNECT tunneling.
