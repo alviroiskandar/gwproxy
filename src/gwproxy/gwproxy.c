@@ -873,7 +873,7 @@ static int gwp_ctx_init_thread(struct gwp_wrk *w,
 
 	r = gwp_ctx_init_thread_sock(w, bind_addr);
 	if (r < 0) {
-		pr_err(&ctx->lh, "gwp_ctx_init_thread_sock: %s\n", strerror(-r));
+		pr_err(&ctx->lh, "gwp_ctx_init_thread_sock: %s", strerror(-r));
 		return r;
 	}
 
@@ -888,7 +888,7 @@ static int gwp_ctx_init_thread(struct gwp_wrk *w,
 
 	r = gwp_ctx_init_thread_event(w);
 	if (r < 0) {
-		pr_err(&ctx->lh, "gwp_ctx_init_thread_event: %s\n", strerror(-r));
+		pr_err(&ctx->lh, "gwp_ctx_init_thread_event: %s", strerror(-r));
 		goto out_err_raw_dns;
 	}
 
@@ -1027,13 +1027,13 @@ static int gwp_ctx_init_threads(struct gwp_ctx *ctx)
 	int i, r;
 
 	if (cfg->nr_workers <= 0) {
-		pr_err(&ctx->lh, "Number of workers must be at least 1\n");
+		pr_err(&ctx->lh, "Number of workers must be at least 1");
 		return -EINVAL;
 	}
 
 	r = convert_str_to_ssaddr(cfg->bind, &bind_addr, 0);
 	if (r) {
-		pr_err(&ctx->lh, "Invalid bind address '%s'\n", cfg->bind);
+		pr_err(&ctx->lh, "Invalid bind address '%s'", cfg->bind);
 		return r;
 	}
 

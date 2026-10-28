@@ -184,7 +184,7 @@ int gwp_ctx_init_thread_epoll(struct gwp_wrk *w)
 	ep_fd = __sys_epoll_create1(EPOLL_CLOEXEC);
 	if (ep_fd < 0) {
 		r = ep_fd;
-		pr_err(&w->ctx->lh, "Failed to create epoll instance: %s\n",
+		pr_err(&w->ctx->lh, "Failed to create epoll instance: %s",
 			strerror(-r));
 		return r;
 	}
@@ -192,7 +192,7 @@ int gwp_ctx_init_thread_epoll(struct gwp_wrk *w)
 	ev_fd = __sys_eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
 	if (ev_fd < 0) {
 		r = ev_fd;
-		pr_err(&w->ctx->lh, "Failed to create eventfd: %s\n", strerror(-r));
+		pr_err(&w->ctx->lh, "Failed to create eventfd: %s", strerror(-r));
 		goto out_close_ep_fd;
 	}
 
@@ -200,7 +200,7 @@ int gwp_ctx_init_thread_epoll(struct gwp_wrk *w)
 	events = calloc(w->evsz, sizeof(*events));
 	if (!events) {
 		r = -ENOMEM;
-		pr_err(&w->ctx->lh, "Failed to allocate memory for events: %s\n",
+		pr_err(&w->ctx->lh, "Failed to allocate memory for events: %s",
 			strerror(-r));
 		goto out_close_ev_fd;
 	}
