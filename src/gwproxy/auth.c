@@ -508,40 +508,60 @@ static int base64_decode(const char *in, size_t inlen, unsigned char *out,
 	return (int)olen;
 }
 
-bool gwp_auth_check_basic_ex(struct gwp_auth *auth, const char *hdr_val,
-			     char *user_out, size_t user_cap)
+/*
+ * Decode a "Basic" credential header value into @dec (GWP_AUTH_BASIC_DEC_MAX
+ * bytes) and find the username in it. Returns the decoded length and sets
+ * *@ulen to the length of the username, or returns -1 if the value is not a
+ * well-formed Basic credential.
+ */
+static int basic_decode(const char *hdr_val, unsigned char *dec, size_t *ulen)
 {
-	unsigned char dec[GWP_AUTH_BASIC_DEC_MAX];
 	const char *b64;
 	const void *colon;
-	size_t ulen, plen;
 	int dlen;
 
-	if (!auth || !hdr_val)
-		return false;
+	if (!hdr_val)
+		return -1;
 
 	/* The scheme token is case-insensitive and followed by whitespace. */
 	if (strncasecmp(hdr_val, "Basic", 5))
-		return false;
+		return -1;
 	b64 = hdr_val + 5;
 	if (*b64 != ' ' && *b64 != '\t')
-		return false;
+		return -1;
 	while (*b64 == ' ' || *b64 == '\t')
 		b64++;
 
-	dlen = base64_decode(b64, strlen(b64), dec, sizeof(dec));
+	dlen = base64_decode(b64, strlen(b64), dec, GWP_AUTH_BASIC_DEC_MAX);
 	if (dlen < 0)
-		return false;
+		return -1;
 
 	/* RFC 7617: split on the first ':'; the password may contain ':'. */
 	colon = memchr(dec, ':', (size_t)dlen);
 	if (!colon)
+		return -1;
+
+	*ulen = (size_t)((const unsigned char *)colon - dec);
+	return dlen;
+}
+
+bool gwp_auth_check_basic_ex(struct gwp_auth *auth, const char *hdr_val,
+			     char *user_out, size_t user_cap)
+{
+	unsigned char dec[GWP_AUTH_BASIC_DEC_MAX];
+	size_t ulen, plen;
+	int dlen;
+
+	if (!auth)
 		return false;
 
-	ulen = (size_t)((const unsigned char *)colon - dec);
+	dlen = basic_decode(hdr_val, dec, &ulen);
+	if (dlen < 0)
+		return false;
+
 	plen = (size_t)dlen - ulen - 1;
 	if (!gwp_auth_check(auth, (const char *)dec, ulen,
-			    (const char *)colon + 1, plen))
+			    (const char *)dec + ulen + 1, plen))
 		return false;
 
 	if (user_out && user_cap) {
@@ -551,6 +571,22 @@ bool gwp_auth_check_basic_ex(struct gwp_auth *auth, const char *hdr_val,
 		user_out[n] = '\0';
 	}
 	return true;
+}
+
+int gwp_auth_basic_user(const char *hdr_val, char *user_out, size_t user_cap)
+{
+	unsigned char dec[GWP_AUTH_BASIC_DEC_MAX];
+	size_t ulen;
+	int r;
+
+	r = basic_decode(hdr_val, dec, &ulen);
+	if (r < 0)
+		return -1;
+
+	if (ulen > user_cap)
+		ulen = user_cap;
+	memcpy(user_out, dec, ulen);
+	return (int)ulen;
 }
 
 bool gwp_auth_check_basic(struct gwp_auth *auth, const char *hdr_val)

@@ -61,8 +61,15 @@ struct gwp_http_conn {
 	 */
 	char				*target;
 
-	/* Authenticated username (Basic auth), for ACL "-m user" matching. */
+	/*
+	 * Authenticated username (Basic auth), for ACL "-m user" matching.
+	 * After a failed login (auth_failed), @user holds the first
+	 * @bad_user_len bytes of the username the client tried instead, for
+	 * the log; -1 if its credentials did not decode.
+	 */
 	bool				have_user;
+	bool				auth_failed;
+	int16_t				bad_user_len;
 	char				user[256];
 
 	/*
@@ -135,6 +142,17 @@ bool gwp_http_conn_is_forward(const struct gwp_http_conn *hc)
 const char *gwp_http_conn_username(const struct gwp_http_conn *hc)
 {
 	return hc->have_user ? hc->user : NULL;
+}
+
+bool gwp_http_conn_auth_failed(const struct gwp_http_conn *hc,
+			       const char **user, size_t *len)
+{
+	if (!hc->auth_failed)
+		return false;
+
+	*user = hc->bad_user_len >= 0 ? hc->user : NULL;
+	*len = hc->bad_user_len >= 0 ? (size_t)hc->bad_user_len : 0;
+	return true;
 }
 
 /*
@@ -663,8 +681,15 @@ static int classify_req(struct gwp_http_conn *hc, struct gwp_auth *auth,
 		const char *cred = gwnet_http_hdr_fields_get(&req->fields,
 							     "Proxy-Authorization");
 		if (!gwp_auth_check_basic_ex(auth, cred, hc->user,
-					     sizeof(hc->user)))
+					     sizeof(hc->user))) {
+			/* Credentials sent and refused: a failed login. */
+			if (cred) {
+				hc->auth_failed = true;
+				hc->bad_user_len = (int16_t)gwp_auth_basic_user(
+					cred, hc->user, sizeof(hc->user) - 1);
+			}
 			return GWP_HTTP_NEED_AUTH;
+		}
 		hc->have_user = true;
 	}
 

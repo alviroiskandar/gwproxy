@@ -873,7 +873,7 @@ static int gwp_ctx_init_thread(struct gwp_wrk *w,
 
 	r = gwp_ctx_init_thread_sock(w, bind_addr);
 	if (r < 0) {
-		pr_err(&ctx->lh, "gwp_ctx_init_thread_sock: %s\n", strerror(-r));
+		pr_err(&ctx->lh, "gwp_ctx_init_thread_sock: %s", strerror(-r));
 		return r;
 	}
 
@@ -888,7 +888,7 @@ static int gwp_ctx_init_thread(struct gwp_wrk *w,
 
 	r = gwp_ctx_init_thread_event(w);
 	if (r < 0) {
-		pr_err(&ctx->lh, "gwp_ctx_init_thread_event: %s\n", strerror(-r));
+		pr_err(&ctx->lh, "gwp_ctx_init_thread_event: %s", strerror(-r));
 		goto out_err_raw_dns;
 	}
 
@@ -1027,13 +1027,13 @@ static int gwp_ctx_init_threads(struct gwp_ctx *ctx)
 	int i, r;
 
 	if (cfg->nr_workers <= 0) {
-		pr_err(&ctx->lh, "Number of workers must be at least 1\n");
+		pr_err(&ctx->lh, "Number of workers must be at least 1");
 		return -EINVAL;
 	}
 
 	r = convert_str_to_ssaddr(cfg->bind, &bind_addr, 0);
 	if (r) {
-		pr_err(&ctx->lh, "Invalid bind address '%s'\n", cfg->bind);
+		pr_err(&ctx->lh, "Invalid bind address '%s'", cfg->bind);
 		return r;
 	}
 
@@ -3311,31 +3311,41 @@ int gwp_socks5_handle_data(struct gwp_conn_pair *gcp)
 static void socks5_log_auth_failure(struct gwp_wrk *w,
 				    struct gwp_conn_pair *gcp)
 {
-	static const char hex[] = "0123456789abcdef";
-	char user[255 * 4 + 1], *d = user;
-	const unsigned char *u;
-	size_t len, i;
+	char user[GWP_LOG_ESC_SIZE(255)];
+	const char *u;
+	size_t len;
 
-	u = (const unsigned char *)gwp_socks5_conn_rejected_user(gcp->s5_conn,
-								 &len);
+	u = gwp_socks5_conn_rejected_user(gcp->s5_conn, &len);
 	if (!u)
 		return;
 
-	for (i = 0; i < len && i < 255; i++) {
-		unsigned char c = u[i];
-
-		if (c >= 0x20 && c < 0x7f && c != '"' && c != '\\') {
-			*d++ = (char)c;
-			continue;
-		}
-		*d++ = '\\';
-		*d++ = 'x';
-		*d++ = hex[c >> 4];
-		*d++ = hex[c & 0xf];
-	}
-	*d = '\0';
-
+	gwp_log_escape(user, u, len < 255 ? len : 255);
 	pr_info(&w->ctx->lh, "SOCKS5 authentication failed (ca=%s, user=\"%s\")",
+		ip_to_str(&gcp->client_addr), user);
+}
+
+/*
+ * Log a failed HTTP proxy login like the SOCKS5 one. A request without
+ * Proxy-Authorization is how a client learns that credentials are needed,
+ * not a failure, and is not logged.
+ */
+static void http_log_auth_failure(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	char user[GWP_LOG_ESC_SIZE(255)];
+	const char *u;
+	size_t len;
+
+	if (!gwp_http_conn_auth_failed(gcp->http_conn, &u, &len))
+		return;
+
+	if (!u) {
+		pr_info(&w->ctx->lh, "HTTP proxy authentication failed (ca=%s, malformed credentials)",
+			ip_to_str(&gcp->client_addr));
+		return;
+	}
+
+	gwp_log_escape(user, u, len < 255 ? len : 255);
+	pr_info(&w->ctx->lh, "HTTP proxy authentication failed (ca=%s, user=\"%s\")",
 		ip_to_str(&gcp->client_addr), user);
 }
 
@@ -4134,6 +4144,7 @@ int gwp_handle_conn_state_http(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 			return http_reject_too_large(gcp);
 		return 0;
 	case GWP_HTTP_NEED_AUTH:
+		http_log_auth_failure(w, gcp);
 		return http_reject_unauthorized(gcp);
 	case GWP_HTTP_CONNECT:
 		return http_connect_target(w, gcp, host, port);

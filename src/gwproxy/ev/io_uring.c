@@ -1333,8 +1333,9 @@ static int upstream_iou_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	if (r)
 		return r;
 
-	pr_info(&ctx->lh, "Upstream tunnel established (idx=%u, ca=%s)",
-		gcp->idx, ip_to_str(&gcp->client_addr));
+	pr_info(&ctx->lh, "Upstream tunnel established (idx=%u, ca=%s, dst=%s)",
+		gcp->idx, ip_to_str(&gcp->client_addr),
+		gwp_upstream_dst_str(gcp));
 
 	/* Start forwarding. */
 	if (gcp->target.len)

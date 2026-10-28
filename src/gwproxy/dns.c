@@ -330,11 +330,20 @@ static void deliver_entry(struct gwp_dns_entry *e)
 	/*
 	 * Only the push onto an empty list signals: until the loop takes the
 	 * list, that one wakeup covers whatever is pushed after it.
+	 *
+	 * The write needs no handling beyond the EINTR retry. Adding 1 to an
+	 * eventfd fails only with EAGAIN, when the counter would pass
+	 * 2^64 - 2, and here it stays tiny: it is written only on this
+	 * transition and reset by every gwp_dns_cq_pop(). Anything else
+	 * (EBADF, EINVAL) would be a bug, not a runtime condition: the
+	 * eventfd lives until gwp_dns_ctx_free(), after the resolver threads
+	 * are joined.
 	 */
 	if (!old) {
 		do {
 			r = __sys_write(cq->efd, &one, sizeof(one));
 		} while (r == -EINTR);
+		assert(r == (ssize_t)sizeof(one));
 	}
 }
 
