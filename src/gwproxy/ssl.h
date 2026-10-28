@@ -41,7 +41,14 @@ enum {
 /* Create a server SSL_CTX from a PEM certificate chain + private key. */
 int gwp_ssl_ctx_server_create(struct gwp_ssl_ctx **out, const char *cert_file,
 			      const char *key_file);
-/* Create a client SSL_CTX (no peer verification; for tests / future use). */
+/*
+ * Create a client SSL_CTX for the unit tests. It does NOT verify the peer:
+ * any certificate is accepted and no host name is checked or sent. Before
+ * anything connects to a real server with it (an https:// upstream proxy,
+ * say), it needs SSL_VERIFY_PEER with a trust store, and each connection
+ * needs SSL_set1_host() and SSL_set_tlsext_host_name() for the server's
+ * name; without them an on-path attacker can read the proxy credentials.
+ */
 int gwp_ssl_ctx_client_create(struct gwp_ssl_ctx **out);
 void gwp_ssl_ctx_free(struct gwp_ssl_ctx *ctx);
 

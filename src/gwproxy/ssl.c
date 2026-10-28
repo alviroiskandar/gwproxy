@@ -274,6 +274,7 @@ int gwp_ssl_ctx_client_create(struct gwp_ssl_ctx **out)
 	}
 
 	SSL_CTX_set_min_proto_version(c->ctx, TLS1_2_VERSION);
+	/* Test-only, see ssl.h: no peer verification. */
 	SSL_CTX_set_verify(c->ctx, SSL_VERIFY_NONE, NULL);
 	*out = c;
 	return 0;
