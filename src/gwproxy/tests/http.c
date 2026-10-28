@@ -1107,6 +1107,55 @@ static void test_auth_store(void)
 	PRTEST_OK();
 }
 
+/*
+ * The "Basic" token is base64 with optional padding and nothing after it: a
+ * malformed token is refused even when its valid prefix decodes to the
+ * right credentials.
+ */
+static void test_auth_basic_token(void)
+{
+	static const char cred_data[] = "user:pass\nab:c\nabc:d\n";
+	static const struct {
+		const char	*hdr;
+		bool		ok;
+	} cases[] = {
+		{ "Basic dXNlcjpwYXNz",		true },	/* user:pass */
+		{ "basic \tdXNlcjpwYXNz \t",	true },
+		{ "Basic YWI6Yw==",		true },	/* ab:c */
+		{ "Basic YWI6Yw",		true },	/* unpadded */
+		{ "Basic YWJjOmQ=",		true },	/* abc:d */
+		{ "Basic YWJjOmQ",		true },
+		{ "Basic dXNlcjpwYXNz=",	false },
+		{ "Basic dXNlcjpwYXNz==",	false },
+		{ "Basic dXNlcjpwYXNz=x",	false },
+		{ "Basic dXNlcjpwYXNzA",	false },
+		{ "Basic dXNlcjpwYXNz x",	false },
+		{ "Basic YWI6Yw==x",		false },
+		{ "Basic YWI6Yw===",		false },
+		{ "Basic YWI6Yw=",		false },
+		{ "Basic YWI6Yw== YWI6Yw==",	false },
+		{ "Basic YWJjOmQ==",		false },
+		{ "Basic YWJjOmQ=dXNl",		false },
+		{ "Basic =",			false },
+		{ "Basic ",			false },
+	};
+	char cred_file[] = "/tmp/gwp_http_auth.XXXXXX";
+	struct gwp_auth *auth = NULL;
+	size_t i;
+	ssize_t w;
+
+	w = write_temp_file(cred_file, cred_data, sizeof(cred_data) - 1);
+	assert(w == (ssize_t)(sizeof(cred_data) - 1));
+	assert(!gwp_auth_create(&auth, cred_file));
+
+	for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+		assert(gwp_auth_check_basic(auth, cases[i].hdr) == cases[i].ok);
+
+	gwp_auth_destroy(auth);
+	unlink(cred_file);
+	PRTEST_OK();
+}
+
 int main(void)
 {
 	size_t i;
@@ -1136,6 +1185,7 @@ int main(void)
 	/* Byte-by-byte feeding of 17 KiB headers: once is enough. */
 	test_incremental();
 	test_auth_store();
+	test_auth_basic_token();
 
 	printf("All tests passed!\n");
 	return 0;

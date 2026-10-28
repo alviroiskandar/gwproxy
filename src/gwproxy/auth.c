@@ -437,15 +437,17 @@ static int b64_val(unsigned char c)
 }
 
 /*
- * Decode a base64 (RFC 4648) token into @out. Padding '=' and any trailing
- * whitespace terminate the token. Returns the decoded length on success, or
- * -1 on an invalid character or if the output would exceed @out_cap.
+ * Decode a base64 (RFC 4648) token into @out. The token may end with the '='
+ * padding that completes its last 4-character group, and trailing whitespace
+ * is ignored; nothing else may follow. Returns the decoded length on success,
+ * or -1 on an invalid character, a malformed length or padding, or if the
+ * output would exceed @out_cap.
  */
 static int base64_decode(const char *in, size_t inlen, unsigned char *out,
 			 size_t out_cap)
 {
+	size_t olen = 0, nchars = 0, npad = 0, i;
 	uint32_t acc = 0;
-	size_t olen = 0, i;
 	int nbits = 0;
 
 	for (i = 0; i < inlen; i++) {
@@ -459,6 +461,7 @@ static int base64_decode(const char *in, size_t inlen, unsigned char *out,
 		if (v < 0)
 			return -1;
 
+		nchars++;
 		acc = (acc << 6) | (uint32_t)v;
 		nbits += 6;
 		if (nbits >= 8) {
@@ -467,6 +470,24 @@ static int base64_decode(const char *in, size_t inlen, unsigned char *out,
 				return -1;
 			out[olen++] = (unsigned char)((acc >> nbits) & 0xffu);
 		}
+	}
+
+	/*
+	 * One character of a group carries only 6 bits, less than a byte: no
+	 * encoder produces it. Padding, when present, must complete the group.
+	 */
+	if (nchars % 4 == 1)
+		return -1;
+	for (; i < inlen && in[i] == '='; i++)
+		npad++;
+	if (npad && (npad > 2 || (nchars + npad) % 4))
+		return -1;
+
+	/* Only whitespace may follow; "<b64>=<garbage>" is not a token. */
+	for (; i < inlen; i++) {
+		if (in[i] != ' ' && in[i] != '\t' && in[i] != '\r' &&
+		    in[i] != '\n')
+			return -1;
 	}
 
 	return (int)olen;
