@@ -257,6 +257,37 @@ static bool upstream_pass_span(const char *url, size_t *off, size_t *len)
 }
 
 /*
+ * Take the --upstream-proxy URL out of argv. Its password is readable by
+ * every local user through ps and /proc/<pid>/cmdline for as long as the
+ * process runs, so keep a private copy for the parser and overwrite the
+ * password in the argv string with "***", shifting the rest of it left and
+ * zeroing the freed tail, so that not even its length shows. It is still
+ * visible between exec and this point; --upstream-proxy-auth-file avoids
+ * that window entirely.
+ *
+ * A URL too long for the copy is left alone: the parser rejects it anyway.
+ */
+static const char *upstream_take_url(char *arg)
+{
+	static char url[1024];
+	size_t off, len, n, tail;
+
+	tail = strlen(arg);
+	if (tail >= sizeof(url))
+		return arg;
+	memcpy(url, arg, tail + 1);
+
+	if (!upstream_pass_span(arg, &off, &len) || !len)
+		return url;
+	n = len < 3 ? len : 3;
+	tail = strlen(arg + off + len) + 1;
+	memset(arg + off, '*', n);
+	memmove(arg + off + n, arg + off + len, tail);
+	memset(arg + off + n + tail, 0, len - n);
+	return url;
+}
+
+/*
  * Name an option by its getopt value, for error messages: the long name,
  * which every option has.
  */
@@ -480,7 +511,7 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 			cfg->pid_file = optarg;
 			break;
 		case 'x':
-			cfg->upstream_proxy = optarg;
+			cfg->upstream_proxy = upstream_take_url(optarg);
 			break;
 		case OPT_UPSTREAM_AUTH_FILE:
 			cfg->upstream_auth_file = optarg;

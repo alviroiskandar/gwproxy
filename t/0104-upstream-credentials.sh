@@ -10,7 +10,9 @@
 #       upstream SOCKS5 proxy that demands them, a password holding '@' and
 #       ':' included, the wrong ones do not; a URL with credentials of its
 #       own, a missing file, a malformed file, and the option without
-#       --upstream-proxy are all refused at startup.
+#       --upstream-proxy are all refused at startup;
+#   (3) credentials given in the URL still work, but the password is
+#       overwritten in /proc/<pid>/cmdline once gwproxy has started.
 
 . "$(dirname "$0")/lib.sh"
 require curl
@@ -73,6 +75,21 @@ fetch "$fp" "$WORK/bad.bin" && \
 	fail "fetch with a wrong password from a file succeeded"
 cmp -s "$WORK/payload.bin" "$WORK/bad.bin" && \
 	fail "the wrong file credentials still got the payload"
+kill "$GWP_PID" 2>/dev/null
+
+# (3) Credentials in the URL: the chain works, and the password, which
+# contains '@' and ':' here, no longer shows in the process's command line.
+fp="$(pick_port)"
+gwp_start "[::1]:$fp" --as-socks5=1 --event-loop=epoll --nr-workers=1 \
+	--upstream-proxy="socks5://up:p@ss:$SECRET@[::1]:$up"
+tr '\0' ' ' <"/proc/$GWP_PID/cmdline" >"$WORK/cmdline"
+grep -qF "$SECRET" "$WORK/cmdline" && \
+	fail "the upstream password is visible in /proc/<pid>/cmdline: $(cat "$WORK/cmdline")"
+grep -qF -- "--upstream-proxy=socks5://up:***@[::1]:$up" "$WORK/cmdline" || \
+	fail "the masked upstream URL is missing from the command line: $(cat "$WORK/cmdline")"
+fetch "$fp" "$WORK/url.bin" || fail "fetch with credentials in the URL failed"
+assert_files_equal "$WORK/payload.bin" "$WORK/url.bin" \
+	"the chain with URL credentials corrupted the payload"
 kill "$GWP_PID" 2>/dev/null
 
 # expect_reject <what> <errno> <args...>: gwproxy refuses to start, exiting
