@@ -3174,6 +3174,7 @@ int gwp_socks5_handle_data(struct gwp_conn_pair *gcp)
 
 static int handle_socks5_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
+	uint32_t clen = gcp->client.len, tlen = gcp->target.len;
 	struct gwp_ctx *ctx = w->ctx;
 	int r;
 
@@ -3204,6 +3205,17 @@ static int handle_socks5_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		gcp->s5_conn = NULL;
 		/* Unclaim it, so an HTTP fallback can take the union over. */
 		gcp->prot_type = GWP_PROT_TYPE_NONE;
+		/*
+		 * Only a first byte that is not SOCKS5 leaves both buffers
+		 * as they were. Once the parser took a greeting and queued
+		 * its reply, the client spoke SOCKS5: a later failure
+		 * (wrong password, bad request) is final, or the HTTP parser
+		 * would get the rest of the bytes, answer behind the SOCKS5
+		 * replies and give the client another password guess.
+		 */
+		if (r == -EINVAL &&
+		    (gcp->client.len != clen || gcp->target.len != tlen))
+			r = -EPROTO;
 		return r;
 	}
 
