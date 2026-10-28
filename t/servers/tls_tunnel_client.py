@@ -42,6 +42,14 @@
 #       held by the proxy's TLS engine while the method reply is being
 #       sent. A proxy that then waits for the socket instead of working
 #       through them once the reply is out never answers.
+#   splitearly
+#       SOCKS5 over TLS against a proxy with a small --client-buf-size.
+#       Send the greeting, the CONNECT request and 1000 bytes for the
+#       tunnel as many small TLS records in a single TCP send, and expect
+#       the method reply, the CONNECT reply and all 1000 bytes echoed.
+#       Most of the records are still held by the proxy's TLS engine when
+#       the connect completes. A proxy that forwards only what fit in its
+#       client buffer and then waits for the socket never echoes the rest.
 #
 # Exits 0 on success, 1 on failure (with a message on stderr).
 
@@ -343,6 +351,24 @@ def scen_splitauth(pport, user, pw):
         die("tunnel after a split SOCKS5 handshake echoed %r" % got)
 
 
+def scen_splitearly(pport):
+    oport = start_origin(echo_origin)
+    greet = b"\x05\x01\x00"
+    conn = b"\x05\x01\x00\x01" + socket.inet_aton("127.0.0.1") + \
+        oport.to_bytes(2, "big")
+    data = bytes(i % 251 for i in range(1000))
+
+    c = RecordClient(pport)
+    c.send_records([greet, conn] + chunks(data, 50))
+    got = c.recv_until(lambda g: len(g) >= 2 + 10 + len(data))
+    if got[:2] != b"\x05\x00":
+        die("method reply %r, want no authentication" % got[:2])
+    if got[2:4] != b"\x05\x00":
+        die("CONNECT reply %r, want success" % got[2:12])
+    if got[12:] != data:
+        die("got %d of the %d early bytes back" % (len(got) - 12, len(data)))
+
+
 def main():
     scen = sys.argv[1]
     pport = int(sys.argv[2])
@@ -358,6 +384,8 @@ def main():
         scen_splitrec(pport)
     elif scen == "splitauth":
         scen_splitauth(pport, sys.argv[3].encode(), sys.argv[4].encode())
+    elif scen == "splitearly":
+        scen_splitearly(pport)
     else:
         die("unknown scenario %s" % scen)
 

@@ -13,6 +13,11 @@
 # username/password request and the CONNECT request, all in small records
 # in one segment, against a 256-byte client buffer. Once the method reply
 # is out, the records the engine still holds must be worked through.
+#
+# Nor may records holding tunnel bytes pipelined behind a SOCKS5 CONNECT
+# be left in the engine: with a 256-byte client buffer, most of 1000
+# such bytes are still there when the connect completes, and must be
+# forwarded then.
 
 . "$(dirname "$0")/lib.sh"
 require python3
@@ -47,6 +52,14 @@ for loop in epoll io_uring; do
 	timeout 30 python3 "$SERVERS_DIR/tls_tunnel_client.py" splitauth "$pp" \
 		"$user" "$pass" \
 		|| fail "[$loop] a SOCKS5 handshake overflowing the client buffer got no reply"
+	kill "$GWP_PID" 2>/dev/null
+
+	pp="$(pick_port)"
+	gwp_start "127.0.0.1:$pp" --as-socks5=1 --client-buf-size=256 \
+		--event-loop="$loop" --tls-cert="$WORK/cert.pem" \
+		--tls-key="$WORK/key.pem" --nr-workers=1
+	timeout 30 python3 "$SERVERS_DIR/tls_tunnel_client.py" splitearly "$pp" \
+		|| fail "[$loop] tunnel bytes pipelined behind a SOCKS5 CONNECT were not all forwarded"
 	kill "$GWP_PID" 2>/dev/null
 done
 

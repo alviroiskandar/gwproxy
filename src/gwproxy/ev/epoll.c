@@ -1256,6 +1256,25 @@ static int arm_idle_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	return __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, gcp->timer_fd, &ev);
 }
 
+/*
+ * Send what the client sent while the target was being connected. A TLS
+ * client may have sent more than client.buf holds: the rest is held by the
+ * engine, off the socket already, so no EPOLLIN would bring it back. Take it
+ * in as the send makes room, as forwarding does.
+ */
+static int flush_early_data(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	bool held = false;
+
+#ifdef CONFIG_HTTPS
+	held = gcp->client.tls && gwp_ssl_rx_more(gcp->client.tls);
+#endif
+	if (!gcp->client.len && !held)
+		return 0;
+
+	return do_splice(w, gcp, &gcp->client, &gcp->target, held, true);
+}
+
 /* The upstream tunnel is up (reply already spliced); start forwarding. */
 static int upstream_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
@@ -1291,11 +1310,9 @@ static int upstream_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	}
 
 	/* Flush any client data buffered during the handshake to the target. */
-	if (gcp->client.len) {
-		sr = __do_send(&gcp->client, &gcp->target);
-		if (unlikely(sr < 0))
-			return (int)sr;
-	}
+	r = flush_early_data(w, gcp);
+	if (unlikely(r))
+		return r;
 
 	/* And a FIN the client sent meanwhile. */
 	return forward_progress(w, gcp, NULL);
@@ -1426,7 +1443,6 @@ static int handle_ev_target_conn_result(struct gwp_wrk *w,
 {
 	struct gwp_ctx *ctx = w->ctx;
 	int r;
-	ssize_t sr;
 
 	/*
 	 * Connected to the upstream SOCKS5 proxy. Perform the client handshake
@@ -1464,11 +1480,9 @@ static int handle_ev_target_conn_result(struct gwp_wrk *w,
 	if (unlikely(r))
 		return r;
 
-	if (gcp->client.len) {
-		sr = __do_send(&gcp->client, &gcp->target);
-		if (unlikely(sr < 0))
-			return (int)sr;
-	}
+	r = flush_early_data(w, gcp);
+	if (unlikely(r))
+		return r;
 
 	/*
 	 * Pass on a FIN the client sent during the connect. Forced: the
@@ -2612,6 +2626,8 @@ static bool client_past_handshake(const struct gwp_conn_pair *gcp)
  * on past CONN_STATE_PROT: the client buffer may fill in the middle of a
  * SOCKS5 or HTTP handshake (a greeting followed by a long authentication
  * request, say), and the rest is only taken once that has been parsed.
+ * Records left once the connect has started are taken when it completes
+ * (see flush_early_data()).
  */
 static int client_prot_in(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
