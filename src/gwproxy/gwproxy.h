@@ -641,6 +641,13 @@ struct iou {
 	 * in this worker's own ring wakes the worker up.
 	 */
 	int			stop_efd;
+
+	/*
+	 * The last io_uring_submit_and_wait() failed with a transient error
+	 * and is being retried (see fish_events()), so that it is logged
+	 * once per episode rather than on every retry.
+	 */
+	bool			submit_stalled;
 };
 #endif
 

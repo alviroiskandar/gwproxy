@@ -2618,6 +2618,17 @@ static int handle_events(struct gwp_wrk *w)
 	return r;
 }
 
+/*
+ * Submit what is queued and wait for a completion.
+ *
+ * The submit can fail for want of kernel memory (-EAGAIN, -ENOMEM), or, on
+ * older kernels, while completions sit in the CQ overflow list (-EBUSY), as
+ * get_sqe_nofail() describes. None of that is a reason to stop the worker,
+ * which would stop the proxy and drop every live connection: flush what
+ * overflowed into the CQ ring for handle_events() to reap, back off for a
+ * millisecond and go round again. The queued SQEs stay in the SQ ring and go
+ * out with the next submit.
+ */
 static int fish_events(struct gwp_wrk *w)
 {
 	struct iou *iou = w->iou;
@@ -2625,16 +2636,29 @@ static int fish_events(struct gwp_wrk *w)
 
 	r = io_uring_submit_and_wait(&iou->ring, 1);
 	w->now = gwp_now_sec();
-	if (unlikely(r < 0)) {
-		if (r != -EINTR) {
-			log_submit_err(w, r);
-			return r;
-		}
-
-		pr_info(&w->ctx->lh, "io_uring_submit_and_wait() interrupted");
+	if (likely(r >= 0)) {
+		iou->submit_stalled = false;
+		return 0;
 	}
 
-	return 0;
+	if (r == -EINTR) {
+		pr_info(&w->ctx->lh, "io_uring_submit_and_wait() interrupted");
+		return 0;
+	}
+
+	if (r == -EAGAIN || r == -ENOMEM || r == -EBUSY) {
+		if (!iou->submit_stalled)
+			pr_warn(&w->ctx->lh,
+				"Worker %u: io_uring_submit_and_wait(): %s; retrying",
+				w->idx, strerror(-r));
+		iou->submit_stalled = true;
+		io_uring_get_events(&iou->ring);
+		usleep(1000);
+		return 0;
+	}
+
+	pr_err(&w->ctx->lh, "io_uring_submit_and_wait(): %s", strerror(-r));
+	return r;
 }
 
 static void submit_unconsumed_sqes(struct gwp_wrk *w)
