@@ -223,8 +223,9 @@ static void arm_stop_poll(struct gwp_wrk *w)
 }
 
 /*
- * accept() is paused because of fd exhaustion (EMFILE/ENFILE): arm a short
- * one-shot timer and retry the accept when it fires (see handle_ev_accept()).
+ * accept() is paused because of fd exhaustion (EMFILE/ENFILE), or because it
+ * keeps failing the same way (see handle_ev_accept()): arm a short one-shot
+ * timer and retry the accept when it fires.
  * Polling this way decouples recovery from connection-teardown timing, so the
  * worker can never get permanently stuck with accepting disabled.
  */
@@ -488,6 +489,16 @@ static struct io_uring_sqe *__prep_send_client(struct gwp_wrk *w,
 	int fd = gcp->client.fd;
 	struct io_uring_sqe *s;
 
+	/*
+	 * A send already on its way covers the start of target.buf, and its
+	 * completion (handle_ev_client_send()) sends the rest, including what
+	 * has been appended since. In the protocol phase a client recv is
+	 * armed alongside the reply's send and may complete first; queueing
+	 * target.buf again from there would hand the client the reply twice.
+	 */
+	if (gcp->client_tx)
+		return NULL;
+
 	s = get_sqe_nofail(w);
 #if USE_SEND_ZC
 	io_uring_prep_send_zc(s, fd, buf, len, MSG_NOSIGNAL, 0);
@@ -496,6 +507,7 @@ static struct io_uring_sqe *__prep_send_client(struct gwp_wrk *w,
 #endif
 	io_uring_sqe_set_data(s, gcp);
 	s->user_data |= EV_BIT_IOU_CLIENT_SEND;
+	gcp->client_tx = true;
 	get_gcp_io(gcp, s);
 	pr_dbg(&w->ctx->lh,
 		"Prepared send for client fd=%d, len=%zu, buf=%p, ref_cnt=%d",
@@ -596,22 +608,12 @@ static void prep_attempt_timer_del(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
  * first at removal time. An already-armed timer is left alone: it fires no
  * later than the deadline a fresh one would have had.
  */
-static void arm_attempt_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+static void __arm_attempt_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+				int ms)
 {
 	struct gwp_ctx *ctx = w->ctx;
 	struct io_uring_sqe *s;
-	int ms;
 
-	if (gcp->attempt_timer_armed)
-		return;
-	if (gcp->next_cand >= gcp->nr_cand)
-		return;			/* nothing left to start */
-	if (ctx->cfg.connect_attempt_delay <= 0)
-		return;			/* racing disabled: fall back only */
-	if (ctx->upstream.enabled)
-		return;			/* one proxy, nothing to race */
-
-	ms = ctx->cfg.connect_attempt_delay;
 	gcp->ats.tv_sec = ms / 1000;
 	gcp->ats.tv_nsec = (long long)(ms % 1000) * 1000000LL;
 
@@ -624,6 +626,59 @@ static void arm_attempt_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	pr_dbg(&ctx->lh,
 		"Prepared attempt timer (idx=%u, ts=%lld.%09lld, ref_cnt=%d)",
 		gcp->idx, gcp->ats.tv_sec, gcp->ats.tv_nsec, gcp->ref_cnt);
+}
+
+static void arm_attempt_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	struct gwp_ctx *ctx = w->ctx;
+
+	if (gcp->attempt_timer_armed)
+		return;
+	if (gcp->next_cand >= gcp->nr_cand)
+		return;			/* nothing left to start */
+	if (ctx->cfg.connect_attempt_delay <= 0)
+		return;			/* racing disabled: fall back only */
+	if (ctx->upstream.enabled)
+		return;			/* one proxy, nothing to race */
+
+	__arm_attempt_timer(w, gcp, ctx->cfg.connect_attempt_delay);
+}
+
+/* How long a connect waits for a free descriptor before it tries again, in ms. */
+#define GWP_FD_RETRY_MS 100
+
+/*
+ * The target socket of a plain or transparent forwarding pair could not be
+ * created because the descriptor table is full. That passes as connections
+ * close, and the client, which has done nothing wrong, is already accepted:
+ * keep it, and try the same candidate again once the attempt timer fires.
+ * The connect timeout still bounds the wait. accept() itself runs out of
+ * descriptors too, and pauses (handle_ev_accept()), so no further client
+ * piles up behind this one in the meantime.
+ *
+ * Only while no other attempt is racing: one that is may well connect, and
+ * the attempt timer is then needed for the race. Plain forwarding has a
+ * single candidate, so this is the case there.
+ */
+static bool wait_for_fd(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int err)
+{
+	if (err != -EMFILE && err != -ENFILE)
+		return false;
+	if (gcp->prot_type != GWP_PROT_TYPE_NONE)
+		return false;
+	if (has_inflight_attempt(gcp) || gcp->attempt_timer_armed)
+		return false;
+
+	if (!(gcp->flags & GWP_CONN_FLAG_FD_WAIT)) {
+		gcp->flags |= GWP_CONN_FLAG_FD_WAIT;
+		pr_warn(&w->ctx->lh,
+			"Too many open files, retrying the target connect (idx=%u, ca=%s)",
+			gcp->idx, ip_to_str(&gcp->client_addr));
+	}
+
+	gcp->next_cand--;
+	__arm_attempt_timer(w, gcp, GWP_FD_RETRY_MS);
+	return true;
 }
 
 /*
@@ -1240,6 +1295,27 @@ static int handle_ev_accept(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 		}
 
 		/*
+		 * Errors that come back the same at once if accept is simply
+		 * re-armed: the kernel is short of socket memory (ENOBUFS), or
+		 * a security module refuses the connection (EPERM, EACCES),
+		 * which leaves it at the head of the backlog for the next
+		 * accept to be refused again. Re-arming at once spins the
+		 * worker and floods the log; pause on the retry timer instead,
+		 * logged once until an accept succeeds.
+		 */
+		if (cqe->res < 0 &&
+		    (r == -ENOBUFS || r == -EPERM || r == -EACCES)) {
+			if (!w->accept_is_stopped) {
+				w->accept_is_stopped = true;
+				pr_warn(&w->ctx->lh,
+					"Failed to accept new connection: %s, pausing accept (tidx=%u)",
+					strerror(-r), w->idx);
+			}
+			arm_accept_retry(w);
+			return 0;
+		}
+
+		/*
 		 * Only a listener that is itself broken is worth stopping
 		 * for: re-arming accept on it would fail the same way
 		 * forever. Everything else concerns one connection -- an
@@ -1844,6 +1920,7 @@ static int handle_ev_client_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 {
 	int r = cqe->res;
 
+	gcp->client_tx = false;
 	r = handle_sock_ret(r);
 	if (r < 0)
 		return r;
@@ -2002,6 +2079,9 @@ static int connect_next_candidate(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 
 		pr_dbg(&w->ctx->lh, "Target %s did not start: %s (idx=%u)",
 			ip_to_str(&gcp->target_addr), strerror(-err), gcp->idx);
+
+		if (wait_for_fd(w, gcp, err))
+			return 0;
 
 		/*
 		 * Chaining: every attempt dials the same upstream proxy, so
@@ -2618,6 +2698,17 @@ static int handle_events(struct gwp_wrk *w)
 	return r;
 }
 
+/*
+ * Submit what is queued and wait for a completion.
+ *
+ * The submit can fail for want of kernel memory (-EAGAIN, -ENOMEM), or, on
+ * older kernels, while completions sit in the CQ overflow list (-EBUSY), as
+ * get_sqe_nofail() describes. None of that is a reason to stop the worker,
+ * which would stop the proxy and drop every live connection: flush what
+ * overflowed into the CQ ring for handle_events() to reap, back off for a
+ * millisecond and go round again. The queued SQEs stay in the SQ ring and go
+ * out with the next submit.
+ */
 static int fish_events(struct gwp_wrk *w)
 {
 	struct iou *iou = w->iou;
@@ -2625,16 +2716,29 @@ static int fish_events(struct gwp_wrk *w)
 
 	r = io_uring_submit_and_wait(&iou->ring, 1);
 	w->now = gwp_now_sec();
-	if (unlikely(r < 0)) {
-		if (r != -EINTR) {
-			log_submit_err(w, r);
-			return r;
-		}
-
-		pr_info(&w->ctx->lh, "io_uring_submit_and_wait() interrupted");
+	if (likely(r >= 0)) {
+		iou->submit_stalled = false;
+		return 0;
 	}
 
-	return 0;
+	if (r == -EINTR) {
+		pr_info(&w->ctx->lh, "io_uring_submit_and_wait() interrupted");
+		return 0;
+	}
+
+	if (r == -EAGAIN || r == -ENOMEM || r == -EBUSY) {
+		if (!iou->submit_stalled)
+			pr_warn(&w->ctx->lh,
+				"Worker %u: io_uring_submit_and_wait(): %s; retrying",
+				w->idx, strerror(-r));
+		iou->submit_stalled = true;
+		io_uring_get_events(&iou->ring);
+		usleep(1000);
+		return 0;
+	}
+
+	pr_err(&w->ctx->lh, "io_uring_submit_and_wait(): %s", strerror(-r));
+	return r;
 }
 
 static void submit_unconsumed_sqes(struct gwp_wrk *w)

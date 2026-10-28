@@ -385,6 +385,12 @@ enum {
 	 * attempt, and a local would only remember the most recent walk.
 	 */
 	GWP_CONN_FLAG_ACL_CAND_OK	= (1ull << 3ull),
+	/*
+	 * The target socket could not be created for want of descriptors and
+	 * the connect is being retried (io_uring); set so that this is logged
+	 * once per pair rather than on every retry.
+	 */
+	GWP_CONN_FLAG_FD_WAIT		= (1ull << 4ull),
 };
 
 enum {
@@ -614,6 +620,13 @@ struct gwp_conn_pair {
 	uint8_t			nr_ops_client;
 	uint8_t			nr_ops_target;
 	uint8_t			nr_ops_udp;
+	/*
+	 * A plaintext send of target.buf to the client is in flight. It
+	 * covers the bytes that were there when it was queued, so another
+	 * send must not be queued over them; its completion sends whatever
+	 * was appended in the meantime.
+	 */
+	bool			client_tx;
 #endif
 };
 
@@ -641,6 +654,13 @@ struct iou {
 	 * in this worker's own ring wakes the worker up.
 	 */
 	int			stop_efd;
+
+	/*
+	 * The last io_uring_submit_and_wait() failed with a transient error
+	 * and is being retried (see fish_events()), so that it is logged
+	 * once per episode rather than on every retry.
+	 */
+	bool			submit_stalled;
 };
 #endif
 
