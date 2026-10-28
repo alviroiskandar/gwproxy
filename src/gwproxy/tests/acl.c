@@ -1217,7 +1217,7 @@ static void test_empty_chain_policy(void)
 		"-P INPUT REJECT\n",
 		"-P OUTPUT REJECT\n-A INPUT -s 10.0.0.0/8 -j REJECT\n",
 		"-A OUTPUT --dports 80 -j REJECT\n",
-		"",
+		"# no rules\n",
 	};
 	/* in(10.1.1.1), in(192.0.2.1), out(:80), out(:443) per file */
 	static const enum gwp_acl_verdict want[][4] = {
@@ -1251,7 +1251,23 @@ static void test_empty_chain_policy(void)
 		assert(out(a, &t, NULL, 80, GWP_ACL_PROTO_TCP) == want[i][2]);
 		assert(out(a, &t, NULL, 443, GWP_ACL_PROTO_TCP) == want[i][3]);
 	}
+
+	/*
+	 * An empty file, as a writer that truncates and then refills the file
+	 * leaves it in between, is refused and the rules stay.
+	 */
+	fd = open(path, O_WRONLY | O_TRUNC);
+	assert(fd >= 0);
+	assert(write(fd, files[0], strlen(files[0])) == (ssize_t)strlen(files[0]));
+	close(fd);
+	assert(!gwp_acl_reload(a));
+	fd = open(path, O_WRONLY | O_TRUNC);
+	assert(fd >= 0);
+	close(fd);
+	assert(gwp_acl_reload(a) == -ENODATA);
+	assert(in(a, &c1, 1234, GWP_ACL_PROTO_TCP) == want[0][0]);
 	gwp_acl_destroy(a);
+	assert(gwp_acl_create(&a, path) == -ENODATA);
 	unlink(path);
 	free(path);
 }

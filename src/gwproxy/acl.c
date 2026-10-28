@@ -1214,6 +1214,18 @@ static int read_file(const char *path, char **out)
 		return -EIO;
 	}
 
+	/*
+	 * An empty file is what a writer that truncates the file and then
+	 * fills it leaves in between, and loading it would replace every rule
+	 * with two ACCEPT policies. A file meant to have no rules still needs
+	 * a line (a comment will do), so refuse an empty one.
+	 */
+	if (!sz) {
+		fprintf(stderr, "acl: %s: file is empty\n", path);
+		fclose(fp);
+		return -ENODATA;
+	}
+
 	buf = malloc((size_t)sz + 1);
 	if (!buf) {
 		fclose(fp);
