@@ -1420,7 +1420,13 @@ int gwp_http_cli_build_connect(const char *authority, const char *user,
 			       uint8_t ulen, const char *pass, uint8_t plen,
 			       void *out, size_t out_cap, size_t *out_len)
 {
-	char auth_hdr[8 + ((255 + 1 + 255 + 2) / 3) * 4 + 4] = "";
+	/*
+	 * "Proxy-Authorization: Basic " + base64 of the longest "user:pass"
+	 * the URL parser accepts (255 + 1 + 255 bytes, 684 characters) +
+	 * CRLF + NUL.
+	 */
+	char auth_hdr[sizeof("Proxy-Authorization: Basic ") - 1 +
+		      ((255 + 1 + 255 + 2) / 3) * 4 + sizeof("\r\n")] = "";
 	int n;
 
 	if (user && ulen) {

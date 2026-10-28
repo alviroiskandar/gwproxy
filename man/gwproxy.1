@@ -61,7 +61,9 @@ Every boolean option takes an explicit
 .B 0
 or
 .B 1
-argument. Long options and their single\-letter equivalents are interchangeable.
+argument. A numeric argument must be a whole decimal integer; anything else,
+or a value out of the option's range, is rejected at startup.
+Long options and their single\-letter equivalents are interchangeable.
 .SS General
 .TP
 .BR \-h ", " \-\-help
@@ -84,7 +86,11 @@ Address and port to listen on. IPv6 literals are written in brackets, e.g.
 .BR [::1]:1080 " or " 0.0.0.0:8080 .
 The default,
 .BR [::]:1080 ,
-listens on the dual\-stack IPv4/IPv6 wildcard.
+listens on the dual\-stack IPv4/IPv6 wildcard. A SOCKS5 or HTTP proxy
+listening on anything but loopback without
+.B \-\-auth\-file
+is open to every client that can reach it; gwproxy logs a warning at startup
+when it is configured that way.
 .TP
 .BR \-t ", " \-\-target=\fIaddr:port\fR
 For plain TCP forwarding, the fixed destination every accepted connection is
@@ -94,7 +100,7 @@ comes from the protocol or the socket.
 .BR \-w ", " \-\-nr\-workers=\fInr\fR
 Number of worker threads, each with its own
 .B SO_REUSEPORT
-listener. Default:
+listener, from 1 to 1024. Default:
 .BR 4 .
 .TP
 .BR \-o ", " \-\-protocol\-timeout=\fIsec\fR
@@ -677,7 +683,7 @@ means unlimited. Default:
 .BR 65536 .
 .TP
 .BR \-W ", " \-\-nr\-dns\-workers=\fInr\fR
-Number of DNS resolver worker threads. Default:
+Number of DNS resolver worker threads, at most 1024. Default:
 .BR 4 .
 .TP
 .BR \-j ", " \-\-dns\-server=\fIaddr:port\fR
@@ -714,12 +720,39 @@ an HTTP proxy reached with an HTTP CONNECT request. Optional
 supplies username/password authentication to the upstream (RFC\ 1929 for
 SOCKS5, HTTP Basic for HTTP). The port defaults to 1080 for SOCKS5 and 8080
 for HTTP.
+gwproxy overwrites the password in its command line with
+.B ***
+as soon as it has read it, but other local users can still catch it there in
+the moment before, and it stays in shell history and service definitions;
+.B \-\-upstream\-proxy\-auth\-file
+keeps it out of the command line altogether.
+.TP
+.BR \-\-upstream\-proxy\-auth\-file=\fIfile\fR
+Read the upstream credentials from the first line of
+.I file
+instead of the
+.B \-\-upstream\-proxy
+URL, as
+.B user:pass
+(split at the first colon) or a bare
+.BR user ,
+each part at most 255 bytes. The command line is readable by every local
+user (\fBps\fR(1), \fI/proc/<pid>/cmdline\fR), so this keeps the password
+out of it; make the file readable only by the user gwproxy runs as. The
+password may contain any character except a line break, including
+.B @
+and
+.BR : .
+The URL must not carry credentials of its own when this option is given.
 .SS Networking
 .TP
 .BR \-M ", " \-\-mark=\fInr\fR
 Set
 .B SO_MARK
 (fwmark) on outgoing connections, for policy routing and iptables matching.
+The mark is a 32\-bit value, written in decimal or, with a
+.B 0x
+prefix, in hexadecimal.
 Requires
 .B CAP_NET_ADMIN
 or, since Linux 5.11,
