@@ -3544,11 +3544,22 @@ reply:
 
 int gwp_handle_conn_state_socks5(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
+	bool decided = false;
 	int r, ct;
 
 	ct = gcp->conn_state;
 	if (ct == CONN_STATE_PROT) {
-		return handle_socks5_prot(w, gcp);
+		r = handle_socks5_prot(w, gcp);
+		if (r)
+			return r;
+		/*
+		 * A client that does not wait for each reply sends its request
+		 * in the same read as the greeting, and the parser has already
+		 * reached the command. No further read brings us back here
+		 * when the client has nothing more to send, so act on it now,
+		 * as for a request that arrives on its own.
+		 */
+		decided = true;
 	} else if (ct == CONN_STATE_SOCKS5_DATA) {
 		r = gwp_socks5_handle_data(gcp);
 		if (r)
@@ -3593,6 +3604,13 @@ int gwp_handle_conn_state_socks5(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 			gcp->conn_state = CONN_STATE_SOCKS5_UDP_ASSOCIATE;
 	}
 
+	/*
+	 * The greeting made this a SOCKS5 connection. A failure from here
+	 * on must not read as "not SOCKS5" to gwp_handle_conn_state_prot(),
+	 * which would hand the rest of the bytes to the HTTP parser.
+	 */
+	if (decided && r == -EINVAL)
+		r = -EPROTO;
 	return r;
 }
 
