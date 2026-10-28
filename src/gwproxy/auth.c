@@ -550,6 +550,7 @@ bool gwp_auth_check_basic_ex(struct gwp_auth *auth, const char *hdr_val,
 {
 	unsigned char dec[GWP_AUTH_BASIC_DEC_MAX];
 	size_t ulen, plen;
+	bool ok = false;
 	int dlen;
 
 	if (!auth)
@@ -557,12 +558,12 @@ bool gwp_auth_check_basic_ex(struct gwp_auth *auth, const char *hdr_val,
 
 	dlen = basic_decode(hdr_val, dec, &ulen);
 	if (dlen < 0)
-		return false;
+		goto out;
 
 	plen = (size_t)dlen - ulen - 1;
 	if (!gwp_auth_check(auth, (const char *)dec, ulen,
 			    (const char *)dec + ulen + 1, plen))
-		return false;
+		goto out;
 
 	if (user_out && user_cap) {
 		size_t n = ulen < user_cap - 1 ? ulen : user_cap - 1;
@@ -570,7 +571,11 @@ bool gwp_auth_check_basic_ex(struct gwp_auth *auth, const char *hdr_val,
 		memcpy(user_out, dec, n);
 		user_out[n] = '\0';
 	}
-	return true;
+	ok = true;
+out:
+	/* The plaintext password must not outlive the check on the stack. */
+	explicit_bzero(dec, sizeof(dec));
+	return ok;
 }
 
 int gwp_auth_basic_user(const char *hdr_val, char *user_out, size_t user_cap)
@@ -580,13 +585,16 @@ int gwp_auth_basic_user(const char *hdr_val, char *user_out, size_t user_cap)
 	int r;
 
 	r = basic_decode(hdr_val, dec, &ulen);
-	if (r < 0)
-		return -1;
+	if (r >= 0) {
+		if (ulen > user_cap)
+			ulen = user_cap;
+		memcpy(user_out, dec, ulen);
+		r = (int)ulen;
+	}
 
-	if (ulen > user_cap)
-		ulen = user_cap;
-	memcpy(user_out, dec, ulen);
-	return (int)ulen;
+	/* @dec holds the password too, not only the user name. */
+	explicit_bzero(dec, sizeof(dec));
+	return r < 0 ? -1 : r;
 }
 
 bool gwp_auth_check_basic(struct gwp_auth *auth, const char *hdr_val)
