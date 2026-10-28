@@ -387,8 +387,10 @@ enum {
 	GWP_CONN_FLAG_ACL_CAND_OK	= (1ull << 3ull),
 	/*
 	 * The target socket could not be created for want of descriptors and
-	 * the connect is being retried (io_uring); set so that this is logged
-	 * once per pair rather than on every retry.
+	 * the connect is being retried; set so that this is logged once per
+	 * pair rather than on every retry. io_uring only: the epoll loop logs
+	 * when it puts the pair on its own wait list (gwp_wrk::tgt_wait) and
+	 * retries from that list, so it never logs a retry and needs no flag.
 	 */
 	GWP_CONN_FLAG_FD_WAIT		= (1ull << 4ull),
 };
