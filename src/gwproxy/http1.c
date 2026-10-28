@@ -659,11 +659,19 @@ static int parse_hdr_fields(struct gwnet_http_hdr_pctx *ctx,
 		const char *k, *v, *p;
 		uint32_t kl, vl;
 
+		/*
+		 * A CR here can only start the CRLF that ends the header. A
+		 * lone CR is not a line terminator (RFC 9112 Section 2.2), and
+		 * skipping it would read "\rX: y" as the field "X: y", while
+		 * a peer that treats the CR differently sees another line.
+		 */
 		if (buf[off] == '\r') {
 			if (++off >= len)
 				return -EAGAIN;
 			if (ctx->tot_len + off >= ctx->max_len)
 				return -E2BIG;
+			if (buf[off] != '\n')
+				return -EINVAL;
 		}
 
 		if (buf[off] == '\n') {
@@ -1901,6 +1909,44 @@ static void test_res_hdr_invalid_space_before_colon(void)
 	PRTEST_OK();
 }
 
+/*
+ * A lone CR at the start of a header line is malformed; it must not be
+ * skipped so that the rest of the line parses as a field.
+ */
+static void test_req_hdr_invalid_lone_cr(void)
+{
+	static const char * const bufs[] = {
+		"GET /index.html HTTP/1.1\r\n"
+		"Host: example.com\r\n"
+		"\rX-Smuggled: 1\r\n"
+		"\r\n",
+		"GET /index.html HTTP/1.1\r\n"
+		"\rHost: example.com\r\n"
+		"\r\n",
+		"GET /index.html HTTP/1.1\r\n"
+		"Host: example.com\r\n"
+		"\r\r\n",
+	};
+	size_t i;
+
+	for (i = 0; i < sizeof(bufs) / sizeof(bufs[0]); i++) {
+		struct gwnet_http_hdr_pctx ctx;
+		struct gwnet_http_req_hdr hdr;
+		int r;
+
+		r = gwnet_http_hdr_pctx_init(&ctx);
+		assert(!r);
+		ctx.buf = bufs[i];
+		ctx.len = strlen(bufs[i]);
+		r = gwnet_http_req_hdr_parse(&ctx, &hdr);
+		assert(r == -EINVAL);
+		assert(ctx.err == GWNET_HTTP_HDR_ERR_MALFORMED);
+		gwnet_http_req_hdr_free(&hdr);
+		gwnet_http_hdr_pctx_free(&ctx);
+	}
+	PRTEST_OK();
+}
+
 static void test_req_hdr_duplicate_fields_merged_into_comma(void)
 {
 	static const char buf[] =
@@ -2725,6 +2771,7 @@ void gwnet_http_run_tests(void)
 		test_res_hdr_invalid_duplicate_fields();
 		test_req_hdr_invalid_space_before_colon();
 		test_res_hdr_invalid_space_before_colon();
+		test_req_hdr_invalid_lone_cr();
 		test_req_hdr_duplicate_fields_merged_into_comma();
 		test_res_hdr_duplicate_fields_merged_into_comma();
 		test_req_hdr_duplicate_fields_empty_value();
