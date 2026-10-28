@@ -3324,6 +3324,31 @@ static void socks5_log_auth_failure(struct gwp_wrk *w,
 		ip_to_str(&gcp->client_addr), user);
 }
 
+/*
+ * Log a failed HTTP proxy login like the SOCKS5 one. A request without
+ * Proxy-Authorization is how a client learns that credentials are needed,
+ * not a failure, and is not logged.
+ */
+static void http_log_auth_failure(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	char user[GWP_LOG_ESC_SIZE(255)];
+	const char *u;
+	size_t len;
+
+	if (!gwp_http_conn_auth_failed(gcp->http_conn, &u, &len))
+		return;
+
+	if (!u) {
+		pr_info(&w->ctx->lh, "HTTP proxy authentication failed (ca=%s, malformed credentials)",
+			ip_to_str(&gcp->client_addr));
+		return;
+	}
+
+	gwp_log_escape(user, u, len < 255 ? len : 255);
+	pr_info(&w->ctx->lh, "HTTP proxy authentication failed (ca=%s, user=\"%s\")",
+		ip_to_str(&gcp->client_addr), user);
+}
+
 static int handle_socks5_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	uint32_t clen = gcp->client.len, tlen = gcp->target.len;
@@ -4119,6 +4144,7 @@ int gwp_handle_conn_state_http(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 			return http_reject_too_large(gcp);
 		return 0;
 	case GWP_HTTP_NEED_AUTH:
+		http_log_auth_failure(w, gcp);
 		return http_reject_unauthorized(gcp);
 	case GWP_HTTP_CONNECT:
 		return http_connect_target(w, gcp, host, port);

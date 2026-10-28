@@ -49,6 +49,16 @@ bool gwp_http_conn_is_forward(const struct gwp_http_conn *hc);
  */
 const char *gwp_http_conn_username(const struct gwp_http_conn *hc);
 
+/*
+ * After GWP_HTTP_NEED_AUTH: whether the request carried Proxy-Authorization,
+ * that is, whether a login failed rather than credentials being asked for.
+ * If so, *@user and *@len give the username it tried (any bytes, not
+ * NUL-terminated, at most 255), *@user being NULL if the credentials did not
+ * decode. Valid until gwp_http_conn_free().
+ */
+bool gwp_http_conn_auth_failed(const struct gwp_http_conn *hc,
+			       const char **user, size_t *len);
+
 /**
  * Consume client request bytes and, once the header is complete, classify the
  * request.

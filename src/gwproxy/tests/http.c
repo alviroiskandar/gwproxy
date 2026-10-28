@@ -1066,13 +1066,19 @@ static void test_auth(void)
 	static const char bad[] =
 		"CONNECT example.com:443 HTTP/1.1\r\n"
 		"Proxy-Authorization: Basic dXNlcjp3cm9uZw==\r\n\r\n";
+	static const char odd[] =	/* Basic base64("u\nx\0:wrong") */
+		"CONNECT example.com:443 HTTP/1.1\r\n"
+		"Proxy-Authorization: Basic dQp4ADp3cm9uZw==\r\n\r\n";
+	static const char malformed[] =
+		"CONNECT example.com:443 HTTP/1.1\r\n"
+		"Proxy-Authorization: Basic !!!!\r\n\r\n";
 	static const char cred_data[] = "user:pass\n";
 	char cred_file[] = "/tmp/gwp_http_auth.XXXXXX";
 	struct gwp_auth *auth = NULL;
 	struct gwp_http_conn *hc;
 	char *host, *port;
-	const char *req = NULL;
-	size_t req_len = 0;
+	const char *req = NULL, *user;
+	size_t req_len = 0, ulen;
 	uint8_t out[128];
 	ssize_t w;
 	int r;
@@ -1087,12 +1093,33 @@ static void test_auth(void)
 	hc = gwp_http_conn_alloc();
 	assert(hc);
 	assert(run(hc, auth, no_cred, &host, &port, &req, &req_len) == GWP_HTTP_NEED_AUTH);
+	/* Not a failed login: nothing was tried. */
+	assert(!gwp_http_conn_auth_failed(hc, &user, &ulen));
 	gwp_http_conn_free(hc);
 
-	/* Wrong credentials -> challenge. */
+	/* Wrong credentials -> challenge, a failed login by "user". */
 	hc = gwp_http_conn_alloc();
 	assert(hc);
 	assert(run(hc, auth, bad, &host, &port, &req, &req_len) == GWP_HTTP_NEED_AUTH);
+	assert(gwp_http_conn_auth_failed(hc, &user, &ulen));
+	assert(user && ulen == 4 && !memcmp(user, "user", 4));
+	assert(!gwp_http_conn_username(hc));
+	gwp_http_conn_free(hc);
+
+	/* The username tried comes back whole, whatever its bytes. */
+	hc = gwp_http_conn_alloc();
+	assert(hc);
+	assert(run(hc, auth, odd, &host, &port, &req, &req_len) == GWP_HTTP_NEED_AUTH);
+	assert(gwp_http_conn_auth_failed(hc, &user, &ulen));
+	assert(user && ulen == 4 && !memcmp(user, "u\nx\0", 4));
+	gwp_http_conn_free(hc);
+
+	/* Credentials that do not decode: a failure, with no username. */
+	hc = gwp_http_conn_alloc();
+	assert(hc);
+	assert(run(hc, auth, malformed, &host, &port, &req, &req_len) == GWP_HTTP_NEED_AUTH);
+	assert(gwp_http_conn_auth_failed(hc, &user, &ulen));
+	assert(!user && !ulen);
 	gwp_http_conn_free(hc);
 
 	/* Correct credentials -> proceed. */
@@ -1100,6 +1127,7 @@ static void test_auth(void)
 	assert(hc);
 	assert(run(hc, auth, good, &host, &port, &req, &req_len) == GWP_HTTP_CONNECT);
 	assert(!strcmp(host, "example.com"));
+	assert(!gwp_http_conn_auth_failed(hc, &user, &ulen));
 	gwp_http_conn_free(hc);
 
 	/* The 407 challenge reply is well-formed and bounds-checked. */
