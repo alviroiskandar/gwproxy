@@ -620,6 +620,13 @@ struct gwp_conn_pair {
 	uint8_t			nr_ops_client;
 	uint8_t			nr_ops_target;
 	uint8_t			nr_ops_udp;
+	/*
+	 * A plaintext send of target.buf to the client is in flight. It
+	 * covers the bytes that were there when it was queued, so another
+	 * send must not be queued over them; its completion sends whatever
+	 * was appended in the meantime.
+	 */
+	bool			client_tx;
 #endif
 };
 

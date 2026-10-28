@@ -489,6 +489,16 @@ static struct io_uring_sqe *__prep_send_client(struct gwp_wrk *w,
 	int fd = gcp->client.fd;
 	struct io_uring_sqe *s;
 
+	/*
+	 * A send already on its way covers the start of target.buf, and its
+	 * completion (handle_ev_client_send()) sends the rest, including what
+	 * has been appended since. In the protocol phase a client recv is
+	 * armed alongside the reply's send and may complete first; queueing
+	 * target.buf again from there would hand the client the reply twice.
+	 */
+	if (gcp->client_tx)
+		return NULL;
+
 	s = get_sqe_nofail(w);
 #if USE_SEND_ZC
 	io_uring_prep_send_zc(s, fd, buf, len, MSG_NOSIGNAL, 0);
@@ -497,6 +507,7 @@ static struct io_uring_sqe *__prep_send_client(struct gwp_wrk *w,
 #endif
 	io_uring_sqe_set_data(s, gcp);
 	s->user_data |= EV_BIT_IOU_CLIENT_SEND;
+	gcp->client_tx = true;
 	get_gcp_io(gcp, s);
 	pr_dbg(&w->ctx->lh,
 		"Prepared send for client fd=%d, len=%zu, buf=%p, ref_cnt=%d",
@@ -1909,6 +1920,7 @@ static int handle_ev_client_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 {
 	int r = cqe->res;
 
+	gcp->client_tx = false;
 	r = handle_sock_ret(r);
 	if (r < 0)
 		return r;
