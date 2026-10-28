@@ -2582,6 +2582,41 @@ static int handle_conn_state_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	}
 }
 
+/*
+ * Has the client's handshake handed over to the connect? handle_connect()
+ * does not retag the client fd, so a client still registered under
+ * EV_BIT_CLIENT_PROT belongs to handle_ev_client() from then on: it buffers
+ * what the client sends until the target is up, and then forwards.
+ */
+static bool client_past_handshake(const struct gwp_conn_pair *gcp)
+{
+	int cs = gcp->conn_state;
+
+	return cs == CONN_STATE_SOCKS5_CONNECT ||
+	       cs == CONN_STATE_HTTP_CONNECT ||
+	       cs == CONN_STATE_FORWARDING || gwp_in_upstream_hs(gcp);
+}
+
+/*
+ * A FIN from the client during the handshake. Before its request is complete
+ * the client has given up, and the pair goes. Once the request is complete and
+ * only the lookup of its target's name is outstanding, the client has merely
+ * finished sending: a client may well close its write side right after the
+ * request and wait for the answer. The connect goes ahead and the FIN is
+ * passed on once the target is up, as for a FIN during the connect (see
+ * handle_ev_target_conn_result()); handle_ev_client_prot() stops watching
+ * for input meanwhile, as there is no more of it.
+ */
+static int client_prot_eof(const struct gwp_conn_pair *gcp)
+{
+	int cs = gcp->conn_state;
+
+	if (cs == CONN_STATE_SOCKS5_DNS_QUERY || cs == CONN_STATE_HTTP_DNS_QUERY ||
+	    client_past_handshake(gcp))
+		return 0;
+	return -ECONNRESET;
+}
+
 static int handle_ev_client_prot_in(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	uint32_t from = gcp->client.len;
@@ -2591,10 +2626,8 @@ static int handle_ev_client_prot_in(struct gwp_wrk *w, struct gwp_conn_pair *gcp
 	ret = __do_recv(&gcp->client);
 	if (unlikely(ret < 0))
 		return (int)ret;
-	if (unlikely(gcp->client.rd_eof))
-		return -ECONNRESET;
 	if (!ret)
-		return 0;
+		return gcp->client.rd_eof ? client_prot_eof(gcp) : 0;
 
 	/*
 	 * More of a forwarding request's body (or what follows it) arriving
@@ -2611,11 +2644,11 @@ static int handle_ev_client_prot_in(struct gwp_wrk *w, struct gwp_conn_pair *gcp
 		/*
 		 * The TCP control connection is idle once the UDP association is
 		 * up (the relay runs on gcp->udp_fd). Discard any stray bytes;
-		 * a peer close was already turned into -ECONNRESET above and
-		 * tears the association down.
+		 * a peer close is turned into -ECONNRESET and tears the
+		 * association down.
 		 */
 		gcp->client.len = 0;
-		return 0;
+		return gcp->client.rd_eof ? -ECONNRESET : 0;
 	}
 	if (ct == CONN_STATE_PROT) {
 		r = handle_conn_state_prot(w, gcp);
@@ -2639,6 +2672,9 @@ static int handle_ev_client_prot_in(struct gwp_wrk *w, struct gwp_conn_pair *gcp
 			return (int)ret;
 	}
 
+	/* A TLS client's last records and its FIN can come in one recv(). */
+	if (!r && unlikely(gcp->client.rd_eof))
+		r = client_prot_eof(gcp);
 	return r;
 }
 
@@ -2663,21 +2699,6 @@ static int handle_ev_client_prot_out(struct gwp_wrk *w, struct gwp_conn_pair *gc
 		return r;
 
 	return 0;
-}
-
-/*
- * Has the client's handshake handed over to the connect? handle_connect()
- * does not retag the client fd, so a client still registered under
- * EV_BIT_CLIENT_PROT belongs to handle_ev_client() from then on: it buffers
- * what the client sends until the target is up, and then forwards.
- */
-static bool client_past_handshake(const struct gwp_conn_pair *gcp)
-{
-	int cs = gcp->conn_state;
-
-	return cs == CONN_STATE_SOCKS5_CONNECT ||
-	       cs == CONN_STATE_HTTP_CONNECT ||
-	       cs == CONN_STATE_FORWARDING || gwp_in_upstream_hs(gcp);
 }
 
 /*
