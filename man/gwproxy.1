@@ -213,7 +213,14 @@ rejected (at startup, or by keeping the previous rules on reload). When
 is not given, a built\-in default ACL is applied instead (see
 .BR \-\-acl\-allow\-all
 below). Each line is one directive, evaluated top\-to\-bottom
-with first\-match\-wins; a chain's policy applies when nothing matches:
+with first\-match\-wins; a chain's policy applies when nothing matches.
+A word that starts with
+.B #
+begins a comment that runs to the end of the line; a
+.B #
+inside a word (a regexp such as
+.BR ^[^#]+$ )
+is part of that word. The directives are:
 .RS
 .IP \(bu 3
 .BI "\-P " "chain target"

@@ -634,6 +634,27 @@ static noinline void test_comments_and_default_policy(void)
 	assert(out(a, &s, NULL, 53, GWP_ACL_PROTO_UDP) == GWP_ACL_REJECT);
 	gwp_acl_destroy(a);
 
+	/*
+	 * Only a '#' that starts a token begins a comment; inside a value it
+	 * is part of the value and must not cut the rule short.
+	 */
+	assert(!gwp_acl_parse_str(&a,
+		"-A OUTPUT -m user --user ops#1 -j REJECT #ops#1 only\n"
+		"#-A OUTPUT -j REJECT\n"
+		"\t# indented comment\n"));
+	s = sa4("1.2.3.4", 80);
+	assert(out_user(a, &s, "ops#1", 80) == GWP_ACL_REJECT);
+	assert(out_user(a, &s, "ops", 80) == GWP_ACL_ACCEPT);
+	gwp_acl_destroy(a);
+#ifdef CONFIG_PCRE
+	assert(!gwp_acl_parse_str(&a,
+		"-A OUTPUT -m domain --domain-regexp ^[^#]+$ -j ACCEPT\n"
+		"-P OUTPUT REJECT\n"));
+	assert(out(a, NULL, "a.example", 443, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
+	assert(out(a, NULL, "a#b.example", 443, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+	gwp_acl_destroy(a);
+#endif
+
 	/* NULL ACL and empty ruleset both allow everything. */
 	s = sa4("1.2.3.4", 1);
 	assert(out(NULL, &s, NULL, 1, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);

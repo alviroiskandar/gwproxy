@@ -1144,9 +1144,17 @@ static int parse_line(struct gwp_acl_ruleset *rs, char *line)
 	char *hash;
 	int n;
 
-	hash = strchr(line, '#');
-	if (hash)
-		*hash = '\0';
+	/*
+	 * A comment starts with a '#' that begins a token. A '#' inside a
+	 * token is part of its value: a regexp such as "^[^#]+$" must not be
+	 * cut short into a different, broader pattern.
+	 */
+	for (hash = strchr(line, '#'); hash; hash = strchr(hash + 1, '#')) {
+		if (hash == line || strchr(" \t\r", hash[-1])) {
+			*hash = '\0';
+			break;
+		}
+	}
 
 	n = tokenise(line, tok);
 	if (n < 0)
