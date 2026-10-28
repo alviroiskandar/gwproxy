@@ -139,4 +139,100 @@ for lim in 64 65; do
 	run_with_limit "$lim"
 done
 
+# Plain forwarding creates the target socket at accept time. When the
+# table ran out at the target socket, the client was accepted and closed
+# at once; it must be kept instead, and connected once descriptors are
+# returned. The origin closes a connection once the client has, so that
+# the pair goes away.
+#
+# With a connect timer, the spare timer and accept() itself, which takes
+# a descriptor before it looks at the backlog, always run out first in a
+# single worker. Without one (--connect-timeout=0) a client takes two
+# descriptors, and the parity of the free ones decides whether the table
+# runs out at accept() or at the target socket, hence two limits; one of
+# them has to end at the target socket.
+origin_port=""
+python3 -c '
+import socket, threading
+def serve(c):
+    c.sendall(b"R\n")
+    while c.recv(4096):
+        pass
+    c.close()
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+s.listen(256)
+print(s.getsockname()[1], flush=True)
+while True:
+    c, _ = s.accept()
+    threading.Thread(target=serve, args=(c,), daemon=True).start()' >"$WORK/origin.port" &
+_PIDS+=("$!")
+for _ in $(seq 1 50); do
+	origin_port="$(cat "$WORK/origin.port" 2>/dev/null)"
+	[ -n "$origin_port" ] && break
+	sleep 0.1
+done
+[ -n "$origin_port" ] || fail "origin did not start"
+
+hit_target=0
+for lim in 64 65; do
+	pp="$(pick_port)"
+	log="$WORK/gwp.plain.$lim.log"
+	( ulimit -n "$lim"; exec "$GWPROXY" --event-loop=epoll \
+		--target="127.0.0.1:$origin_port" --bind="127.0.0.1:$pp" \
+		--connect-timeout=0 \
+		--acl-allow-all --nr-workers=1 --log-level=3 ) >"$log" 2>&1 &
+	gwp_pid=$!
+	_PIDS+=("$gwp_pid")
+	wait_listen "$pp" "$gwp_pid" || fail "proxy did not listen"
+
+	out="$(python3 - "$pp" <<-'PY'
+	import socket, sys
+	port = int(sys.argv[1])
+
+	def banner(c, timeout):
+	    c.settimeout(timeout)
+	    try:
+	        return c.recv(2)
+	    except socket.timeout:
+	        return None
+	    except ConnectionResetError:
+	        return b""
+
+	# Fill the table with forwarded clients until one is left waiting.
+	idle, waiting = [], None
+	for _ in range(64):
+	    c = socket.create_connection(("127.0.0.1", port), timeout=5)
+	    rep = banner(c, 0.5)
+	    if rep == b"":
+	        print("client %d was accepted and dropped" % (len(idle) + 1))
+	        sys.exit(1)
+	    if rep == b"R\n":
+	        idle.append(c)
+	        continue
+	    waiting = c
+	    break
+	if waiting is None:
+	    print("never ran out of descriptors (%d clients)" % len(idle))
+	    sys.exit(1)
+
+	for c in idle:
+	    c.close()
+	rep = banner(waiting, 4.0)
+	if rep != b"R\n":
+	    print("the waiting client was not connected once descriptors were "
+	          "returned (%r)" % rep)
+	    sys.exit(1)
+	print("ok with %d clients" % (len(idle) + 1))
+	PY
+	)" || fail "plain forwarding, fd limit $lim: $out"
+	diag "plain forwarding, fd limit $lim: $out"
+	kill -0 "$gwp_pid" 2>/dev/null || fail "proxy died"
+	kill "$gwp_pid" 2>/dev/null
+	wait "$gwp_pid" 2>/dev/null
+	grep -q "retrying the target connect" "$log" && hit_target=1
+done
+[ "$hit_target" = 1 ] || \
+	fail "no limit ran out at the target socket; test inconclusive"
+
 pass

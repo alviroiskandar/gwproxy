@@ -684,10 +684,19 @@ struct gwp_wrk {
 			int			spare_timer_fd;
 			/*
 			 * When to retry what is waiting on a timed pause
-			 * (accept, see handle_accept_error()), in
-			 * CLOCK_MONOTONIC milliseconds; 0 while nothing is.
+			 * (accept, see handle_accept_error(), or a target
+			 * socket, see wait_for_target()), in CLOCK_MONOTONIC
+			 * milliseconds; 0 while nothing is.
 			 */
 			uint64_t		retry_at_ms;
+			/*
+			 * Plain and transparent forwarding clients whose
+			 * target socket could not be created for want of
+			 * descriptors, retried by run_retries().
+			 */
+			struct gwp_conn_pair	**tgt_wait;
+			uint32_t		nr_tgt_wait;
+			uint32_t		tgt_wait_cap;
 			uint16_t		evsz;
 			uint16_t		nr_dead;
 			uint16_t		dead_cap;
