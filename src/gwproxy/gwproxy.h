@@ -674,6 +674,13 @@ struct gwp_wrk {
 			 * same batch may still point at them.
 			 */
 			struct gwp_conn_pair	**dead;
+			/*
+			 * A timerfd created before the next client is
+			 * accepted, so that a client never takes the last
+			 * free descriptor and is then dropped for want of
+			 * its timer. -1 while there is none.
+			 */
+			int			spare_timer_fd;
 			uint16_t		evsz;
 			uint16_t		nr_dead;
 			uint16_t		dead_cap;

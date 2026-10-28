@@ -185,6 +185,7 @@ int gwp_ctx_init_thread_epoll(struct gwp_wrk *w)
 	struct gwp_ctx *ctx = w->ctx;
 	int ep_fd, ev_fd, r;
 
+	w->spare_timer_fd = -1;
 	ep_fd = __sys_epoll_create1(EPOLL_CLOEXEC);
 	if (ep_fd < 0) {
 		r = ep_fd;
@@ -287,6 +288,11 @@ out_close_ep_fd:
 __cold
 void gwp_ctx_free_thread_epoll(struct gwp_wrk *w)
 {
+	if (w->spare_timer_fd >= 0) {
+		__sys_close(w->spare_timer_fd);
+		w->spare_timer_fd = -1;
+	}
+
 	if (w->ev_fd >= 0) {
 		__sys_close(w->ev_fd);
 		pr_dbg(&w->ctx->lh, "Worker %u eventfd closed (fd=%d)", w->idx,
@@ -465,6 +471,33 @@ static int reap_dead_pairs(struct gwp_wrk *w)
 	return ret;
 }
 
+/*
+ * The timeout handle_new_client() arms for a client: the protocol timeout for
+ * the SOCKS5 and HTTP front-ends, the connect timeout for plain and
+ * transparent forwarding.
+ */
+static int new_client_timeout(const struct gwp_cfg *cfg)
+{
+	if (cfg->as_http || cfg->as_socks5)
+		return cfg->protocol_timeout;
+	return cfg->connect_timeout;
+}
+
+/*
+ * Arm @sec seconds on the spare timer __handle_ev_accept() made ready before
+ * accepting the client, and hand it over; create one if there is no spare.
+ */
+static int take_spare_timer(struct gwp_wrk *w, int sec)
+{
+	int fd = w->spare_timer_fd, r;
+
+	w->spare_timer_fd = -1;
+	r = gwp_create_timer(fd, sec, 0);
+	if (unlikely(r < 0) && fd >= 0)
+		__sys_close(fd);
+	return r;
+}
+
 __hot
 static int handle_new_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
@@ -479,9 +512,9 @@ static int handle_new_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	 * connection does not have a target socket. We will create the target
 	 * socket later.
 	 */
+	timeout = new_client_timeout(cfg);
 	if (cfg->as_http || cfg->as_socks5) {
 		gcp->is_target_alive = false;
-		timeout = cfg->protocol_timeout;
 		gcp->conn_state = CONN_STATE_PROT;
 #ifdef CONFIG_HTTPS
 		/*
@@ -521,7 +554,6 @@ static int handle_new_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 				strerror(-target_fd));
 			return target_fd;
 		}
-		timeout = cfg->connect_timeout;
 		gcp->conn_state = CONN_STATE_FORWARDING;
 		cl_ev_bit = EV_BIT_CLIENT;
 
@@ -534,7 +566,7 @@ static int handle_new_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	}
 
 	if (timeout > 0) {
-		timer_fd = gwp_create_timer(-1, timeout, 0);
+		timer_fd = take_spare_timer(w, timeout);
 		if (unlikely(timer_fd < 0)) {
 			__sys_close(target_fd);
 			return timer_fd;
@@ -626,6 +658,21 @@ static int __handle_ev_accept(struct gwp_wrk *w)
 	struct gwp_sockaddr addr;
 	socklen_t addr_len;
 	int fd, r;
+
+	/*
+	 * Have the client's timer ready before taking the client. Otherwise,
+	 * with the descriptor table nearly full, the client could take the
+	 * last free slot and leave none for its timer, and a client accepted
+	 * only to be closed again sees a reset. Failing here instead stops
+	 * accept (handle_accept_error()) with the client still waiting in the
+	 * backlog, to be served once descriptors are returned.
+	 */
+	if (w->spare_timer_fd < 0 && new_client_timeout(cfg) > 0) {
+		r = gwp_create_timer(-1, 0, 0);
+		if (unlikely(r < 0))
+			return handle_accept_error(w, r);
+		w->spare_timer_fd = r;
+	}
 
 	addr_len = sizeof(addr);
 	fd = __sys_accept4(w->tcp_fd, &addr.sa, &addr_len, flags);
