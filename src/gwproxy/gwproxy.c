@@ -1170,12 +1170,19 @@ static void gwp_ctx_free_thread(struct gwp_wrk *w)
 {
 	struct gwp_cfg *cfg = &w->ctx->cfg;
 
+	/*
+	 * Event loop first: an io_uring request still in flight would write
+	 * into the buffers freed below (closing a socket's fd does not end a
+	 * recv armed on it), so the ring must be done with them before they
+	 * go. Tearing it down cancels whatever it has left.
+	 */
+	gwp_ctx_free_thread_event(w);
+
 	if (cfg->use_raw_dns)
 		gwp_ctx_free_raw_dns(w);
 
 	gwp_ctx_free_thread_sock_pairs(w);
 	gwp_ctx_free_thread_sock(w);
-	gwp_ctx_free_thread_event(w);
 }
 
 /*

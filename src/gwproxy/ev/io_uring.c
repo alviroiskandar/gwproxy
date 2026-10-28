@@ -186,9 +186,71 @@ static struct io_uring_sqe *get_sqe_nofail(struct gwp_wrk *w)
 	abort();
 }
 
+/*
+ * Requests still in flight point into memory the caller frees next: the
+ * pairs' buffers, their sockets, this worker's iou. Closing a socket's fd
+ * does not end them, the request holds its own reference to the file, and
+ * neither does closing the ring: io_uring_queue_exit() returns while the
+ * kernel cancels what is left in the background. So cancel everything
+ * first. The synchronous cancel returns once the requests it found can no
+ * longer touch user memory (a recv waiting for data is disarmed on the
+ * spot), and it works from any thread, also for a worker that has already
+ * exited. Kernels before 6.0 lack it; there, an async cancel of everything
+ * does the same for the poll-driven socket I/O this loop uses, and its own
+ * completion says when it is done.
+ */
+__cold
+static void cancel_all_requests(struct gwp_wrk *w)
+{
+	struct io_uring_sync_cancel_reg reg = {
+		.fd = -1,
+		.flags = IORING_ASYNC_CANCEL_ANY,
+		.timeout = { .tv_sec = -1, .tv_nsec = -1 },
+	};
+	/* Unlike the stop poll's, never a value any request carries. */
+	const uint64_t tag = EV_BIT_IOU_STOP | 1;
+	struct io_uring *ring = &w->iou->ring;
+	struct io_uring_cqe *cqe;
+	struct io_uring_sqe *s;
+	int r;
+
+	r = io_uring_register_sync_cancel(ring, &reg);
+	if (r >= 0 || r == -ENOENT)
+		return;
+
+	io_uring_submit(ring);	/* never let a queued SQE go out after us */
+	s = io_uring_get_sqe(ring);
+	if (!s)
+		goto out_err;
+	io_uring_prep_cancel(s, NULL, IORING_ASYNC_CANCEL_ANY);
+	s->user_data = tag;
+	r = io_uring_submit(ring);
+	if (r < 0)
+		goto out_err;
+
+	for (;;) {
+		bool done;
+
+		r = io_uring_wait_cqe(ring, &cqe);
+		if (r == -EINTR)
+			continue;
+		if (r < 0)
+			goto out_err;
+		done = cqe->user_data == tag;
+		io_uring_cqe_seen(ring, cqe);
+		if (done)
+			return;
+	}
+
+out_err:
+	pr_err(&w->ctx->lh, "Worker %u: cannot cancel pending io_uring requests: %s",
+	       w->idx, strerror(r < 0 ? -r : EAGAIN));
+}
+
 __cold
 void gwp_ctx_free_thread_io_uring(struct gwp_wrk *w)
 {
+	cancel_all_requests(w);
 	io_uring_queue_exit(&w->iou->ring);
 	__sys_close(w->iou->stop_efd);
 	pr_dbg(&w->ctx->lh, "Worker %u io_uring queue exited", w->idx);
