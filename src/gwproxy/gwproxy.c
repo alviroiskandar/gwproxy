@@ -229,6 +229,30 @@ static bool ev_is_io_uring(const struct gwp_cfg *cfg)
 }
 
 /*
+ * Locate the password of an --upstream-proxy URL the way gwp_parse_upstream()
+ * splits it: the "user:pass" before the last '@' after the scheme, the
+ * password after its first ':'. Works on malformed URLs too, so an error
+ * message can leave the password out. Returns false when there is none;
+ * otherwise the password spans @url[*off, *off + *len), possibly empty.
+ */
+static bool upstream_pass_span(const char *url, size_t *off, size_t *len)
+{
+	const char *rest, *at, *colon;
+
+	rest = strstr(url, "://");
+	rest = rest ? rest + 3 : url;
+	at = strrchr(rest, '@');
+	if (!at)
+		return false;
+	colon = memchr(rest, ':', (size_t)(at - rest));
+	if (!colon)
+		return false;
+	*off = (size_t)(colon + 1 - url);
+	*len = (size_t)(at - colon - 1);
+	return true;
+}
+
+/*
  * Name an option by its getopt value, for error messages: the long name,
  * which every option has.
  */
@@ -2218,11 +2242,18 @@ static int gwp_ctx_init(struct gwp_ctx *ctx)
 		goto out_free_log;
 
 	if (ctx->cfg.upstream_proxy) {
-		r = gwp_parse_upstream(ctx->cfg.upstream_proxy,
-					      &ctx->upstream);
+		const char *url = ctx->cfg.upstream_proxy;
+		size_t off, len;
+
+		r = gwp_parse_upstream(url, &ctx->upstream);
 		if (r) {
-			pr_err(&ctx->lh, "Invalid --upstream-proxy value '%s'",
-			       ctx->cfg.upstream_proxy);
+			/* Name the URL, but never its password. */
+			if (!upstream_pass_span(url, &off, &len)) {
+				off = strlen(url);
+				len = 0;
+			}
+			pr_err(&ctx->lh, "Invalid --upstream-proxy value '%.*s%s%s'",
+			       (int)off, url, len ? "***" : "", url + off + len);
 			goto out_free_log;
 		}
 		if (ctx->upstream.use_tls) {
