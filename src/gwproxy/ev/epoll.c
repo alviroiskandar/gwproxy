@@ -349,7 +349,7 @@ static int rearm_accept(struct gwp_wrk *w, int nr_fd_closed)
 		return r;
 
 	w->accept_is_stopped = false;
-	pr_info(&ctx->lh,
+	pr_dbg(&ctx->lh,
 		"Rearmed main TCP socket for accepting new connections (tidx=%u, fd=%d)",
 		w->idx, w->tcp_fd);
 
@@ -845,8 +845,16 @@ static int handle_accept_error(struct gwp_wrk *w, int e)
 		 * closed a file descriptor.
 		 *
 		 * See free_conn_pair() for more details.
+		 *
+		 * The pause is logged once, until a connection is accepted
+		 * again, in the same words as the io_uring loop uses.
 		 */
-		pr_warn(&w->ctx->lh, "Too many open files, stop accepting new connections");
+		if (!w->accept_paused) {
+			w->accept_paused = true;
+			pr_warn(&w->ctx->lh,
+				"Too many open files, pausing accept (tidx=%u)",
+				w->idx);
+		}
 		w->accept_is_stopped = true;
 		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_DEL, w->tcp_fd, NULL);
 		if (unlikely(r))
@@ -1614,6 +1622,55 @@ static int upstream_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	return r;	/* negative errno */
 }
 
+/*
+ * Whether part of a reply to the client is still waiting to be sent: in
+ * target.buf, or for a TLS client also as ciphertext in the engine.
+ */
+static bool client_reply_pending(struct gwp_conn_pair *gcp)
+{
+#ifdef CONFIG_HTTPS
+	if (gcp->client.tls && gwp_ssl_bio_pending(gcp->client.tls) > 0)
+		return true;
+#endif
+	return gcp->target.len > 0;
+}
+
+/*
+ * Connected to the upstream proxy, but the handshake with it has not begun:
+ * upstream_hold() left that until the client has its reply.
+ */
+static bool upstream_start_held(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	int cs = gcp->conn_state;
+
+	return w->ctx->upstream.enabled && gcp->target.fd >= 0 &&
+	       (cs == CONN_STATE_SOCKS5_CONNECT || cs == CONN_STATE_HTTP_CONNECT);
+}
+
+/*
+ * The handshake builds its requests in target.buf, which still holds part
+ * of a SOCKS5 method or auth reply to the client: the client was answered
+ * and asked to connect in one go, and the reply's send came up short. Have
+ * the client socket flush it first (handle_ev_client_held()), and watch the
+ * target only for a hangup meanwhile.
+ */
+static int upstream_hold(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	struct epoll_event ev;
+	int r;
+
+	r = upstream_arm(w, gcp, EPOLLRDHUP);
+	if (unlikely(r))
+		return r;
+
+	if (!adj_epl_out(&gcp->target, &gcp->client))
+		return 0;
+
+	ev.events = gcp->client.ep_mask;
+	ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_CLIENT;
+	return __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_MOD, gcp->client.fd, &ev);
+}
+
 __hot
 static int handle_ev_upstream(struct gwp_wrk *w,
 			      struct gwp_conn_pair *gcp,
@@ -1711,10 +1768,14 @@ static int handle_ev_target_conn_result(struct gwp_wrk *w,
 
 	/*
 	 * Connected to the upstream SOCKS5 proxy. Perform the client handshake
-	 * before forwarding; the connect timer is kept to bound it.
+	 * before forwarding; the connect timer is kept to bound it, also while
+	 * the client's reply is still being flushed (upstream_hold()).
 	 */
-	if (ctx->upstream.enabled)
+	if (ctx->upstream.enabled) {
+		if (client_reply_pending(gcp))
+			return upstream_hold(w, gcp);
 		return upstream_start(w, gcp);
+	}
 
 	log_target_connected(w, gcp);
 	r = arm_idle_timer(w, gcp);
@@ -2008,6 +2069,13 @@ static int handle_ev_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	struct gwp_conn *hup = NULL;
 	int r;
 
+	/*
+	 * Held before the upstream handshake, the target is watched only for
+	 * a hangup: the upstream went away before it was spoken to.
+	 */
+	if (unlikely(upstream_start_held(w, gcp)))
+		return -ECONNRESET;
+
 	if (unlikely(ev->events & EPOLLERR)) {
 		if (!gcp->is_target_alive)
 			return handle_ev_target_conn_err(w, gcp);
@@ -2081,6 +2149,41 @@ static int handle_ev_client_upstream_hs(struct gwp_wrk *w,
 	return __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_MOD, gcp->client.fd, &cev);
 }
 
+/*
+ * A client event while the upstream handshake waits for the client's reply to
+ * be flushed (upstream_hold()). Once it is out, drop EPOLLOUT and start the
+ * handshake; what the client sends is taken in as during the handshake.
+ */
+static int handle_ev_client_held(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+				 struct epoll_event *ev)
+{
+	struct epoll_event cev;
+	ssize_t sr;
+	int r;
+
+	if (ev->events & EPOLLOUT) {
+		sr = __do_send(&gcp->target, &gcp->client);
+		if (unlikely(sr < 0))
+			return (int)sr;
+	}
+
+	if (!client_reply_pending(gcp)) {
+		gcp->client.ep_mask &= ~EPOLLOUT;
+		cev.events = gcp->client.ep_mask;
+		cev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_CLIENT;
+		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_MOD, gcp->client.fd,
+				    &cev);
+		if (unlikely(r))
+			return r;
+
+		r = upstream_start(w, gcp);
+		if (unlikely(r))
+			return r;
+	}
+
+	return handle_ev_client_upstream_hs(w, gcp, ev);
+}
+
 __hot
 static int handle_ev_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			    struct epoll_event *ev)
@@ -2095,6 +2198,9 @@ static int handle_ev_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 
 	if (gwp_in_upstream_hs(gcp))
 		return handle_ev_client_upstream_hs(w, gcp, ev);
+
+	if (unlikely(upstream_start_held(w, gcp)))
+		return handle_ev_client_held(w, gcp, ev);
 
 	if (ev->events & (EPOLLIN | EPOLLHUP)) {
 		r = do_splice(w, gcp, &gcp->client, &gcp->target, true,

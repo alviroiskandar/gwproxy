@@ -387,8 +387,10 @@ enum {
 	GWP_CONN_FLAG_ACL_CAND_OK	= (1ull << 3ull),
 	/*
 	 * The target socket could not be created for want of descriptors and
-	 * the connect is being retried (io_uring); set so that this is logged
-	 * once per pair rather than on every retry.
+	 * the connect is being retried; set so that this is logged once per
+	 * pair rather than on every retry. io_uring only: the epoll loop logs
+	 * when it puts the pair on its own wait list (gwp_wrk::tgt_wait) and
+	 * retries from that list, so it never logs a retry and needs no flag.
 	 */
 	GWP_CONN_FLAG_FD_WAIT		= (1ull << 4ull),
 };
@@ -729,9 +731,11 @@ struct gwp_wrk {
 			/*
 			 * accept() failed for a reason that closing
 			 * descriptors does not cure: the listener is out of
-			 * the epoll set until retry_at_ms (accept_retry),
-			 * and the pause is logged once, until a connection
-			 * is accepted again (accept_paused).
+			 * the epoll set until retry_at_ms (accept_retry).
+			 * Any accept pause, this one or the one for running
+			 * out of descriptors (accept_is_stopped), is logged
+			 * once, until a connection is accepted again
+			 * (accept_paused).
 			 */
 			bool			accept_retry;
 			bool			accept_paused;
