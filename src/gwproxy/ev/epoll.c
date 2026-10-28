@@ -2219,8 +2219,14 @@ static int handle_ev_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			return r;
 	}
 
+	/*
+	 * Before the target is up, EPOLLOUT on the client can only be the rest
+	 * of a handshake reply (target.buf) still being flushed; there is no
+	 * target socket to read from yet.
+	 */
 	if (ev->events & EPOLLOUT) {
-		r = do_splice(w, gcp, &gcp->target, &gcp->client, true, true);
+		r = do_splice(w, gcp, &gcp->target, &gcp->client,
+			      gcp->is_target_alive, true);
 		if (r)
 			return r;
 	}
