@@ -1178,6 +1178,40 @@ static void gwp_ctx_free_thread(struct gwp_wrk *w)
 	gwp_ctx_free_thread_event(w);
 }
 
+/*
+ * The defaults make an open proxy: the listener is the [::]:1080 wildcard and
+ * SOCKS5 and HTTP clients need no credentials without --auth-file. Changing
+ * either default would break existing setups, so say it loudly at startup
+ * instead when a SOCKS5 or HTTP proxy without --auth-file listens on anything
+ * but loopback. The ACL's INPUT chain may still limit the clients; whether it
+ * does cannot be told from here, so the warning names it.
+ */
+__cold
+static void gwp_ctx_warn_open_proxy(struct gwp_ctx *ctx,
+				    const struct gwp_sockaddr *addr)
+{
+	const struct gwp_cfg *cfg = &ctx->cfg;
+	const uint8_t *a6;
+
+	if (!cfg->as_socks5 && !cfg->as_http)
+		return;
+	if (cfg->auth_file && *cfg->auth_file)
+		return;
+
+	if (addr->sa.sa_family == AF_INET) {
+		if ((ntohl(addr->i4.sin_addr.s_addr) >> 24) == 127)
+			return;
+	} else {
+		a6 = addr->i6.sin6_addr.s6_addr;
+		if (IN6_IS_ADDR_LOOPBACK(&addr->i6.sin6_addr) ||
+		    (IN6_IS_ADDR_V4MAPPED(&addr->i6.sin6_addr) && a6[12] == 127))
+			return;
+	}
+
+	pr_warn(&ctx->lh, "Listening on %s without --auth-file: anyone who can reach it can use this proxy, unless an --acl-file INPUT rule limits the clients",
+		ip_to_str(addr));
+}
+
 __cold
 static int gwp_ctx_init_threads(struct gwp_ctx *ctx)
 {
@@ -1196,6 +1230,7 @@ static int gwp_ctx_init_threads(struct gwp_ctx *ctx)
 		pr_err(&ctx->lh, "Invalid bind address '%s'\n", cfg->bind);
 		return r;
 	}
+	gwp_ctx_warn_open_proxy(ctx, &bind_addr);
 
 	if (posix_memalign((void **)&workers, GWP_CACHELINE,
 			   (size_t)cfg->nr_workers * sizeof(*workers)))

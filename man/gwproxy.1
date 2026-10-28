@@ -86,7 +86,11 @@ Address and port to listen on. IPv6 literals are written in brackets, e.g.
 .BR [::1]:1080 " or " 0.0.0.0:8080 .
 The default,
 .BR [::]:1080 ,
-listens on the dual\-stack IPv4/IPv6 wildcard.
+listens on the dual\-stack IPv4/IPv6 wildcard. A SOCKS5 or HTTP proxy
+listening on anything but loopback without
+.B \-\-auth\-file
+is open to every client that can reach it; gwproxy logs a warning at startup
+when it is configured that way.
 .TP
 .BR \-t ", " \-\-target=\fIaddr:port\fR
 For plain TCP forwarding, the fixed destination every accepted connection is
