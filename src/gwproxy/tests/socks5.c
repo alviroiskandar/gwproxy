@@ -518,6 +518,46 @@ static int try_cred_file(const char *data)
  * a user with an empty password, which a client could log in as by sending
  * none (PLEN 0); a comment line did the same.
  */
+/*
+ * The password comparison walks a fixed number of positions whatever the
+ * lengths; it must still match only the exact password: no prefix, no
+ * extension, nothing longer than any stored password, and the longest one
+ * a store can hold.
+ */
+static void test_auth_check_lengths(void)
+{
+	char cred_file[] = "/tmp/gwp_socks5_auth.XXXXXX";
+	char data[16 + 256 + 1], pw[300];
+	struct gwp_auth *auth;
+	ssize_t r;
+	int n;
+
+	memset(pw, 'q', sizeof(pw));
+	n = snprintf(data, sizeof(data), "user:pass\nlong:%.*s\n", 255, pw);
+	assert(n > 0 && (size_t)n < sizeof(data));
+	r = write_temp_file(cred_file, data, (size_t)n);
+	assert(r == n);
+	r = gwp_auth_create(&auth, cred_file);
+	assert(!r);
+
+	assert(gwp_auth_check(auth, "user", 4, "pass", 4));
+	assert(!gwp_auth_check(auth, "user", 4, "pas", 3));
+	assert(!gwp_auth_check(auth, "user", 4, "passs", 5));
+	assert(!gwp_auth_check(auth, "user", 4, "pasS", 4));
+	assert(!gwp_auth_check(auth, "user", 4, NULL, 0));
+	assert(!gwp_auth_check(auth, "nouser", 6, "pass", 4));
+
+	assert(gwp_auth_check(auth, "long", 4, pw, 255));
+	assert(!gwp_auth_check(auth, "long", 4, pw, 254));
+	assert(!gwp_auth_check(auth, "long", 4, pw, 256));
+	assert(!gwp_auth_check(auth, "long", 4, pw, sizeof(pw)));
+	pw[254] = 'r';
+	assert(!gwp_auth_check(auth, "long", 4, pw, 255));
+
+	gwp_auth_destroy(auth);
+	unlink(cred_file);
+}
+
 static void test_auth_file_lines(void)
 {
 	char longline[5000];
@@ -1139,6 +1179,7 @@ static void gwp_socks5_run_tests(void)
 
 	/* Once: each refused file prints its parse error. */
 	test_auth_file_lines();
+	test_auth_check_lengths();
 
 	for (i = 0; i < 5000; i++) {
 		test_udp_associate();

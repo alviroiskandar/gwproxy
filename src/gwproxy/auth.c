@@ -285,21 +285,29 @@ static int auth_lock_init(pthread_rwlock_t *lock)
 }
 
 /*
- * Constant-time byte comparison for credential checks. Unlike memcmp() it does
- * not short-circuit on the first mismatch, so it does not leak (via timing) how
- * many leading bytes of a supplied username/password are correct. A zero length
- * compares equal without dereferencing either pointer, which also makes the
- * empty-password case (p == NULL) well-defined rather than UB.
+ * Compare a supplied password with a stored one in time that depends on
+ * neither length nor content. Comparing only equal-length passwords, and
+ * those only up to their length, let the response time tell how long the
+ * stored password is. Instead, always walk 255 byte positions (the longest
+ * password the store holds), reading each side only within its own length:
+ * a position past the end reads byte 0 and masks it to zero. The lengths
+ * are folded into the result, so a prefix never matches. A zero length
+ * never dereferences its pointer, so a NULL password is fine.
  */
-static bool ct_bytes_eq(const void *a, const void *b, size_t len)
+static bool ct_pass_eq(const char *a, size_t alen, const char *b, size_t blen)
 {
-	const volatile unsigned char *pa = a;
-	const volatile unsigned char *pb = b;
-	unsigned char diff = 0;
+	static const unsigned char zero;
+	const volatile unsigned char *pa = alen ? (const void *)a : &zero;
+	const volatile unsigned char *pb = blen ? (const void *)b : &zero;
+	size_t diff = alen ^ blen;
 	size_t i;
 
-	for (i = 0; i < len; i++)
-		diff |= pa[i] ^ pb[i];
+	for (i = 0; i < 255; i++) {
+		size_t ma = (size_t)0 - (size_t)(i < alen);
+		size_t mb = (size_t)0 - (size_t)(i < blen);
+
+		diff |= (pa[i & ma] & ma) ^ (pb[i & mb] & mb);
+	}
 
 	return diff == 0;
 }
@@ -308,6 +316,7 @@ bool gwp_auth_check(struct gwp_auth *auth, const char *u, size_t ulen,
 		    const char *p, size_t plen)
 {
 	const struct auth_set *set;
+	bool compared = false;
 	bool ret = false;
 	size_t i;
 
@@ -327,18 +336,24 @@ bool gwp_auth_check(struct gwp_auth *auth, const char *u, size_t ulen,
 
 		/*
 		 * Only the password is compared in constant time. Whether a
-		 * username exists already shows through which chain is walked
-		 * and its length; the password must not.
+		 * username exists already shows through which chain is walked;
+		 * the password, its length included, must not.
 		 */
 		if (ulen != ae->ulen || (ulen && memcmp(u, ae->u, ulen)))
 			continue;
-		if (plen != ae->plen)
-			continue;
-		if (!ct_bytes_eq(p, ae->p, plen))
-			continue;
-		ret = true;
-		break;
+		compared = true;
+		if (ct_pass_eq(p, plen, ae->p, ae->plen)) {
+			ret = true;
+			break;
+		}
 	}
+
+	/*
+	 * An unknown username costs a password comparison too, so the
+	 * time does not set it apart from a known one by that much.
+	 */
+	if (!compared)
+		(void)ct_pass_eq(p, plen, NULL, 0);
 	pthread_rwlock_unlock(&auth->lock);
 	return ret;
 }
