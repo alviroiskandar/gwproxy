@@ -173,6 +173,10 @@ static int handle_ev_raw_dns_query(struct gwp_wrk __unused *w,
 static int connect_next_candidate(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				  int err);
 static bool has_inflight_attempt(const struct gwp_conn_pair *gcp);
+static int __forward_progress(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			      struct gwp_conn *hup, bool force_target);
+static int forward_progress(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			    struct gwp_conn *hup);
 
 __cold
 int gwp_ctx_init_thread_epoll(struct gwp_wrk *w)
@@ -181,6 +185,7 @@ int gwp_ctx_init_thread_epoll(struct gwp_wrk *w)
 	struct gwp_ctx *ctx = w->ctx;
 	int ep_fd, ev_fd, r;
 
+	w->spare_timer_fd = -1;
 	ep_fd = __sys_epoll_create1(EPOLL_CLOEXEC);
 	if (ep_fd < 0) {
 		r = ep_fd;
@@ -283,6 +288,11 @@ out_close_ep_fd:
 __cold
 void gwp_ctx_free_thread_epoll(struct gwp_wrk *w)
 {
+	if (w->spare_timer_fd >= 0) {
+		__sys_close(w->spare_timer_fd);
+		w->spare_timer_fd = -1;
+	}
+
 	if (w->ev_fd >= 0) {
 		__sys_close(w->ev_fd);
 		pr_dbg(&w->ctx->lh, "Worker %u eventfd closed (fd=%d)", w->idx,
@@ -461,6 +471,33 @@ static int reap_dead_pairs(struct gwp_wrk *w)
 	return ret;
 }
 
+/*
+ * The timeout handle_new_client() arms for a client: the protocol timeout for
+ * the SOCKS5 and HTTP front-ends, the connect timeout for plain and
+ * transparent forwarding.
+ */
+static int new_client_timeout(const struct gwp_cfg *cfg)
+{
+	if (cfg->as_http || cfg->as_socks5)
+		return cfg->protocol_timeout;
+	return cfg->connect_timeout;
+}
+
+/*
+ * Arm @sec seconds on the spare timer __handle_ev_accept() made ready before
+ * accepting the client, and hand it over; create one if there is no spare.
+ */
+static int take_spare_timer(struct gwp_wrk *w, int sec)
+{
+	int fd = w->spare_timer_fd, r;
+
+	w->spare_timer_fd = -1;
+	r = gwp_create_timer(fd, sec, 0);
+	if (unlikely(r < 0) && fd >= 0)
+		__sys_close(fd);
+	return r;
+}
+
 __hot
 static int handle_new_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
@@ -475,9 +512,9 @@ static int handle_new_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	 * connection does not have a target socket. We will create the target
 	 * socket later.
 	 */
+	timeout = new_client_timeout(cfg);
 	if (cfg->as_http || cfg->as_socks5) {
 		gcp->is_target_alive = false;
-		timeout = cfg->protocol_timeout;
 		gcp->conn_state = CONN_STATE_PROT;
 #ifdef CONFIG_HTTPS
 		/*
@@ -517,7 +554,6 @@ static int handle_new_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 				strerror(-target_fd));
 			return target_fd;
 		}
-		timeout = cfg->connect_timeout;
 		gcp->conn_state = CONN_STATE_FORWARDING;
 		cl_ev_bit = EV_BIT_CLIENT;
 
@@ -530,7 +566,7 @@ static int handle_new_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	}
 
 	if (timeout > 0) {
-		timer_fd = gwp_create_timer(-1, timeout, 0);
+		timer_fd = take_spare_timer(w, timeout);
 		if (unlikely(timer_fd < 0)) {
 			__sys_close(target_fd);
 			return timer_fd;
@@ -622,6 +658,21 @@ static int __handle_ev_accept(struct gwp_wrk *w)
 	struct gwp_sockaddr addr;
 	socklen_t addr_len;
 	int fd, r;
+
+	/*
+	 * Have the client's timer ready before taking the client. Otherwise,
+	 * with the descriptor table nearly full, the client could take the
+	 * last free slot and leave none for its timer, and a client accepted
+	 * only to be closed again sees a reset. Failing here instead stops
+	 * accept (handle_accept_error()) with the client still waiting in the
+	 * backlog, to be served once descriptors are returned.
+	 */
+	if (w->spare_timer_fd < 0 && new_client_timeout(cfg) > 0) {
+		r = gwp_create_timer(-1, 0, 0);
+		if (unlikely(r < 0))
+			return handle_accept_error(w, r);
+		w->spare_timer_fd = r;
+	}
 
 	addr_len = sizeof(addr);
 	fd = __sys_accept4(w->tcp_fd, &addr.sa, &addr_len, flags);
@@ -825,9 +876,21 @@ static int __adjust_epl_mask(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	int r;
 
 	client_need_ctl |= adj_epl_out(&gcp->target, &gcp->client);
-	target_need_ctl |= adj_epl_out(&gcp->client, &gcp->target);
 	client_need_ctl |= adj_epl_in(&gcp->client);
-	target_need_ctl |= adj_epl_in(&gcp->target);
+
+	/*
+	 * Until the target is connected, its registration belongs to the
+	 * connect, and client events must leave it alone. There may be no
+	 * target socket yet: connect attempts live in attempt_fd[] until one
+	 * wins, and adopt_winning_attempt() sets the mask it registers the
+	 * winner with. A target socket created at accept time waits for
+	 * EPOLLOUT to learn that its connect completed, which taking it away
+	 * for want of client data to send would leave unreported.
+	 */
+	if (gcp->is_target_alive) {
+		target_need_ctl |= adj_epl_out(&gcp->client, &gcp->target);
+		target_need_ctl |= adj_epl_in(&gcp->target);
+	}
 
 	if (client_need_ctl) {
 		ev.events = gcp->client.ep_mask;
@@ -838,12 +901,7 @@ static int __adjust_epl_mask(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			return r;
 	}
 
-	/*
-	 * No target socket yet: connect attempts live in attempt_fd[] until
-	 * one wins, and adopt_winning_attempt() sets the mask it registers the
-	 * winner with. Client data arriving meanwhile must not be fatal.
-	 */
-	if (target_need_ctl && gcp->target.fd >= 0) {
+	if (target_need_ctl) {
 		ev.events = gcp->target.ep_mask;
 		ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_TARGET;
 
@@ -853,11 +911,6 @@ static int __adjust_epl_mask(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	}
 
 	return 0;
-}
-
-static int adjust_epl_mask(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
-{
-	return __adjust_epl_mask(w, gcp, false);
 }
 
 #ifdef CONFIG_HTTPS
@@ -1250,6 +1303,25 @@ static int arm_idle_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	return __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, gcp->timer_fd, &ev);
 }
 
+/*
+ * Send what the client sent while the target was being connected. A TLS
+ * client may have sent more than client.buf holds: the rest is held by the
+ * engine, off the socket already, so no EPOLLIN would bring it back. Take it
+ * in as the send makes room, as forwarding does.
+ */
+static int flush_early_data(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	bool held = false;
+
+#ifdef CONFIG_HTTPS
+	held = gcp->client.tls && gwp_ssl_rx_more(gcp->client.tls);
+#endif
+	if (!gcp->client.len && !held)
+		return 0;
+
+	return do_splice(w, gcp, &gcp->client, &gcp->target, held, true);
+}
+
 /* The upstream tunnel is up (reply already spliced); start forwarding. */
 static int upstream_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
@@ -1263,7 +1335,7 @@ static int upstream_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 	/*
 	 * target.ep_mask is left as upstream_arm() registered it, so that
-	 * adjust_epl_mask() below changes only what actually differs.
+	 * forward_progress() below changes only what actually differs.
 	 */
 	gcp->up_tx = false;
 	gcp->is_target_alive = true;
@@ -1285,13 +1357,12 @@ static int upstream_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	}
 
 	/* Flush any client data buffered during the handshake to the target. */
-	if (gcp->client.len) {
-		sr = __do_send(&gcp->client, &gcp->target);
-		if (unlikely(sr < 0))
-			return (int)sr;
-	}
+	r = flush_early_data(w, gcp);
+	if (unlikely(r))
+		return r;
 
-	return adjust_epl_mask(w, gcp);
+	/* And a FIN the client sent meanwhile. */
+	return forward_progress(w, gcp, NULL);
 }
 
 /*
@@ -1419,7 +1490,6 @@ static int handle_ev_target_conn_result(struct gwp_wrk *w,
 {
 	struct gwp_ctx *ctx = w->ctx;
 	int r;
-	ssize_t sr;
 
 	/*
 	 * Connected to the upstream SOCKS5 proxy. Perform the client handshake
@@ -1457,14 +1527,15 @@ static int handle_ev_target_conn_result(struct gwp_wrk *w,
 	if (unlikely(r))
 		return r;
 
-	if (gcp->client.len) {
-		sr = __do_send(&gcp->client, &gcp->target);
-		if (unlikely(sr < 0))
-			return (int)sr;
-	}
+	r = flush_early_data(w, gcp);
+	if (unlikely(r))
+		return r;
 
-	/* Forced: the target may still carry its attempt tag. */
-	return __adjust_epl_mask(w, gcp, true);
+	/*
+	 * Pass on a FIN the client sent during the connect. Forced: the
+	 * target may still carry its attempt tag.
+	 */
+	return __forward_progress(w, gcp, NULL, true);
 }
 
 /*
@@ -1572,8 +1643,8 @@ static int client_wr_flushed(struct gwp_conn_pair __unused *gcp)
  * drained (see handle_ev_hup()); it stops being monitored here unless the pair
  * is torn down anyway.
  */
-static int forward_progress(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
-			    struct gwp_conn *hup)
+static int __forward_progress(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			      struct gwp_conn *hup, bool force_target)
 {
 	bool shut_client = false, shut_target = false, done;
 
@@ -1594,8 +1665,20 @@ static int forward_progress(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	}
 
 	if (gcp->client.rd_eof && gcp->client.len == 0 && !gcp->target.wr_shut) {
-		shut_target = true;
-		gcp->target.wr_shut = true;
+		/*
+		 * The client may finish before the target is even connected.
+		 * There is no target socket yet, or only one still in
+		 * SYN_SENT, which shutdown() would abort: hold the FIN back
+		 * until handle_ev_target_conn_result() or upstream_finish()
+		 * comes back here. A client that hung up altogether is owed
+		 * nothing, though, so the pair goes now.
+		 */
+		if (gcp->is_target_alive) {
+			shut_target = true;
+			gcp->target.wr_shut = true;
+		} else if (gcp->client.wr_shut) {
+			return -ECONNRESET;
+		}
 	}
 
 	/*
@@ -1620,7 +1703,13 @@ static int forward_progress(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		hup->ep_mask = 0;
 	}
 
-	return adjust_epl_mask(w, gcp);
+	return __adjust_epl_mask(w, gcp, force_target);
+}
+
+static int forward_progress(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			    struct gwp_conn *hup)
+{
+	return __forward_progress(w, gcp, hup, false);
 }
 
 /*
@@ -2561,6 +2650,45 @@ static int handle_ev_client_prot_out(struct gwp_wrk *w, struct gwp_conn_pair *gc
 	return 0;
 }
 
+/*
+ * Has the client's handshake handed over to the connect? handle_connect()
+ * does not retag the client fd, so a client still registered under
+ * EV_BIT_CLIENT_PROT belongs to handle_ev_client() from then on: it buffers
+ * what the client sends until the target is up, and then forwards.
+ */
+static bool client_past_handshake(const struct gwp_conn_pair *gcp)
+{
+	int cs = gcp->conn_state;
+
+	return cs == CONN_STATE_SOCKS5_CONNECT ||
+	       cs == CONN_STATE_HTTP_CONNECT ||
+	       cs == CONN_STATE_FORWARDING || gwp_in_upstream_hs(gcp);
+}
+
+/*
+ * Take in what the client sends during the handshake, and act on it. A TLS
+ * client's records may already be off the socket, held by the engine: no
+ * EPOLLIN brings them back, so work through them for as long as
+ * client.buf has room and the handshake still owns the client. That goes
+ * on past CONN_STATE_PROT: the client buffer may fill in the middle of a
+ * SOCKS5 or HTTP handshake (a greeting followed by a long authentication
+ * request, say), and the rest is only taken once that has been parsed.
+ * Records left once the connect has started are taken when it completes
+ * (see flush_early_data()).
+ */
+static int client_prot_in(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	int r = handle_ev_client_prot_in(w, gcp);
+
+#ifdef CONFIG_HTTPS
+	while (!r && gcp->client.tls && !client_past_handshake(gcp) &&
+	       gcp->client.len < gcp->client.cap &&
+	       gwp_ssl_rx_more(gcp->client.tls))
+		r = handle_ev_client_prot_in(w, gcp);
+#endif
+	return r;
+}
+
 #ifdef CONFIG_HTTPS
 /* Re-arm the client fd under EV_BIT_CLIENT_PROT with @mask. */
 static int tls_arm_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
@@ -2653,7 +2781,7 @@ static int handle_ev_tls_handshake(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	if (r)
 		return r;
 
-	return handle_ev_client_prot_in(w, gcp);
+	return client_prot_in(w, gcp);
 }
 
 /*
@@ -2721,25 +2849,9 @@ static int handle_ev_client_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	}
 
 	if (ev->events & EPOLLIN) {
-		r = handle_ev_client_prot_in(w, gcp);
+		r = client_prot_in(w, gcp);
 		if (r)
 			return r;
-
-#ifdef CONFIG_HTTPS
-		/*
-		 * Application data the engine holds, decrypted or not, would
-		 * not be surfaced by another EPOLLIN (its ciphertext is already
-		 * off the socket), so drain it here while the protocol buffer
-		 * still has room.
-		 */
-		while (gcp->client.tls && gcp->conn_state == CONN_STATE_PROT &&
-		       gcp->client.len < gcp->client.cap &&
-		       gwp_ssl_rx_more(gcp->client.tls)) {
-			r = handle_ev_client_prot_in(w, gcp);
-			if (r)
-				return r;
-		}
-#endif
 	}
 
 	/*
@@ -2761,21 +2873,6 @@ static int handle_ev_client_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	}
 
 	return 0;
-}
-
-/*
- * Has the client's handshake handed over to the connect? handle_connect()
- * does not retag the client fd, so a client still registered under
- * EV_BIT_CLIENT_PROT belongs to handle_ev_client() from then on: it buffers
- * what the client sends until the target is up, and then forwards.
- */
-static bool client_past_handshake(const struct gwp_conn_pair *gcp)
-{
-	int cs = gcp->conn_state;
-
-	return cs == CONN_STATE_SOCKS5_CONNECT ||
-	       cs == CONN_STATE_HTTP_CONNECT ||
-	       cs == CONN_STATE_FORWARDING || gwp_in_upstream_hs(gcp);
 }
 
 static int handle_event(struct gwp_wrk *w, struct epoll_event *ev)
