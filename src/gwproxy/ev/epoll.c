@@ -186,6 +186,9 @@ int gwp_ctx_init_thread_epoll(struct gwp_wrk *w)
 	int ep_fd, ev_fd, r;
 
 	w->spare_timer_fd = -1;
+	w->retry_at_ms = 0;
+	w->accept_retry = false;
+	w->accept_paused = false;
 	ep_fd = __sys_epoll_create1(EPOLL_CLOEXEC);
 	if (ep_fd < 0) {
 		r = ep_fd;
@@ -632,12 +635,92 @@ static int handle_new_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	return 0;
 }
 
+/* How long a timed pause lasts, in milliseconds; the io_uring loop's too. */
+#define RETRY_DELAY_MS	100
+
+static uint64_t now_ms(void)
+{
+	struct timespec t;
+
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return (uint64_t)t.tv_sec * 1000 + (uint64_t)t.tv_nsec / 1000000;
+}
+
+/* Have fish_events() wake up for run_retries() RETRY_DELAY_MS from now. */
+static void arm_retry(struct gwp_wrk *w)
+{
+	if (!w->retry_at_ms)
+		w->retry_at_ms = now_ms() + RETRY_DELAY_MS;
+}
+
+/*
+ * The epoll_wait() timeout: until the next timed retry is due, or for ever
+ * when none is.
+ */
+static int retry_timeout(const struct gwp_wrk *w)
+{
+	uint64_t now;
+
+	if (likely(!w->retry_at_ms))
+		return -1;
+
+	now = now_ms();
+	if (now >= w->retry_at_ms)
+		return 0;
+	return (int)(w->retry_at_ms - now);
+}
+
+/* Do what a timed pause has been holding back, once it is due. */
+static int run_retries(struct gwp_wrk *w)
+{
+	struct epoll_event ev;
+	int r;
+
+	if (likely(!w->retry_at_ms) || now_ms() < w->retry_at_ms)
+		return 0;
+
+	w->retry_at_ms = 0;
+	if (w->accept_retry) {
+		ev.events = EPOLLIN;
+		ev.data.u64 = EV_BIT_ACCEPT;
+		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, w->tcp_fd, &ev);
+		if (unlikely(r))
+			return r;
+		w->accept_retry = false;
+	}
+
+	return 0;
+}
+
 static int handle_accept_error(struct gwp_wrk *w, int e)
 {
 	int r;
 
 	if (likely(e == -EAGAIN || e == -EINTR))
 		return e;
+
+	if (e == -ENOBUFS || e == -EPERM || e == -EACCES) {
+		/*
+		 * Out of socket memory, or a security module refusing the
+		 * connection at the head of the backlog. The listener stays
+		 * readable, so trying again at once would only fail again,
+		 * as fast as the worker can loop, and freeing descriptors
+		 * does not help either. Take it out of the epoll set and try
+		 * again a little later, until a connection is accepted.
+		 */
+		if (!w->accept_paused) {
+			w->accept_paused = true;
+			pr_warn(&w->ctx->lh,
+				"Failed to accept new connection: %s, pausing accept (tidx=%u)",
+				strerror(-e), w->idx);
+		}
+		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_DEL, w->tcp_fd, NULL);
+		if (unlikely(r))
+			return r;
+		w->accept_retry = true;
+		arm_retry(w);
+		return -EAGAIN;
+	}
 
 	if (likely(e == -EMFILE || e == -ENFILE || e == -ENOMEM)) {
 		/*
@@ -696,6 +779,12 @@ static int __handle_ev_accept(struct gwp_wrk *w)
 	fd = __sys_accept4(w->tcp_fd, &addr.sa, &addr_len, flags);
 	if (fd < 0)
 		return handle_accept_error(w, fd);
+
+	if (unlikely(w->accept_paused)) {
+		w->accept_paused = false;
+		pr_info(&ctx->lh, "Resumed accepting new connections (tidx=%u)",
+			w->idx);
+	}
 
 	pr_dbg(&ctx->lh, "New connection from %s (fd=%d)", ip_to_str(&addr),
 		fd);
@@ -3013,6 +3102,12 @@ static int handle_events(struct gwp_wrk *w, int nr_events)
 			break;
 	}
 
+	if (r >= 0) {
+		x = run_retries(w);
+		if (unlikely(x))
+			r = x;
+	}
+
 	x = reap_dead_pairs(w);
 	if (unlikely(x) && r >= 0)
 		r = x;
@@ -3025,7 +3120,7 @@ static int fish_events(struct gwp_wrk *w)
 	int r;
 
 	w->ev_need_reload = false;
-	r = __sys_epoll_wait(w->ep_fd, w->events, w->evsz, -1);
+	r = __sys_epoll_wait(w->ep_fd, w->events, w->evsz, retry_timeout(w));
 	w->now = gwp_now_sec();
 	if (unlikely(r < 0)) {
 		if (r != -EINTR)
