@@ -886,6 +886,14 @@ static void send_client_tls(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	struct gwp_ssl *ssl = gcp->client.tls;
 	int n;
 
+	/*
+	 * The tx scratch is still being sent. Its completion
+	 * (handle_ev_client_send()) comes back here for what has been added
+	 * to target.buf since, as for a plaintext client (__prep_send_client()).
+	 */
+	if (t->tx_sent < t->tx_len)
+		return;
+
 	while (gcp->target.len) {
 		size_t consumed = 0;
 		int sr = gwp_ssl_write(ssl, gcp->target.buf, gcp->target.len,
