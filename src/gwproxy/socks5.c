@@ -76,6 +76,16 @@ const char *gwp_socks5_conn_username(const struct gwp_socks5_conn *conn)
 	return (conn && conn->user_len) ? conn->user : NULL;
 }
 
+const char *gwp_socks5_conn_rejected_user(const struct gwp_socks5_conn *conn,
+					  size_t *len)
+{
+	if (!conn || !conn->bad_user_len)
+		return NULL;
+
+	*len = conn->bad_user_len;
+	return conn->user;
+}
+
 struct data_arg {
 	struct gwp_socks5_ctx	*ctx;
 	struct gwp_socks5_conn	*conn;
@@ -326,10 +336,14 @@ static int handle_state_auth_userpass(struct data_arg *d)
 		memcpy(d->conn->user, u, ulen);
 		d->conn->user[ulen] = '\0';
 		d->conn->user_len = (uint8_t)ulen;
+		d->conn->bad_user_len = 0;
 	} else {
 		/* STATUS = 0x01 (failure) */
 		resp[1] = 0x01;
 		d->conn->state = GWP_SOCKS5_ST_ERR;
+		/* Keep the name for the caller to log the failure with. */
+		memcpy(d->conn->user, u, ulen);
+		d->conn->bad_user_len = (uint8_t)ulen;
 	}
 
 	if (append_out_buf(d, resp, sizeof(resp)))

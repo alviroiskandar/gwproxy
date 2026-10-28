@@ -598,6 +598,15 @@ static void test_auth_userpass_empty_password(void)
 	assert(out[0] == 0x01);
 	assert(out[1] == 0x01); /* STATUS: failure */
 	assert(conn->state == GWP_SOCKS5_ST_ERR);
+	/* The rejected name is kept for the log, not as the user. */
+	assert(!gwp_socks5_conn_username(conn));
+	{
+		const char *bad;
+		size_t blen = 0;
+
+		bad = gwp_socks5_conn_rejected_user(conn, &blen);
+		assert(bad && blen == 4 && !memcmp(bad, "user", 4));
+	}
 
 	gwp_socks5_conn_free(conn);
 	gwp_socks5_ctx_free(ctx);
@@ -963,6 +972,8 @@ static void test_enobufs_combined_with_multi_state_at_once(void)
 	assert(out[0] == 0x05); /* VER */
 	assert(out[1] == 0x02); /* METHOD: USER/PASS */
 	assert(conn->state == GWP_SOCKS5_ST_CMD_CONNECT);
+	assert(!strcmp(gwp_socks5_conn_username(conn), "user"));
+	assert(!gwp_socks5_conn_rejected_user(conn, &in_len));
 	assert(conn->dst_addr.ver == GWP_SOCKS5_ATYP_IPV4);
 	assert(!memcmp(conn->dst_addr.ip4, "\x7f\x00\x00\x01", 4));
 	assert(!memcmp(&conn->dst_addr.port, "\x00\x50", 2));

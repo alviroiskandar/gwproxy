@@ -86,6 +86,7 @@ struct gwp_socks5_conn {
 	struct gwp_socks5_addr	dst_addr;
 	struct gwp_socks5_ctx	*ctx;
 	uint8_t			user_len;	/* authenticated username len, 0=none */
+	uint8_t			bad_user_len;	/* rejected username len, 0=none */
 	char			user[256];	/* NUL-terminated when user_len > 0 */
 };
 
@@ -134,6 +135,14 @@ void gwp_socks5_conn_free(struct gwp_socks5_conn *conn);
  * pointer stays valid for the connection's life.
  */
 const char *gwp_socks5_conn_username(const struct gwp_socks5_conn *conn);
+
+/**
+ * Return the username whose credentials were rejected on @conn and store its
+ * length in *@len, or return NULL if none was. The bytes are the client's,
+ * unchecked: they may hold any value, NUL included.
+ */
+const char *gwp_socks5_conn_rejected_user(const struct gwp_socks5_conn *conn,
+					  size_t *len);
 
 /**
  * Handle incoming data and prepare outgoing data for a SOCKS5 connection.
