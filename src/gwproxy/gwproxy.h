@@ -385,6 +385,12 @@ enum {
 	 * attempt, and a local would only remember the most recent walk.
 	 */
 	GWP_CONN_FLAG_ACL_CAND_OK	= (1ull << 3ull),
+	/*
+	 * The target socket could not be created for want of descriptors and
+	 * the connect is being retried (io_uring); set so that this is logged
+	 * once per pair rather than on every retry.
+	 */
+	GWP_CONN_FLAG_FD_WAIT		= (1ull << 4ull),
 };
 
 enum {

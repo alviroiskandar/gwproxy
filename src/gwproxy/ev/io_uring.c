@@ -596,22 +596,12 @@ static void prep_attempt_timer_del(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
  * first at removal time. An already-armed timer is left alone: it fires no
  * later than the deadline a fresh one would have had.
  */
-static void arm_attempt_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+static void __arm_attempt_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+				int ms)
 {
 	struct gwp_ctx *ctx = w->ctx;
 	struct io_uring_sqe *s;
-	int ms;
 
-	if (gcp->attempt_timer_armed)
-		return;
-	if (gcp->next_cand >= gcp->nr_cand)
-		return;			/* nothing left to start */
-	if (ctx->cfg.connect_attempt_delay <= 0)
-		return;			/* racing disabled: fall back only */
-	if (ctx->upstream.enabled)
-		return;			/* one proxy, nothing to race */
-
-	ms = ctx->cfg.connect_attempt_delay;
 	gcp->ats.tv_sec = ms / 1000;
 	gcp->ats.tv_nsec = (long long)(ms % 1000) * 1000000LL;
 
@@ -624,6 +614,59 @@ static void arm_attempt_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	pr_dbg(&ctx->lh,
 		"Prepared attempt timer (idx=%u, ts=%lld.%09lld, ref_cnt=%d)",
 		gcp->idx, gcp->ats.tv_sec, gcp->ats.tv_nsec, gcp->ref_cnt);
+}
+
+static void arm_attempt_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	struct gwp_ctx *ctx = w->ctx;
+
+	if (gcp->attempt_timer_armed)
+		return;
+	if (gcp->next_cand >= gcp->nr_cand)
+		return;			/* nothing left to start */
+	if (ctx->cfg.connect_attempt_delay <= 0)
+		return;			/* racing disabled: fall back only */
+	if (ctx->upstream.enabled)
+		return;			/* one proxy, nothing to race */
+
+	__arm_attempt_timer(w, gcp, ctx->cfg.connect_attempt_delay);
+}
+
+/* How long a connect waits for a free descriptor before it tries again, in ms. */
+#define GWP_FD_RETRY_MS 100
+
+/*
+ * The target socket of a plain or transparent forwarding pair could not be
+ * created because the descriptor table is full. That passes as connections
+ * close, and the client, which has done nothing wrong, is already accepted:
+ * keep it, and try the same candidate again once the attempt timer fires.
+ * The connect timeout still bounds the wait. accept() itself runs out of
+ * descriptors too, and pauses (handle_ev_accept()), so no further client
+ * piles up behind this one in the meantime.
+ *
+ * Only while no other attempt is racing: one that is may well connect, and
+ * the attempt timer is then needed for the race. Plain forwarding has a
+ * single candidate, so this is the case there.
+ */
+static bool wait_for_fd(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int err)
+{
+	if (err != -EMFILE && err != -ENFILE)
+		return false;
+	if (gcp->prot_type != GWP_PROT_TYPE_NONE)
+		return false;
+	if (has_inflight_attempt(gcp) || gcp->attempt_timer_armed)
+		return false;
+
+	if (!(gcp->flags & GWP_CONN_FLAG_FD_WAIT)) {
+		gcp->flags |= GWP_CONN_FLAG_FD_WAIT;
+		pr_warn(&w->ctx->lh,
+			"Too many open files, retrying the target connect (idx=%u, ca=%s)",
+			gcp->idx, ip_to_str(&gcp->client_addr));
+	}
+
+	gcp->next_cand--;
+	__arm_attempt_timer(w, gcp, GWP_FD_RETRY_MS);
+	return true;
 }
 
 /*
@@ -2002,6 +2045,9 @@ static int connect_next_candidate(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 
 		pr_dbg(&w->ctx->lh, "Target %s did not start: %s (idx=%u)",
 			ip_to_str(&gcp->target_addr), strerror(-err), gcp->idx);
+
+		if (wait_for_fd(w, gcp, err))
+			return 0;
 
 		/*
 		 * Chaining: every attempt dials the same upstream proxy, so
