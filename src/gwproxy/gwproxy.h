@@ -729,9 +729,11 @@ struct gwp_wrk {
 			/*
 			 * accept() failed for a reason that closing
 			 * descriptors does not cure: the listener is out of
-			 * the epoll set until retry_at_ms (accept_retry),
-			 * and the pause is logged once, until a connection
-			 * is accepted again (accept_paused).
+			 * the epoll set until retry_at_ms (accept_retry).
+			 * Any accept pause, this one or the one for running
+			 * out of descriptors (accept_is_stopped), is logged
+			 * once, until a connection is accepted again
+			 * (accept_paused).
 			 */
 			bool			accept_retry;
 			bool			accept_paused;

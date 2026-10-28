@@ -349,7 +349,7 @@ static int rearm_accept(struct gwp_wrk *w, int nr_fd_closed)
 		return r;
 
 	w->accept_is_stopped = false;
-	pr_info(&ctx->lh,
+	pr_dbg(&ctx->lh,
 		"Rearmed main TCP socket for accepting new connections (tidx=%u, fd=%d)",
 		w->idx, w->tcp_fd);
 
@@ -845,8 +845,16 @@ static int handle_accept_error(struct gwp_wrk *w, int e)
 		 * closed a file descriptor.
 		 *
 		 * See free_conn_pair() for more details.
+		 *
+		 * The pause is logged once, until a connection is accepted
+		 * again, in the same words as the io_uring loop uses.
 		 */
-		pr_warn(&w->ctx->lh, "Too many open files, stop accepting new connections");
+		if (!w->accept_paused) {
+			w->accept_paused = true;
+			pr_warn(&w->ctx->lh,
+				"Too many open files, pausing accept (tidx=%u)",
+				w->idx);
+		}
 		w->accept_is_stopped = true;
 		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_DEL, w->tcp_fd, NULL);
 		if (unlikely(r))
