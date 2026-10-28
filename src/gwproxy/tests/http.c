@@ -179,6 +179,62 @@ static void test_forward_default_port(void)
 	PRTEST_OK();
 }
 
+/*
+ * The authority of an absolute-form target ends at the first '/', '?' or
+ * '#': what follows a '?' or '#' is never the host, even past an '@'.
+ */
+static void test_forward_authority_end(void)
+{
+	static const char query[] =
+		"GET http://example.com:8080?q=1 HTTP/1.1\r\n\r\n";
+	static const char query_at[] =
+		"GET http://evil.example?@127.0.0.1/ HTTP/1.1\r\n\r\n";
+	static const char frag_at[] =
+		"GET http://evil.example#@127.0.0.1/ HTTP/1.1\r\n\r\n";
+	static const char path_at[] =
+		"GET http://example.com/a@127.0.0.1/ HTTP/1.1\r\n\r\n";
+	struct gwp_http_conn *hc;
+	char *host, *port;
+	const char *req = NULL;
+	size_t req_len = 0;
+
+	/* A query with an empty path: the path becomes "/". */
+	hc = gwp_http_conn_alloc();
+	assert(hc);
+	assert(run(hc, NULL, query, &host, &port, &req, &req_len) == GWP_HTTP_FORWARD);
+	assert(!strcmp(host, "example.com"));
+	assert(!strcmp(port, "8080"));
+	assert(!strncmp(req, "GET /?q=1 HTTP/1.1\r\n", 20));
+	assert(strstr(req, "\r\nHost: example.com:8080\r\n"));
+	gwp_http_conn_free(hc);
+
+	/* An '@' in the query is not userinfo. */
+	hc = gwp_http_conn_alloc();
+	assert(hc);
+	assert(run(hc, NULL, query_at, &host, &port, &req, &req_len) == GWP_HTTP_FORWARD);
+	assert(!strcmp(host, "evil.example"));
+	assert(!strcmp(port, "80"));
+	assert(!strncmp(req, "GET /?@127.0.0.1/ HTTP/1.1\r\n", 28));
+	assert(strstr(req, "\r\nHost: evil.example\r\n"));
+	gwp_http_conn_free(hc);
+
+	/* Nor is one in the path. */
+	hc = gwp_http_conn_alloc();
+	assert(hc);
+	assert(run(hc, NULL, path_at, &host, &port, &req, &req_len) == GWP_HTTP_FORWARD);
+	assert(!strcmp(host, "example.com"));
+	assert(!strncmp(req, "GET /a@127.0.0.1/ HTTP/1.1\r\n", 28));
+	gwp_http_conn_free(hc);
+
+	/* A fragment straight after the authority leaves nothing to send. */
+	hc = gwp_http_conn_alloc();
+	assert(hc);
+	assert(run(hc, NULL, frag_at, &host, &port, &req, &req_len) == GWP_HTTP_ERR);
+	gwp_http_conn_free(hc);
+
+	PRTEST_OK();
+}
+
 static void test_forward_hop_by_hop(void)
 {
 	/*
@@ -1107,6 +1163,55 @@ static void test_auth_store(void)
 	PRTEST_OK();
 }
 
+/*
+ * The "Basic" token is base64 with optional padding and nothing after it: a
+ * malformed token is refused even when its valid prefix decodes to the
+ * right credentials.
+ */
+static void test_auth_basic_token(void)
+{
+	static const char cred_data[] = "user:pass\nab:c\nabc:d\n";
+	static const struct {
+		const char	*hdr;
+		bool		ok;
+	} cases[] = {
+		{ "Basic dXNlcjpwYXNz",		true },	/* user:pass */
+		{ "basic \tdXNlcjpwYXNz \t",	true },
+		{ "Basic YWI6Yw==",		true },	/* ab:c */
+		{ "Basic YWI6Yw",		true },	/* unpadded */
+		{ "Basic YWJjOmQ=",		true },	/* abc:d */
+		{ "Basic YWJjOmQ",		true },
+		{ "Basic dXNlcjpwYXNz=",	false },
+		{ "Basic dXNlcjpwYXNz==",	false },
+		{ "Basic dXNlcjpwYXNz=x",	false },
+		{ "Basic dXNlcjpwYXNzA",	false },
+		{ "Basic dXNlcjpwYXNz x",	false },
+		{ "Basic YWI6Yw==x",		false },
+		{ "Basic YWI6Yw===",		false },
+		{ "Basic YWI6Yw=",		false },
+		{ "Basic YWI6Yw== YWI6Yw==",	false },
+		{ "Basic YWJjOmQ==",		false },
+		{ "Basic YWJjOmQ=dXNl",		false },
+		{ "Basic =",			false },
+		{ "Basic ",			false },
+	};
+	char cred_file[] = "/tmp/gwp_http_auth.XXXXXX";
+	struct gwp_auth *auth = NULL;
+	size_t i;
+	ssize_t w;
+
+	w = write_temp_file(cred_file, cred_data, sizeof(cred_data) - 1);
+	assert(w == (ssize_t)(sizeof(cred_data) - 1));
+	assert(!gwp_auth_create(&auth, cred_file));
+
+	for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+		assert(gwp_auth_check_basic(auth, cases[i].hdr) == cases[i].ok);
+
+	gwp_auth_destroy(auth);
+	unlink(cred_file);
+	PRTEST_OK();
+}
+
 int main(void)
 {
 	size_t i;
@@ -1116,6 +1221,7 @@ int main(void)
 		test_connect_ipv6();
 		test_forward_get();
 		test_forward_default_port();
+		test_forward_authority_end();
 		test_forward_hop_by_hop();
 		test_forward_conn_lists_framing();
 		test_forward_conn_limit();
@@ -1136,6 +1242,7 @@ int main(void)
 	/* Byte-by-byte feeding of 17 KiB headers: once is enough. */
 	test_incremental();
 	test_auth_store();
+	test_auth_basic_token();
 
 	printf("All tests passed!\n");
 	return 0;
