@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <errno.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
@@ -150,6 +151,48 @@ static noinline void test_default_ruleset(void)
 	s = sa6("2606:4700::1", 22);
 	assert(out(a, &s, NULL, 22, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
 
+	gwp_acl_destroy(a);
+}
+
+/*
+ * A v4-mapped prefix in a rule must match like the IPv4 prefix it carries:
+ * targets are matched with v4-mapped addresses folded into IPv4, so a rule
+ * left as IPv6 never matched anything, mapped or not.
+ */
+static noinline void test_v4mapped_cidr(void)
+{
+	struct gwp_acl *a = NULL;
+	struct gwp_sockaddr s;
+
+	assert(!gwp_acl_parse_str(&a,
+		"-A OUTPUT -d ::ffff:10.0.0.0/104 -j REJECT\n"
+		"-A OUTPUT -d ::ffff:192.0.2.7 -j REJECT\n"
+		"-A INPUT -s ::ffff:198.51.100.0/120 -j REJECT\n"));
+	s = sa4("10.1.2.3", 80);
+	assert(out(a, &s, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+	s = sa4mapped("10.1.2.3", 80);
+	assert(out(a, &s, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+	s = sa4("11.1.2.3", 80);
+	assert(out(a, &s, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
+	s = sa4("192.0.2.7", 80);
+	assert(out(a, &s, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+	s = sa4("192.0.2.8", 80);
+	assert(out(a, &s, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
+	/* The rule is IPv4 now: a non-mapped IPv6 target is not caught. */
+	s = sa6("::10.1.2.3", 80);
+	assert(out(a, &s, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
+	s = sa4mapped("198.51.100.9", 1234);
+	assert(in(a, &s, 1234, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+	s = sa4("198.51.101.9", 1234);
+	assert(in(a, &s, 1234, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
+	gwp_acl_destroy(a);
+
+	/* All of ::ffff:0:0/96 is all of IPv4. */
+	assert(!gwp_acl_parse_str(&a, "-A OUTPUT -d ::ffff:0:0/96 -j REJECT\n"));
+	s = sa4("93.184.216.34", 443);
+	assert(out(a, &s, NULL, 443, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+	s = sa6("2606:4700::1", 443);
+	assert(out(a, &s, NULL, 443, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
 	gwp_acl_destroy(a);
 }
 
@@ -592,6 +635,27 @@ static noinline void test_comments_and_default_policy(void)
 	assert(out(a, &s, NULL, 53, GWP_ACL_PROTO_UDP) == GWP_ACL_REJECT);
 	gwp_acl_destroy(a);
 
+	/*
+	 * Only a '#' that starts a token begins a comment; inside a value it
+	 * is part of the value and must not cut the rule short.
+	 */
+	assert(!gwp_acl_parse_str(&a,
+		"-A OUTPUT -m user --user ops#1 -j REJECT #ops#1 only\n"
+		"#-A OUTPUT -j REJECT\n"
+		"\t# indented comment\n"));
+	s = sa4("1.2.3.4", 80);
+	assert(out_user(a, &s, "ops#1", 80) == GWP_ACL_REJECT);
+	assert(out_user(a, &s, "ops", 80) == GWP_ACL_ACCEPT);
+	gwp_acl_destroy(a);
+#ifdef CONFIG_PCRE
+	assert(!gwp_acl_parse_str(&a,
+		"-A OUTPUT -m domain --domain-regexp ^[^#]+$ -j ACCEPT\n"
+		"-P OUTPUT REJECT\n"));
+	assert(out(a, NULL, "a.example", 443, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
+	assert(out(a, NULL, "a#b.example", 443, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+	gwp_acl_destroy(a);
+#endif
+
 	/* NULL ACL and empty ruleset both allow everything. */
 	s = sa4("1.2.3.4", 1);
 	assert(out(NULL, &s, NULL, 1, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
@@ -613,6 +677,7 @@ static noinline void test_parse_errors(void)
 		"-A OUTPUT ! -j REJECT\n",		    /* negate before -j */
 		"-P OUTPUT MAYBE\n",			    /* bad policy */
 		"-P BOGUS ACCEPT\n",			    /* bad chain */
+		"-A OUTPUT -d ::ffff:0:0/95 -j REJECT\n",	    /* mapped, < /96 */
 		"-A OUTPUT -j DNAT\n",			    /* DNAT w/o --to */
 		"-A OUTPUT -d 1.2.3.4 -j DNAT --to :\n",	    /* empty port */
 		"-A OUTPUT -d 1.2.3.4 -j ACCEPT --to :80\n",	    /* --to w/o DNAT */
@@ -1152,7 +1217,7 @@ static void test_empty_chain_policy(void)
 		"-P INPUT REJECT\n",
 		"-P OUTPUT REJECT\n-A INPUT -s 10.0.0.0/8 -j REJECT\n",
 		"-A OUTPUT --dports 80 -j REJECT\n",
-		"",
+		"# no rules\n",
 	};
 	/* in(10.1.1.1), in(192.0.2.1), out(:80), out(:443) per file */
 	static const enum gwp_acl_verdict want[][4] = {
@@ -1186,6 +1251,66 @@ static void test_empty_chain_policy(void)
 		assert(out(a, &t, NULL, 80, GWP_ACL_PROTO_TCP) == want[i][2]);
 		assert(out(a, &t, NULL, 443, GWP_ACL_PROTO_TCP) == want[i][3]);
 	}
+
+	/*
+	 * An empty file, as a writer that truncates and then refills the file
+	 * leaves it in between, is refused and the rules stay.
+	 */
+	fd = open(path, O_WRONLY | O_TRUNC);
+	assert(fd >= 0);
+	assert(write(fd, files[0], strlen(files[0])) == (ssize_t)strlen(files[0]));
+	close(fd);
+	assert(!gwp_acl_reload(a));
+	fd = open(path, O_WRONLY | O_TRUNC);
+	assert(fd >= 0);
+	close(fd);
+	assert(gwp_acl_reload(a) == -ENODATA);
+	assert(in(a, &c1, 1234, GWP_ACL_PROTO_TCP) == want[0][0]);
+	gwp_acl_destroy(a);
+	assert(gwp_acl_create(&a, path) == -ENODATA);
+	unlink(path);
+	free(path);
+}
+
+/*
+ * A NUL byte in the rule file must refuse the file, at creation and on
+ * reload, rather than end it there and drop every rule after it.
+ */
+static void test_file_nul(void)
+{
+	static const char nul_rules[] =
+		"-A OUTPUT -d 192.0.2.1 -j ACCEPT\n"
+		"\0"
+		"-P OUTPUT REJECT\n";
+	struct gwp_sockaddr t = sa4("93.184.216.34", 80);
+	struct gwp_acl *a;
+	char *path;
+	int fd;
+
+	path = write_tmp_rules("");
+	fd = open(path, O_WRONLY | O_TRUNC);
+	assert(fd >= 0);
+	assert(write(fd, nul_rules, sizeof(nul_rules) - 1) ==
+	       (ssize_t)sizeof(nul_rules) - 1);
+	close(fd);
+	assert(gwp_acl_create(&a, path) == -EINVAL);
+
+	fd = open(path, O_WRONLY | O_TRUNC);
+	assert(fd >= 0);
+	assert(write(fd, "-P OUTPUT REJECT\n", 17) == 17);
+	close(fd);
+	assert(!gwp_acl_create(&a, path));
+	assert(out(a, &t, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+
+	/* A reload that meets a NUL keeps the old rules. */
+	fd = open(path, O_WRONLY | O_TRUNC);
+	assert(fd >= 0);
+	assert(write(fd, nul_rules, sizeof(nul_rules) - 1) ==
+	       (ssize_t)sizeof(nul_rules) - 1);
+	close(fd);
+	assert(gwp_acl_reload(a) == -EINVAL);
+	assert(out(a, &t, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+
 	gwp_acl_destroy(a);
 	unlink(path);
 	free(path);
@@ -1200,9 +1325,11 @@ static void run_tests(void)
 	test_reload_under_readers();
 	test_generation();
 	test_empty_chain_policy();
+	test_file_nul();
 
 	for (i = 0; i < 200; i++) {
 		test_default_ruleset();
+		test_v4mapped_cidr();
 		test_ports_and_negation();
 		test_input_and_proto();
 		test_domain();

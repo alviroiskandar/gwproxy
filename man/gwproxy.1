@@ -208,12 +208,23 @@ Load an iptables\-style access\-control list that filters incoming clients
 and outgoing targets
 .RB ( OUTPUT " chain)."
 The file is watched and hot\-reloaded on change, and a malformed file is
-rejected (at startup, or by keeping the previous rules on reload). When
+rejected (at startup, or by keeping the previous rules on reload); so is an
+empty file, one with a NUL byte, and one that changes while it is read. A file
+that is rewritten in place can still be reloaded half written; replace it
+atomically instead: write the new rules to a temporary file in the same
+directory and rename it over the old one. When
 .B \-\-acl\-file
 is not given, a built\-in default ACL is applied instead (see
 .BR \-\-acl\-allow\-all
 below). Each line is one directive, evaluated top\-to\-bottom
-with first\-match\-wins; a chain's policy applies when nothing matches:
+with first\-match\-wins; a chain's policy applies when nothing matches.
+A word that starts with
+.B #
+begins a comment that runs to the end of the line; a
+.B #
+inside a word (a regexp such as
+.BR ^[^#]+$ )
+is part of that word. The directives are:
 .RS
 .IP \(bu 3
 .BI "\-P " "chain target"

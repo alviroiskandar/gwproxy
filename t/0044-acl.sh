@@ -28,6 +28,17 @@ if "$GWPROXY" --bind="127.0.0.1:$bp" --as-socks5=1 \
 fi
 grep -qi 'ACL' "$WORK/bad.log" || fail "malformed ACL startup lacked an error"
 
+# So is an empty one: it is what a writer that truncates and refills the file
+# leaves in between, not a rule set. If it were accepted, gwproxy would keep
+# running; the timeout turns that into a failure instead of a hang.
+: >"$WORK/empty.acl"
+ec=0
+timeout 10 "$GWPROXY" --bind="127.0.0.1:$(pick_port)" --as-socks5=1 \
+	--acl-file="$WORK/empty.acl" >"$WORK/empty.log" 2>&1 || ec=$?
+{ [ "$ec" -ne 0 ] && [ "$ec" -ne 124 ]; } || \
+	fail "gwproxy accepted an empty ACL file (exit $ec)"
+grep -qi 'ACL' "$WORK/empty.log" || fail "empty ACL startup lacked an error"
+
 # A valid ACL loads and proxying still works, on every available loop.
 printf -- '%s\n' \
 	'# sample ACL: allow the HTTP origin port, deny port 9 (discard)' \

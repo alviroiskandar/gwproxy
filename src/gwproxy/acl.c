@@ -367,7 +367,8 @@ static int parse_cidr(const char *s, struct gwp_acl_cidr *c)
 	char buf[INET6_ADDRSTRLEN + 8];
 	unsigned long bits;
 	char *slash;
-	uint8_t v4[4], v6[16];
+	struct in6_addr v6;
+	uint8_t v4[4];
 
 	if (strlen(s) >= sizeof(buf))
 		return -EINVAL;
@@ -382,9 +383,9 @@ static int parse_cidr(const char *s, struct gwp_acl_cidr *c)
 		c->is_v4 = true;
 		memcpy(c->addr, v4, 4);
 		bits = 32;
-	} else if (inet_pton(AF_INET6, buf, v6) == 1) {
+	} else if (inet_pton(AF_INET6, buf, &v6) == 1) {
 		c->is_v4 = false;
-		memcpy(c->addr, v6, 16);
+		memcpy(c->addr, v6.s6_addr, 16);
 		bits = 128;
 	} else {
 		return -EINVAL;
@@ -399,6 +400,22 @@ static int parse_cidr(const char *s, struct gwp_acl_cidr *c)
 			return -EINVAL;
 		if (bits > (c->is_v4 ? 32u : 128u))
 			return -EINVAL;
+	}
+
+	/*
+	 * cidr_match() folds a v4-mapped target (::ffff:a.b.c.d) into IPv4, so
+	 * a v4-mapped rule prefix has to be folded the same way or it never
+	 * matches anything. A mapped address with a prefix shorter than /96
+	 * reaches outside the mapped range; that cannot be expressed as one
+	 * IPv4 prefix and is most likely a mistake, so refuse it.
+	 */
+	if (!c->is_v4 && IN6_IS_ADDR_V4MAPPED(&v6)) {
+		if (bits < 96)
+			return -EINVAL;
+		c->is_v4 = true;
+		memcpy(c->addr, &v6.s6_addr[12], 4);
+		memset(&c->addr[4], 0, 12);
+		bits -= 96;
 	}
 
 	c->bits = (uint8_t)bits;
@@ -1127,9 +1144,17 @@ static int parse_line(struct gwp_acl_ruleset *rs, char *line)
 	char *hash;
 	int n;
 
-	hash = strchr(line, '#');
-	if (hash)
-		*hash = '\0';
+	/*
+	 * A comment starts with a '#' that begins a token. A '#' inside a
+	 * token is part of its value: a regexp such as "^[^#]+$" must not be
+	 * cut short into a different, broader pattern.
+	 */
+	for (hash = strchr(line, '#'); hash; hash = strchr(hash + 1, '#')) {
+		if (hash == line || strchr(" \t\r", hash[-1])) {
+			*hash = '\0';
+			break;
+		}
+	}
 
 	n = tokenise(line, tok);
 	if (n < 0)
@@ -1189,15 +1214,46 @@ static int read_file(const char *path, char **out)
 		return -EIO;
 	}
 
+	/*
+	 * An empty file is what a writer that truncates the file and then
+	 * fills it leaves in between, and loading it would replace every rule
+	 * with two ACCEPT policies. A file meant to have no rules still needs
+	 * a line (a comment will do), so refuse an empty one.
+	 */
+	if (!sz) {
+		fprintf(stderr, "acl: %s: file is empty\n", path);
+		fclose(fp);
+		return -ENODATA;
+	}
+
 	buf = malloc((size_t)sz + 1);
 	if (!buf) {
 		fclose(fp);
 		return -ENOMEM;
 	}
 
-	rd = fread(buf, 1, (size_t)sz, fp);
-	buf[rd] = '\0';
+	/*
+	 * The text is parsed as a C string, so a NUL byte would silently end
+	 * the file there and drop every rule after it. And a file that is
+	 * shorter or longer than its size said was changed while being read:
+	 * what was read is not the whole of any version of it. Refuse both
+	 * rather than load a partial rule set. Asking for one byte more than
+	 * the size is what notices a file that grew.
+	 */
+	rd = fread(buf, 1, (size_t)sz + 1, fp);
+	if (ferror(fp) || rd != (size_t)sz) {
+		fprintf(stderr, "acl: %s: changed while being read\n", path);
+		free(buf);
+		fclose(fp);
+		return -EIO;
+	}
 	fclose(fp);
+	if (memchr(buf, '\0', rd)) {
+		fprintf(stderr, "acl: %s: contains a NUL byte\n", path);
+		free(buf);
+		return -EINVAL;
+	}
+	buf[rd] = '\0';
 	*out = buf;
 	return 0;
 }
