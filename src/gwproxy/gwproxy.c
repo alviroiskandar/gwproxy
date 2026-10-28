@@ -913,6 +913,27 @@ static void log_conn_pair_close(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		ip_to_str(&gcp->target_addr));
 }
 
+/*
+ * Drop the name lookup a connection pair may still be waiting for: free a
+ * raw-DNS query's packet and close its socket, or tell the DNS thread pool
+ * that nobody wants the answer any more. gdp and gde share a union, so which
+ * one is live depends on --raw-dns.
+ */
+static void gwp_conn_pair_drop_dns(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+#ifdef CONFIG_NEW_DNS_RESOLVER
+	if (w->ctx->cfg.use_raw_dns) {
+		/* Closes the query's socket if it is still open. */
+		gwp_free_dns_packet(gcp);
+		return;
+	}
+#else
+	(void)w;
+#endif
+	if (gcp->gde)
+		gwp_dns_entry_cancel(gcp->gde);
+}
+
 __cold
 static void gwp_ctx_free_thread_sock_pairs(struct gwp_wrk *w)
 {
@@ -935,6 +956,7 @@ static void gwp_ctx_free_thread_sock_pairs(struct gwp_wrk *w)
 		if (gcp->udp_fd >= 0)
 			__sys_close(gcp->udp_fd);
 		gwp_conn_close_attempts(gcp);
+		gwp_conn_pair_drop_dns(w, gcp);
 		free(gcp->udp_iou);	/* io_uring relay scratch, else NULL */
 
 		/*
@@ -2297,17 +2319,7 @@ int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		__sys_close(gcp->udp_fd);
 	gwp_conn_close_attempts(gcp);
 
-#ifdef CONFIG_NEW_DNS_RESOLVER
-	if (w->ctx->cfg.use_raw_dns && gcp->gdp) {
-		/* Closes the query's socket if it is still open. */
-		gwp_free_dns_packet(gcp);
-	} else if (gcp->gde) {
-		gwp_dns_entry_cancel(gcp->gde);
-	}
-#else
-	if (gcp->gde)
-		gwp_dns_entry_cancel(gcp->gde);
-#endif
+	gwp_conn_pair_drop_dns(w, gcp);
 
 	switch (gcp->prot_type) {
 	case GWP_PROT_TYPE_SOCKS5:
