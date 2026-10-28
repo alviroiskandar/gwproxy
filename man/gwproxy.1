@@ -61,7 +61,9 @@ Every boolean option takes an explicit
 .B 0
 or
 .B 1
-argument. Long options and their single\-letter equivalents are interchangeable.
+argument. A numeric argument must be a whole decimal integer; anything else,
+or a value out of the option's range, is rejected at startup.
+Long options and their single\-letter equivalents are interchangeable.
 .SS General
 .TP
 .BR \-h ", " \-\-help
@@ -94,7 +96,7 @@ comes from the protocol or the socket.
 .BR \-w ", " \-\-nr\-workers=\fInr\fR
 Number of worker threads, each with its own
 .B SO_REUSEPORT
-listener. Default:
+listener, from 1 to 1024. Default:
 .BR 4 .
 .TP
 .BR \-o ", " \-\-protocol\-timeout=\fIsec\fR
@@ -677,7 +679,7 @@ means unlimited. Default:
 .BR 65536 .
 .TP
 .BR \-W ", " \-\-nr\-dns\-workers=\fInr\fR
-Number of DNS resolver worker threads. Default:
+Number of DNS resolver worker threads, at most 1024. Default:
 .BR 4 .
 .TP
 .BR \-j ", " \-\-dns\-server=\fIaddr:port\fR
@@ -720,6 +722,9 @@ for HTTP.
 Set
 .B SO_MARK
 (fwmark) on outgoing connections, for policy routing and iptables matching.
+The mark is a 32\-bit value, written in decimal or, with a
+.B 0x
+prefix, in hexadecimal.
 Requires
 .B CAP_NET_ADMIN
 or, since Linux 5.11,

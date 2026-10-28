@@ -57,6 +57,12 @@ enum {
 	OPT_IDLE_TIMEOUT,
 };
 
+/*
+ * Upper bound for --nr-workers and --nr-dns-workers: far above any useful
+ * thread count, low enough that a typo cannot ask for millions of threads.
+ */
+#define GWP_MAX_WORKERS	1024
+
 static const struct option long_opts[] = {
 	{ "help",		no_argument,		NULL,	'h' },
 	{ "event-loop",		required_argument,	NULL,	'e' },
@@ -222,6 +228,67 @@ static bool ev_is_io_uring(const struct gwp_cfg *cfg)
 		!strcmp(cfg->event_loop, "iou"));
 }
 
+/*
+ * Name an option by its getopt value, for error messages: the long name,
+ * which every option has.
+ */
+static const char *opt_name(int c)
+{
+	size_t i;
+
+	for (i = 0; long_opts[i].name; i++) {
+		if (long_opts[i].val == c)
+			return long_opts[i].name;
+	}
+	return "?";
+}
+
+/*
+ * Parse the argument of option @c as a whole integer in [@min, @max], in
+ * @base as for strtoll(). atoi() took "abc" or "5s" for a number, quietly
+ * turned "0x10" into 0 and had undefined behaviour on overflow, so a typo
+ * started the proxy with some other setting than the one asked for.
+ */
+static int opt_num(int c, const char *arg, long long min, long long max,
+		   int base, long long *out)
+{
+	char *end;
+	long long v;
+
+	errno = 0;
+	v = strtoll(arg, &end, base);
+	if (!*arg || *end || errno || v < min || v > max) {
+		fprintf(stderr, "Error: --%s: '%s' is not an integer in the range %lld..%lld\n",
+			opt_name(c), arg, min, max);
+		return -EINVAL;
+	}
+	*out = v;
+	return 0;
+}
+
+static int opt_int(int c, const char *arg, int min, int max, int *out)
+{
+	long long v;
+	int r;
+
+	r = opt_num(c, arg, min, max, 10, &v);
+	if (!r)
+		*out = (int)v;
+	return r;
+}
+
+/* An on/off switch: any integer, non-zero is on. */
+static int opt_bool(int c, const char *arg, bool *out)
+{
+	long long v;
+	int r;
+
+	r = opt_num(c, arg, INT_MIN, INT_MAX, 10, &v);
+	if (!r)
+		*out = !!v;
+	return r;
+}
+
 __cold
 static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 {
@@ -229,6 +296,7 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 	#define NR_OPTS ((sizeof(long_opts) / sizeof(long_opts[0])) - 1)
 	char short_opts[(NR_OPTS * 2) + 1], *p;
 	size_t i;
+	long long v;
 	int c;
 
 	p = short_opts;
@@ -264,19 +332,24 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 			cfg->target = optarg;
 			break;
 		case 'S':
-			cfg->as_socks5 = !!atoi(optarg);
+			if (opt_bool(c, optarg, &cfg->as_socks5))
+				goto einval;
 			break;
 		case 'H':
-			cfg->as_http = !!atoi(optarg);
+			if (opt_bool(c, optarg, &cfg->as_http))
+				goto einval;
 			break;
 		case 'U':
-			cfg->udp_associate = !!atoi(optarg);
+			if (opt_bool(c, optarg, &cfg->udp_associate))
+				goto einval;
 			break;
 		case 'Q':
-			cfg->prefer_ipv6 = !!atoi(optarg);
+			if (opt_bool(c, optarg, &cfg->prefer_ipv6))
+				goto einval;
 			break;
 		case 'o':
-			cfg->protocol_timeout = atoi(optarg);
+			if (opt_int(c, optarg, INT_MIN, INT_MAX, &cfg->protocol_timeout))
+				goto einval;
 			break;
 		case 'A':
 			cfg->auth_file = optarg;
@@ -295,42 +368,53 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 				goto einval_outfam;
 			break;
 		case OPT_BIND_IPV6_ONLY:
-			cfg->bind_ipv6_only = !!atoi(optarg);
+			if (opt_bool(c, optarg, &cfg->bind_ipv6_only))
+				goto einval;
 			break;
 		case OPT_ACL_ALLOW_ALL:
 			cfg->acl_allow_all = true;
 			break;
 		case 'L':
-			cfg->dns_cache_secs = atoi(optarg);
+			if (opt_int(c, optarg, INT_MIN, INT_MAX, &cfg->dns_cache_secs))
+				goto einval;
 			break;
 		case OPT_DNS_CACHE_MAX_ENTRIES:
-			cfg->dns_cache_max_entries = atoi(optarg);
+			if (opt_int(c, optarg, INT_MIN, INT_MAX, &cfg->dns_cache_max_entries))
+				goto einval;
 			break;
 		case 'w':
-			cfg->nr_workers = atoi(optarg);
+			if (opt_int(c, optarg, 1, GWP_MAX_WORKERS, &cfg->nr_workers))
+				goto einval;
 			break;
 		case 'W':
-			cfg->nr_dns_workers = atoi(optarg);
+			if (opt_int(c, optarg, 0, GWP_MAX_WORKERS, &cfg->nr_dns_workers))
+				goto einval;
 			break;
 		case 'c':
-			cfg->connect_timeout = atoi(optarg);
+			if (opt_int(c, optarg, INT_MIN, INT_MAX, &cfg->connect_timeout))
+				goto einval;
 			break;
 		case OPT_IDLE_TIMEOUT:
-			cfg->idle_timeout = atoi(optarg);
+			if (opt_int(c, optarg, INT_MIN, INT_MAX, &cfg->idle_timeout))
+				goto einval;
 			if (cfg->idle_timeout < 0)
 				cfg->idle_timeout = 0;
 			break;
 		case 'D':
-			cfg->connect_attempt_delay = atoi(optarg);
+			if (opt_int(c, optarg, INT_MIN, INT_MAX, &cfg->connect_attempt_delay))
+				goto einval;
 			break;
 		case 'T':
-			cfg->target_buf_size = atoi(optarg);
+			if (opt_int(c, optarg, INT_MIN, INT_MAX, &cfg->target_buf_size))
+				goto einval;
 			break;
 		case 'C':
-			cfg->client_buf_size = atoi(optarg);
+			if (opt_int(c, optarg, INT_MIN, INT_MAX, &cfg->client_buf_size))
+				goto einval;
 			break;
 		case 'd':
-			cfg->tcp_nodelay = !!atoi(optarg);
+			if (opt_bool(c, optarg, &cfg->tcp_nodelay))
+				goto einval;
 			break;
 		case 'K':
 			/*
@@ -342,19 +426,24 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 			fprintf(stderr, "Warning: --tcp-quickack has no effect and is ignored\n");
 			break;
 		case 'k':
-			cfg->tcp_keepalive = !!atoi(optarg);
+			if (opt_bool(c, optarg, &cfg->tcp_keepalive))
+				goto einval;
 			break;
 		case 'i':
-			cfg->tcp_keepidle = atoi(optarg);
+			if (opt_int(c, optarg, INT_MIN, INT_MAX, &cfg->tcp_keepidle))
+				goto einval;
 			break;
 		case 'l':
-			cfg->tcp_keepintvl = atoi(optarg);
+			if (opt_int(c, optarg, INT_MIN, INT_MAX, &cfg->tcp_keepintvl))
+				goto einval;
 			break;
 		case 'g':
-			cfg->tcp_keepcnt = atoi(optarg);
+			if (opt_int(c, optarg, INT_MIN, INT_MAX, &cfg->tcp_keepcnt))
+				goto einval;
 			break;
 		case 'm':
-			cfg->log_level = atoi(optarg);
+			if (opt_int(c, optarg, INT_MIN, INT_MAX, &cfg->log_level))
+				goto einval;
 			break;
 		case 'f':
 			cfg->log_file = optarg;
@@ -366,7 +455,9 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 			cfg->upstream_proxy = optarg;
 			break;
 		case 'M':
-			cfg->mark = atoi(optarg);
+			if (opt_num(c, optarg, 0, UINT32_MAX, 0, &v))
+				goto einval;
+			cfg->mark = (uint32_t)v;
 			break;
 		case 'B':
 			cfg->bind_source = optarg;
@@ -375,7 +466,8 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 			cfg->bind_iface = optarg;
 			break;
 		case 'R':
-			cfg->as_transparent = !!atoi(optarg);
+			if (opt_bool(c, optarg, &cfg->as_transparent))
+				goto einval;
 			break;
 #ifdef CONFIG_HTTPS
 		case 'E':
@@ -389,7 +481,8 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 			cfg->dns_servers = optarg;
 			break;
 		case 'r':
-			cfg->use_raw_dns = !!atoi(optarg);
+			if (opt_bool(c, optarg, &cfg->use_raw_dns))
+				goto einval;
 			break;
 		default:
 			fprintf(stderr, "Unknown option: %c\n", c);
@@ -2184,7 +2277,7 @@ static int gwp_ctx_init(struct gwp_ctx *ctx)
 					     &ctx->cfg.mark, sizeof(ctx->cfg.mark));
 			__sys_close(tfd);
 			if (r) {
-				pr_err(&ctx->lh, "Cannot set --mark=%d (SO_MARK): %s (CAP_NET_ADMIN or CAP_NET_RAW required)",
+				pr_err(&ctx->lh, "Cannot set --mark=%u (SO_MARK): %s (CAP_NET_ADMIN or CAP_NET_RAW required)",
 				       ctx->cfg.mark, strerror(-r));
 				goto out_free_log;
 			}
@@ -2659,7 +2752,7 @@ int gwp_create_sock_target(struct gwp_wrk *w, struct gwp_sockaddr *addr,
 			return r;
 		}
 	} else if (w->ctx->cfg.mark) {
-		setskopt_int(fd, SOL_SOCKET, SO_MARK, w->ctx->cfg.mark);
+		setskopt_int(fd, SOL_SOCKET, SO_MARK, (int)w->ctx->cfg.mark);
 	}
 
 	/*
@@ -3678,7 +3771,7 @@ int gwp_socks5_udp_associate_setup(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 	setskopt_int(fd, IPPROTO_IPV6, IPV6_V6ONLY, 0);
 	if (ctx->cfg.mark)
-		setskopt_int(fd, SOL_SOCKET, SO_MARK, ctx->cfg.mark);
+		setskopt_int(fd, SOL_SOCKET, SO_MARK, (int)ctx->cfg.mark);
 
 	memset(&relay, 0, sizeof(relay));
 	relay.i6.sin6_family = AF_INET6;

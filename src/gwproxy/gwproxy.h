@@ -94,7 +94,7 @@ struct gwp_cfg {
 	const char	*pid_file;
 	const char	*dns_servers;
 	const char	*upstream_proxy;
-	int		mark;
+	uint32_t	mark;
 	/*
 	 * Global default for the ACL's -j BIND: the source address
 	 * (--bind-source, "ip[:port]") and/or interface (--bind-iface) to pin
