@@ -50,18 +50,54 @@ static void log_write(int fd, const char *buf, size_t len)
 	}
 }
 
+static inline bool log_is_ctl(unsigned char c)
+{
+	return c < 0x20 || c == 0x7f;
+}
+
+/*
+ * Rewrite each control byte of the @len bytes at @s as "\xHH", in place,
+ * working back from the end. The buffer must have room for @len + 3 * @nr_ctl
+ * bytes, @nr_ctl being the number of control bytes in it. Returns the new
+ * length.
+ */
+static size_t log_escape_ctl(char *s, size_t len, size_t nr_ctl)
+{
+	static const char hex[] = "0123456789abcdef";
+	char *src = s + len, *dst = src + 3 * nr_ctl;
+
+	while (dst > src) {
+		unsigned char c = (unsigned char)*--src;
+
+		if (!log_is_ctl(c)) {
+			*--dst = (char)c;
+			continue;
+		}
+		*--dst = hex[c & 0xf];
+		*--dst = hex[c >> 4];
+		*--dst = 'x';
+		*--dst = '\\';
+	}
+	return len + 3 * nr_ctl;
+}
+
 /*
  * The whole line is formatted once into one buffer and handed to the kernel
  * with a single write(2), bypassing stdio: no FILE lock for the workers to
  * serialise on, no second formatting pass, and no flush. A regular log file
  * is opened with O_APPEND (fopen "a"), so lines from different workers never
  * interleave.
+ *
+ * Control bytes in the message (CR, LF, ESC, ...) are written as "\xHH":
+ * messages carry strings that come from clients, and a raw line break would
+ * let a client end the line and append entries of its own. The trailing '\n'
+ * is added here, so no format needs one.
  */
 __attribute__((__format__(printf, 3, 4)))
 void __pr_log(FILE *handle, int level, const char *fmt, ...)
 {
-	char loc_buf[4096], *pb = loc_buf;
-	size_t hlen, room;
+	char loc_buf[4096], *pb = loc_buf, *nb;
+	size_t hlen, room, mlen, cap, nr_ctl = 0, i;
 	va_list ap, ap2;
 	const char *ls;
 	int r;
@@ -101,9 +137,38 @@ void __pr_log(FILE *handle, int level, const char *fmt, ...)
 		memcpy(pb, loc_buf, hlen);
 		vsnprintf(pb + hlen, (size_t)r + 1, fmt, ap2);
 	}
+	mlen = (size_t)r;
+	cap = pb == loc_buf ? sizeof(loc_buf) : hlen + mlen + 2;
 
-	pb[hlen + (size_t)r] = '\n';
-	log_write(fileno(handle), pb, hlen + (size_t)r + 1);
+	for (i = 0; i < mlen; i++)
+		nr_ctl += log_is_ctl((unsigned char)pb[hlen + i]);
+
+	if (unlikely(nr_ctl)) {
+		if (hlen + mlen + 3 * nr_ctl + 1 > cap) {
+			nb = malloc(hlen + mlen + 3 * nr_ctl + 1);
+			if (nb) {
+				memcpy(nb, pb, hlen + mlen);
+				if (pb != loc_buf)
+					free(pb);
+				pb = nb;
+			}
+		} else {
+			nb = pb;
+		}
+
+		if (nb) {
+			mlen = log_escape_ctl(pb + hlen, mlen, nr_ctl);
+		} else {
+			/* No room to escape: still never pass one through. */
+			for (i = 0; i < mlen; i++) {
+				if (log_is_ctl((unsigned char)pb[hlen + i]))
+					pb[hlen + i] = '?';
+			}
+		}
+	}
+
+	pb[hlen + mlen] = '\n';
+	log_write(fileno(handle), pb, hlen + mlen + 1);
 	if (unlikely(pb != loc_buf))
 		free(pb);
 out:
