@@ -461,6 +461,20 @@ static int reap_dead_pairs(struct gwp_wrk *w)
 	return ret;
 }
 
+/*
+ * Every connection to a target is logged once it is up, the same way on both
+ * event loops: in handle_ev_target_conn_result() once the connect completes,
+ * or in handle_new_client() for a plain forwarding connect that completed at
+ * once. A connection through an upstream proxy is logged when the tunnel is
+ * up instead.
+ */
+static void log_target_connected(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	pr_info(&w->ctx->lh, "Target socket connected (fd=%d, idx=%u, ca=%s, ta=%s)",
+		gcp->target.fd, gcp->idx, ip_to_str(&gcp->client_addr),
+		ip_to_str(&gcp->target_addr));
+}
+
 __hot
 static int handle_new_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
@@ -572,8 +586,12 @@ static int handle_new_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 			return r;
 	}
 
-	if (gcp->target.fd >= 0)
+	if (gcp->target.fd >= 0) {
 		log_conn_pair_created(w, gcp);
+		/* Otherwise it is logged when EPOLLOUT reports the connect. */
+		if (gcp->is_target_alive)
+			log_target_connected(w, gcp);
+	}
 
 	return 0;
 }
@@ -1428,6 +1446,7 @@ static int handle_ev_target_conn_result(struct gwp_wrk *w,
 	if (ctx->upstream.enabled)
 		return upstream_start(w, gcp);
 
+	log_target_connected(w, gcp);
 	r = arm_idle_timer(w, gcp);
 	if (unlikely(r))
 		return r;
@@ -1524,10 +1543,6 @@ static int handle_ev_target_attempt(struct gwp_wrk *w,
 	 * re-deriving from cand[] would silently undo.
 	 */
 	gcp->target_addr = gcp->attempt_addr[slot];
-	pr_info(&ctx->lh, "Target socket connected (fd=%d, idx=%u, ca=%s, ta=%s)",
-		fd, gcp->idx, ip_to_str(&gcp->client_addr),
-		ip_to_str(&gcp->target_addr));
-
 	r = adopt_winning_attempt(w, gcp, slot);
 	if (unlikely(r))
 		return r;
