@@ -367,7 +367,8 @@ static int parse_cidr(const char *s, struct gwp_acl_cidr *c)
 	char buf[INET6_ADDRSTRLEN + 8];
 	unsigned long bits;
 	char *slash;
-	uint8_t v4[4], v6[16];
+	struct in6_addr v6;
+	uint8_t v4[4];
 
 	if (strlen(s) >= sizeof(buf))
 		return -EINVAL;
@@ -382,9 +383,9 @@ static int parse_cidr(const char *s, struct gwp_acl_cidr *c)
 		c->is_v4 = true;
 		memcpy(c->addr, v4, 4);
 		bits = 32;
-	} else if (inet_pton(AF_INET6, buf, v6) == 1) {
+	} else if (inet_pton(AF_INET6, buf, &v6) == 1) {
 		c->is_v4 = false;
-		memcpy(c->addr, v6, 16);
+		memcpy(c->addr, v6.s6_addr, 16);
 		bits = 128;
 	} else {
 		return -EINVAL;
@@ -399,6 +400,22 @@ static int parse_cidr(const char *s, struct gwp_acl_cidr *c)
 			return -EINVAL;
 		if (bits > (c->is_v4 ? 32u : 128u))
 			return -EINVAL;
+	}
+
+	/*
+	 * cidr_match() folds a v4-mapped target (::ffff:a.b.c.d) into IPv4, so
+	 * a v4-mapped rule prefix has to be folded the same way or it never
+	 * matches anything. A mapped address with a prefix shorter than /96
+	 * reaches outside the mapped range; that cannot be expressed as one
+	 * IPv4 prefix and is most likely a mistake, so refuse it.
+	 */
+	if (!c->is_v4 && IN6_IS_ADDR_V4MAPPED(&v6)) {
+		if (bits < 96)
+			return -EINVAL;
+		c->is_v4 = true;
+		memcpy(c->addr, &v6.s6_addr[12], 4);
+		memset(&c->addr[4], 0, 12);
+		bits -= 96;
 	}
 
 	c->bits = (uint8_t)bits;
