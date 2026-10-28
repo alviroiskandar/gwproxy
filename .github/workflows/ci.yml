@@ -14,6 +14,9 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Each commit becomes 14 build jobs, and a matrix may hold 256 jobs
+      # at most. A push of more commits (a rewritten history, say) would
+      # fail before testing anything, so test only its newest 18 commits.
       - name: Get commit list
         id: get_commit_list
         run: |
@@ -22,7 +25,7 @@ jobs:
             ( \
               git log --pretty="%h" --reverse ${{github.event.commits[0].id}}^...${{github.sha}} || \
               (printf "%s" ${{github.sha}} | head -c 12) \
-            ) | awk '{ print "id" NR "=" $1 }' \
+            ) | tail -n 18 | awk '{ print "id" NR "=" $1 }' \
           ) > $GITHUB_OUTPUT;
           echo "List of tested commits:" > $GITHUB_STEP_SUMMARY;
           cat $GITHUB_OUTPUT >> $GITHUB_STEP_SUMMARY;
