@@ -608,6 +608,13 @@ struct gwp_conn_pair {
 	 */
 	uint32_t		last_act;
 
+	/*
+	 * How much of an http:// upstream's CONNECT reply has been searched
+	 * for the end of its header, so a reply arriving in pieces is not
+	 * searched from its start again on every read.
+	 */
+	uint32_t		up_scan;
+
 	/* One-byte scalars last, so they pack instead of each opening a hole. */
 	bool			is_target_alive;
 	/* The pair's timer is now the --idle-timeout check. */

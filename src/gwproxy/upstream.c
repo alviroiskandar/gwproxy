@@ -178,11 +178,12 @@ static int s5_parse(struct gwp_wrk *w, struct gwp_conn_pair *gcp, bool *notify)
 
 static int http_parse(struct gwp_wrk *w, struct gwp_conn_pair *gcp, bool *notify)
 {
-	size_t consumed;
+	size_t consumed, scan = gcp->up_scan;
 	int status, r;
 
 	r = gwp_http_cli_parse_connect_reply(gcp->target.buf, gcp->target.len,
-					     &status, &consumed);
+					     &scan, &status, &consumed);
+	gcp->up_scan = (uint32_t)scan;
 	/*
 	 * A reply header that fills the buffer without ending never will:
 	 * there is no room left to receive the rest. Waiting for it only
@@ -298,6 +299,7 @@ static int http_start(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 	gcp->target.len = (uint32_t)len;
 	gcp->up_tx = true;
+	gcp->up_scan = 0;
 	gcp->conn_state = CONN_STATE_UPSTREAM_HTTP_CONNECT;
 	pr_dbg(&w->ctx->lh, "Upstream HTTP CONNECT started (idx=%u, dst=%s)",
 		gcp->idx, authority);
