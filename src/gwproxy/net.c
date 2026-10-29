@@ -52,6 +52,17 @@ int convert_str_to_ssaddr(const char *str,
 
 	strncpy(host, str, l);
 	host[l] = '\0';
+	/*
+	 * A host name or IP literal holds nothing but letters, digits and
+	 * "-._" (plus ':' and '%' for an IPv6 literal and its zone). Refuse
+	 * anything else here: what getaddrinfo() makes of, say, a space is up
+	 * to the C library, and musl sends such a name to the DNS server and
+	 * waits for its timeout where glibc refuses it at once.
+	 */
+	if (!*host || host[strspn(host, "abcdefghijklmnopqrstuvwxyz"
+				     "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+				     "0123456789-._:%")])
+		return -EINVAL;
 	if (default_port) {
 		snprintf(port, 6, "%hu", default_port);
 	} else {

@@ -31,8 +31,11 @@ SECRET="s3cr3t-Upstream-Pw"
 # invalid on any resolver) is rejected at startup; the message names the user
 # and the host, and must not carry the password.
 out="$(timeout 5 "$GWPROXY" --as-socks5=1 --bind="127.0.0.1:$(pick_port)" \
-	--upstream-proxy="http://opuser:$SECRET@bad host:1" 2>&1)" && \
-	fail "a malformed --upstream-proxy URL was accepted"
+	--upstream-proxy="http://opuser:$SECRET@bad host:1" 2>&1)"
+case $? in
+0) fail "a malformed --upstream-proxy URL was accepted" ;;
+124) fail "a malformed --upstream-proxy URL went to the resolver and timed out" ;;
+esac
 printf '%s\n' "$out" | grep -q "Invalid --upstream-proxy value 'http://opuser:\*\*\*@bad host:1'" || \
 	fail "no masked upstream URL in the error: $out"
 printf '%s\n' "$out" | grep -qF "$SECRET" && \
