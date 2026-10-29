@@ -182,4 +182,12 @@ uint32_t gwp_acl_generation(struct gwp_acl *acl);
 enum gwp_acl_verdict gwp_acl_eval_input(struct gwp_acl *acl,
 					struct gwp_acl_req *req);
 
+/*
+ * How many rules of @acl's current ruleset are looked up through an index
+ * instead of tested one by one: those in runs of at least 8 consecutive
+ * rules that each test only an exact -m domain, a -d or a -s (not negated)
+ * and end the evaluation when they match. For diagnostics and tests.
+ */
+uint32_t gwp_acl_nr_indexed(struct gwp_acl *acl);
+
 #endif /* #ifndef GWP_ACL_H */
