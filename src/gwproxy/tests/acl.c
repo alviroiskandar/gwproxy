@@ -795,6 +795,377 @@ static noinline void test_parse_errors(void)
 }
 
 /*
+ * Long runs of single-criterion terminal rules are answered from an index.
+ * The answer must be the first matching rule of the run in file order:
+ * not the most specific prefix, not a later duplicate, and only rules of
+ * the run (a rule that breaks the run is still tested in its place).
+ */
+static noinline void test_index_first_match(void)
+{
+	static const char rules[] =
+		"-P OUTPUT ACCEPT\n"
+		"-A OUTPUT -d 10.0.0.0/8 -j ACCEPT\n"
+		"-A OUTPUT -d 10.1.0.0/16 -j REJECT\n"
+		"-A OUTPUT -d 10.1.2.3 -j REJECT\n"
+		"-A OUTPUT -d 192.0.2.0/24 -j REJECT\n"
+		"-A OUTPUT -d 192.0.2.0/24 -j ACCEPT\n"
+		"-A OUTPUT -d 2001:db8::/32 -j REJECT\n"
+		"-A OUTPUT -d ::ffff:198.51.100.0/120 -j REJECT\n"
+		"-A OUTPUT -m domain --domain Bad.Example -j REJECT\n"
+		"-A OUTPUT -d 203.0.113.7 -j DNAT --to 127.0.0.1:8080\n"
+		"-A OUTPUT -m domain --domain marked.example -j MARK --set-mark 7 --accept\n"
+		"-A OUTPUT -s 100.64.0.0/10 -j REJECT\n"
+		"-A OUTPUT -m domain --domain bad.example -j ACCEPT\n"
+		/* Not indexable: ends the run. */
+		"-A OUTPUT -d 172.16.0.0/12 --dports 443 -j ACCEPT\n"
+		"-A OUTPUT -d 172.16.0.0/12 -j REJECT\n"
+		"-A OUTPUT -d 172.16.1.0/24 -j REJECT\n"
+		"-A OUTPUT -d 172.16.2.0/24 -j REJECT\n"
+		"-A OUTPUT -d 172.16.3.0/24 -j REJECT\n"
+		"-A OUTPUT -d 172.16.4.0/24 -j REJECT\n"
+		"-A OUTPUT -d 172.16.5.0/24 -j REJECT\n"
+		"-A OUTPUT -d 172.16.6.0/24 -j REJECT\n"
+		"-A OUTPUT -d 172.16.7.0/24 -j REJECT\n"
+		"-A INPUT -s 10.0.0.0/8 -j REJECT\n"
+		"-A INPUT -s 10.9.0.0/16 -j ACCEPT\n"
+		"-A INPUT -s 10.8.0.0/16 -j ACCEPT\n"
+		"-A INPUT -s 10.7.0.0/16 -j ACCEPT\n"
+		"-A INPUT -s 10.6.0.0/16 -j ACCEPT\n"
+		"-A INPUT -s 10.5.0.0/16 -j ACCEPT\n"
+		"-A INPUT -s 10.4.0.0/16 -j ACCEPT\n"
+		"-A INPUT -s 192.0.2.1 -j ACCEPT\n";
+	struct gwp_sockaddr t, c;
+	struct gwp_acl_req req;
+	struct gwp_acl *a;
+
+	assert(!gwp_acl_parse_str(&a, rules));
+	/* 12 + 8 OUTPUT rules in two runs, 8 INPUT rules in one. */
+	assert(gwp_acl_nr_indexed(a) == 12 + 8 + 8);
+
+	t = sa4("10.1.2.3", 80);
+	assert(out(a, &t, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
+	t = sa4("192.0.2.9", 80);
+	assert(out(a, &t, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+	t = sa6("2001:db8::1", 80);
+	assert(out(a, &t, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+	t = sa4mapped("198.51.100.20", 80);
+	assert(out(a, &t, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+	t = sa4("198.51.100.20", 80);
+	assert(out(a, &t, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+	t = sa4("198.51.101.20", 80);
+	assert(out(a, &t, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
+
+	/* Domains: case-insensitive, first rule wins, none without a name. */
+	t = sa4("93.184.216.34", 80);
+	assert(out(a, &t, "BAD.example", 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+	assert(out(a, &t, "bad.example.", 80, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
+	assert(out(a, NULL, "bad.example", 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+
+	/* An address rule before a domain rule of the same run wins. */
+	t = sa4("192.0.2.1", 80);
+	assert(out(a, &t, "bad.example", 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+	t = sa4("10.0.0.1", 80);
+	assert(out(a, &t, "bad.example", 80, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
+
+	/* DNAT and MARK --accept from an indexed rule. */
+	t = sa4("203.0.113.7", 443);
+	memset(&req, 0, sizeof(req));
+	req.target = &t;
+	req.dport = 443;
+	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_ACCEPT);
+	assert(req.dnat_applied && req.dnat.i4.sin_port == htons(8080));
+	t = sa4("93.184.216.34", 443);
+	memset(&req, 0, sizeof(req));
+	req.target = &t;
+	req.domain = "Marked.Example";
+	req.dport = 443;
+	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_ACCEPT);
+	assert(req.mark_set && req.mark == 7 && !req.dnat_applied);
+
+	/* -s in OUTPUT needs the client address. */
+	c = sa4("100.64.1.1", 5555);
+	memset(&req, 0, sizeof(req));
+	req.target = &t;
+	req.client = &c;
+	req.dport = 443;
+	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_REJECT);
+	req.client = NULL;
+	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_ACCEPT);
+
+	/* The rule that breaks the run is still tested in its place. */
+	t = sa4("172.16.1.1", 443);
+	assert(out(a, &t, NULL, 443, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
+	assert(out(a, &t, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+	assert(out(a, NULL, "x.example", 80, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
+
+	/* INPUT: the broad REJECT comes first. */
+	c = sa4("10.9.1.1", 1234);
+	assert(in(a, &c, 1234, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+	c = sa4("192.0.2.1", 1234);
+	assert(in(a, &c, 1234, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
+	c = sa4("192.0.2.2", 1234);
+	assert(in(a, &c, 1234, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
+	gwp_acl_destroy(a);
+
+	/* Seven rules are not worth an index; negated or modifier rules never. */
+	assert(!gwp_acl_parse_str(&a,
+		"-A OUTPUT -d 10.0.0.1 -j REJECT\n-A OUTPUT -d 10.0.0.2 -j REJECT\n"
+		"-A OUTPUT -d 10.0.0.3 -j REJECT\n-A OUTPUT -d 10.0.0.4 -j REJECT\n"
+		"-A OUTPUT -d 10.0.0.5 -j REJECT\n-A OUTPUT -d 10.0.0.6 -j REJECT\n"
+		"-A OUTPUT -d 10.0.0.7 -j REJECT\n"
+		"-A OUTPUT ! -d 10.0.0.8 -j REJECT\n"
+		"-A OUTPUT -d 10.0.0.9 -j MARK --set-mark 1\n"
+		"-A OUTPUT -d 10.0.0.10 -j REJECT\n"));
+	assert(gwp_acl_nr_indexed(a) == 0);
+	gwp_acl_destroy(a);
+}
+
+/* A small deterministic PRNG, so a failure can be replayed. */
+static uint32_t rnd_state;
+
+static uint32_t rnd(uint32_t n)
+{
+	rnd_state ^= rnd_state << 13;
+	rnd_state ^= rnd_state >> 17;
+	rnd_state ^= rnd_state << 5;
+	return rnd_state % n;
+}
+
+static const char *const rnd_v4_nets[] = {
+	"10.0.0.0/8", "10.1.0.0/16", "10.1.2.0/24", "10.1.2.3", "10.1.2.128/25",
+	"10.2.0.0/15", "10.3.3.3/32", "10.0.0.0/7", "0.0.0.0/0", "10.1.3.0/24",
+	"::ffff:10.1.2.0/120", "10.2.2.0/23",
+};
+static const char *const rnd_v6_nets[] = {
+	"2001:db8::/32", "2001:db8:1::/48", "2001:db8:1::1", "::/0",
+	"2001:db8:1:2::/64", "2001:db9::/16",
+	/* The same leading bytes as 10.1.0.0/16 and 10.1.2.3/32. */
+	"a01::/16", "a01:203::/32",
+};
+static const char *const rnd_v4_addrs[] = {
+	"10.1.2.3", "10.1.2.200", "10.1.3.1", "10.2.2.1", "10.3.3.3",
+	"11.0.0.1", "10.0.0.1", "192.0.2.1",
+};
+static const char *const rnd_v6_addrs[] = {
+	"2001:db8:1::1", "2001:db8:1:2::5", "2001:db8:2::1", "2001:db9::1",
+	"fe80::1", "a01:203::1",
+};
+static const char *const rnd_doms[] = {
+	"a.example", "B.example", "c.EXAMPLE", "d.example", "a.example.",
+	"xn--bcher-kva.example", "e.example",
+};
+
+#define NELEM(x) (sizeof(x) / sizeof((x)[0]))
+
+static const char *rnd_case(const char *s, char *buf)
+{
+	size_t i;
+
+	for (i = 0; s[i]; i++) {
+		char ch = s[i];
+
+		if (ch >= 'a' && ch <= 'z' && rnd(2))
+			ch = (char)(ch - 'a' + 'A');
+		else if (ch >= 'A' && ch <= 'Z' && rnd(2))
+			ch = (char)(ch - 'A' + 'a');
+		buf[i] = ch;
+	}
+	buf[i] = '\0';
+	return buf;
+}
+
+static const char *rnd_net(void)
+{
+	return rnd(4) ? rnd_v4_nets[rnd(NELEM(rnd_v4_nets))]
+		      : rnd_v6_nets[rnd(NELEM(rnd_v6_nets))];
+}
+
+static const char *rnd_action(char *buf, bool output, bool terminal)
+{
+	static const char *const out_acts[] = {
+		"-j ACCEPT", "-j REJECT", "-j DNAT --to 127.0.0.1:81",
+		"-j DNAT --to :82", "-j MARK --set-mark 5 --accept",
+		"-j BIND --to-source 127.0.0.2 --accept", "-j MARK --set-mark 6",
+		"-j BIND --to-iface lo",
+	};
+
+	if (!output)
+		return rnd(2) ? "-j ACCEPT" : "-j REJECT";
+	strcpy(buf, out_acts[rnd(terminal || rnd(4) ? 6 : NELEM(out_acts))]);
+	return buf;
+}
+
+/*
+ * Append one random rule for @chain to @p; returns the new end. With
+ * @indexable, one an index can answer.
+ */
+static char *rnd_rule(char *p, bool output, bool indexable)
+{
+	static const uint32_t ikinds[] = { 0, 6, 7, 8 };
+	char cbuf[64], abuf[64];
+	const char *chain = output ? "OUTPUT" : "INPUT";
+	uint32_t kind;
+
+	if (indexable)
+		kind = output ? ikinds[rnd(NELEM(ikinds))] : 0;
+	else
+		kind = rnd(output ? 11 : 6);
+
+	p += sprintf(p, "-A %s ", chain);
+	switch (kind) {
+	case 0: case 1: case 2:
+		p += sprintf(p, "-s %s ", rnd_net());
+		break;
+	case 3:
+		p += sprintf(p, "! -s %s ", rnd_net());
+		break;
+	case 4:
+		p += sprintf(p, "-s %s -p %s ", rnd_net(), rnd(2) ? "tcp" : "udp");
+		break;
+	case 5: {
+		uint32_t lo = rnd(3) * 1000;
+
+		p += sprintf(p, "--sports %u-%u ", lo, lo + 500 + rnd(2) * 500);
+		break;
+	}
+	case 6: case 7:
+		p += sprintf(p, "-d %s ", rnd_net());
+		break;
+	case 8:
+		p += sprintf(p, "-m domain --domain %s ",
+			     rnd_case(rnd_doms[rnd(NELEM(rnd_doms))], cbuf));
+		break;
+	case 9:
+		p += sprintf(p, "! -d %s ", rnd_net());
+		break;
+	default:
+		if (rnd(2))
+			p += sprintf(p, "-d %s --dports %d ", rnd_net(),
+				     rnd(2) ? 80 : 443);
+		else
+			p += sprintf(p, "-m domain ! --domain %s ",
+				     rnd_doms[rnd(NELEM(rnd_doms))]);
+		break;
+	}
+	p += sprintf(p, "%s\n", rnd_action(abuf, output, indexable));
+	return p;
+}
+
+static void rnd_addr(struct gwp_sockaddr *s)
+{
+	uint32_t k = rnd(5);
+
+	if (k < 2)
+		*s = sa4(rnd_v4_addrs[rnd(NELEM(rnd_v4_addrs))], 443);
+	else if (k < 3)
+		*s = sa4mapped(rnd_v4_addrs[rnd(NELEM(rnd_v4_addrs))], 443);
+	else
+		*s = sa6(rnd_v6_addrs[rnd(NELEM(rnd_v6_addrs))], 443);
+	s->i4.sin_port = htons((uint16_t)(rnd(2) ? 80 : 443));
+}
+
+static bool same_result(const struct gwp_acl_req *x, enum gwp_acl_verdict vx,
+			const struct gwp_acl_req *y, enum gwp_acl_verdict vy)
+{
+	if (vx != vy || x->dnat_applied != y->dnat_applied ||
+	    x->mark_set != y->mark_set || x->bind.set != y->bind.set)
+		return false;
+	if (x->dnat_applied && memcmp(&x->dnat, &y->dnat, sizeof(x->dnat)))
+		return false;
+	if (x->mark_set && x->mark != y->mark)
+		return false;
+	if (x->bind.set && memcmp(&x->bind, &y->bind, sizeof(x->bind)))
+		return false;
+	return true;
+}
+
+/*
+ * Random rule files, each evaluated twice: as written, where long runs
+ * are indexed, and with a never-matching two-criterion rule after every
+ * rule, which leaves no run to index. Every request must get the same
+ * verdict and the same DNAT/MARK/BIND result from both.
+ */
+static noinline void test_index_matches_linear(void)
+{
+	static const size_t max_rules = 120;
+	char *txt, *ref;
+	unsigned iter;
+
+	txt = malloc(max_rules * 160);
+	ref = malloc(max_rules * 2 * 160);
+	assert(txt && ref);
+	rnd_state = 0x9e3779b9u;
+	for (iter = 0; iter < 300; iter++) {
+		struct gwp_acl *a, *b;
+		size_t nr = 8 + rnd(max_rules - 8), i, burst = 0;
+		char *p = txt, *q = ref, *line;
+		bool burst_out = false;
+		unsigned k;
+
+		p += sprintf(p, "-P INPUT %s\n-P OUTPUT %s\n",
+			     rnd(2) ? "ACCEPT" : "REJECT",
+			     rnd(2) ? "ACCEPT" : "REJECT");
+		q += sprintf(q, "%s", txt);
+		for (i = 0; i < nr; i++) {
+			bool output = rnd(3) != 0;
+
+			/* Now and then a run of indexable rules for one chain. */
+			if (!burst && !rnd(10)) {
+				burst = 6 + rnd(15);
+				burst_out = rnd(3) != 0;
+			}
+			if (burst) {
+				burst--;
+				output = burst_out;
+			}
+			line = p;
+			p = rnd_rule(p, output, burst != 0);
+			q += sprintf(q, "%.*s", (int)(p - line), line);
+			q += sprintf(q, output ?
+				     "-A OUTPUT -d 0.0.0.0/32 --dports 1 -j REJECT\n" :
+				     "-A INPUT -s 0.0.0.0/32 --sports 1 -j REJECT\n");
+		}
+		assert(!gwp_acl_parse_str(&a, txt));
+		assert(!gwp_acl_parse_str(&b, ref));
+		assert(gwp_acl_nr_indexed(b) == 0);
+
+		for (k = 0; k < 200; k++) {
+			struct gwp_sockaddr t, c;
+			struct gwp_acl_req x, y;
+			enum gwp_acl_verdict vx, vy;
+			char dbuf[64];
+
+			rnd_addr(&t);
+			rnd_addr(&c);
+			memset(&x, 0, sizeof(x));
+			x.target = rnd(6) ? &t : NULL;
+			x.client = rnd(6) ? &c : NULL;
+			x.domain = rnd(3) ? rnd_case(rnd_doms[rnd(NELEM(rnd_doms))], dbuf)
+					  : NULL;
+			x.dport = (uint16_t)(rnd(2) ? 80 : 443);
+			x.sport = (uint16_t)rnd(3000);
+			x.proto = (uint8_t)rnd(2);
+			y = x;
+
+			vx = gwp_acl_eval_output(a, &x);
+			vy = gwp_acl_eval_output(b, &y);
+			if (!same_result(&x, vx, &y, vy)) {
+				fprintf(stderr, "index mismatch, iter %u req %u:\n%s",
+					iter, k, txt);
+				abort();
+			}
+			vx = gwp_acl_eval_input(a, &x);
+			vy = gwp_acl_eval_input(b, &y);
+			assert(vx == vy);
+		}
+		gwp_acl_destroy(a);
+		gwp_acl_destroy(b);
+	}
+	free(txt);
+	free(ref);
+}
+
+/*
  * A domain-only request (no resolved IP, as with a socks5h upstream) carries
  * target == NULL. A target-dependent -d/--dports rule must match NEITHER
  * polarity: otherwise a negated allow-by-exclusion rule flips the unevaluable
@@ -1086,6 +1457,108 @@ static void test_reload_under_readers(void)
 }
 
 /*
+ * Two rulesets that give 10.1.2.3 opposite verdicts, behind a long run of
+ * rules that do not match it so that evaluations last and overlap the
+ * reloads. Ruleset A is loaded at even generations, B at odd ones.
+ */
+static char *swap_rules(bool b)
+{
+	size_t cap = 64 * 2100, len = 0;
+	char *s = malloc(cap);
+	int i;
+
+	assert(s);
+	len += (size_t)sprintf(s + len, "-P OUTPUT %s\n-P INPUT %s\n",
+			       b ? "REJECT" : "ACCEPT", b ? "REJECT" : "ACCEPT");
+	for (i = 0; i < 2000; i++)
+		len += (size_t)sprintf(s + len,
+				       "-A OUTPUT -d 172.%d.%d.0/24 --dports 1-9 -j REJECT\n",
+				       16 + (i >> 8), i & 255);
+	len += (size_t)sprintf(s + len, "-A OUTPUT -d 10.0.0.0/8 -j %s\n",
+			       b ? "ACCEPT" : "REJECT");
+	len += (size_t)sprintf(s + len, "-A INPUT -s 10.0.0.0/8 -j %s\n",
+			       b ? "ACCEPT" : "REJECT");
+	assert(len < cap);
+	return s;
+}
+
+struct swap_reader {
+	struct gwp_acl	*acl;
+	atomic_bool	*stop;
+	atomic_bool	bad;
+};
+
+static void *swap_reader_fn(void *arg)
+{
+	struct swap_reader *sr = arg;
+	struct gwp_sockaddr t = sa4("10.1.2.3", 443);
+	while (!atomic_load_explicit(sr->stop, memory_order_relaxed)) {
+		struct gwp_acl_req req = {
+			.target = &t, .dport = 443, .proto = GWP_ACL_PROTO_TCP,
+		};
+		enum gwp_acl_verdict v = gwp_acl_eval_output(sr->acl, &req);
+		enum gwp_acl_verdict want = (req.gen & 1) ? GWP_ACL_ACCEPT
+							  : GWP_ACL_REJECT;
+
+		if (v != want)
+			atomic_store(&sr->bad, true);
+		/* INPUT has no generation; either ruleset's verdict will do. */
+		in(sr->acl, &t, 1234, GWP_ACL_PROTO_TCP);
+	}
+	return NULL;
+}
+
+/*
+ * Reloads publish a whole ruleset at once and free the old one only after
+ * the evaluations still reading it are done: every verdict must be the one
+ * of the ruleset it is tagged with, while threads evaluate across 200
+ * reloads. A ruleset freed too early is a use-after-free under the
+ * sanitizers, and a wrong or mixed verdict without them.
+ */
+static void test_reload_swaps_whole_ruleset(void)
+{
+	struct swap_reader sr = { 0 };
+	atomic_bool stop = false;
+	char *path, *ra, *rb;
+	struct gwp_acl *a;
+	pthread_t thr[4];
+	size_t i;
+
+	ra = swap_rules(false);
+	rb = swap_rules(true);
+	path = write_tmp_rules(ra);
+	assert(!gwp_acl_create(&a, path));
+	assert(gwp_acl_generation(a) == 0);
+	sr.acl = a;
+	sr.stop = &stop;
+	for (i = 0; i < 4; i++)
+		assert(!pthread_create(&thr[i], NULL, swap_reader_fn, &sr));
+
+	for (i = 1; i <= 200; i++) {
+		const char *txt = (i & 1) ? rb : ra;
+		size_t len = strlen(txt);
+		int fd;
+
+		fd = open(path, O_WRONLY | O_TRUNC);
+		assert(fd >= 0);
+		assert(write(fd, txt, len) == (ssize_t)len);
+		close(fd);
+		assert(!gwp_acl_reload(a));
+		assert(gwp_acl_generation(a) == i);
+	}
+
+	atomic_store(&stop, true);
+	for (i = 0; i < 4; i++)
+		pthread_join(thr[i], NULL);
+	assert(!atomic_load(&sr.bad));
+	gwp_acl_destroy(a);
+	unlink(path);
+	free(path);
+	free(ra);
+	free(rb);
+}
+
+/*
  * Callers cache OUTPUT verdicts keyed on the ruleset generation: it must move
  * on every successful reload and only then, and a chain with a -m statistic
  * rule must mark its verdicts uncacheable.
@@ -1194,7 +1667,7 @@ static void test_memo(void)
 	assert(big);
 	p = big;
 	for (i = 0; i < GWP_ACL_MEMO_RULES + 6; i++)
-		p += sprintf(p, "-A OUTPUT -m domain --domain h%d.example -j REJECT\n", i);
+		p += sprintf(p, "-A OUTPUT -m domain --domain h%d.example -p tcp -j REJECT\n", i);
 	assert(!gwp_acl_parse_str(&a, big));
 	free(big);
 	memset(&m, 0, sizeof(m));
@@ -1323,6 +1796,9 @@ static void run_tests(void)
 	/* Negative cases print the offending line to stderr; run them once. */
 	test_parse_errors();
 	test_reload_under_readers();
+	test_reload_swaps_whole_ruleset();
+	test_index_first_match();
+	test_index_matches_linear();
 	test_generation();
 	test_empty_chain_policy();
 	test_file_nul();
