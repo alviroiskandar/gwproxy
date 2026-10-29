@@ -529,6 +529,14 @@ struct gwp_conn_pair {
 	 * connect.
 	 */
 	int			attempt_timer_fd;
+	/*
+	 * The epoll loop's timers of this pair (GWP_TMR_*): where each sits in
+	 * the worker's timer heap, plus one, or 0 while it is not armed. The
+	 * protocol, connect and idle timeouts share GWP_TMR_CONN; the delay
+	 * before the next connect attempt joins the race is GWP_TMR_ATTEMPT,
+	 * separate because it runs alongside the connect timeout.
+	 */
+	uint32_t		tmr_pos[2];
 	uint32_t		idx;
 #ifdef CONFIG_IO_URING
 	int			ref_cnt;
@@ -691,6 +699,30 @@ struct gwp_wrk_dns {
  * workers array (which is allocated GWP_CACHELINE aligned).
  */
 #define GWP_CACHELINE	64
+
+/* What a timer of the epoll loop does when it expires. */
+enum {
+	/* The protocol, connect or idle timeout of the pair. */
+	GWP_TMR_CONN		= 0,
+	/* The next connect attempt joins the race. */
+	GWP_TMR_ATTEMPT		= 1,
+};
+
+/* An entry of the epoll loop's per-worker timer heap. */
+struct gwp_tmr {
+	/* When it expires, in CLOCK_MONOTONIC milliseconds. */
+	uint64_t		at_ms;
+	struct gwp_conn_pair	*gcp;
+	/* GWP_TMR_*, also the index into gcp->tmr_pos. */
+	uint32_t		kind;
+};
+
+/* A binary min-heap of timers on gwp_tmr::at_ms (ev/tmr.h). */
+struct gwp_tmr_heap {
+	struct gwp_tmr		*tmr;
+	uint32_t		nr;
+	uint32_t		cap;
+};
 
 struct gwp_wrk {
 	int			tcp_fd;
