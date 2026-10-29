@@ -1442,6 +1442,23 @@ static int gwp_reload_drain(struct gwp_ctx *ctx, char *buf, unsigned *flags)
 }
 
 /*
+ * A burst of file events (an editor's save, a deploy script writing both
+ * files, a config manager rewriting a file line by line) is reloaded once it
+ * has been quiet for GWP_RELOAD_QUIET_MS, instead of once per event. Under
+ * changes that never pause, a reload still runs every GWP_RELOAD_MAX_WAIT_MS.
+ */
+#define GWP_RELOAD_QUIET_MS	100
+#define GWP_RELOAD_MAX_WAIT_MS	1000
+
+static uint64_t gwp_reload_now_ms(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+
+/*
  * The reload thread. Reading, parsing and compiling a large auth or ACL file
  * takes milliseconds (tens with many regexes), and a worker doing it serves
  * none of its connections meanwhile, so the files are reloaded here instead.
@@ -1457,11 +1474,18 @@ static void *gwp_reload_thread(void *arg)
 		{ .fd = ctx->ino_fd, .events = POLLIN },
 		{ .fd = ctx->reload_efd, .events = POLLIN },
 	};
-	unsigned flags;
-	int r;
+	uint64_t now, first = 0, last = 0, due = 0;
+	unsigned flags, pending = 0;
+	int r, timeout;
 
 	for (;;) {
-		r = poll(pfd, 2, -1);
+		timeout = -1;
+		if (pending) {
+			now = gwp_reload_now_ms();
+			timeout = due > now ? (int)(due - now) : 0;
+		}
+
+		r = poll(pfd, 2, timeout);
 		if (r < 0) {
 			if (errno == EINTR)
 				continue;
@@ -1470,14 +1494,27 @@ static void *gwp_reload_thread(void *arg)
 		}
 		if (pfd[1].revents)
 			return NULL;
-		if (!pfd[0].revents)
-			continue;
 
-		flags = 0;
-		r = gwp_reload_drain(ctx, buf, &flags);
-		if (r < 0)
-			break;
-		gwp_ctx_reload_files(ctx, flags);
+		if (pfd[0].revents) {
+			flags = 0;
+			r = gwp_reload_drain(ctx, buf, &flags);
+			if (r < 0)
+				break;
+			if (flags) {
+				last = gwp_reload_now_ms();
+				if (!pending)
+					first = last;
+				pending |= flags;
+				due = last + GWP_RELOAD_QUIET_MS;
+				if (due > first + GWP_RELOAD_MAX_WAIT_MS)
+					due = first + GWP_RELOAD_MAX_WAIT_MS;
+			}
+		}
+
+		if (!pending || gwp_reload_now_ms() < due)
+			continue;
+		gwp_ctx_reload_files(ctx, pending);
+		pending = 0;
 	}
 
 	pr_err(&ctx->lh, "Reload thread stopped, file changes are no longer picked up: %s",
