@@ -14,11 +14,11 @@
 # waiting in the listen backlog. Closing one idle client must not let that
 # one in; closing all of them must.
 #
-# Each client takes two descriptors, its socket and its protocol timer. No
-# client may be accepted and then dropped because the table ran out at its
-# timer: the proxy must stop accepting first and leave it in the backlog.
-# Whether the table runs out at the socket or at the timer depends on the
-# parity of the free descriptors, so this runs with two limits.
+# No client may be accepted and then dropped for want of a descriptor: the
+# proxy must stop accepting first and leave it in the backlog. Each client
+# takes one descriptor, its socket; its protocol timer takes none on either
+# event loop. This runs with two limits, so that the table runs out at an
+# odd and at an even number of free descriptors.
 
 . "$(dirname "$0")/lib.sh"
 require python3
@@ -83,9 +83,8 @@ run_with_limit()
 	        sys.exit(1)
 
 	# Fill the descriptor table with idle clients until one is left waiting.
-	# A client accepted and then closed, because no descriptor was left for its
-	# timer, reads as a reset when its greeting had arrived and as an end of
-	# stream when the proxy got there first.
+	# A client accepted and then closed reads as a reset when its greeting
+	# had arrived and as an end of stream when the proxy got there first.
 	idle, waiting = [], None
 	for _ in range(64):
 	    c = socket.create_connection(("127.0.0.1", port), timeout=5)
@@ -145,14 +144,13 @@ done
 # returned. The origin closes a connection once the client has, so that
 # the pair goes away.
 #
-# With a connect timer, the epoll loop's spare timer and accept() itself,
-# which takes a descriptor before it looks at the backlog, always run out
-# first in a single worker. Without one (--connect-timeout=0) a client
-# takes two descriptors, and the parity of the free ones decides whether
-# the table runs out at accept() or at the target socket, hence two
-# limits; one of them has to end at the target socket. The io_uring loop
-# keeps its timers in the ring and never takes a timer descriptor, so a
-# client takes the same two there, and the same two limits cover it.
+# A client takes two descriptors, its socket and the target socket; its
+# connect timer takes none on either event loop. The parity of the free
+# descriptors decides whether the table runs out at accept() or at the
+# target socket, hence two limits; one of them has to end at the target
+# socket. This holds with and without a connect timer: when the epoll loop
+# still gave each client a timerfd, the timer always ran out first and the
+# target socket was never reached with one.
 origin_port=""
 python3 -c '
 import socket, threading
@@ -178,14 +176,14 @@ done
 
 run_plain()
 {
-	local ev="$1" lim pp log gwp_pid out hit_target=0
+	local ev="$1" ct="$2" lim pp log gwp_pid out hit_target=0
 
 	for lim in 64 65; do
 		pp="$(pick_port)"
-		log="$WORK/gwp.plain.$ev.$lim.log"
+		log="$WORK/gwp.plain.$ev.$ct.$lim.log"
 		( ulimit -n "$lim"; exec "$GWPROXY" --event-loop="$ev" \
 			--target="127.0.0.1:$origin_port" --bind="127.0.0.1:$pp" \
-			--connect-timeout=0 \
+			--connect-timeout="$ct" \
 			--acl-allow-all --nr-workers=1 --log-level=3 ) >"$log" 2>&1 &
 		gwp_pid=$!
 		_PIDS+=("$gwp_pid")
@@ -230,21 +228,23 @@ run_plain()
 		    sys.exit(1)
 		print("ok with %d clients" % (len(idle) + 1))
 		PY
-		)" || fail "[$ev] plain forwarding, fd limit $lim: $out"
-		diag "[$ev] plain forwarding, fd limit $lim: $out"
+		)" || fail "[$ev] plain forwarding, connect timeout $ct, fd limit $lim: $out"
+		diag "[$ev] plain forwarding, connect timeout $ct, fd limit $lim: $out"
 		kill -0 "$gwp_pid" 2>/dev/null || fail "[$ev] proxy died"
 		kill "$gwp_pid" 2>/dev/null
 		wait "$gwp_pid" 2>/dev/null
 		grep -q "retrying the target connect" "$log" && hit_target=1
 	done
 	[ "$hit_target" = 1 ] || \
-		fail "[$ev] no limit ran out at the target socket; test inconclusive"
+		fail "[$ev] connect timeout $ct: no limit ran out at the target socket"
 }
 
-run_plain epoll
+run_plain epoll 0
+run_plain epoll 10
 
 if grep -q 'CONFIG_IO_URING' "$ROOT/config.h" 2>/dev/null; then
-	run_plain io_uring
+	run_plain io_uring 0
+	run_plain io_uring 10
 else
 	diag "gwproxy built without io_uring; skipping that leg"
 fi

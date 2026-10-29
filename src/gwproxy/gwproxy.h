@@ -196,7 +196,11 @@ enum {
 	 */
 	EV_BIT_TARGET_ATTEMPT		= (32ull << 48ull),
 
-	/* Fires when it is time to start the next attempt in the race. */
+	/*
+	 * Fires when it is time to start the next attempt in the race. Only
+	 * the io_uring loop has timer events; the epoll loop runs its timers
+	 * from a heap (ev/tmr.h).
+	 */
 	EV_BIT_ATTEMPT_TIMER		= (48ull << 48ull),
 
 	EV_BIT_CLIENT_PROT		= (1000ull << 48ull),
@@ -524,11 +528,13 @@ struct gwp_conn_pair {
 	 */
 	int			udp_fd;
 	/*
-	 * @attempt_timer_fd fires when the next connect attempt should be
-	 * started. It is separate from timer_fd, which bounds the whole
-	 * connect.
+	 * The epoll loop's timers of this pair (GWP_TMR_*): where each sits in
+	 * the worker's timer heap, plus one, or 0 while it is not armed. The
+	 * protocol, connect and idle timeouts share GWP_TMR_CONN; the delay
+	 * before the next connect attempt joins the race is GWP_TMR_ATTEMPT,
+	 * separate because it runs alongside the connect timeout.
 	 */
-	int			attempt_timer_fd;
+	uint32_t		tmr_pos[2];
 	uint32_t		idx;
 #ifdef CONFIG_IO_URING
 	int			ref_cnt;
@@ -692,6 +698,30 @@ struct gwp_wrk_dns {
  */
 #define GWP_CACHELINE	64
 
+/* What a timer of the epoll loop does when it expires. */
+enum {
+	/* The protocol, connect or idle timeout of the pair. */
+	GWP_TMR_CONN		= 0,
+	/* The next connect attempt joins the race. */
+	GWP_TMR_ATTEMPT		= 1,
+};
+
+/* An entry of the epoll loop's per-worker timer heap. */
+struct gwp_tmr {
+	/* When it expires, in CLOCK_MONOTONIC milliseconds. */
+	uint64_t		at_ms;
+	struct gwp_conn_pair	*gcp;
+	/* GWP_TMR_*, also the index into gcp->tmr_pos. */
+	uint32_t		kind;
+};
+
+/* A binary min-heap of timers on gwp_tmr::at_ms (ev/tmr.h). */
+struct gwp_tmr_heap {
+	struct gwp_tmr		*tmr;
+	uint32_t		nr;
+	uint32_t		cap;
+};
+
 struct gwp_wrk {
 	int			tcp_fd;
 	struct gwp_conn_slot	conn_slot;
@@ -709,12 +739,11 @@ struct gwp_wrk {
 			 */
 			struct gwp_conn_pair	**dead;
 			/*
-			 * A timerfd created before the next client is
-			 * accepted, so that a client never takes the last
-			 * free descriptor and is then dropped for want of
-			 * its timer. -1 while there is none.
+			 * The timers of every pair of this worker (see
+			 * ev/tmr.h). They drive the epoll_wait() timeout, so
+			 * a timer costs no descriptor and no system call.
 			 */
-			int			spare_timer_fd;
+			struct gwp_tmr_heap	tmrs;
 			/*
 			 * When to retry what is waiting on a timed pause
 			 * (accept, see handle_accept_error(), or a target
@@ -840,7 +869,6 @@ int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 int gwp_create_sock_target(struct gwp_wrk *w, struct gwp_sockaddr *addr,
 			   const struct gwp_conn_sockopt *so,
 			   bool *is_target_alive, bool non_block);
-int gwp_create_timer(int fd, int sec, int nsec);
 void gwp_setup_cli_sock_options(struct gwp_wrk *w, int fd);
 
 /*
@@ -933,10 +961,9 @@ void gwp_conn_set_single_candidate(struct gwp_conn_pair *gcp,
 				   const struct gwp_sockaddr *addr);
 
 /*
- * Close every connect attempt still in flight and the attempt timer, e.g. once
- * one attempt has won the race or the pair is being torn down. Returns how many
- * descriptors were closed, which the epoll loop credits to its accept-rearm
- * accounting.
+ * Close every connect attempt still in flight, e.g. once one attempt has won
+ * the race or the pair is being torn down. Returns how many descriptors were
+ * closed, which the epoll loop credits to its accept-rearm accounting.
  */
 int gwp_conn_close_attempts(struct gwp_conn_pair *gcp);
 

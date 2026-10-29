@@ -6,6 +6,7 @@
 #define _GNU_SOURCE
 #endif
 #include <gwproxy/ev/epoll.h>
+#include <gwproxy/ev/tmr.h>
 #include <gwproxy/common.h>
 #include <gwproxy/acl.h>
 #include <stdlib.h>
@@ -185,7 +186,7 @@ int gwp_ctx_init_thread_epoll(struct gwp_wrk *w)
 	struct gwp_ctx *ctx = w->ctx;
 	int ep_fd, ev_fd, r;
 
-	w->spare_timer_fd = -1;
+	memset(&w->tmrs, 0, sizeof(w->tmrs));
 	w->retry_at_ms = 0;
 	w->accept_retry = false;
 	w->accept_paused = false;
@@ -293,11 +294,6 @@ out_close_ep_fd:
 __cold
 void gwp_ctx_free_thread_epoll(struct gwp_wrk *w)
 {
-	if (w->spare_timer_fd >= 0) {
-		__sys_close(w->spare_timer_fd);
-		w->spare_timer_fd = -1;
-	}
-
 	if (w->ev_fd >= 0) {
 		__sys_close(w->ev_fd);
 		pr_dbg(&w->ctx->lh, "Worker %u eventfd closed (fd=%d)", w->idx,
@@ -319,6 +315,7 @@ void gwp_ctx_free_thread_epoll(struct gwp_wrk *w)
 	free(w->tgt_wait);
 	w->tgt_wait = NULL;
 	w->nr_tgt_wait = w->tgt_wait_cap = 0;
+	gwp_tmr_free(&w->tmrs);
 	free(w->udp_buf);
 	w->udp_buf = NULL;
 }
@@ -330,11 +327,12 @@ static int rearm_accept(struct gwp_wrk *w, int nr_fd_closed)
 	int x, r;
 
 	/*
-	 * Each connection pair consists of at least 3 file descriptors:
+	 * Each connection pair takes up to 3 file descriptors while it is
+	 * set up:
 	 *
 	 *   1. TCP socket for the client connection.
 	 *   2. TCP socket for the target connection.
-	 *   3. Timer file descriptor (if used).
+	 *   3. A DNS query socket or a second racing connect attempt.
 	 *
 	 * Before rearming the main TCP socket, wait until we have free
 	 * space for at least 3 connection pairs per worker thread.
@@ -378,6 +376,43 @@ static int credit_fd_closed(struct gwp_wrk *w, int n)
 	return rearm_accept(w, x);
 }
 
+static uint64_t now_ms(void)
+{
+	struct timespec t;
+
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return (uint64_t)t.tv_sec * 1000 + (uint64_t)t.tv_nsec / 1000000;
+}
+
+/*
+ * The pairs' timers: the protocol, connect and idle timeouts and the delay
+ * before the next connect attempt. They live in a binary min-heap per worker
+ * whose earliest entry sets the epoll_wait() timeout (wait_timeout()), and
+ * run_timers() runs those that are due once a batch of events is handled.
+ *
+ * A timerfd per pair cost a timerfd_create(), a timerfd_settime() and an
+ * EPOLL_CTL_ADD to arm, a close() to drop, a timerfd_settime() to re-arm,
+ * and a descriptor for as long as it was armed, which could be the one a
+ * client needed under descriptor pressure. Here arming, re-arming and
+ * dropping are O(log n) in memory, and a pair only ever takes its sockets.
+ *
+ * Re-arming moves the pair's entry instead of adding a second one, and an
+ * entry never outlives its pair: free_conn_pair() takes both out. A re-armed
+ * timer therefore cannot fire for the deadline it replaced, which a timerfd
+ * could if its expiry was already reported later in the same batch.
+ */
+static int tmr_arm(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+		   uint32_t kind, uint64_t ms)
+{
+	return gwp_tmr_arm(&w->tmrs, gcp, kind, now_ms() + ms);
+}
+
+static void tmr_disarm(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+		       uint32_t kind)
+{
+	gwp_tmr_disarm(&w->tmrs, gcp, kind);
+}
+
 __hot
 static int __free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
@@ -386,9 +421,6 @@ static int __free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	int r;
 
 	if (gcp->client.fd >= 0)
-		nr_fd_closed++;
-
-	if (gcp->timer_fd >= 0)
 		nr_fd_closed++;
 	if (gcp->target.fd >= 0)
 		nr_fd_closed++;
@@ -409,8 +441,6 @@ static int __free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		for (i = 0; i < GWP_MAX_CONN_CAND; i++)
 			if (gcp->attempt_fd[i] >= 0)
 				nr_fd_closed++;
-		if (gcp->attempt_timer_fd >= 0)
-			nr_fd_closed++;
 	}
 
 	r = gwp_free_conn_pair(w, gcp);
@@ -440,6 +470,9 @@ static int free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 	if (gcp->flags & GWP_CONN_FLAG_IS_DYING)
 		return 0;
+
+	tmr_disarm(w, gcp, GWP_TMR_CONN);
+	tmr_disarm(w, gcp, GWP_TMR_ATTEMPT);
 
 	/* A client waiting for its target socket (see wait_for_target()). */
 	for (i = 0; unlikely(i < w->nr_tgt_wait); i++) {
@@ -502,21 +535,6 @@ static int new_client_timeout(const struct gwp_cfg *cfg)
 }
 
 /*
- * Arm @sec seconds on the spare timer __handle_ev_accept() made ready before
- * accepting the client, and hand it over; create one if there is no spare.
- */
-static int take_spare_timer(struct gwp_wrk *w, int sec)
-{
-	int fd = w->spare_timer_fd, r;
-
-	w->spare_timer_fd = -1;
-	r = gwp_create_timer(fd, sec, 0);
-	if (unlikely(r < 0) && fd >= 0)
-		__sys_close(fd);
-	return r;
-}
-
-/*
  * Every connection to a target is logged once it is up, the same way on both
  * event loops: in handle_ev_target_conn_result() once the connect completes,
  * or in handle_new_client() for a plain forwarding connect that completed at
@@ -532,11 +550,10 @@ static void log_target_connected(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 /*
  * Register a new client's descriptors: its target socket, if it has one by
- * now, the client socket under @cl_ev_bit, and its timer unless @has_timer
- * says it is registered already (see wait_for_target()).
+ * now, and the client socket under @cl_ev_bit.
  */
 static int register_new_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
-			       uint64_t cl_ev_bit, bool has_timer)
+			       uint64_t cl_ev_bit)
 {
 	struct epoll_event ev;
 	int r;
@@ -564,14 +581,6 @@ static int register_new_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	if (unlikely(r))
 		return r;
 
-	if (gcp->timer_fd >= 0 && !has_timer) {
-		ev.events = EPOLLIN;
-		ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_TIMER;
-		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, gcp->timer_fd, &ev);
-		if (unlikely(r))
-			return r;
-	}
-
 	if (gcp->target.fd >= 0) {
 		log_conn_pair_created(w, gcp);
 		/* Otherwise it is logged when EPOLLOUT reports the connect. */
@@ -584,12 +593,10 @@ static int register_new_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 
 /*
  * Plain and transparent forwarding: create the target socket, start its
- * connect, and register the pair (@has_timer as for register_new_client()).
- * -EMFILE or -ENFILE leaves the pair as it was, to be tried again (see
- * wait_for_target()).
+ * connect, and register the pair. -EMFILE or -ENFILE leaves the pair as it
+ * was, to be tried again (see wait_for_target()).
  */
-static int start_new_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
-			    bool has_timer)
+static int start_new_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_sockaddr *ca = &gcp->target_addr;
 	struct gwp_ctx *ctx = w->ctx;
@@ -617,7 +624,7 @@ static int start_new_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	if (ctx->upstream.enabled)
 		gcp->is_target_alive = false;
 
-	return register_new_client(w, gcp, EV_BIT_CLIENT, has_timer);
+	return register_new_client(w, gcp, EV_BIT_CLIENT);
 }
 
 static void arm_retry(struct gwp_wrk *w);
@@ -627,14 +634,11 @@ static void arm_retry(struct gwp_wrk *w);
  * yet. Closing the client would turn a passing shortage into a reset seen by
  * the client, so keep it and try again every 100 ms (RETRY_DELAY_MS), as the
  * io_uring loop does, for as long as its connect timeout allows. Only its
- * timer is registered meanwhile: what the client sends waits in its socket.
+ * timer runs meanwhile: what the client sends waits in its socket.
  */
 static int wait_for_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			   int e)
 {
-	struct epoll_event ev;
-	int r;
-
 	if (w->nr_tgt_wait == w->tgt_wait_cap) {
 		uint32_t cap = w->tgt_wait_cap ? w->tgt_wait_cap * 2 : 16;
 		struct gwp_conn_pair **p;
@@ -644,14 +648,6 @@ static int wait_for_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			return e;
 		w->tgt_wait = p;
 		w->tgt_wait_cap = cap;
-	}
-
-	if (gcp->timer_fd >= 0) {
-		ev.events = EPOLLIN;
-		ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_TIMER;
-		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, gcp->timer_fd, &ev);
-		if (unlikely(r))
-			return r;
 	}
 
 	pr_warn(&w->ctx->lh,
@@ -672,7 +668,7 @@ static void retry_new_targets(struct gwp_wrk *w)
 	w->nr_tgt_wait = 0;
 	for (i = 0; i < n; i++) {
 		gcp = w->tgt_wait[i];
-		r = start_new_target(w, gcp, true);
+		r = start_new_target(w, gcp);
 		if (r == -EMFILE || r == -ENFILE) {
 			/* Still waiting; the list only shrinks here. */
 			w->tgt_wait[w->nr_tgt_wait++] = gcp;
@@ -689,7 +685,7 @@ static void retry_new_targets(struct gwp_wrk *w)
 __hot
 static int handle_new_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
-	int timer_fd, timeout, r;
+	int timeout, r;
 	struct gwp_ctx *ctx = w->ctx;
 	struct gwp_cfg *cfg = &ctx->cfg;
 
@@ -708,12 +704,9 @@ static int handle_new_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 	timeout = new_client_timeout(cfg);
 	if (timeout > 0) {
-		timer_fd = take_spare_timer(w, timeout);
-		if (unlikely(timer_fd < 0))
-			return timer_fd;
-		gcp->timer_fd = timer_fd;
-	} else {
-		gcp->timer_fd = -1;
+		r = tmr_arm(w, gcp, GWP_TMR_CONN, timeout * 1000ull);
+		if (unlikely(r))
+			return r;
 	}
 
 	/*
@@ -734,10 +727,10 @@ static int handle_new_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 			gcp->conn_state = CONN_STATE_TLS_DETECT;
 #endif
 		gcp->target.fd = -1;
-		return register_new_client(w, gcp, EV_BIT_CLIENT_PROT, false);
+		return register_new_client(w, gcp, EV_BIT_CLIENT_PROT);
 	}
 
-	r = start_new_target(w, gcp, false);
+	r = start_new_target(w, gcp);
 	if (r == -EMFILE || r == -ENFILE)
 		r = wait_for_target(w, gcp, r);
 	return r;
@@ -745,14 +738,6 @@ static int handle_new_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 /* How long a timed pause lasts, in milliseconds; the io_uring loop's too. */
 #define RETRY_DELAY_MS	100
-
-static uint64_t now_ms(void)
-{
-	struct timespec t;
-
-	clock_gettime(CLOCK_MONOTONIC, &t);
-	return (uint64_t)t.tv_sec * 1000 + (uint64_t)t.tv_nsec / 1000000;
-}
 
 /* Have fish_events() wake up for run_retries() RETRY_DELAY_MS from now. */
 static void arm_retry(struct gwp_wrk *w)
@@ -762,20 +747,24 @@ static void arm_retry(struct gwp_wrk *w)
 }
 
 /*
- * The epoll_wait() timeout: until the next timed retry is due, or for ever
- * when none is.
+ * The epoll_wait() timeout: until the next timed retry or the next timer is
+ * due, or for ever when neither is.
  */
-static int retry_timeout(const struct gwp_wrk *w)
+static int wait_timeout(const struct gwp_wrk *w)
 {
-	uint64_t now;
+	const struct gwp_tmr *t = gwp_tmr_first(&w->tmrs);
+	uint64_t at = w->retry_at_ms, now;
 
-	if (likely(!w->retry_at_ms))
+	if (t && (!at || t->at_ms < at))
+		at = t->at_ms;
+	if (!at)
 		return -1;
 
 	now = now_ms();
-	if (now >= w->retry_at_ms)
+	if (now >= at)
 		return 0;
-	return (int)(w->retry_at_ms - now);
+	at -= now;
+	return at < INT_MAX ? (int)at : INT_MAX;
 }
 
 /* Do what a timed pause has been holding back, once it is due. */
@@ -878,21 +867,6 @@ static int __handle_ev_accept(struct gwp_wrk *w)
 	struct gwp_sockaddr addr;
 	socklen_t addr_len;
 	int fd, r;
-
-	/*
-	 * Have the client's timer ready before taking the client. Otherwise,
-	 * with the descriptor table nearly full, the client could take the
-	 * last free slot and leave none for its timer, and a client accepted
-	 * only to be closed again sees a reset. Failing here instead stops
-	 * accept (handle_accept_error()) with the client still waiting in the
-	 * backlog, to be served once descriptors are returned.
-	 */
-	if (w->spare_timer_fd < 0 && new_client_timeout(cfg) > 0) {
-		r = gwp_create_timer(-1, 0, 0);
-		if (unlikely(r < 0))
-			return handle_accept_error(w, r);
-		w->spare_timer_fd = r;
-	}
 
 	addr_len = sizeof(addr);
 	fd = __sys_accept4(w->tcp_fd, &addr.sa, &addr_len, flags);
@@ -1510,33 +1484,21 @@ static int upstream_arm(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 
 /*
  * The tunnel or UDP association is up, and the handshake's timer has served
- * its purpose. With --idle-timeout it becomes the idle check (re-armed, not
- * replaced, when there is one); without, it just goes.
+ * its purpose. With --idle-timeout it becomes the idle check; without, it
+ * just goes.
  */
 static int arm_idle_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	int sec = w->ctx->cfg.idle_timeout;
-	struct epoll_event ev;
-	int r;
 
 	if (sec <= 0) {
-		if (gcp->timer_fd >= 0) {
-			__sys_close(gcp->timer_fd);
-			gcp->timer_fd = -1;
-		}
+		tmr_disarm(w, gcp, GWP_TMR_CONN);
 		return 0;
 	}
 
 	gcp->idle_timer = true;
 	gcp->last_act = w->now;
-	r = gwp_create_timer(gcp->timer_fd, sec, 0);
-	if (unlikely(r < 0) || gcp->timer_fd >= 0)
-		return r < 0 ? r : 0;
-
-	gcp->timer_fd = r;
-	ev.events = EPOLLIN;
-	ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_TIMER;
-	return __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, gcp->timer_fd, &ev);
+	return tmr_arm(w, gcp, GWP_TMR_CONN, sec * 1000ull);
 }
 
 /*
@@ -1753,6 +1715,7 @@ static int adopt_winning_attempt(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	int closed, r;
 
 	gcp->attempt_fd[slot] = -1;
+	tmr_disarm(w, gcp, GWP_TMR_ATTEMPT);
 	closed = gwp_conn_close_attempts(gcp);
 	if (closed) {
 		/*
@@ -2017,21 +1980,10 @@ __hot
  * alongside the ones already running. Nothing is cancelled here -- an attempt
  * that is merely slow may still win.
  */
-static int handle_ev_attempt_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+static int handle_attempt_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
-	uint64_t val;
-
-	if (gcp->attempt_timer_fd < 0)
+	if (gcp->next_cand >= gcp->nr_cand)
 		return 0;
-
-	/* Drain the timerfd or it stays readable and spins the loop. */
-	__sys_read(gcp->attempt_timer_fd, &val, sizeof(val));
-
-	if (gcp->next_cand >= gcp->nr_cand) {
-		__sys_close(gcp->attempt_timer_fd);
-		gcp->attempt_timer_fd = -1;
-		return 0;
-	}
 
 	/*
 	 * -EINPROGRESS is not a failure to report: attempts are still running,
@@ -2238,37 +2190,22 @@ static int handle_ev_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 }
 
 __hot
-static int handle_ev_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+static int handle_conn_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_ctx *ctx = w->ctx;
-	uint64_t val;
-	ssize_t r;
-
-	if (gcp->timer_fd < 0)
-		return 0;
-
-	/*
-	 * An expiry reported earlier in this batch may have been discarded
-	 * since, by handle_connect() re-arming the timer for the next phase.
-	 * Only a timerfd that still has an expiry to read has timed out.
-	 */
-	r = __sys_read(gcp->timer_fd, &val, sizeof(val));
-	if (r == -EAGAIN)
-		return 0;
 
 	/*
 	 * Idle check: close the pair if nothing moved for the whole timeout,
 	 * else look again once the rest of it has passed. Re-arming here, not
-	 * on every I/O, keeps the cost to one timerfd_settime() per timeout.
+	 * on every I/O, keeps the cost to one heap update per timeout.
 	 */
 	if (gcp->idle_timer) {
 		int sec = w->ctx->cfg.idle_timeout;
 		uint32_t idle = w->now - gcp->last_act;
 
-		if (idle < (uint32_t)sec) {
-			r = gwp_create_timer(gcp->timer_fd, sec - (int)idle, 0);
-			return r < 0 ? (int)r : 0;
-		}
+		if (idle < (uint32_t)sec)
+			return tmr_arm(w, gcp, GWP_TMR_CONN,
+				       (uint64_t)(sec - (int)idle) * 1000);
 		pr_info(&w->ctx->lh, "Idle timeout (idx=%u, ca=%s, ta=%s)",
 			gcp->idx, ip_to_str(&gcp->client_addr),
 			ip_to_str(&gcp->target_addr));
@@ -2404,8 +2341,7 @@ static int start_connect_attempt(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
  */
 static int arm_attempt_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
-	struct epoll_event ev;
-	int r, ms;
+	int ms;
 
 	if (gcp->next_cand >= gcp->nr_cand)
 		return 0;			/* nothing left to start */
@@ -2415,26 +2351,7 @@ static int arm_attempt_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		return 0;			/* one proxy, nothing to race */
 
 	ms = w->ctx->cfg.connect_attempt_delay;
-	if (gcp->attempt_timer_fd < 0) {
-		r = gwp_create_timer(-1, ms / 1000, (ms % 1000) * 1000000);
-		if (unlikely(r < 0))
-			return r;
-		gcp->attempt_timer_fd = r;
-
-		ev.events = EPOLLIN;
-		ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_ATTEMPT_TIMER;
-		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD,
-				    gcp->attempt_timer_fd, &ev);
-		if (unlikely(r))
-			return r;
-	} else {
-		r = gwp_create_timer(gcp->attempt_timer_fd, ms / 1000,
-				     (ms % 1000) * 1000000);
-		if (unlikely(r < 0))
-			return r;
-	}
-
-	return 0;
+	return tmr_arm(w, gcp, GWP_TMR_ATTEMPT, (uint64_t)ms);
 }
 
 /*
@@ -2550,35 +2467,16 @@ static int handle_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	 * candidate address, so it is armed once here rather than per attempt.
 	 *
 	 * The SOCKS5 and HTTP handshakes ran under the protocol timer, which
-	 * has served its purpose by now. Re-arm that timerfd for the connect
-	 * timeout rather than closing it and creating another: it is already
-	 * registered under the same tag, so this is one timerfd_settime()
-	 * instead of close, timerfd_create, timerfd_settime and EPOLL_CTL_ADD.
-	 * Re-arming also discards an expiry still pending on it, which
-	 * handle_ev_timer() then recognises as stale.
+	 * has served its purpose by now: the same timer now runs for the
+	 * connect timeout instead, or goes when there is none.
 	 */
 	r = w->ctx->cfg.connect_timeout;
-	if (r > 0 && gcp->timer_fd >= 0) {
-		r = gwp_create_timer(gcp->timer_fd, r, 0);
-		if (unlikely(r < 0))
-			return r;
-	} else if (r > 0) {
-		struct epoll_event tev;
-
-		r = gwp_create_timer(-1, r, 0);
-		if (unlikely(r < 0))
-			return r;
-		gcp->timer_fd = r;
-
-		tev.events = EPOLLIN;
-		tev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_TIMER;
-		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, gcp->timer_fd, &tev);
+	if (r > 0) {
+		r = tmr_arm(w, gcp, GWP_TMR_CONN, r * 1000ull);
 		if (unlikely(r))
 			return r;
-	} else if (gcp->timer_fd >= 0) {
-		/* No connect timeout: the protocol timer just goes. */
-		__sys_close(gcp->timer_fd);
-		gcp->timer_fd = -1;
+	} else {
+		tmr_disarm(w, gcp, GWP_TMR_CONN);
 	}
 
 	/*
@@ -2743,8 +2641,6 @@ static bool is_ev_bit_conn_pair(uint64_t ev_bit)
 	switch (ev_bit) {
 	case EV_BIT_CLIENT:
 	case EV_BIT_TARGET:
-	case EV_BIT_TIMER:
-	case EV_BIT_ATTEMPT_TIMER:
 	case EV_BIT_CLIENT_SOCKS5:
 	case EV_BIT_CLIENT_PROT:
 	case EV_BIT_UDP_RELAY:
@@ -3264,9 +3160,8 @@ static int handle_event(struct gwp_wrk *w, struct epoll_event *ev)
 		/* Torn down earlier in this batch; see free_conn_pair(). */
 		if (gcp->flags & GWP_CONN_FLAG_IS_DYING)
 			return 0;
-		/* Any event but its own timer is activity (--idle-timeout). */
-		if (ev_bit != EV_BIT_TIMER)
-			gcp->last_act = w->now;
+		/* Any event is activity (--idle-timeout). */
+		gcp->last_act = w->now;
 	}
 
 	/*
@@ -3283,9 +3178,6 @@ static int handle_event(struct gwp_wrk *w, struct epoll_event *ev)
 	}
 
 	switch (ev_bit) {
-	case EV_BIT_ATTEMPT_TIMER:
-		r = handle_ev_attempt_timer(w, udata);
-		break;
 	case EV_BIT_ACCEPT:
 		r = handle_ev_accept(w, ev);
 		break;
@@ -3306,9 +3198,6 @@ static int handle_event(struct gwp_wrk *w, struct epoll_event *ev)
 		break;
 	case EV_BIT_UDP_RELAY:
 		r = handle_ev_udp_relay(w, udata);
-		break;
-	case EV_BIT_TIMER:
-		r = handle_ev_timer(w, udata);
 		break;
 	case EV_BIT_DNS_QUERY:
 		r = handle_ev_dns_cq(w);
@@ -3333,6 +3222,45 @@ out:
 	return r;
 }
 
+/*
+ * Run the timers that are due, at most a batch's worth (w->evsz) at a time,
+ * as many as one epoll_wait() reports events: when more are due, the next
+ * epoll_wait() does not block and they run after its events. A pair a timer
+ * tears down is freed with the rest of the batch (free_conn_pair()).
+ */
+static int run_timers(struct gwp_wrk *w)
+{
+	uint32_t budget = w->evsz;
+	const struct gwp_tmr *t;
+	uint64_t now;
+	int r;
+
+	t = gwp_tmr_first(&w->tmrs);
+	if (likely(!t))
+		return 0;
+
+	now = now_ms();
+	for (; t && t->at_ms <= now && budget; t = gwp_tmr_first(&w->tmrs)) {
+		struct gwp_conn_pair *gcp = t->gcp;
+		uint32_t kind = t->kind;
+
+		budget--;
+		tmr_disarm(w, gcp, kind);
+		if (kind == GWP_TMR_CONN)
+			r = handle_conn_timer(w, gcp);
+		else
+			r = handle_attempt_timer(w, gcp);
+
+		if (r) {
+			r = free_conn_pair(w, gcp);
+			if (unlikely(r))
+				return r;
+		}
+	}
+
+	return 0;
+}
+
 static int handle_events(struct gwp_wrk *w, int nr_events)
 {
 	struct epoll_event *events = w->events;
@@ -3349,6 +3277,12 @@ static int handle_events(struct gwp_wrk *w, int nr_events)
 
 		if (unlikely(w->ev_need_reload))
 			break;
+	}
+
+	if (r >= 0 && likely(!ctx->stop)) {
+		x = run_timers(w);
+		if (unlikely(x))
+			r = x;
 	}
 
 	if (r >= 0) {
@@ -3369,7 +3303,7 @@ static int fish_events(struct gwp_wrk *w)
 	int r;
 
 	w->ev_need_reload = false;
-	r = __sys_epoll_wait(w->ep_fd, w->events, w->evsz, retry_timeout(w));
+	r = __sys_epoll_wait(w->ep_fd, w->events, w->evsz, wait_timeout(w));
 	w->now = gwp_now_sec();
 	if (unlikely(r < 0)) {
 		if (r != -EINTR)
