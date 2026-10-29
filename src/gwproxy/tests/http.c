@@ -761,7 +761,7 @@ static void test_need_more(void)
 {
 	/* Request line complete, header fields not yet terminated. */
 	static const char part1[] = "CONNECT example.com:443 HTTP/1.1\r\n";
-	static const char part2[] = "\r\n";
+	static const char full[] = "CONNECT example.com:443 HTTP/1.1\r\n\r\n";
 	struct gwp_http_conn *hc = gwp_http_conn_alloc();
 	char *host, *port;
 	const char *req = NULL;
@@ -773,13 +773,17 @@ static void test_need_more(void)
 	r = gwp_http_conn_process(hc, NULL, part1, &in_len, &host, &port, &req,
 				  &req_len);
 	assert(r == GWP_HTTP_NEED_MORE);
-	assert(in_len == strlen(part1));	/* request line consumed */
+	assert(in_len == 0);	/* nothing consumed until complete */
 
-	/* Feeding the terminating blank line completes the request. */
-	in_len = strlen(part2);
-	r = gwp_http_conn_process(hc, NULL, part2, &in_len, &host, &port, &req,
+	/*
+	 * The terminating blank line completes the request: the caller hands
+	 * over the whole header again, in another buffer here.
+	 */
+	in_len = strlen(full);
+	r = gwp_http_conn_process(hc, NULL, full, &in_len, &host, &port, &req,
 				  &req_len);
 	assert(r == GWP_HTTP_CONNECT);
+	assert(in_len == strlen(full));
 	assert(!strcmp(host, "example.com"));
 	assert(!strcmp(port, "443"));
 	gwp_http_conn_free(hc);

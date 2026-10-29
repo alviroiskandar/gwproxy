@@ -51,33 +51,80 @@ enum {
 };
 
 /*
- * One stored field. @key and @val share a single allocation, owned through
- * @key; @val follows the key's NUL. Their lengths are kept so a lookup or a
- * merge does not have to strlen() them.
+ * One stored field: where its name and value are, as offsets into the header
+ * the parser was given (struct gwnet_http_hdr_fields::base), so a field costs
+ * no copy. The one exception is the value of a list field that was repeated:
+ * its parts are joined with ", " in the store's own buffer (@merged set, @voff
+ * then counts from gwnet_http_hdr_fields::mbuf). Neither name nor value is
+ * NUL-terminated; use gwnet_http_hdr_field_key() and gwnet_http_hdr_field_val()
+ * with the lengths.
  */
 struct gwnet_http_hdr_field {
-	char	*key;
-	char	*val;
-	size_t	klen;
-	size_t	vlen;
+	uint32_t	koff;
+	uint32_t	klen;
+	uint32_t	voff;
+	uint32_t	vlen;
+	bool		merged;
 };
 
 struct gwnet_http_hdr_fields {
+	/*
+	 * The header the offsets count from: the parser sets it to the buffer
+	 * it was last given. The fields can be read only while that buffer
+	 * still holds the header.
+	 */
+	const char			*base;
 	struct gwnet_http_hdr_field	*ff;
 	size_t				nr;
 	size_t				cap;
+
+	/* Values merged from repeated list fields. */
+	char				*mbuf;
+	size_t				mlen;
+	size_t				mcap;
 };
 
+static inline const char *
+gwnet_http_hdr_field_key(const struct gwnet_http_hdr_fields *ff,
+			 const struct gwnet_http_hdr_field *f)
+{
+	return ff->base + f->koff;
+}
+
+static inline const char *
+gwnet_http_hdr_field_val(const struct gwnet_http_hdr_fields *ff,
+			 const struct gwnet_http_hdr_field *f)
+{
+	return (f->merged ? ff->mbuf : ff->base) + f->voff;
+}
+
+/*
+ * The request line. The request-target (@uri) and its path and query string
+ * are offsets into the header, like the fields: @path is the start of @uri
+ * with any trailing '/' but one dropped, @qs what follows the first '?' (no
+ * query string if @qs_len is 0). Use gwnet_http_req_uri() and friends.
+ */
 struct gwnet_http_req_hdr {
 	uint8_t		method;
 	uint8_t		version;
-	/* One allocation, owned through @path; @uri and @qs point into it. */
-	char		*path;
-	char		*uri;
-	char		*qs;
+	uint32_t	uri_off;
+	uint32_t	uri_len;
+	uint32_t	path_len;
+	uint32_t	qs_off;
+	uint32_t	qs_len;
 
 	struct gwnet_http_hdr_fields fields;
 };
+
+static inline const char *gwnet_http_req_uri(const struct gwnet_http_req_hdr *h)
+{
+	return h->fields.base + h->uri_off;
+}
+
+static inline const char *gwnet_http_req_qs(const struct gwnet_http_req_hdr *h)
+{
+	return h->fields.base + h->qs_off;
+}
 
 struct gwnet_http_res_hdr {
 	uint8_t		version;
@@ -104,7 +151,11 @@ struct gwnet_http_hdr_pctx {
 	uint8_t		err;
 
 	/*
-	 * Filled by the caller to pass the buffer to be parsed.
+	 * Filled by the caller to pass the buffer to be parsed. It holds the
+	 * header from its first byte: when a header arrives in pieces, every
+	 * call passes all of it received so far, the bytes already parsed
+	 * unchanged (the buffer itself may move). The parsed request line and
+	 * fields are offsets into it rather than copies.
 	 */
 	const char	*buf;
 
@@ -119,11 +170,9 @@ struct gwnet_http_hdr_pctx {
 	 * Initially set to zero, it will be filled with the length
 	 * of the number of bytes that have successfully been
 	 * parsed from the buffer. Partially parsed headers will
-	 * return -EAGAIN and advance this offset.
-	 *
-	 * The caller must reset this to zero before continuing the
-	 * parsing operation. In that case, the buffer must be
-	 * advanced to the next unparsed byte.
+	 * return -EAGAIN and advance this offset to the end of the
+	 * last complete line; the next call resumes from there.
+	 * The caller does not change it.
 	 */
 	uint64_t	off;
 
@@ -324,33 +373,17 @@ void gwnet_http_res_hdr_free(struct gwnet_http_res_hdr *hdr);
 void gwnet_http_hdr_fields_free(struct gwnet_http_hdr_fields *ff);
 
 /**
- * Add a header field with the specified key and value, using explicit
- * lengths for both key and value.
- *
- * @param ff   Pointer to the HTTP header fields structure.
- * @param k    Pointer to the header key.
- * @param klen Length of the header key.
- * @param v    Pointer to the header value.
- * @param vlen Length of the header value.
- * @return     0 on success (a repeated list field is appended to the
- *             existing value), -EEXIST if @k is already present and may
- *             appear only once (the stored value is left alone), or
- *             -ENOMEM.
- */
-int gwnet_http_hdr_fields_addl(struct gwnet_http_hdr_fields *ff,
-			       const char *k, size_t klen, const char *v,
-			       size_t vlen);
-
-/**
  * Retrieve the value of a header field by its key from the HTTP
  * header fields structure.
  *
- * @param ff Pointer to the HTTP header fields structure.
- * @param k  Null-terminated string containing the header key.
- * @return   Pointer to the header value, or NULL if not found.
+ * @param ff   Pointer to the HTTP header fields structure.
+ * @param k    Null-terminated string containing the header key.
+ * @param vlen Receives the length of the value.
+ * @return     Pointer to the header value (not NUL-terminated), or NULL
+ *             if not found.
  */
 const char *gwnet_http_hdr_fields_get(const struct gwnet_http_hdr_fields *ff,
-				      const char *k);
+				      const char *k, size_t *vlen);
 
 /**
  * Retrieve the value of a header field by its key, using an explicit
@@ -359,10 +392,13 @@ const char *gwnet_http_hdr_fields_get(const struct gwnet_http_hdr_fields *ff,
  * @param ff   Pointer to the HTTP header fields structure.
  * @param k    Pointer to the header key.
  * @param klen Length of the header key.
- * @return     Pointer to the header value, or NULL if not found.
+ * @param vlen Receives the length of the value.
+ * @return     Pointer to the header value (not NUL-terminated), or NULL
+ *             if not found.
  */
 const char *gwnet_http_hdr_fields_getl(const struct gwnet_http_hdr_fields *ff,
-				       const char *k, size_t klen);
+				       const char *k, size_t klen,
+				       size_t *vlen);
 
 
 /*

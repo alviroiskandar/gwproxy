@@ -65,8 +65,12 @@ bool gwp_http_conn_auth_failed(const struct gwp_http_conn *hc,
  *
  * @hc		Per-connection state.
  * @auth	Credential store, or NULL to disable authentication.
- * @in		Client bytes to parse.
- * @in_len	In: number of bytes in @in. Out: number of bytes consumed.
+ * @in		Client bytes to parse: the request from its first byte. While
+ *		the header is incomplete nothing is consumed, and the next call
+ *		passes the same bytes again with more behind them (the parsed
+ *		part is not copied, so it must be left unchanged).
+ * @in_len	In: number of bytes in @in. Out: number of bytes consumed, 0
+ *		until the header is complete; then the header's length.
  * @host_p	Out (CONNECT/FORWARD): target host, NUL-terminated, owned by @hc
  *		and valid until gwp_http_conn_free().
  * @port_p	Out (CONNECT/FORWARD): target port string, same lifetime.
