@@ -1129,20 +1129,45 @@ static void test_upstream_reply(void)
 		{ "HTTP/1.1 20\r\n\r\n", -EINVAL, 0, 0 },
 		{ "SSH-2.0-x\r\n\r\n", -EINVAL, 0, 0 },
 	};
-	size_t i, consumed;
+	size_t i, n, len, scan, consumed;
 	int status, r;
 
 	for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+		len = strlen(cases[i].in);
 		consumed = 0;
 		status = 0;
-		r = gwp_http_cli_parse_connect_reply(cases[i].in,
-						     strlen(cases[i].in),
+		scan = 0;
+		r = gwp_http_cli_parse_connect_reply(cases[i].in, len, &scan,
 						     &status, &consumed);
 		assert(r == cases[i].ret);
+		if (r == -EAGAIN)
+			assert(scan <= len);
 		if (r)
 			continue;
 		assert(status == cases[i].status);
 		assert(consumed == cases[i].consumed);
+
+		/*
+		 * Received a byte at a time, the reply gives the same result
+		 * the first time it is complete, and none before: the search
+		 * resumes where it stopped and never passes the received
+		 * bytes.
+		 */
+		scan = 0;
+		for (n = 1; n <= len; n++) {
+			consumed = 0;
+			r = gwp_http_cli_parse_connect_reply(cases[i].in, n,
+							     &scan, &status,
+							     &consumed);
+			if (n < cases[i].consumed) {
+				assert(r == -EAGAIN && scan <= n);
+				continue;
+			}
+			assert(!r && status == cases[i].status &&
+			       consumed == cases[i].consumed);
+			break;
+		}
+		assert(n == cases[i].consumed);
 	}
 	PRTEST_OK();
 }

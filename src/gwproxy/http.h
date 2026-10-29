@@ -222,14 +222,18 @@ int gwp_http_cli_build_connect(const char *authority, const char *user,
 			       void *out, size_t out_cap, size_t *out_len);
 
 /**
- * Parse an upstream HTTP CONNECT reply.
+ * Parse an upstream HTTP CONNECT reply, the @len bytes of it received so far
+ * at @buf. *@scan is where the search for the end of its header resumes: 0
+ * for a new reply, then left as the call leaves it, so that a reply received
+ * in pieces is not searched from its start each time.
  *
  * @return	0 with *status (HTTP code) and *consumed (bytes through the
  *		blank line, CRLF or LF) set once the header block has arrived;
  *		-EAGAIN if more data is needed; -EINVAL on a malformed status
  *		line (not "HTTP/1.0" or "HTTP/1.1" SP 3DIGIT).
  */
-int gwp_http_cli_parse_connect_reply(const void *buf, size_t len, int *status,
+int gwp_http_cli_parse_connect_reply(const void *buf, size_t len,
+				     size_t *scan, int *status,
 				     size_t *consumed);
 
 #endif /* #ifndef GWPROXY__HTTP_H */

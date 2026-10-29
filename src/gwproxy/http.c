@@ -1515,7 +1515,8 @@ int gwp_http_cli_build_connect(const char *authority, const char *user,
 
 /*
  * Parse an upstream HTTP CONNECT reply. Returns -EAGAIN until the header,
- * up to and including the blank line that ends it, has arrived. On
+ * up to and including the blank line that ends it, has arrived; *@scan keeps
+ * how far the search for it got, as for an origin's response. On
  * completion it sets *status to the HTTP status code and *consumed to the
  * number of bytes of the header (any bytes after that are early tunnel data),
  * and returns 0. Returns -EINVAL on a malformed status line.
@@ -1525,14 +1526,17 @@ int gwp_http_cli_build_connect(const char *authority, const char *user,
  * "HTTP/1.0" or "HTTP/1.1", a three-digit code followed by a space or the
  * end of the line, LF or CRLF line ends.
  */
-int gwp_http_cli_parse_connect_reply(const void *buf, size_t len, int *status,
+int gwp_http_cli_parse_connect_reply(const void *buf, size_t len,
+				     size_t *scan, int *status,
 				     size_t *consumed)
 {
 	const char *p = buf;
-	size_t scan = 0, end, n;
+	size_t end, n;
 
 	/* Need the full header block. */
-	end = find_hdr_end(p, len, &scan);
+	if (*scan > len)
+		*scan = 0;
+	end = find_hdr_end(p, len, scan);
 	if (!end)
 		return -EAGAIN;
 
