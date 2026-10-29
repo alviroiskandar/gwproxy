@@ -27,7 +27,8 @@ struct gwp_http_conn;
 enum gwp_http_result {
 	GWP_HTTP_NEED_MORE = 0,	/* Header incomplete; feed more client bytes. */
 	GWP_HTTP_CONNECT,	/* CONNECT tunnel; host/port are set. */
-	GWP_HTTP_FORWARD,	/* Forward request; host/port + rewritten req set. */
+	GWP_HTTP_FORWARD,	/* Forward request; host/port set, the request
+				 * rewritten in place. */
 	GWP_HTTP_NEED_AUTH,	/* Proxy auth required/failed; reply 407. */
 	GWP_HTTP_ERR,		/* Malformed or unsupported; tear the conn down. */
 	GWP_HTTP_BAD_REQUEST,	/* Well-formed but unacceptable (e.g. a field
@@ -60,36 +61,30 @@ bool gwp_http_conn_auth_failed(const struct gwp_http_conn *hc,
 			       const char **user, size_t *len);
 
 /**
- * Consume client request bytes and, once the header is complete, classify the
- * request.
+ * Parse the client's request header and, once it is complete, classify the
+ * request; a forwarding request is rewritten in place.
  *
  * @hc		Per-connection state.
  * @auth	Credential store, or NULL to disable authentication.
- * @in		Client bytes to parse: the request from its first byte. While
- *		the header is incomplete nothing is consumed, and the next call
+ * @buf		The client's bytes, the request from its first byte. While the
+ *		header is incomplete nothing is consumed, and the next call
  *		passes the same bytes again with more behind them (the parsed
  *		part is not copied, so it must be left unchanged).
- * @in_len	In: number of bytes in @in. Out: number of bytes consumed, 0
- *		until the header is complete; then the header's length.
+ * @buf_len	In: number of bytes in @buf. Out (FORWARD): the number after
+ *		the rewrite; otherwise unchanged.
+ * @cap		Room in @buf, for the rewrite of a forwarding request.
  * @host_p	Out (CONNECT/FORWARD): target host, NUL-terminated, owned by @hc
  *		and valid until gwp_http_conn_free().
  * @port_p	Out (CONNECT/FORWARD): target port string, same lifetime.
- * @req_p	Out (FORWARD): the rewritten origin-form request header to send
- *		to the origin, owned by @hc and valid until
- *		gwp_http_conn_drop_req() or gwp_http_conn_free().
- * @req_len_p	Out (FORWARD): length of *@req_p.
+ * @hdr_len_p	Out: 0 while the header is incomplete. FORWARD: the length of
+ *		the origin-form request header that now starts @buf, to send to
+ *		the origin, any body bytes already received following it.
+ *		Otherwise: the length of the request header, to be dropped.
  * @return	One of enum gwp_http_result.
  */
 int gwp_http_conn_process(struct gwp_http_conn *hc, struct gwp_auth *auth,
-			  const void *in, size_t *in_len,
-			  char **host_p, char **port_p,
-			  const char **req_p, size_t *req_len_p);
-
-/*
- * Free the rewritten request returned by gwp_http_conn_process() once the
- * caller has copied it, rather than keeping it for the connection's life.
- */
-void gwp_http_conn_drop_req(struct gwp_http_conn *hc);
+			  void *buf, size_t *buf_len, size_t cap,
+			  char **host_p, char **port_p, size_t *hdr_len_p);
 
 /**
  * Delimit the body of a forwarding request. Called with each run of client

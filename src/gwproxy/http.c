@@ -44,13 +44,6 @@ struct gwp_http_conn {
 	bool				is_forward;
 
 	/*
-	 * Rewritten origin-form request header for a forwarding request, kept
-	 * only until the caller has taken it (gwp_http_conn_drop_req()).
-	 */
-	char				*fwd_req;
-	size_t				fwd_req_len;
-
-	/*
 	 * The target's authority, once classified, split in place into the
 	 * host and port handed out (a default port is a static string). They
 	 * outlive the parsed request, which is freed as soon as the request
@@ -118,17 +111,9 @@ void gwp_http_conn_free(struct gwp_http_conn *hc)
 
 	gwnet_http_hdr_pctx_free(&hc->ctx_hdr);
 	gwnet_http_req_hdr_free(&hc->req_hdr);
-	free(hc->fwd_req);
 	free(hc->target);
 	free(hc->res_buf);
 	free(hc);
-}
-
-void gwp_http_conn_drop_req(struct gwp_http_conn *hc)
-{
-	free(hc->fwd_req);
-	hc->fwd_req = NULL;
-	hc->fwd_req_len = 0;
 }
 
 bool gwp_http_conn_is_forward(const struct gwp_http_conn *hc)
@@ -369,19 +354,19 @@ static bool buf_add(char *buf, size_t cap, size_t *n, const char *p,
 }
 
 /*
- * Rebuild the request in origin-form into hc->fwd_req: the absolute-form
+ * Rebuild the request in origin-form into @buf (@cap bytes): the absolute-form
  * request-target is replaced by @path (a bare "?query" gets the "/" its empty
  * path stands for), hop-by-hop / connection-specific headers are dropped and
  * "Connection: close" is appended (this proxy handles one request per
- * connection). @authority is the URI's authority, passed as
- * pointer+length because at this point it is still part of the request line
- * and not NUL-terminated. @hdr_len is the length of the parsed request
- * header, used to size the scratch buffer (the rewrite is never materially
- * larger). Returns 0 or a negative error.
+ * connection). @path and @authority, the URI's authority, are passed as
+ * pointer+length because they are part of the request line and not
+ * NUL-terminated. Returns the length written, -E2BIG if it does not fit, or
+ * another negative error.
  */
-static int build_forward_request(struct gwp_http_conn *hc, const char *path,
-				 size_t path_len, const char *authority,
-				 size_t auth_len, size_t hdr_len)
+static ssize_t build_forward_request(struct gwp_http_conn *hc,
+				     const char *path, size_t path_len,
+				     const char *authority, size_t auth_len,
+				     char *buf, size_t cap)
 {
 	static const char cls[] = "Connection: close\r\n\r\n";
 	struct gwnet_http_req_hdr *req = &hc->req_hdr;
@@ -393,10 +378,9 @@ static int build_forward_request(struct gwp_http_conn *hc, const char *path,
 	const char *conn = gwnet_http_hdr_fields_get(ff, "Connection",
 						     &conn_len);
 	struct conn_tok toks[CONN_MAX_TOKENS];
-	size_t cap = hdr_len * 2 + 64, n = 0, i;
+	size_t n = 0, i;
 	int nr_toks = 0;
 	bool ok;
-	char *buf;
 
 	if (!method)
 		return -EINVAL;
@@ -421,10 +405,6 @@ static int build_forward_request(struct gwp_http_conn *hc, const char *path,
 	    conn_toks_have(toks, nr_toks, "Transfer-Encoding", 17) ||
 	    conn_toks_have(toks, nr_toks, "Host", 4))
 		return -EBADMSG;
-
-	buf = malloc(cap);
-	if (!buf)
-		return -ENOMEM;
 
 	ok = buf_add(buf, cap, &n, method, strlen(method)) &&
 	     buf_add(buf, cap, &n, " ", 1) &&
@@ -455,10 +435,8 @@ static int build_forward_request(struct gwp_http_conn *hc, const char *path,
 			host = at + 1;
 			hlen = auth_len - (size_t)(host - authority);
 		}
-		if (!hlen) {
-			free(buf);
+		if (!hlen)
 			return -EINVAL;
-		}
 
 		ok = buf_add(buf, cap, &n, "Host: ", 6) &&
 		     buf_add(buf, cap, &n, host, hlen) &&
@@ -487,18 +465,11 @@ static int build_forward_request(struct gwp_http_conn *hc, const char *path,
 			goto too_big;
 	}
 
-	/* NUL-terminated as well, for whoever wants to log or search it. */
-	if (!buf_add(buf, cap, &n, cls, sizeof(cls)))
+	if (!buf_add(buf, cap, &n, cls, sizeof(cls) - 1))
 		goto too_big;
-	n--;
-
-	free(hc->fwd_req);
-	hc->fwd_req = buf;
-	hc->fwd_req_len = n;
-	return 0;
+	return (ssize_t)n;
 
 too_big:
-	free(buf);
 	return -E2BIG;
 }
 
@@ -554,19 +525,34 @@ static int set_req_framing(struct gwp_http_conn *hc)
 }
 
 /*
- * Classify a fully-parsed forwarding request: rebuild it in origin-form and
- * split the http:// authority into host/port. Returns GWP_HTTP_FORWARD,
- * GWP_HTTP_BAD_REQUEST or GWP_HTTP_ERR.
+ * The rewrite of a forwarding request is built here, on the stack, before it
+ * replaces the request in the caller's buffer; a larger one in a buffer
+ * allocated for it. The rewrite is never more than twice the header's size
+ * and 64 bytes.
  */
-static int classify_forward(struct gwp_http_conn *hc, size_t hdr_len,
-			    char **host_p, char **port_p,
-			    const char **req_p, size_t *req_len_p)
+#define REQ_FAST_MAX		4096
+
+/*
+ * Classify a fully-parsed forwarding request: split the http:// authority
+ * into host/port and rewrite the request in origin-form in place, where it
+ * takes the place of the original header in @buf (*@len of @cap bytes) and
+ * whatever followed the header moves along behind it. *@len and *@hdr_len_p
+ * are set to the new lengths. Returns GWP_HTTP_FORWARD, GWP_HTTP_BAD_REQUEST,
+ * GWP_HTTP_TOO_LARGE or GWP_HTTP_ERR.
+ */
+/* Not inlined: its stack frame must not add up with its callers'. */
+static noinline int classify_forward(struct gwp_http_conn *hc, char *buf,
+				     size_t *len, size_t cap, char **host_p,
+				     char **port_p, size_t *hdr_len_p)
 {
 	static char default_port[] = "80";
 	const char *uri = gwnet_http_req_uri(&hc->req_hdr);
 	const char *uri_end = uri + hc->req_hdr.uri_len;
+	size_t hdr_len = hc->ctx_hdr.off, rest = *len - hdr_len;
+	size_t max = hdr_len * 2 + 64, path_len, auth_len;
 	const char *authority, *slash, *path;
-	size_t path_len;
+	char sbuf[REQ_FAST_MAX], *out = sbuf;
+	ssize_t w;
 	int r;
 
 	/* Only absolute-form http:// URIs are supported (no TLS termination). */
@@ -589,6 +575,7 @@ static int classify_forward(struct gwp_http_conn *hc, size_t hdr_len,
 		slash++;
 	if (slash == authority || (slash < uri_end && *slash == '#'))
 		return GWP_HTTP_ERR;		/* empty authority, fragment */
+	auth_len = (size_t)(slash - authority);
 	if (slash < uri_end) {
 		path = slash;
 		path_len = (size_t)(uri_end - slash);
@@ -598,46 +585,66 @@ static int classify_forward(struct gwp_http_conn *hc, size_t hdr_len,
 	}
 
 	r = set_req_framing(hc);
-	if (!r)
-		r = build_forward_request(hc, path, path_len, authority,
-					  (size_t)(slash - authority), hdr_len);
 	if (r == -EBADMSG)
 		return GWP_HTTP_BAD_REQUEST;
-	if (r < 0)
-		return GWP_HTTP_ERR;
 
-	if (set_target(hc, authority, (size_t)(slash - authority), host_p,
-		       port_p, default_port) < 0)
-		return GWP_HTTP_ERR;
+	/* Built aside: it is read from the header it is going to replace. */
+	w = build_forward_request(hc, path, path_len, authority, auth_len,
+				  sbuf, max < sizeof(sbuf) ? max : sizeof(sbuf));
+	if (w == -E2BIG && max > sizeof(sbuf)) {
+		out = malloc(max);
+		if (!out)
+			return GWP_HTTP_ERR;
+		w = build_forward_request(hc, path, path_len, authority,
+					  auth_len, out, max);
+	}
 
-	hc->is_forward = true;
-	*req_p = hc->fwd_req;
-	*req_len_p = hc->fwd_req_len;
-	return GWP_HTTP_FORWARD;
+	if (w == -EBADMSG)
+		r = GWP_HTTP_BAD_REQUEST;
+	else if (w < 0)
+		r = GWP_HTTP_ERR;
+	else if (set_target(hc, authority, auth_len, host_p, port_p,
+			    default_port) < 0)
+		r = GWP_HTTP_ERR;
+	else if ((size_t)w > cap || rest > cap - (size_t)w)
+		r = GWP_HTTP_TOO_LARGE;		/* does not fit the buffer */
+	else
+		r = GWP_HTTP_FORWARD;
+
+	if (r == GWP_HTTP_FORWARD) {
+		memmove(buf + w, buf + hdr_len, rest);
+		memcpy(buf, out, (size_t)w);
+		*len = (size_t)w + rest;
+		*hdr_len_p = (size_t)w;
+		hc->is_forward = true;
+	}
+
+	if (out != sbuf)
+		free(out);
+	return r;
 }
 
 static int classify_req(struct gwp_http_conn *hc, struct gwp_auth *auth,
-			char **host_p, char **port_p, const char **req_p,
-			size_t *req_len_p);
+			char *buf, size_t *len, size_t cap, char **host_p,
+			char **port_p, size_t *hdr_len_p);
 
 int gwp_http_conn_process(struct gwp_http_conn *hc, struct gwp_auth *auth,
-			  const void *in, size_t *in_len,
-			  char **host_p, char **port_p,
-			  const char **req_p, size_t *req_len_p)
+			  void *buf, size_t *buf_len, size_t cap,
+			  char **host_p, char **port_p, size_t *hdr_len_p)
 {
 	struct gwnet_http_hdr_pctx *ctx = &hc->ctx_hdr;
 	struct gwnet_http_req_hdr *req = &hc->req_hdr;
-	size_t len = *in_len;
-	const char *p = in;
+	size_t len = *buf_len;
+	const char *p = buf;
 	int r;
 
 	/*
-	 * Nothing is consumed until the header is complete: the parsed lines
-	 * are read from @in. Nothing to do until a line is complete, either:
+	 * The header stays in @buf until it is complete: the parsed lines are
+	 * read from there. Nothing to do until a line is complete, either:
 	 * only the bytes not searched yet are looked at. Past the length
 	 * limit the parser runs anyway, to refuse the header.
 	 */
-	*in_len = 0;
+	*hdr_len_p = 0;
 	if (hc->scan > len || hc->scan < ctx->off)
 		hc->scan = ctx->off;
 	if (len <= REQ_HDR_MAX && !memchr(p + hc->scan, '\n', len - hc->scan)) {
@@ -645,7 +652,7 @@ int gwp_http_conn_process(struct gwp_http_conn *hc, struct gwp_auth *auth,
 		return GWP_HTTP_NEED_MORE;
 	}
 
-	ctx->buf = in;
+	ctx->buf = buf;
 	ctx->len = len;
 	r = gwnet_http_req_hdr_parse(ctx, req);
 	if (r == -EAGAIN) {
@@ -658,7 +665,7 @@ int gwp_http_conn_process(struct gwp_http_conn *hc, struct gwp_auth *auth,
 			   ctx->off : len;
 		return GWP_HTTP_NEED_MORE;
 	}
-	*in_len = ctx->off;
+	*hdr_len_p = ctx->off;
 	/*
 	 * A repeated field that may appear only once (Host, Content-Length,
 	 * ...) is a well-formed line in an unacceptable request; say so
@@ -671,7 +678,8 @@ int gwp_http_conn_process(struct gwp_http_conn *hc, struct gwp_auth *auth,
 	else if (r < 0)
 		r = GWP_HTTP_ERR;
 	else
-		r = classify_req(hc, auth, host_p, port_p, req_p, req_len_p);
+		r = classify_req(hc, auth, buf, buf_len, cap, host_p, port_p,
+				 hdr_len_p);
 
 	/*
 	 * Once classified, only the target (copied out), the username and
@@ -722,8 +730,8 @@ static bool check_auth(struct gwp_http_conn *hc, struct gwp_auth *auth)
 }
 
 static int classify_req(struct gwp_http_conn *hc, struct gwp_auth *auth,
-			char **host_p, char **port_p, const char **req_p,
-			size_t *req_len_p)
+			char *buf, size_t *len, size_t cap, char **host_p,
+			char **port_p, size_t *hdr_len_p)
 {
 	struct gwnet_http_req_hdr *req = &hc->req_hdr;
 
@@ -739,8 +747,8 @@ static int classify_req(struct gwp_http_conn *hc, struct gwp_auth *auth,
 
 	/* A non-CONNECT method is a forwarding request (absolute-form target). */
 	if (req->method != GWNET_HTTP_METHOD_CONNECT)
-		return classify_forward(hc, hc->ctx_hdr.off, host_p, port_p,
-					req_p, req_len_p);
+		return classify_forward(hc, buf, len, cap, host_p, port_p,
+					hdr_len_p);
 
 	/* CONNECT: the target is an authority-form "host:port" to tunnel to. */
 	if (set_target(hc, gwnet_http_req_uri(req), req->uri_len, host_p,

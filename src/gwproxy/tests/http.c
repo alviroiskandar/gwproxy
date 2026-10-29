@@ -49,17 +49,47 @@ static ssize_t write_temp_file(char *tmpl, const void *data, size_t len)
 	return w;
 }
 
-/* Run gwp_http_conn_process() on a full request buffer in one shot. */
+/*
+ * Run gwp_http_conn_process() on a copy of @buf, a whole request, in one shot.
+ * For a forwarding request *@req and *@req_len are set to the rewritten
+ * header, which then starts the NUL-terminated copy (valid until the next
+ * call); otherwise *@req_len is the length of the header. *@len is set to the
+ * bytes in the copy afterwards, if @len is not NULL.
+ */
+static char proc_buf[65536];
+
+static int proc(struct gwp_http_conn *hc, struct gwp_auth *auth,
+		const char *buf, char **host, char **port, const char **req,
+		size_t *req_len, size_t *len)
+{
+	size_t n = strlen(buf);
+	int r;
+
+	assert(n < sizeof(proc_buf));
+	memcpy(proc_buf, buf, n);
+	r = gwp_http_conn_process(hc, auth, proc_buf, &n, sizeof(proc_buf) - 1,
+				  host, port, req_len);
+	proc_buf[n] = '\0';	/* for strlen() and memmem() on it */
+	*req = r == GWP_HTTP_FORWARD ? proc_buf : NULL;
+	if (len)
+		*len = n;
+	return r;
+}
+
 static int run(struct gwp_http_conn *hc, struct gwp_auth *auth, const char *buf,
 	       char **host, char **port, const char **req, size_t *req_len)
 {
-	size_t in_len = strlen(buf);
-	int r = gwp_http_conn_process(hc, auth, buf, &in_len, host, port, req,
-				      req_len);
+	size_t len;
+	int r = proc(hc, auth, buf, host, port, req, req_len, &len);
 
-	/* On a complete request the whole buffer is consumed. */
-	if (r != GWP_HTTP_NEED_MORE && r != GWP_HTTP_ERR)
-		assert(in_len == strlen(buf));
+	/*
+	 * On a complete request the whole buffer is the header (the tests
+	 * here send no body); a forwarding one is replaced by its rewrite.
+	 */
+	if (r == GWP_HTTP_FORWARD)
+		assert(*req_len == len);
+	else if (r != GWP_HTTP_NEED_MORE && r != GWP_HTTP_ERR)
+		assert(*req_len == strlen(buf));
 	return r;
 }
 
@@ -765,25 +795,22 @@ static void test_need_more(void)
 	struct gwp_http_conn *hc = gwp_http_conn_alloc();
 	char *host, *port;
 	const char *req = NULL;
-	size_t req_len = 0, in_len;
+	size_t req_len = 0, len;
 	int r;
 
 	assert(hc);
-	in_len = strlen(part1);
-	r = gwp_http_conn_process(hc, NULL, part1, &in_len, &host, &port, &req,
-				  &req_len);
+	r = proc(hc, NULL, part1, &host, &port, &req, &req_len, &len);
 	assert(r == GWP_HTTP_NEED_MORE);
-	assert(in_len == 0);	/* nothing consumed until complete */
+	/* Nothing consumed until complete. */
+	assert(!req_len && len == strlen(part1));
 
 	/*
 	 * The terminating blank line completes the request: the caller hands
 	 * over the whole header again, in another buffer here.
 	 */
-	in_len = strlen(full);
-	r = gwp_http_conn_process(hc, NULL, full, &in_len, &host, &port, &req,
-				  &req_len);
+	r = proc(hc, NULL, full, &host, &port, &req, &req_len, &len);
 	assert(r == GWP_HTTP_CONNECT);
-	assert(in_len == strlen(full));
+	assert(req_len == strlen(full) && len == strlen(full));
 	assert(!strcmp(host, "example.com"));
 	assert(!strcmp(port, "443"));
 	gwp_http_conn_free(hc);
@@ -803,7 +830,6 @@ static int feed_steps(const char *req, size_t len, size_t step, char *fwd,
 	struct gwp_http_conn *hc = gwp_http_conn_alloc();
 	size_t have = 0, pos = 0, in, rl = 0;
 	int r = GWP_HTTP_NEED_MORE;
-	const char *rq = NULL;
 	char *h, *p;
 
 	assert(hc);
@@ -814,16 +840,25 @@ static int feed_steps(const char *req, size_t len, size_t step, char *fwd,
 		have += n;
 		pos += n;
 		in = have;
-		r = gwp_http_conn_process(hc, NULL, buf, &in, &h, &p, &rq, &rl);
-		assert(in <= have);
-		have -= in;
-		memmove(buf, buf + in, have);
+		r = gwp_http_conn_process(hc, NULL, buf, &in, sizeof(buf), &h,
+					  &p, &rl);
+		/*
+		 * A forwarding request is replaced by its rewrite, followed
+		 * by what followed the header; take the rewrite. Any other
+		 * header is dropped once complete, nothing before.
+		 */
+		if (r == GWP_HTTP_FORWARD) {
+			assert(rl <= in);
+			memcpy(fwd, buf, rl);
+			have = in;
+		} else {
+			assert(in == have);
+		}
+		assert(rl <= have);
+		have -= rl;
+		memmove(buf, buf + rl, have);
 	}
-	*fwd_len = 0;
-	if (r == GWP_HTTP_FORWARD) {
-		memcpy(fwd, rq, rl);
-		*fwd_len = rl;
-	}
+	*fwd_len = r == GWP_HTTP_FORWARD ? rl : 0;
 	if (r == GWP_HTTP_FORWARD || r == GWP_HTTP_CONNECT)
 		sprintf(hp, "%s|%s", h, p);
 	else
@@ -947,14 +982,11 @@ static void test_duplicate_field(void)
 	size_t req_len = 0, i;
 
 	for (i = 0; i < sizeof(dups) / sizeof(dups[0]); i++) {
-		size_t in_len = strlen(dups[i]);
-
 		/* Not run(): the request is refused before it is all read. */
 		hc = gwp_http_conn_alloc();
 		assert(hc);
-		assert(gwp_http_conn_process(hc, NULL, dups[i], &in_len, &host,
-					     &port, &req, &req_len) ==
-		       GWP_HTTP_BAD_REQUEST);
+		assert(proc(hc, NULL, dups[i], &host, &port, &req, &req_len,
+			    NULL) == GWP_HTTP_BAD_REQUEST);
 		gwp_http_conn_free(hc);
 	}
 
@@ -963,6 +995,65 @@ static void test_duplicate_field(void)
 	assert(run(hc, NULL, list, &host, &port, &req, &req_len) ==
 	       GWP_HTTP_FORWARD);
 	assert(memmem(req, req_len, "\r\nAccept: a, b\r\n", 16));
+	gwp_http_conn_free(hc);
+	PRTEST_OK();
+}
+
+/*
+ * A forwarding request is rewritten where it lies: the rewrite takes the
+ * header's place and the bytes behind the header follow it, whether the
+ * rewrite is built on the stack or (past 4 KiB) in an allocated buffer. One
+ * that does not fit the buffer leaves it alone and is refused with 431.
+ */
+static void test_forward_in_place(void)
+{
+	static const char body_req[] =
+		"POST http://e/x HTTP/1.1\r\nContent-Length: 4\r\n\r\nbodyMORE";
+	static const char body_want[] =
+		"POST /x HTTP/1.1\r\nHost: e\r\nContent-Length: 4\r\n"
+		"Connection: close\r\n\r\nbodyMORE";
+	static const char grow[] = "GET http://e HTTP/1.1\r\nX: y\r\n\r\n";
+	static char buf[16384], want[16384];
+	struct gwp_http_conn *hc;
+	size_t len, hl, n, wn;
+	char *host, *port;
+
+	hc = gwp_http_conn_alloc();
+	assert(hc);
+	len = strlen(body_req);
+	memcpy(buf, body_req, len);
+	assert(gwp_http_conn_process(hc, NULL, buf, &len, sizeof(buf), &host,
+				     &port, &hl) == GWP_HTTP_FORWARD);
+	assert(len == strlen(body_want) && !memcmp(buf, body_want, len));
+	assert(hl == len - 8);
+	assert(!strcmp(host, "e") && !strcmp(port, "80"));
+	gwp_http_conn_free(hc);
+
+	/* A rewrite past the 4 KiB stack buffer, with bytes behind it. */
+	n = (size_t)sprintf(buf, "GET http://e/ HTTP/1.1\r\nCookie: ");
+	wn = (size_t)sprintf(want, "GET / HTTP/1.1\r\nHost: e\r\nCookie: ");
+	memset(buf + n, 'c', 6000);
+	memset(want + wn, 'c', 6000);
+	n += 6000;
+	wn += 6000;
+	n += (size_t)sprintf(buf + n, "\r\n\r\nTAIL");
+	wn += (size_t)sprintf(want + wn, "\r\nConnection: close\r\n\r\nTAIL");
+	hc = gwp_http_conn_alloc();
+	assert(hc);
+	len = n;
+	assert(gwp_http_conn_process(hc, NULL, buf, &len, sizeof(buf), &host,
+				     &port, &hl) == GWP_HTTP_FORWARD);
+	assert(len == wn && !memcmp(buf, want, wn) && hl == wn - 4);
+	gwp_http_conn_free(hc);
+
+	/* The rewrite is longer than the request and the buffer is full. */
+	hc = gwp_http_conn_alloc();
+	assert(hc);
+	len = strlen(grow);
+	memcpy(buf, grow, len);
+	assert(gwp_http_conn_process(hc, NULL, buf, &len, len, &host, &port,
+				     &hl) == GWP_HTTP_TOO_LARGE);
+	assert(len == strlen(grow) && !memcmp(buf, grow, len));
 	gwp_http_conn_free(hc);
 	PRTEST_OK();
 }
@@ -978,7 +1069,7 @@ static void test_header_limits(void)
 	struct gwp_http_conn *hc;
 	char *host, *port;
 	const char *req = NULL;
-	size_t req_len = 0, n, in_len;
+	size_t req_len = 0, n;
 	int i, r;
 
 	/* Exactly at the limit: accepted. */
@@ -996,9 +1087,7 @@ static void test_header_limits(void)
 	sprintf(buf + n - 2, "Accept: a\r\n\r\n");
 	hc = gwp_http_conn_alloc();
 	assert(hc);
-	in_len = strlen(buf);
-	r = gwp_http_conn_process(hc, NULL, buf, &in_len, &host, &port, &req,
-				  &req_len);
+	r = proc(hc, NULL, buf, &host, &port, &req, &req_len, NULL);
 	assert(r == GWP_HTTP_TOO_LARGE);
 	gwp_http_conn_free(hc);
 
@@ -1009,9 +1098,7 @@ static void test_header_limits(void)
 	sprintf(buf + n, "\r\n\r\n");
 	hc = gwp_http_conn_alloc();
 	assert(hc);
-	in_len = strlen(buf);
-	r = gwp_http_conn_process(hc, NULL, buf, &in_len, &host, &port, &req,
-				  &req_len);
+	r = proc(hc, NULL, buf, &host, &port, &req, &req_len, NULL);
 	assert(r == GWP_HTTP_TOO_LARGE);
 	gwp_http_conn_free(hc);
 	PRTEST_OK();
@@ -1309,6 +1396,7 @@ int main(void)
 		test_errors();
 		test_duplicate_field();
 		test_header_limits();
+	test_forward_in_place();
 		test_auth();
 		test_upstream_reply();
 		test_upstream_connect();

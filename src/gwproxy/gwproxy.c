@@ -4273,24 +4273,6 @@ static int http_reject_bad_request(struct gwp_conn_pair *gcp)
 }
 
 /*
- * Prepend a rewritten origin-form forward request to any request-body bytes
- * already buffered in client.buf, so the forwarding path streams it to the
- * origin.
- */
-static int http_inject_forward_request(struct gwp_conn_pair *gcp,
-				       const char *req, size_t req_len)
-{
-	if (req_len > (size_t)(gcp->client.cap - gcp->client.len))
-		return -E2BIG;
-
-	if (gcp->client.len)
-		memmove(gcp->client.buf + req_len, gcp->client.buf, gcp->client.len);
-	memcpy(gcp->client.buf, req, req_len);
-	gcp->client.len += (uint32_t)req_len;
-	return 0;
-}
-
-/*
  * A port as an HTTP authority carries it: decimal digits only, no sign, no
  * service name, at most 65535.
  */
@@ -4494,8 +4476,7 @@ int gwp_http_fwd_begin(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 int gwp_handle_conn_state_http(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_ctx *ctx = w->ctx;
-	const char *req = NULL;
-	size_t in_len, req_len = 0;
+	size_t len, hdr_len;
 	char *host, *port;
 	int r;
 
@@ -4521,10 +4502,18 @@ int gwp_handle_conn_state_http(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		return -EINVAL;
 	}
 
-	in_len = gcp->client.len;
+	/*
+	 * A forwarding request is rewritten in place, ready to go to the
+	 * origin; any other header is dropped once it has been dealt with.
+	 */
+	len = gcp->client.len;
 	r = gwp_http_conn_process(gcp->http_conn, ctx->auth, gcp->client.buf,
-				  &in_len, &host, &port, &req, &req_len);
-	gwp_conn_buf_advance(&gcp->client, in_len);
+				  &len, gcp->client.cap, &host, &port,
+				  &hdr_len);
+	if (r == GWP_HTTP_FORWARD)
+		gcp->client.len = (uint32_t)len;
+	else
+		gwp_conn_buf_advance(&gcp->client, hdr_len);
 
 	switch (r) {
 	case GWP_HTTP_NEED_MORE:
@@ -4544,14 +4533,8 @@ int gwp_handle_conn_state_http(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	case GWP_HTTP_CONNECT:
 		return http_connect_target(w, gcp, host, port);
 	case GWP_HTTP_FORWARD:
-		r = http_inject_forward_request(gcp, req, req_len);
-		gwp_http_conn_drop_req(gcp->http_conn);
-		if (r == -E2BIG)
-			return http_reject_too_large(gcp);
-		if (r < 0)
-			return r;
 		/* Whatever came in behind the header is the body, or not. */
-		r = http_fwd_client_in(w, gcp, (uint32_t)req_len);
+		r = http_fwd_client_in(w, gcp, (uint32_t)hdr_len);
 		if (r == -EBADMSG)
 			return http_reject_bad_request(gcp);
 		if (r < 0)
