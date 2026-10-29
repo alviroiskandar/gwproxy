@@ -22,6 +22,13 @@
 # once, one connection each. The client stays idle for a while and then reads
 # everything; the proxy's CPU time over that idle period must stay near zero,
 # and every byte must arrive. Exercised on every available event loop.
+#
+# The idle period starts once the proxy has stopped working on the
+# transfers' first part: on a slow, busy machine the origin's threads can
+# still be writing when the last connection is up, and forwarding that is no
+# spin. A proxy that spins never settles, so it is still measured, and a
+# failure prints the ticks per tenth of a second, the epoll interest of each
+# of the proxy's descriptors and the state of its sockets.
 
 . "$(dirname "$0")/lib.sh"
 require python3
@@ -62,9 +69,47 @@ for loop in epoll io_uring; do
 	            c.shutdown(socket.SHUT_WR)
 	        conns.append((c, kib * 1024))
 
-	t0 = ticks()
-	time.sleep(idle)
-	used = ticks() - t0
+	# Let the forwarding of the transfers' first part finish: wait for
+	# 0.2 s without a tick, for at most 3 s.
+	quiet, waited = 0, 0.0
+	while quiet < 4 and waited < 3.0:
+	    a = ticks()
+	    time.sleep(0.05)
+	    waited += 0.05
+	    quiet = quiet + 1 if ticks() == a else 0
+
+	slices = []
+	for _ in range(int(idle / 0.1)):
+	    a = ticks()
+	    time.sleep(0.1)
+	    slices.append(ticks() - a)
+	used = sum(slices)
+
+	diag = []
+	limit = int(idle * hz / 4)
+	if used > limit:
+	    diag.append("settled: %s after %.2f s; ticks per 0.1 s: %s" %
+	                ("yes" if quiet >= 4 else "no", waited, slices))
+	    fds = "/proc/%s/fd" % pid
+	    for fd in sorted(os.listdir(fds), key=int):
+	        try:
+	            info = open("/proc/%s/fdinfo/%s" % (pid, fd)).read()
+	        except OSError:
+	            continue
+	        if "tfd:" in info:
+	            diag += ["epoll fd %s: %s" % (fd, l.strip())
+	                     for l in info.splitlines() if l.startswith("tfd:")]
+	    try:
+	        import subprocess
+	        out = subprocess.run(["ss", "-tanpi"], capture_output=True,
+	                             text=True).stdout.splitlines()
+	        # Each socket is a line naming its owner, then a line of
+	        # TCP details.
+	        for i, l in enumerate(out):
+	            if "pid=%s," % pid in l:
+	                diag += out[i:i + 2]
+	    except OSError:
+	        pass
 
 	for c, n in conns:
 	    got = 0
@@ -80,8 +125,9 @@ for loop in epoll io_uring; do
 
 	# Spinning shows up as most of the idle period; allow a quarter of it
 	# for a loaded machine and the bookkeeping of the transfer itself.
-	limit = int(idle * hz / 4)
 	print("%d ticks while idle (limit %d, %d Hz)" % (used, limit, hz))
+	for l in diag:
+	    print("  " + l)
 	sys.exit(2 if used > limit else 0)
 	PY
 	)"
