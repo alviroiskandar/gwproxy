@@ -15,6 +15,7 @@
 #include <strings.h>
 #include <errno.h>
 #include <stdatomic.h>
+#include <sched.h>
 
 #ifdef CONFIG_PCRE
 #include <pcre2.h>
@@ -148,22 +149,31 @@ struct gwp_acl_ruleset {
 	struct gwp_acl_rule	*in_head, **in_tail;
 	struct gwp_acl_rule	*out_head, **out_tail;
 	enum gwp_acl_verdict	in_policy, out_policy;
+	/* The ACL generation this ruleset was published as. */
+	uint32_t		gen;
 	/* OUTPUT has a -m statistic rule: its verdicts must not be cached. */
 	bool			out_has_stat;
 	/* memo_idx slots handed out to OUTPUT rules so far. */
 	uint8_t			out_nr_memo;
 };
 
+/*
+ * The rules in force are the ruleset @rs points to. A reload builds a new
+ * ruleset aside and publishes it by swapping the pointer; evaluations load
+ * the pointer without a lock (see rs_get()), and the replaced ruleset is
+ * freed once no evaluation can still be reading it (see rs_retire()).
+ */
 struct gwp_acl {
-	struct gwp_acl_ruleset	rs;
+	_Atomic(struct gwp_acl_ruleset *) rs;
 	char			*path;
-	pthread_rwlock_t	lock;
+	/* Serialises reloads; evaluations never take it. */
+	pthread_mutex_t		reload_lock;
 	/* Bumped by every successful reload; see gwp_acl_generation(). */
 	_Atomic(uint32_t)	gen;
 	/*
 	 * ACL_SUM_* summary of @rs, published with it: an empty chain's
 	 * verdict is its policy, and the evaluators answer that from here
-	 * without taking the lock (the built-in default ACL has no INPUT
+	 * without touching the ruleset (the built-in default ACL has no INPUT
 	 * rules, so that is every accepted connection).
 	 */
 	_Atomic(uint8_t)	sum;
@@ -1279,54 +1289,227 @@ static uint8_t ruleset_summary(const struct gwp_acl_ruleset *rs)
 	return sum;
 }
 
-/*
- * Every worker takes the read lock per evaluation, and the only writer is the
- * reload, which runs on worker 0's event loop. glibc's default rwlock prefers
- * readers: a waiting writer does not hold off new ones, so while the other
- * workers keep overlapping their evaluations (a busy proxy with a large rule
- * file) the reload never gets in, and worker 0 with every connection it owns
- * stalls behind it. Prefer the writer instead. The non-recursive kind is
- * required for that and is safe here: no reader takes the lock twice.
- */
-static int acl_lock_init(pthread_rwlock_t *lock)
+static void ruleset_destroy(struct gwp_acl_ruleset *rs)
 {
-	pthread_rwlockattr_t attr;
-	int r;
+	if (!rs)
+		return;
+	ruleset_free(rs);
+	free(rs);
+}
 
-	r = pthread_rwlockattr_init(&attr);
+/*
+ * ------------------------------------------------------------------------
+ * Ruleset publication
+ * ------------------------------------------------------------------------
+ *
+ * Every worker evaluates the rules for every connection, and a reload may
+ * replace them at any time. A lock around each evaluation, even a read
+ * lock, makes every evaluation on every worker write the same lock word,
+ * so its cache line bounces between all of them and the throughput of the
+ * whole proxy stays at what one core manages; the reload also had to wait
+ * for the readers to let it in.
+ *
+ * Instead the ruleset is published RCU-style through one pointer, and its
+ * memory is reclaimed with hazard pointers. Each thread that evaluates
+ * owns a reader slot on a cache line of its own. To read, it stores the
+ * ruleset pointer it loaded in its slot and loads the pointer again; when
+ * both agree, the ruleset cannot be freed until the slot is cleared, which
+ * it is at the end of the evaluation. A reload swaps the pointer, then
+ * waits until no slot still holds the old ruleset, then frees it. Readers
+ * write only their own line and never wait; the reload waits for at most
+ * the evaluations that had already started on the old rules, because any
+ * later one finds the new pointer.
+ *
+ * Why not the alternatives:
+ *   - a reference count in the ruleset is again one shared word that every
+ *     evaluation writes, twice;
+ *   - quiescent-state counters bumped by each worker at the top of its
+ *     event loop would make the read side free of fences, but acl.c would
+ *     have to know about the workers and both event loops would have to
+ *     report to it, and a thread that is not a worker (the unit tests, a
+ *     reload helper) or a worker blocked in its loop would hold up or
+ *     escape the grace period;
+ *   - a per-thread epoch counter costs the reader the same fence as a
+ *     hazard pointer, but makes the reload wait for any evaluation in
+ *     progress, not only those on the rules being replaced.
+ * The price here is one sequentially consistent store, to the thread's own
+ * slot, per evaluation.
+ *
+ * The slots form a list that only grows; a thread's slot goes back to the
+ * pool when it exits (a pthread key destructor) and the next new thread
+ * reuses it, so the list is as long as the most threads that ever
+ * evaluated at once. If a slot cannot be allocated, the thread borrows the
+ * one static fallback slot under a mutex instead, so an evaluation never
+ * fails for want of memory.
+ */
+struct acl_reader {
+	_Atomic(struct gwp_acl_ruleset *) hazard;
+	_Atomic(bool)		in_use;
+	/* Set before the slot is published; never changes afterwards. */
+	struct acl_reader	*next;
+} __attribute__((__aligned__(64)));
+
+static struct acl_reader g_reader_fallback;
+static pthread_mutex_t g_reader_fallback_lock = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic(struct acl_reader *) g_readers = &g_reader_fallback;
+static pthread_once_t g_reader_once = PTHREAD_ONCE_INIT;
+static pthread_key_t g_reader_key;
+static bool g_reader_key_ok;
+static __thread struct acl_reader *t_reader;
+
+static void reader_release(void *p)
+{
+	struct acl_reader *r = p;
+
+	t_reader = NULL;
+	atomic_store_explicit(&r->in_use, false, memory_order_release);
+}
+
+static void reader_key_init(void)
+{
+	g_reader_key_ok = !pthread_key_create(&g_reader_key, reader_release);
+}
+
+/* This thread's reader slot, claimed or allocated on first use; NULL on OOM. */
+static struct acl_reader *reader_get(void)
+{
+	struct acl_reader *r = t_reader, *head;
+	void *mem;
+
 	if (r)
 		return r;
-#ifdef __GLIBC__
-	pthread_rwlockattr_setkind_np(&attr,
-				      PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
-#endif
-	r = pthread_rwlock_init(lock, &attr);
-	pthread_rwlockattr_destroy(&attr);
+
+	pthread_once(&g_reader_once, reader_key_init);
+	head = atomic_load_explicit(&g_readers, memory_order_acquire);
+	for (r = head; r; r = r->next) {
+		bool free_slot = false;
+
+		if (r == &g_reader_fallback)
+			continue;
+		if (atomic_compare_exchange_strong_explicit(&r->in_use,
+							    &free_slot, true,
+							    memory_order_acquire,
+							    memory_order_relaxed))
+			goto claimed;
+	}
+
+	if (posix_memalign(&mem, 64, sizeof(*r)))
+		return NULL;
+	r = mem;
+	atomic_init(&r->hazard, NULL);
+	atomic_init(&r->in_use, true);
+	/*
+	 * Sequentially consistent, like the reload's swap and its load of
+	 * the list head: a reload whose scan misses this slot swapped the
+	 * pointer before the push, so this thread's first rs_get() already
+	 * finds the new ruleset.
+	 */
+	r->next = head;
+	while (!atomic_compare_exchange_weak_explicit(&g_readers, &head, r,
+						      memory_order_seq_cst,
+						      memory_order_acquire))
+		r->next = head;
+
+claimed:
+	/*
+	 * Without the key the slot is not returned at thread exit; that
+	 * leaks one slot per thread, which is still correct.
+	 */
+	if (g_reader_key_ok)
+		pthread_setspecific(g_reader_key, r);
+	t_reader = r;
 	return r;
+}
+
+/*
+ * Enter a read section on @acl's current ruleset and return it. It stays
+ * valid until the matching rs_put(@*slot). Read sections do not nest.
+ */
+static struct gwp_acl_ruleset *rs_get(struct gwp_acl *acl,
+				      struct acl_reader **slot)
+{
+	struct gwp_acl_ruleset *rs, *again;
+	struct acl_reader *r = reader_get();
+
+	if (!r) {
+		pthread_mutex_lock(&g_reader_fallback_lock);
+		r = &g_reader_fallback;
+	}
+
+	rs = atomic_load_explicit(&acl->rs, memory_order_relaxed);
+	for (;;) {
+		/*
+		 * The store must be visible before the pointer is checked
+		 * again (store-load order, hence seq_cst on both): a reload
+		 * that swaps after the check sees the hazard in its scan.
+		 */
+		atomic_store_explicit(&r->hazard, rs, memory_order_seq_cst);
+		again = atomic_load_explicit(&acl->rs, memory_order_seq_cst);
+		if (again == rs)
+			break;
+		rs = again;
+	}
+	*slot = r;
+	return rs;
+}
+
+static void rs_put(struct acl_reader *r)
+{
+	atomic_store_explicit(&r->hazard, NULL, memory_order_release);
+	if (r == &g_reader_fallback)
+		pthread_mutex_unlock(&g_reader_fallback_lock);
+}
+
+/*
+ * Free @old, which is no longer published, once no read section can still
+ * be using it. Only the evaluations that loaded @old before it was swapped
+ * out are waited for, and each of them is one evaluation long.
+ */
+static void rs_retire(struct gwp_acl_ruleset *old)
+{
+	struct acl_reader *r;
+
+	r = atomic_load_explicit(&g_readers, memory_order_seq_cst);
+	for (; r; r = r->next) {
+		while (atomic_load_explicit(&r->hazard,
+					    memory_order_seq_cst) == old)
+			sched_yield();
+	}
+	ruleset_destroy(old);
 }
 
 int gwp_acl_parse_str(struct gwp_acl **out, const char *text)
 {
+	struct gwp_acl_ruleset *rs;
 	struct gwp_acl *acl;
 	int r;
 
 	acl = calloc(1, sizeof(*acl));
-	if (!acl)
+	rs = malloc(sizeof(*rs));
+	if (!acl || !rs) {
+		free(acl);
+		free(rs);
 		return -ENOMEM;
+	}
 
-	r = acl_lock_init(&acl->lock);
+	r = pthread_mutex_init(&acl->reload_lock, NULL);
 	if (r) {
 		free(acl);
+		free(rs);
 		return -r;
 	}
 
-	r = parse_text(&acl->rs, text);
+	r = parse_text(rs, text);
 	if (r) {
-		pthread_rwlock_destroy(&acl->lock);
+		pthread_mutex_destroy(&acl->reload_lock);
 		free(acl);
+		free(rs);
 		return r;
 	}
-	atomic_init(&acl->sum, ruleset_summary(&acl->rs));
+	rs->gen = 0;
+	atomic_init(&acl->rs, rs);
+	atomic_init(&acl->gen, 0);
+	atomic_init(&acl->sum, ruleset_summary(rs));
 
 	*out = acl;
 	return 0;
@@ -1364,7 +1547,8 @@ int gwp_acl_create(struct gwp_acl **out, const char *path)
 
 int gwp_acl_reload(struct gwp_acl *acl)
 {
-	struct gwp_acl_ruleset rs, old;
+	struct gwp_acl_ruleset *rs, *old;
+	uint32_t gen;
 	char *text;
 	int r;
 
@@ -1375,49 +1559,44 @@ int gwp_acl_reload(struct gwp_acl *acl)
 	if (r)
 		return r;
 
-	r = parse_text(&rs, text);
+	rs = malloc(sizeof(*rs));
+	if (!rs) {
+		free(text);
+		return -ENOMEM;
+	}
+	r = parse_text(rs, text);
 	free(text);
-	if (r)
+	if (r) {
+		free(rs);
 		return r;			/* keep the old rules */
+	}
 
+	pthread_mutex_lock(&acl->reload_lock);
+	gen = atomic_load_explicit(&acl->gen, memory_order_relaxed) + 1;
+	rs->gen = gen;
+	old = atomic_exchange_explicit(&acl->rs, rs, memory_order_seq_cst);
 	/*
-	 * Only swap under the lock. Freeing the old rules (every pcre2 code
-	 * and port array) can take a millisecond for a large file, and every
-	 * evaluation on every worker waits while the write lock is held, so
-	 * that is done after unlocking, on the copy taken here.
+	 * Summary before generation: a reader on the empty-chain path loads
+	 * the generation first, so one that sees the new generation also sees
+	 * the new summary, and a verdict is never tagged newer than its rules.
+	 * A verdict from the ruleset itself is tagged with its own @gen.
 	 */
-	pthread_rwlock_wrlock(&acl->lock);
-	old = acl->rs;
-	acl->rs = rs;
-	/*
-	 * Summary before generation: a lock-free reader loads the generation
-	 * first, so one that sees the new generation also sees the new
-	 * summary, and a verdict is never tagged newer than its rules.
-	 */
-	atomic_store_explicit(&acl->sum, ruleset_summary(&rs),
+	atomic_store_explicit(&acl->sum, ruleset_summary(rs),
 			      memory_order_release);
-	atomic_store_explicit(&acl->gen,
-			      atomic_load_explicit(&acl->gen,
-						   memory_order_relaxed) + 1,
-			      memory_order_release);
-	/* The tail pointers in @rs point at @rs's stack head slots when a chain
-	 * is empty; re-anchor them to the live struct. */
-	if (!acl->rs.in_head)
-		acl->rs.in_tail = &acl->rs.in_head;
-	if (!acl->rs.out_head)
-		acl->rs.out_tail = &acl->rs.out_head;
-	pthread_rwlock_unlock(&acl->lock);
+	atomic_store_explicit(&acl->gen, gen, memory_order_release);
+	pthread_mutex_unlock(&acl->reload_lock);
 
-	ruleset_free(&old);
+	rs_retire(old);
 	return 0;
 }
 
+/* The caller guarantees that no evaluation is running or will start. */
 void gwp_acl_destroy(struct gwp_acl *acl)
 {
 	if (!acl)
 		return;
-	ruleset_free(&acl->rs);
-	pthread_rwlock_destroy(&acl->lock);
+	ruleset_destroy(atomic_load_explicit(&acl->rs, memory_order_relaxed));
+	pthread_mutex_destroy(&acl->reload_lock);
 	free(acl->path);
 	free(acl);
 }
@@ -1477,9 +1656,9 @@ static bool user_match(const struct gwp_acl_rule *r, const char *user)
  * degrading into "whoever raced". Relaxed ordering: the counter is not
  * synchronising anything, it only has to be handed out without duplicates.
  *
- * The rule is shared and evaluated under the ACL's read lock, so this is the
- * one place a rule is written to; @st_count being atomic is what makes that
- * safe without promoting the lock.
+ * The rule is shared by every thread that evaluates the ruleset, so this is
+ * the one place a rule is written to; @st_count being atomic is what makes
+ * that safe while rules are otherwise read-only.
  *
  * Note the counter counts EVALUATIONS, not connections. A target with several
  * candidate addresses is evaluated once per candidate (Happy Eyeballs), so a
@@ -1701,7 +1880,9 @@ static enum gwp_acl_verdict eval_chain(struct gwp_acl_rule *head,
 enum gwp_acl_verdict gwp_acl_eval_output(struct gwp_acl *acl,
 					 struct gwp_acl_req *req)
 {
+	struct gwp_acl_ruleset *rs;
 	enum gwp_acl_verdict verdict;
+	struct acl_reader *slot;
 	uint32_t gen;
 	uint8_t sum;
 
@@ -1721,9 +1902,9 @@ enum gwp_acl_verdict gwp_acl_eval_output(struct gwp_acl *acl,
 						  : GWP_ACL_ACCEPT;
 	}
 
-	pthread_rwlock_rdlock(&acl->lock);
-	req->gen = atomic_load_explicit(&acl->gen, memory_order_relaxed);
-	req->cacheable = !acl->rs.out_has_stat;
+	rs = rs_get(acl, &slot);
+	req->gen = rs->gen;
+	req->cacheable = !rs->out_has_stat;
 	/* Memo slots are only meaningful for the ruleset that filled them. */
 	if (req->memo && (!req->memo->valid || req->memo->gen != req->gen)) {
 		req->memo->valid = true;
@@ -1731,8 +1912,8 @@ enum gwp_acl_verdict gwp_acl_eval_output(struct gwp_acl *acl,
 		req->memo->known = 0;
 		req->memo->ok = 0;
 	}
-	verdict = eval_chain(acl->rs.out_head, acl->rs.out_policy, req);
-	pthread_rwlock_unlock(&acl->lock);
+	verdict = eval_chain(rs->out_head, rs->out_policy, req);
+	rs_put(slot);
 	return verdict;
 }
 
@@ -1746,7 +1927,9 @@ uint32_t gwp_acl_generation(struct gwp_acl *acl)
 enum gwp_acl_verdict gwp_acl_eval_input(struct gwp_acl *acl,
 					struct gwp_acl_req *req)
 {
+	struct gwp_acl_ruleset *rs;
 	enum gwp_acl_verdict verdict;
+	struct acl_reader *slot;
 	uint8_t sum;
 
 	if (!acl)
@@ -1757,8 +1940,8 @@ enum gwp_acl_verdict gwp_acl_eval_input(struct gwp_acl *acl,
 		return (sum & ACL_SUM_IN_REJECT) ? GWP_ACL_REJECT
 						 : GWP_ACL_ACCEPT;
 
-	pthread_rwlock_rdlock(&acl->lock);
-	verdict = eval_chain(acl->rs.in_head, acl->rs.in_policy, req);
-	pthread_rwlock_unlock(&acl->lock);
+	rs = rs_get(acl, &slot);
+	verdict = eval_chain(rs->in_head, rs->in_policy, req);
+	rs_put(slot);
 	return verdict;
 }

@@ -1086,6 +1086,108 @@ static void test_reload_under_readers(void)
 }
 
 /*
+ * Two rulesets that give 10.1.2.3 opposite verdicts, behind a long run of
+ * rules that do not match it so that evaluations last and overlap the
+ * reloads. Ruleset A is loaded at even generations, B at odd ones.
+ */
+static char *swap_rules(bool b)
+{
+	size_t cap = 64 * 2100, len = 0;
+	char *s = malloc(cap);
+	int i;
+
+	assert(s);
+	len += (size_t)sprintf(s + len, "-P OUTPUT %s\n-P INPUT %s\n",
+			       b ? "REJECT" : "ACCEPT", b ? "REJECT" : "ACCEPT");
+	for (i = 0; i < 2000; i++)
+		len += (size_t)sprintf(s + len,
+				       "-A OUTPUT -d 172.%d.%d.0/24 --dports 1-9 -j REJECT\n",
+				       16 + (i >> 8), i & 255);
+	len += (size_t)sprintf(s + len, "-A OUTPUT -d 10.0.0.0/8 -j %s\n",
+			       b ? "ACCEPT" : "REJECT");
+	len += (size_t)sprintf(s + len, "-A INPUT -s 10.0.0.0/8 -j %s\n",
+			       b ? "ACCEPT" : "REJECT");
+	assert(len < cap);
+	return s;
+}
+
+struct swap_reader {
+	struct gwp_acl	*acl;
+	atomic_bool	*stop;
+	atomic_bool	bad;
+};
+
+static void *swap_reader_fn(void *arg)
+{
+	struct swap_reader *sr = arg;
+	struct gwp_sockaddr t = sa4("10.1.2.3", 443);
+	while (!atomic_load_explicit(sr->stop, memory_order_relaxed)) {
+		struct gwp_acl_req req = {
+			.target = &t, .dport = 443, .proto = GWP_ACL_PROTO_TCP,
+		};
+		enum gwp_acl_verdict v = gwp_acl_eval_output(sr->acl, &req);
+		enum gwp_acl_verdict want = (req.gen & 1) ? GWP_ACL_ACCEPT
+							  : GWP_ACL_REJECT;
+
+		if (v != want)
+			atomic_store(&sr->bad, true);
+		/* INPUT has no generation; either ruleset's verdict will do. */
+		in(sr->acl, &t, 1234, GWP_ACL_PROTO_TCP);
+	}
+	return NULL;
+}
+
+/*
+ * Reloads publish a whole ruleset at once and free the old one only after
+ * the evaluations still reading it are done: every verdict must be the one
+ * of the ruleset it is tagged with, while threads evaluate across 200
+ * reloads. A ruleset freed too early is a use-after-free under the
+ * sanitizers, and a wrong or mixed verdict without them.
+ */
+static void test_reload_swaps_whole_ruleset(void)
+{
+	struct swap_reader sr = { 0 };
+	atomic_bool stop = false;
+	char *path, *ra, *rb;
+	struct gwp_acl *a;
+	pthread_t thr[4];
+	size_t i;
+
+	ra = swap_rules(false);
+	rb = swap_rules(true);
+	path = write_tmp_rules(ra);
+	assert(!gwp_acl_create(&a, path));
+	assert(gwp_acl_generation(a) == 0);
+	sr.acl = a;
+	sr.stop = &stop;
+	for (i = 0; i < 4; i++)
+		assert(!pthread_create(&thr[i], NULL, swap_reader_fn, &sr));
+
+	for (i = 1; i <= 200; i++) {
+		const char *txt = (i & 1) ? rb : ra;
+		size_t len = strlen(txt);
+		int fd;
+
+		fd = open(path, O_WRONLY | O_TRUNC);
+		assert(fd >= 0);
+		assert(write(fd, txt, len) == (ssize_t)len);
+		close(fd);
+		assert(!gwp_acl_reload(a));
+		assert(gwp_acl_generation(a) == i);
+	}
+
+	atomic_store(&stop, true);
+	for (i = 0; i < 4; i++)
+		pthread_join(thr[i], NULL);
+	assert(!atomic_load(&sr.bad));
+	gwp_acl_destroy(a);
+	unlink(path);
+	free(path);
+	free(ra);
+	free(rb);
+}
+
+/*
  * Callers cache OUTPUT verdicts keyed on the ruleset generation: it must move
  * on every successful reload and only then, and a chain with a -m statistic
  * rule must mark its verdicts uncacheable.
@@ -1323,6 +1425,7 @@ static void run_tests(void)
 	/* Negative cases print the offending line to stderr; run them once. */
 	test_parse_errors();
 	test_reload_under_readers();
+	test_reload_swaps_whole_ruleset();
 	test_generation();
 	test_empty_chain_policy();
 	test_file_nul();
