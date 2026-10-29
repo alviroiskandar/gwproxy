@@ -42,7 +42,6 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <netinet/tcp.h>
-#include <sys/timerfd.h>
 #include <sys/resource.h>
 #include <sys/inotify.h>
 #include <sys/file.h>
@@ -2745,7 +2744,6 @@ struct gwp_conn_pair *gwp_alloc_conn_pair(struct gwp_wrk *w)
 
 	gcp->timer_fd = -1;
 	gcp->udp_fd = -1;
-	gcp->attempt_timer_fd = -1;
 	memset(gcp->attempt_fd, 0xff, sizeof(gcp->attempt_fd));	/* all -1 */
 	gcp->idx = gcs->nr;
 	gcp->conn_state = CONN_STATE_INIT;
@@ -3107,37 +3105,6 @@ int gwp_create_sock_target(struct gwp_wrk *w, struct gwp_sockaddr *addr,
 	return fd;
 }
 
-__hot
-int gwp_create_timer(int fd, int sec, int nsec)
-{
-	static const int flags = TFD_CLOEXEC | TFD_NONBLOCK;
-	const struct itimerspec its = {
-		.it_value.tv_sec = sec,
-		.it_value.tv_nsec = nsec,
-		.it_interval.tv_sec = 0,
-		.it_interval.tv_nsec = 0,
-	};
-	bool need_close = false;
-	int r;
-
-	if (fd < 0) {
-		fd = __sys_timerfd_create(CLOCK_MONOTONIC, flags);
-		if (fd < 0)
-			return fd;
-
-		need_close = true;
-	}
-
-	r = __sys_timerfd_settime(fd, 0, &its, NULL);
-	if (r < 0) {
-		if (need_close)
-			__sys_close(fd);
-		return r;
-	}
-
-	return fd;
-}
-
 static int socks5_translate_err(int err)
 {
 	switch (err) {
@@ -3237,7 +3204,7 @@ int gwp_conn_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int err)
 {
 	/*
 	 * The two event loops report a connect timeout with different errnos:
-	 * epoll's timerfd path uses -ETIMEDOUT, io_uring's timeout CQE gives
+	 * epoll's timer path uses -ETIMEDOUT, io_uring's timeout CQE gives
 	 * -ETIME. Normalise, or the SOCKS5 mapping below would answer the
 	 * generic REP 0x01 on io_uring instead of 0x06 (TTL expired).
 	 */
@@ -3494,12 +3461,6 @@ int gwp_conn_close_attempts(struct gwp_conn_pair *gcp)
 			continue;
 		__sys_close(gcp->attempt_fd[i]);
 		gcp->attempt_fd[i] = -1;
-		n++;
-	}
-
-	if (gcp->attempt_timer_fd >= 0) {
-		__sys_close(gcp->attempt_timer_fd);
-		gcp->attempt_timer_fd = -1;
 		n++;
 	}
 
