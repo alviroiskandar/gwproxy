@@ -2592,35 +2592,6 @@ static int handle_ev_dns_cq(struct gwp_wrk *w)
 	return 0;
 }
 
-static void prep_reload_files(struct gwp_wrk *w)
-{
-	struct gwp_ctx *ctx = w->ctx;
-	struct io_uring_sqe *s;
-
-	s = get_sqe_nofail(w);
-	io_uring_prep_read(s, ctx->ino_fd, ctx->ino_buf, GWP_INO_BUF_SIZE, 0);
-	s->user_data = EV_BIT_IOU_RELOAD_FILES;
-}
-
-/*
- * One read takes every record queued so far (the buffer has room for a
- * burst), and each file it names is reloaded once however many records name
- * it. The re-armed read is only submitted after this returns, so the buffer
- * is not overwritten while it is parsed.
- */
-static int handle_ev_reload_files(struct gwp_wrk *w, int res)
-{
-	struct gwp_ctx *ctx = w->ctx;
-
-	prep_reload_files(w);
-	if (res <= 0)
-		return 0;
-
-	gwp_ctx_reload_files(ctx, gwp_reload_events(ctx, ctx->ino_buf,
-						     (size_t)res));
-	return 0;
-}
-
 static int handle_event(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 {
 	void *udata = U64_TO_PTR(CLEAR_EV_BIT(cqe->user_data));
@@ -2750,9 +2721,6 @@ static int handle_event(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 		pr_dbg(&ctx->lh, "Handling upstream SOCKS5 handshake event: %d", cqe->res);
 		r = handle_ev_upstream_s5(w, udata, cqe);
 		break;
-	case EV_BIT_IOU_RELOAD_FILES:
-		pr_dbg(&ctx->lh, "Handling auth/ACL file reload event: %d", cqe->res);
-		return handle_ev_reload_files(w, cqe->res);
 	case EV_BIT_IOU_TARGET_CANCEL:
 		gcp = udata;
 		pr_dbg(&ctx->lh, "Handling target cancel event: %d", cqe->res);
@@ -2883,9 +2851,6 @@ int gwp_ctx_thread_entry_io_uring(struct gwp_wrk *w)
 	int r = 0;
 
 	pr_info(&ctx->lh, "Worker %u started (io_uring)", w->idx);
-
-	if (w->idx == 0 && ctx->ino_fd >= 0)
-		prep_reload_files(w);
 
 	io_uring_set_iowait(&w->iou->ring, false);
 	arm_stop_poll(w);
