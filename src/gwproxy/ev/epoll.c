@@ -247,14 +247,6 @@ int gwp_ctx_init_thread_epoll(struct gwp_wrk *w)
 	if (unlikely(r))
 		goto out_free_events;
 
-	if (w->idx == 0 && (ctx->ino_fd >= 0)) {
-		ev.events = EPOLLIN;
-		ev.data.u64 = EV_BIT_RELOAD_FILES;
-		r = __sys_epoll_ctl(ep_fd, EPOLL_CTL_ADD, ctx->ino_fd, &ev);
-		if (unlikely(r))
-			goto out_free_events;
-	}
-
 	/* Results of this worker's getaddrinfo() lookups. */
 	if (ctx->dns) {
 		ev.events = EPOLLIN;
@@ -2597,39 +2589,6 @@ static int handle_ev_dns_cq(struct gwp_wrk *w)
 	return ret;
 }
 
-/*
- * Drain the reload watch, then reload each file it named once: an editor
- * save or a deploy script often fires several records in a row, and each
- * would otherwise cost a full re-read and re-parse. The drain is bounded so a
- * directory under constant churn cannot hold worker 0 here.
- */
-static int handle_ev_reload_files(struct gwp_wrk *w)
-{
-	struct gwp_ctx *ctx = w->ctx;
-	unsigned flags = 0;
-	ssize_t r;
-	int i;
-
-	for (i = 0; i < 16; i++) {
-		r = __sys_read(ctx->ino_fd, ctx->ino_buf, GWP_INO_BUF_SIZE);
-		if (r < 0) {
-			if (r == -EINTR)
-				continue;
-			if (r == -EAGAIN)
-				break;
-			pr_err(&ctx->lh, "Failed to read inotify event: %s",
-				strerror((int)-r));
-			return (int)r;
-		}
-		if (!r)
-			break;
-		flags |= gwp_reload_events(ctx, ctx->ino_buf, (size_t)r);
-	}
-
-	gwp_ctx_reload_files(ctx, flags);
-	return 0;
-}
-
 static bool is_ev_bit_conn_pair(uint64_t ev_bit)
 {
 	/* Every attempt slot of a Happy Eyeballs race points at the pair. */
@@ -3201,9 +3160,6 @@ static int handle_event(struct gwp_wrk *w, struct epoll_event *ev)
 		break;
 	case EV_BIT_DNS_QUERY:
 		r = handle_ev_dns_cq(w);
-		break;
-	case EV_BIT_RELOAD_FILES:
-		r = handle_ev_reload_files(w);
 		break;
 	case EV_BIT_RAW_DNS_QUERY:
 		r = handle_ev_raw_dns_query(w, udata);

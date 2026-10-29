@@ -44,6 +44,7 @@
 #include <netinet/tcp.h>
 #include <sys/resource.h>
 #include <sys/inotify.h>
+#include <poll.h>
 #include <sys/file.h>
 
 /* Long-only options (no short letter): values >= 128 are skipped by the
@@ -1301,6 +1302,17 @@ static void gwp_ctx_free_threads(struct gwp_ctx *ctx)
 	ctx->workers = NULL;
 }
 
+/*
+ * Hot reload of the auth and ACL files. The reload thread reads ctx->ino_fd
+ * into a GWP_INO_BUF_SIZE buffer (room for a burst of records, so one read
+ * usually drains it), gwp_reload_events() turns the records into the
+ * GWP_RELOAD_* files they name, and gwp_ctx_reload_files() reloads each of
+ * those once.
+ */
+#define GWP_INO_BUF_SIZE	4096
+#define GWP_RELOAD_AUTH		(1u << 0)
+#define GWP_RELOAD_ACL		(1u << 1)
+
 static const char *path_basename(const char *path)
 {
 	const char *slash = strrchr(path, '/');
@@ -1353,8 +1365,8 @@ static bool inotify_names(const struct inotify_event *e, const char *path)
  * unrelated directory churn are ignored, and a burst of records for the same
  * file still yields a single reload.
  */
-unsigned gwp_reload_events(const struct gwp_ctx *ctx, const void *buf,
-			   size_t len)
+static unsigned gwp_reload_events(const struct gwp_ctx *ctx, const void *buf,
+				  size_t len)
 {
 	const char *auth = ctx->auth ? ctx->cfg.auth_file : NULL;
 	const char *acl = ctx->acl_watched ? ctx->cfg.acl_file : NULL;
@@ -1386,7 +1398,7 @@ unsigned gwp_reload_events(const struct gwp_ctx *ctx, const void *buf,
 }
 
 /* Reload the files named by @flags (GWP_RELOAD_*), logging the outcome. */
-void gwp_ctx_reload_files(struct gwp_ctx *ctx, unsigned flags)
+static void gwp_ctx_reload_files(struct gwp_ctx *ctx, unsigned flags)
 {
 	if ((flags & GWP_RELOAD_AUTH) && ctx->auth) {
 		if (gwp_auth_reload(ctx->auth))
@@ -1403,17 +1415,127 @@ void gwp_ctx_reload_files(struct gwp_ctx *ctx, unsigned flags)
 }
 
 /*
+ * Read every inotify record queued so far and return the GWP_RELOAD_* files
+ * they name, or -errno. The drain is bounded so a directory under constant
+ * churn cannot keep the caller here forever.
+ */
+static int gwp_reload_drain(struct gwp_ctx *ctx, char *buf, unsigned *flags)
+{
+	ssize_t r;
+	int i;
+
+	for (i = 0; i < 16; i++) {
+		r = __sys_read(ctx->ino_fd, buf, GWP_INO_BUF_SIZE);
+		if (r < 0) {
+			if (r == -EINTR)
+				continue;
+			if (r == -EAGAIN)
+				break;
+			return (int)r;
+		}
+		if (!r)
+			break;
+		*flags |= gwp_reload_events(ctx, buf, (size_t)r);
+	}
+	return 0;
+}
+
+/*
+ * A burst of file events (an editor's save, a deploy script writing both
+ * files, a config manager rewriting a file line by line) is reloaded once it
+ * has been quiet for GWP_RELOAD_QUIET_MS, instead of once per event. Under
+ * changes that never pause, a reload still runs every GWP_RELOAD_MAX_WAIT_MS.
+ */
+#define GWP_RELOAD_QUIET_MS	100
+#define GWP_RELOAD_MAX_WAIT_MS	1000
+
+static uint64_t gwp_reload_now_ms(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+
+/*
+ * The reload thread. Reading, parsing and compiling a large auth or ACL file
+ * takes milliseconds (tens with many regexes), and a worker doing it serves
+ * none of its connections meanwhile, so the files are reloaded here instead.
+ * The stores publish a new set under their own locks, so no worker waits for
+ * more than that swap.
+ */
+static void *gwp_reload_thread(void *arg)
+{
+	struct gwp_ctx *ctx = arg;
+	char buf[GWP_INO_BUF_SIZE]
+		__attribute__((aligned(__alignof__(struct inotify_event))));
+	struct pollfd pfd[2] = {
+		{ .fd = ctx->ino_fd, .events = POLLIN },
+		{ .fd = ctx->reload_efd, .events = POLLIN },
+	};
+	uint64_t now, first = 0, last = 0, due = 0;
+	unsigned flags, pending = 0;
+	int r, timeout;
+
+	for (;;) {
+		timeout = -1;
+		if (pending) {
+			now = gwp_reload_now_ms();
+			timeout = due > now ? (int)(due - now) : 0;
+		}
+
+		r = poll(pfd, 2, timeout);
+		if (r < 0) {
+			if (errno == EINTR)
+				continue;
+			r = -errno;
+			break;
+		}
+		if (pfd[1].revents)
+			return NULL;
+
+		if (pfd[0].revents) {
+			flags = 0;
+			r = gwp_reload_drain(ctx, buf, &flags);
+			if (r < 0)
+				break;
+			if (flags) {
+				last = gwp_reload_now_ms();
+				if (!pending)
+					first = last;
+				pending |= flags;
+				due = last + GWP_RELOAD_QUIET_MS;
+				if (due > first + GWP_RELOAD_MAX_WAIT_MS)
+					due = first + GWP_RELOAD_MAX_WAIT_MS;
+			}
+		}
+
+		if (!pending || gwp_reload_now_ms() < due)
+			continue;
+		gwp_ctx_reload_files(ctx, pending);
+		pending = 0;
+	}
+
+	pr_err(&ctx->lh, "Reload thread stopped, file changes are no longer picked up: %s",
+	       strerror(-r));
+	return NULL;
+}
+
+/*
  * One inotify instance watches both the auth file and the ACL file, so when
- * they share a directory each event is read once, not once per store. Worker 0
- * polls it. Leaves ino_fd at -1 when neither file is configured.
+ * they share a directory each event is read once, not once per store. The
+ * reload thread polls it. Leaves ino_fd at -1 and starts no thread when
+ * neither file is configured.
  */
 static int gwp_ctx_init_reload(struct gwp_ctx *ctx)
 {
 	struct gwp_cfg *cfg = &ctx->cfg;
+	sigset_t all, old;
 	int r;
 
 	ctx->ino_fd = -1;
-	ctx->ino_buf = NULL;
+	ctx->reload_efd = -1;
+	ctx->reload_running = false;
 	if (!ctx->auth && !ctx->acl_watched)
 		return 0;
 
@@ -1448,24 +1570,60 @@ static int gwp_ctx_init_reload(struct gwp_ctx *ctx)
 			cfg->acl_file, r);
 	}
 
-	ctx->ino_buf = malloc(GWP_INO_BUF_SIZE);
-	if (!ctx->ino_buf) {
-		pr_err(&ctx->lh, "Failed to allocate inotify buffer: %s", strerror(ENOMEM));
-		r = -ENOMEM;
+	r = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+	if (r < 0) {
+		r = -errno;
+		pr_err(&ctx->lh, "Failed to create reload eventfd: %s", strerror(-r));
 		goto out_err;
 	}
+	ctx->reload_efd = r;
+
+	/*
+	 * SIGINT and SIGTERM are for the workers to act on; the reload thread
+	 * starts with every signal blocked so they are never delivered here.
+	 */
+	sigfillset(&all);
+	pthread_sigmask(SIG_SETMASK, &all, &old);
+	r = pthread_create(&ctx->reload_thread, NULL, gwp_reload_thread, ctx);
+	pthread_sigmask(SIG_SETMASK, &old, NULL);
+	if (r) {
+		r = -r;
+		pr_err(&ctx->lh, "Failed to create reload thread: %s", strerror(-r));
+		goto out_err;
+	}
+	pthread_setname_np(ctx->reload_thread, "gwproxy-reload");
+	ctx->reload_running = true;
 	return 0;
 
 out_err:
+	if (ctx->reload_efd >= 0) {
+		__sys_close(ctx->reload_efd);
+		ctx->reload_efd = -1;
+	}
 	__sys_close(ctx->ino_fd);
 	ctx->ino_fd = -1;
 	return r;
 }
 
+/*
+ * Stop the reload thread. A reload in progress finishes first, so the stores
+ * are not freed under it.
+ */
 static void gwp_ctx_free_reload(struct gwp_ctx *ctx)
 {
-	free(ctx->ino_buf);
-	ctx->ino_buf = NULL;
+	if (ctx->reload_running) {
+		eventfd_t one = 1;
+
+		if (eventfd_write(ctx->reload_efd, one))
+			pr_err(&ctx->lh, "Failed to signal the reload thread: %s",
+			       strerror(errno));
+		pthread_join(ctx->reload_thread, NULL);
+		ctx->reload_running = false;
+	}
+	if (ctx->reload_efd >= 0) {
+		__sys_close(ctx->reload_efd);
+		ctx->reload_efd = -1;
+	}
 	if (ctx->ino_fd >= 0) {
 		__sys_close(ctx->ino_fd);
 		ctx->ino_fd = -1;

@@ -159,8 +159,10 @@ enum {
 	EV_BIT_TIMER			= (5ull << 48ull),
 	EV_BIT_CLIENT_SOCKS5		= (6ull << 48ull),
 	EV_BIT_DNS_QUERY		= (7ull << 48ull),
-	/* inotify watch for the auth and ACL files (worker 0 only). */
-	EV_BIT_RELOAD_FILES		= (8ull << 48ull),
+	/*
+	 * 8 was the inotify watch for the auth and ACL files, now polled by
+	 * the reload thread instead of worker 0.
+	 */
 
 	/*
 	 * Raw DNS resolver socket (--raw-dns), epoll only. Values 9-21 belong
@@ -175,7 +177,7 @@ enum {
 	 */
 	EV_BIT_UDP_RELAY		= (22ull << 48ull),
 
-	/* 25 was the ACL file's own inotify watch, now EV_BIT_RELOAD_FILES. */
+	/* 25 was the ACL file's own inotify watch. */
 
 	/*
 	 * This ev_bit is used for user_data masking during protocol
@@ -210,7 +212,6 @@ enum {
 	 * Only used by io_uring.
 	 */
 	EV_BIT_IOU_DNS_QUERY		= EV_BIT_DNS_QUERY,
-	EV_BIT_IOU_RELOAD_FILES		= EV_BIT_RELOAD_FILES,
 	EV_BIT_IOU_TIMER		= EV_BIT_TIMER,
 	EV_BIT_IOU_ACCEPT		= EV_BIT_ACCEPT,
 	EV_BIT_IOU_CLIENT_PROT		= EV_BIT_CLIENT_SOCKS5,
@@ -844,10 +845,14 @@ struct gwp_ctx {
 	/*
 	 * One inotify instance watching the auth file and the ACL file (their
 	 * parent directories, see add_reload_watch()); -1 when neither is
-	 * configured. @ino_buf holds GWP_INO_BUF_SIZE bytes.
+	 * configured. @reload_thread polls it and reloads the files, off the
+	 * workers; @reload_efd tells it to exit. @reload_running: the thread
+	 * was started and still needs a join.
 	 */
 	int				ino_fd;
-	char				*ino_buf;
+	int				reload_efd;
+	pthread_t			reload_thread;
+	bool				reload_running;
 	/* ACL rule store. Global to all proxy modes, unlike @auth which is
 	 * prot-only. @acl_watched: loaded from --acl-file (so reloadable),
 	 * not the built-in default rules. */
@@ -981,19 +986,6 @@ bool gwp_ctx_outgoing_family_ok(const struct gwp_ctx *ctx,
 int gwp_get_orig_dst(int fd, const struct gwp_sockaddr *client,
 		     struct gwp_sockaddr *dst);
 const char *ip_to_str(const struct gwp_sockaddr *gs);
-
-/*
- * Hot reload of the auth and ACL files. Worker 0 reads ctx->ino_fd into
- * ctx->ino_buf (GWP_INO_BUF_SIZE bytes: room for a burst of records, so one
- * read drains it), gwp_reload_events() turns the records into the GWP_RELOAD_*
- * files they name, and gwp_ctx_reload_files() reloads each of those once.
- */
-#define GWP_INO_BUF_SIZE	4096
-#define GWP_RELOAD_AUTH		(1u << 0)
-#define GWP_RELOAD_ACL		(1u << 1)
-unsigned gwp_reload_events(const struct gwp_ctx *ctx, const void *buf,
-			   size_t len);
-void gwp_ctx_reload_files(struct gwp_ctx *ctx, unsigned flags);
 
 /* Monotonic seconds, at the coarse clock's resolution (a few ms). */
 static inline uint32_t gwp_now_sec(void)
