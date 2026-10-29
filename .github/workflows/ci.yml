@@ -171,67 +171,63 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-  # Temporarily disabled: gitlab.alpinelinux.org is unreachable, and
-  # jirutka/setup-alpine downloads apk.static from it, so this job
-  # fails before building anything. Uncomment once it is back.
-  #
-  # alpine-musl-build:
-  #   needs: get_commit_list
-  #   runs-on: ubuntu-24.04
-  #   strategy:
-  #     matrix:
-  #       commit: ${{ fromJson(needs.get_commit_list.outputs.commit_list) }}
-  #
-  #   steps:
-  #     - name: Checkout source
-  #       uses: actions/checkout@v4
-  #       with:
-  #         fetch-depth: 0
-  #
-  #     - name: Checkout commit
-  #       run: |
-  #         git checkout ${{ matrix.commit }};
-  #
-  #     - name: Setup Alpine Environment
-  #       uses: jirutka/setup-alpine@v1
-  #       with:
-  #         branch: v3.15
-  #
-  #     - name: Display Alpine version
-  #       shell: alpine.sh {0}
-  #       run: cat /etc/alpine-release;
-  #
-  #     - name: Install build dependencies
-  #       shell: alpine.sh --root {0}
-  #       run: |
-  #         # Bootstrap only: bash is what runs the CI script, the script
-  #         # installs the actual build dependencies so that the package list
-  #         # travels with the commit under test.
-  #         apk add --no-cache bash;
-  #         ./.github/scripts/ci.sh alpine-deps;
-  #
-  #     - name: Build
-  #       shell: alpine.sh {0}
-  #       run: |
-  #         ./.github/scripts/ci.sh alpine-build;
-  #
-  #     # This job runs the suite too, so it loses the same evidence. Uploaded
-  #     # from the host rather than the chroot -- the workspace is shared.
-  #     - name: Upload test logs
-  #       if: failure()
-  #       uses: actions/upload-artifact@v4
-  #       with:
-  #         name: test-logs-alpine-${{matrix.commit}}
-  #         path: |
-  #           .test-out/
-  #           config.make
-  #           config.h
-  #         # .test-out is a dot directory and upload-artifact skips hidden
-  #         # paths unless told otherwise. Without this the step still goes
-  #         # green, on an artifact holding only the two config files.
-  #         include-hidden-files: true
-  #         if-no-files-found: ignore
-  #         retention-days: 14
+  alpine-musl-build:
+    needs: get_commit_list
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        commit: ${{ fromJson(needs.get_commit_list.outputs.commit_list) }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout commit
+        run: |
+          git checkout ${{ matrix.commit }};
+
+      - name: Setup Alpine Environment
+        uses: jirutka/setup-alpine@v1
+        with:
+          branch: v3.15
+
+      - name: Display Alpine version
+        shell: alpine.sh {0}
+        run: cat /etc/alpine-release;
+
+      - name: Install build dependencies
+        shell: alpine.sh --root {0}
+        run: |
+          # Bootstrap only: bash is what runs the CI script, the script
+          # installs the actual build dependencies so that the package list
+          # travels with the commit under test.
+          apk add --no-cache bash;
+          ./.github/scripts/ci.sh alpine-deps;
+
+      - name: Build
+        shell: alpine.sh {0}
+        run: |
+          ./.github/scripts/ci.sh alpine-build;
+
+      # This job runs the suite too, so it loses the same evidence. Uploaded
+      # from the host rather than the chroot -- the workspace is shared.
+      - name: Upload test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-alpine-${{matrix.commit}}
+          path: |
+            .test-out/
+            config.make
+            config.h
+          # .test-out is a dot directory and upload-artifact skips hidden
+          # paths unless told otherwise. Without this the step still goes
+          # green, on an artifact holding only the two config files.
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 14
 
   codespell:
     needs: get_commit_list
