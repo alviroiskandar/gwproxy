@@ -1925,21 +1925,37 @@ static bool tls_close_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 static int iou_forward_progress(struct gwp_wrk __unused *w,
 				struct gwp_conn_pair *gcp)
 {
+	bool shut_client = false, shut_target = false, done;
+
 	if (gcp->target.rd_eof && gcp->target.len == 0 && !gcp->client.wr_shut) {
 #ifdef CONFIG_HTTPS
 		if (client_is_tls(gcp) && !tls_close_client(w, gcp))
 			return 0;
 #endif
-		__sys_shutdown(gcp->client.fd, SHUT_WR);
+		shut_client = true;
 		gcp->client.wr_shut = true;
 	}
 
 	if (gcp->client.rd_eof && gcp->client.len == 0 && !gcp->target.wr_shut) {
-		__sys_shutdown(gcp->target.fd, SHUT_WR);
+		shut_target = true;
 		gcp->target.wr_shut = true;
 	}
 
-	if (gcp->client.wr_shut && gcp->target.wr_shut)
+	/*
+	 * Once both directions are done the pair is torn down, and closing
+	 * its sockets sends the FINs. A shutdown() right before that close
+	 * only costs a syscall, provided nothing is left unread on the
+	 * socket: close() answers unread data with an RST instead of a FIN.
+	 * Here a write side is shut only after the other socket's read side
+	 * reached EOF, so when both are done both sockets have been read to
+	 * EOF; the test is kept explicit, as in the epoll loop.
+	 */
+	done = gcp->client.wr_shut && gcp->target.wr_shut;
+	if (shut_client && !(done && gcp->client.rd_eof))
+		__sys_shutdown(gcp->client.fd, SHUT_WR);
+	if (shut_target && !(done && gcp->target.rd_eof))
+		__sys_shutdown(gcp->target.fd, SHUT_WR);
+	if (done)
 		return -ECONNRESET;
 
 	return 0;
