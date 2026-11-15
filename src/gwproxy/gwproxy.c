@@ -11,6 +11,7 @@
 #include <gwproxy/upstream.h>
 #include <gwproxy/common.h>
 #include <gwproxy/log.h>
+#include <gwproxy/rand.h>
 #include <gwproxy/acl.h>
 #include <gwproxy/ev/epoll.h>
 #ifdef CONFIG_IO_URING
@@ -38,9 +39,6 @@
 #include <fcntl.h>
 #include <sys/types.h>
 #include <sys/socket.h>
-#ifdef CONFIG_HAVE_GETRANDOM
-#include <sys/random.h>
-#endif
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <net/if.h>
@@ -3322,11 +3320,8 @@ static uint32_t pool_pick_random(void __unused *arg)
 		struct timespec ts;
 		uint32_t seed = 0;
 
-#ifdef CONFIG_HAVE_GETRANDOM
-		if (getrandom(&seed, sizeof(seed), GRND_NONBLOCK) !=
-		    (ssize_t)sizeof(seed))
+		if (!gwp_getrandom(&seed, sizeof(seed), GRND_NONBLOCK))
 			seed = 0;
-#endif
 		if (!seed) {
 			clock_gettime(CLOCK_MONOTONIC, &ts);
 			seed = (uint32_t)ts.tv_nsec ^ (uint32_t)ts.tv_sec;

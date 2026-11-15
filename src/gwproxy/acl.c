@@ -17,14 +17,12 @@
 #include <stdatomic.h>
 #include <sched.h>
 #include <time.h>
-#ifdef CONFIG_HAVE_GETRANDOM
-#include <sys/random.h>
-#endif
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <dirent.h>
 #include <fnmatch.h>
+#include <gwproxy/rand.h>
 
 #ifdef CONFIG_PCRE
 #include <pcre2.h>
@@ -3379,12 +3377,10 @@ static int index_chain(struct gwp_acl_ruleset *rs, struct acl_chain *c,
 static uint64_t index_seed(const void *salt)
 {
 	struct timespec ts;
-#ifdef CONFIG_HAVE_GETRANDOM
 	uint64_t seed;
 
-	if (getrandom(&seed, sizeof(seed), GRND_NONBLOCK) == sizeof(seed))
+	if (gwp_getrandom(&seed, sizeof(seed), GRND_NONBLOCK))
 		return seed;
-#endif
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return mix64((uint64_t)ts.tv_nsec ^ ((uint64_t)ts.tv_sec << 32) ^
 		     (uint64_t)(uintptr_t)salt);

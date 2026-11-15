@@ -14,9 +14,7 @@
 #include <unistd.h>
 #include <endian.h>
 #include <sys/types.h>
-#ifdef CONFIG_HAVE_GETRANDOM
-#include <sys/random.h>
-#endif
+#include <gwproxy/rand.h>
 
 /*
  * A random 128-bit key for gwp_siphash13(), so an attacker cannot tell
@@ -33,10 +31,8 @@ static inline void gwp_dns_gen_hash_key(uint64_t key[2])
 {
 	uint64_t s;
 
-#ifdef CONFIG_HAVE_GETRANDOM
-	if (getrandom(key, 2 * sizeof(*key), 0) == (ssize_t)(2 * sizeof(*key)))
+	if (gwp_getrandom(key, 2 * sizeof(*key), 0))
 		return;
-#endif
 
 	s = (uint64_t)time(NULL);
 	s ^= (uint64_t)getpid() * 0x9e3779b97f4a7c15ULL;
