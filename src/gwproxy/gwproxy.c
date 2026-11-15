@@ -439,6 +439,21 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 			##__VA_ARGS__);					\
 		goto einval;						\
 	} while (0)
+	/*
+	 * Macros, not functions: each holds a case label of the switch
+	 * below and jumps to einval on a bad value. Taking &cfg->fld keeps
+	 * the type check of opt_int()'s int * and opt_bool()'s bool *.
+	 */
+	#define OPT_INT_CASE(ch, lo, hi, fld)				\
+	case ch:							\
+		if (opt_int(c, optarg, lo, hi, &cfg->fld))		\
+			goto einval;					\
+		break
+	#define OPT_BOOL_CASE(ch, fld)					\
+	case ch:							\
+		if (opt_bool(c, optarg, &cfg->fld))			\
+			goto einval;					\
+		break
 	#define NR_OPTS ((sizeof(long_opts) / sizeof(long_opts[0])) - 1)
 	char short_opts[(NR_OPTS * 2) + 1], *p;
 	size_t i;
@@ -477,26 +492,11 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 		case 't':
 			cfg->target = optarg;
 			break;
-		case 'S':
-			if (opt_bool(c, optarg, &cfg->as_socks5))
-				goto einval;
-			break;
-		case 'H':
-			if (opt_bool(c, optarg, &cfg->as_http))
-				goto einval;
-			break;
-		case 'U':
-			if (opt_bool(c, optarg, &cfg->udp_associate))
-				goto einval;
-			break;
-		case 'Q':
-			if (opt_bool(c, optarg, &cfg->prefer_ipv6))
-				goto einval;
-			break;
-		case 'o':
-			if (opt_int(c, optarg, INT_MIN, INT_MAX, &cfg->protocol_timeout))
-				goto einval;
-			break;
+		OPT_BOOL_CASE('S', as_socks5);
+		OPT_BOOL_CASE('H', as_http);
+		OPT_BOOL_CASE('U', udp_associate);
+		OPT_BOOL_CASE('Q', prefer_ipv6);
+		OPT_INT_CASE('o', INT_MIN, INT_MAX, protocol_timeout);
 		case 'A':
 			cfg->auth_file = optarg;
 			break;
@@ -513,63 +513,28 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 			else
 				OPT_FAIL("--outgoing-family must be any, ipv4 or ipv6.");
 			break;
-		case OPT_BIND_IPV6_ONLY:
-			if (opt_bool(c, optarg, &cfg->bind_ipv6_only))
-				goto einval;
-			break;
+		OPT_BOOL_CASE(OPT_BIND_IPV6_ONLY, bind_ipv6_only);
 		case OPT_ACL_ALLOW_ALL:
 			cfg->acl_allow_all = true;
 			break;
-		case OPT_WATCH_FILES:
-			if (opt_bool(c, optarg, &cfg->watch_files))
-				goto einval;
-			break;
-		case 'L':
-			if (opt_int(c, optarg, INT_MIN, INT_MAX, &cfg->dns_cache_secs))
-				goto einval;
-			break;
-		case OPT_DNS_CACHE_MAX_ENTRIES:
-			if (opt_int(c, optarg, INT_MIN, INT_MAX, &cfg->dns_cache_max_entries))
-				goto einval;
-			break;
-		case 'w':
-			if (opt_int(c, optarg, 1, GWP_MAX_WORKERS, &cfg->nr_workers))
-				goto einval;
-			break;
-		case 'W':
-			if (opt_int(c, optarg, 0, GWP_MAX_WORKERS, &cfg->nr_dns_workers))
-				goto einval;
-			break;
-		case 'c':
-			if (opt_int(c, optarg, INT_MIN, INT_MAX, &cfg->connect_timeout))
-				goto einval;
-			break;
+		OPT_BOOL_CASE(OPT_WATCH_FILES, watch_files);
+		OPT_INT_CASE('L', INT_MIN, INT_MAX, dns_cache_secs);
+		OPT_INT_CASE(OPT_DNS_CACHE_MAX_ENTRIES, INT_MIN, INT_MAX,
+			     dns_cache_max_entries);
+		OPT_INT_CASE('w', 1, GWP_MAX_WORKERS, nr_workers);
+		OPT_INT_CASE('W', 0, GWP_MAX_WORKERS, nr_dns_workers);
+		OPT_INT_CASE('c', INT_MIN, INT_MAX, connect_timeout);
 		case OPT_IDLE_TIMEOUT:
 			if (opt_int(c, optarg, INT_MIN, INT_MAX, &cfg->idle_timeout))
 				goto einval;
 			if (cfg->idle_timeout < 0)
 				cfg->idle_timeout = 0;
 			break;
-		case OPT_MAX_CONNS_PER_IP:
-			if (opt_int(c, optarg, 0, INT_MAX, &cfg->max_conns_per_ip))
-				goto einval;
-			break;
-		case 'D':
-			if (opt_int(c, optarg, INT_MIN, INT_MAX, &cfg->connect_attempt_delay))
-				goto einval;
-			break;
-		case 'T':
-			if (opt_int(c, optarg, INT_MIN, INT_MAX, &cfg->target_buf_size))
-				goto einval;
-			break;
-		case 'C':
-			if (opt_int(c, optarg, INT_MIN, INT_MAX, &cfg->client_buf_size))
-				goto einval;
-			break;
-		case 'd':
-			if (opt_bool(c, optarg, &cfg->tcp_nodelay))
-				goto einval;
-			break;
+		OPT_INT_CASE(OPT_MAX_CONNS_PER_IP, 0, INT_MAX, max_conns_per_ip);
+		OPT_INT_CASE('D', INT_MIN, INT_MAX, connect_attempt_delay);
+		OPT_INT_CASE('T', INT_MIN, INT_MAX, target_buf_size);
+		OPT_INT_CASE('C', INT_MIN, INT_MAX, client_buf_size);
+		OPT_BOOL_CASE('d', tcp_nodelay);
 		case 'K':
 			/*
 			 * --tcp-quickack never did anything: no TCP_QUICKACK was
@@ -579,26 +544,11 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 			 */
 			fprintf(stderr, "Warning: --tcp-quickack has no effect and is ignored\n");
 			break;
-		case 'k':
-			if (opt_bool(c, optarg, &cfg->tcp_keepalive))
-				goto einval;
-			break;
-		case 'i':
-			if (opt_int(c, optarg, INT_MIN, INT_MAX, &cfg->tcp_keepidle))
-				goto einval;
-			break;
-		case 'l':
-			if (opt_int(c, optarg, INT_MIN, INT_MAX, &cfg->tcp_keepintvl))
-				goto einval;
-			break;
-		case 'g':
-			if (opt_int(c, optarg, INT_MIN, INT_MAX, &cfg->tcp_keepcnt))
-				goto einval;
-			break;
-		case 'm':
-			if (opt_int(c, optarg, INT_MIN, INT_MAX, &cfg->log_level))
-				goto einval;
-			break;
+		OPT_BOOL_CASE('k', tcp_keepalive);
+		OPT_INT_CASE('i', INT_MIN, INT_MAX, tcp_keepidle);
+		OPT_INT_CASE('l', INT_MIN, INT_MAX, tcp_keepintvl);
+		OPT_INT_CASE('g', INT_MIN, INT_MAX, tcp_keepcnt);
+		OPT_INT_CASE('m', INT_MIN, INT_MAX, log_level);
 		case 'f':
 			cfg->log_file = optarg;
 			break;
@@ -622,10 +572,7 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 		case 'I':
 			cfg->bind_iface = optarg;
 			break;
-		case 'R':
-			if (opt_bool(c, optarg, &cfg->as_transparent))
-				goto einval;
-			break;
+		OPT_BOOL_CASE('R', as_transparent);
 #ifdef CONFIG_HTTPS
 		case 'E':
 			cfg->tls_cert = optarg;
@@ -640,10 +587,7 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 		case 'j':
 			cfg->dns_servers = optarg;
 			break;
-		case 'r':
-			if (opt_bool(c, optarg, &cfg->use_raw_dns))
-				goto einval;
-			break;
+		OPT_BOOL_CASE('r', use_raw_dns);
 		default:
 			fprintf(stderr, "Unknown option: %c\n", c);
 			show_help(argv[0]);
@@ -743,6 +687,8 @@ einval:
 	fprintf(stderr, "\n");
 	show_help(argv[0]);
 	return -EINVAL;
+	#undef OPT_BOOL_CASE
+	#undef OPT_INT_CASE
 	#undef OPT_FAIL
 	#undef ERR_WRAP
 }
