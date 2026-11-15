@@ -31,6 +31,14 @@
 #define noinline	__attribute__((__noinline__))
 #endif
 
+/*
+ * The number of elements of the array @a. A macro: it is a compile-time
+ * constant, for an array of any type.
+ */
+#ifndef ARRAY_SIZE
+#define ARRAY_SIZE(a)	(sizeof(a) / sizeof((a)[0]))
+#endif
+
 #ifdef __CHECKER__
 #define __must_hold(x) __attribute__((context(x,1,1)))
 #define __acquires(x)  __attribute__((context(x,0,1)))
