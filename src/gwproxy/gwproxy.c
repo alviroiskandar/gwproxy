@@ -5778,6 +5778,20 @@ static int gwp_http_queue_reply(struct gwp_conn *t,
 	return 0;
 }
 
+/*
+ * Take the pair's one final answer: false when an earlier failure or refusal
+ * has already given it (see gwp_conn_fail_reply()), otherwise mark it given
+ * and the client's reply as its last.
+ */
+static inline bool gwp_conn_claim_final_reply(struct gwp_conn_pair *gcp)
+{
+	if (gcp->flags & GWP_CONN_FLAG_FAIL_REPLIED)
+		return false;
+	gcp->flags |= GWP_CONN_FLAG_FAIL_REPLIED;
+	gcp->client.last_reply = true;
+	return true;
+}
+
 int gwp_conn_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int err)
 {
 	/*
@@ -5795,10 +5809,8 @@ int gwp_conn_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int err)
 	 * would follow it, or be written over it. The SOCKS5 reply builder
 	 * refuses a second reply by its state; the HTTP ones would not.
 	 */
-	if (gcp->flags & GWP_CONN_FLAG_FAIL_REPLIED)
+	if (!gwp_conn_claim_final_reply(gcp))
 		return 0;
-	gcp->flags |= GWP_CONN_FLAG_FAIL_REPLIED;
-	gcp->client.last_reply = true;
 	if (timed_out)
 		err = -ETIMEDOUT;
 
@@ -5851,10 +5863,8 @@ int gwp_dns_start_failed(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 int gwp_acl_reject_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	/* A final answer as well, see gwp_conn_fail_reply(). */
-	if (gcp->flags & GWP_CONN_FLAG_FAIL_REPLIED)
+	if (!gwp_conn_claim_final_reply(gcp))
 		return -EACCES;
-	gcp->flags |= GWP_CONN_FLAG_FAIL_REPLIED;
-	gcp->client.last_reply = true;
 
 	pr_info(&w->ctx->lh, "ACL denied target %s for client %s (idx=%u)",
 		gwp_upstream_dst_str(gcp), ip_to_str(&gcp->client_addr),
