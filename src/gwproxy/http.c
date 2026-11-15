@@ -1817,20 +1817,38 @@ int gwp_http_fwd_res_input(struct gwp_http_conn *hc, const void *in,
 	return r;
 }
 
+/*
+ * Copy the fixed reply @resp of @len bytes to @out if it fits; nothing is
+ * written when it does not.
+ */
+static int put_reply(void *out, size_t out_cap, const char *resp, size_t len)
+{
+	if (out_cap < len)
+		return -ENOBUFS;
+
+	memcpy(out, resp, len);
+	return (int)len;
+}
+
+/*
+ * A body-less reply that ends the connection. A macro, not a function, so the
+ * status line is spliced into one string literal at compile time.
+ */
+#define FIXED_REPLY(status)		\
+	"HTTP/1.1 " status "\r\n"	\
+	"Content-Length: 0\r\n"		\
+	"Connection: close\r\n"		\
+	"\r\n"
+
 int gwp_http_build_connect_reply(const struct gwp_http_conn *hc, void *out,
 				 size_t out_cap)
 {
 	static const char ok[] = "HTTP/1.1 200 OK\r\n\r\n";
-	size_t len = sizeof(ok) - 1;
 
 	if (hc->is_forward)
 		return 0;
 
-	if (out_cap < len)
-		return -ENOBUFS;
-
-	memcpy(out, ok, len);
-	return (int)len;
+	return put_reply(out, out_cap, ok, sizeof(ok) - 1);
 }
 
 int gwp_http_build_auth_required_reply(void *out, size_t out_cap)
@@ -1841,157 +1859,71 @@ int gwp_http_build_auth_required_reply(void *out, size_t out_cap)
 		"Content-Length: 0\r\n"
 		"Connection: close\r\n"
 		"\r\n";
-	size_t len = sizeof(resp) - 1;
 
-	if (out_cap < len)
-		return -ENOBUFS;
-
-	memcpy(out, resp, len);
-	return (int)len;
+	return put_reply(out, out_cap, resp, sizeof(resp) - 1);
 }
 
 int gwp_http_build_bad_request_reply(void *out, size_t out_cap)
 {
-	static const char resp[] =
-		"HTTP/1.1 400 Bad Request\r\n"
-		"Content-Length: 0\r\n"
-		"Connection: close\r\n"
-		"\r\n";
-	size_t len = sizeof(resp) - 1;
+	static const char resp[] = FIXED_REPLY("400 Bad Request");
 
-	if (out_cap < len)
-		return -ENOBUFS;
-
-	memcpy(out, resp, len);
-	return (int)len;
+	return put_reply(out, out_cap, resp, sizeof(resp) - 1);
 }
 
 int gwp_http_build_forbidden_reply(void *out, size_t out_cap)
 {
-	static const char resp[] =
-		"HTTP/1.1 403 Forbidden\r\n"
-		"Content-Length: 0\r\n"
-		"Connection: close\r\n"
-		"\r\n";
-	size_t len = sizeof(resp) - 1;
+	static const char resp[] = FIXED_REPLY("403 Forbidden");
 
-	if (out_cap < len)
-		return -ENOBUFS;
-
-	memcpy(out, resp, len);
-	return (int)len;
+	return put_reply(out, out_cap, resp, sizeof(resp) - 1);
 }
 
 int gwp_http_build_bad_gateway_reply(void *out, size_t out_cap)
 {
-	static const char resp[] =
-		"HTTP/1.1 502 Bad Gateway\r\n"
-		"Content-Length: 0\r\n"
-		"Connection: close\r\n"
-		"\r\n";
-	size_t len = sizeof(resp) - 1;
+	static const char resp[] = FIXED_REPLY("502 Bad Gateway");
 
-	if (out_cap < len)
-		return -ENOBUFS;
-
-	memcpy(out, resp, len);
-	return (int)len;
+	return put_reply(out, out_cap, resp, sizeof(resp) - 1);
 }
 
 int gwp_http_build_gateway_timeout_reply(void *out, size_t out_cap)
 {
-	static const char resp[] =
-		"HTTP/1.1 504 Gateway Timeout\r\n"
-		"Content-Length: 0\r\n"
-		"Connection: close\r\n"
-		"\r\n";
-	size_t len = sizeof(resp) - 1;
+	static const char resp[] = FIXED_REPLY("504 Gateway Timeout");
 
-	if (out_cap < len)
-		return -ENOBUFS;
-
-	memcpy(out, resp, len);
-	return (int)len;
+	return put_reply(out, out_cap, resp, sizeof(resp) - 1);
 }
 
 int gwp_http_build_too_large_reply(void *out, size_t out_cap)
 {
-	static const char resp[] =
-		"HTTP/1.1 431 Request Header Fields Too Large\r\n"
-		"Content-Length: 0\r\n"
-		"Connection: close\r\n"
-		"\r\n";
-	size_t len = sizeof(resp) - 1;
+	static const char resp[] = FIXED_REPLY("431 Request Header Fields Too Large");
 
-	if (out_cap < len)
-		return -ENOBUFS;
-
-	memcpy(out, resp, len);
-	return (int)len;
+	return put_reply(out, out_cap, resp, sizeof(resp) - 1);
 }
 
 int gwp_http_build_options_reply(void *out, size_t out_cap)
 {
-	static const char resp[] =
-		"HTTP/1.1 200 OK\r\n"
-		"Content-Length: 0\r\n"
-		"Connection: close\r\n"
-		"\r\n";
-	size_t len = sizeof(resp) - 1;
+	static const char resp[] = FIXED_REPLY("200 OK");
 
-	if (out_cap < len)
-		return -ENOBUFS;
-
-	memcpy(out, resp, len);
-	return (int)len;
+	return put_reply(out, out_cap, resp, sizeof(resp) - 1);
 }
 
 int gwp_http_build_not_implemented_reply(void *out, size_t out_cap)
 {
-	static const char resp[] =
-		"HTTP/1.1 501 Not Implemented\r\n"
-		"Content-Length: 0\r\n"
-		"Connection: close\r\n"
-		"\r\n";
-	size_t len = sizeof(resp) - 1;
+	static const char resp[] = FIXED_REPLY("501 Not Implemented");
 
-	if (out_cap < len)
-		return -ENOBUFS;
-
-	memcpy(out, resp, len);
-	return (int)len;
+	return put_reply(out, out_cap, resp, sizeof(resp) - 1);
 }
 
 int gwp_http_build_bad_version_reply(void *out, size_t out_cap)
 {
-	static const char resp[] =
-		"HTTP/1.1 505 HTTP Version Not Supported\r\n"
-		"Content-Length: 0\r\n"
-		"Connection: close\r\n"
-		"\r\n";
-	size_t len = sizeof(resp) - 1;
+	static const char resp[] = FIXED_REPLY("505 HTTP Version Not Supported");
 
-	if (out_cap < len)
-		return -ENOBUFS;
-
-	memcpy(out, resp, len);
-	return (int)len;
+	return put_reply(out, out_cap, resp, sizeof(resp) - 1);
 }
 
 int gwp_http_build_uri_too_long_reply(void *out, size_t out_cap)
 {
-	static const char resp[] =
-		"HTTP/1.1 414 URI Too Long\r\n"
-		"Content-Length: 0\r\n"
-		"Connection: close\r\n"
-		"\r\n";
-	size_t len = sizeof(resp) - 1;
+	static const char resp[] = FIXED_REPLY("414 URI Too Long");
 
-	if (out_cap < len)
-		return -ENOBUFS;
-
-	memcpy(out, resp, len);
-	return (int)len;
+	return put_reply(out, out_cap, resp, sizeof(resp) - 1);
 }
 
 /* Base64-encode @in into the NUL-terminated @out (RFC 4648). */
