@@ -201,17 +201,6 @@ static inline int __sys_close(int fd)
 	return (int) __do_syscall1(__NR_close, fd);
 }
 
-static inline ssize_t __sys_recv(int sockfd, void *buf, size_t len, int flags)
-{
-	return __sys_recvfrom(sockfd, buf, len, flags, NULL, NULL);
-}
-
-static inline ssize_t __sys_send(int sockfd, const void *buf, size_t len,
-				 int flags)
-{
-	return __sys_sendto(sockfd, buf, len, flags, NULL, 0);
-}
-
 static inline int __sys_accept4(int sockfd, struct sockaddr *addr,
 				 socklen_t *addrlen, int flags)
 {
@@ -353,17 +342,6 @@ static inline int __sys_close(int fd)
 	return (r < 0) ? -errno : r;
 }
 
-static inline ssize_t __sys_recv(int sockfd, void *buf, size_t len, int flags)
-{
-	return __sys_recvfrom(sockfd, buf, len, flags, NULL, NULL);
-}
-
-static inline ssize_t __sys_send(int sockfd, const void *buf, size_t len,
-				 int flags)
-{
-	return __sys_sendto(sockfd, buf, len, flags, NULL, 0);
-}
-
 static inline int __sys_accept4(int sockfd, struct sockaddr *addr,
 				 socklen_t *addrlen, int flags)
 {
@@ -462,5 +440,17 @@ static inline pid_t __sys_gettid(void)
 	return (pid_t)syscall(__NR_gettid);
 }
 #endif /* #endif __x86_64__ */
+
+/* Built on the wrappers above, the same for either branch. */
+static inline ssize_t __sys_recv(int sockfd, void *buf, size_t len, int flags)
+{
+	return __sys_recvfrom(sockfd, buf, len, flags, NULL, NULL);
+}
+
+static inline ssize_t __sys_send(int sockfd, const void *buf, size_t len,
+				 int flags)
+{
+	return __sys_sendto(sockfd, buf, len, flags, NULL, 0);
+}
 
 #endif /* #ifndef GWPROXY_SYSCALL_H */
