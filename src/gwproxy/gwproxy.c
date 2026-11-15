@@ -5521,8 +5521,7 @@ static int apply_conn_bind(struct gwp_wrk *w, int fd,
 			return -EAFNOSUPPORT;
 		}
 
-		len = (s->sa.sa_family == AF_INET) ? sizeof(struct sockaddr_in)
-						   : sizeof(struct sockaddr_in6);
+		len = gwp_sockaddr_len(s);
 
 		/*
 		 * With no port asked for, leave choosing one to connect(), which
@@ -5649,8 +5648,7 @@ int gwp_create_sock_target(struct gwp_wrk *w, struct gwp_sockaddr *addr,
 		return fd;
 	}
 
-	len = (addr->sa.sa_family == AF_INET) ? sizeof(struct sockaddr_in)
-					      : sizeof(struct sockaddr_in6);
+	len = gwp_sockaddr_len(addr);
 	r = __sys_connect(fd, &addr->sa, len);
 	if (likely(r)) {
 		if (r != -EINPROGRESS) {

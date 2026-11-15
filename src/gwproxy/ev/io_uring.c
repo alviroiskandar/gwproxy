@@ -647,7 +647,6 @@ static int start_connect_attempt(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	struct gwp_ctx *ctx = w->ctx;
 	struct gwp_sockaddr *ca;
 	struct io_uring_sqe *s;
-	socklen_t addr_len;
 	int fd;
 
 	/* Plain forwarding, see gwp_target_is_self(). */
@@ -676,13 +675,8 @@ static int start_connect_attempt(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	if (!gcp->upstream)
 		ca = &gcp->attempt_addr[slot];
 
-	if (ca->sa.sa_family == AF_INET)
-		addr_len = sizeof(struct sockaddr_in);
-	else
-		addr_len = sizeof(struct sockaddr_in6);
-
 	s = get_sqe_nofail(w);
-	io_uring_prep_connect(s, fd, &ca->sa, addr_len);
+	io_uring_prep_connect(s, fd, &ca->sa, gwp_sockaddr_len(ca));
 	io_uring_sqe_set_data(s, gcp);
 	s->user_data |= EV_BIT_TARGET_ATTEMPT + ((uint64_t)slot << 48ull);
 	get_gcp(gcp);

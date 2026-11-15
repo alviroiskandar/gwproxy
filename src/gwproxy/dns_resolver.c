@@ -53,16 +53,13 @@ static int parse_srv_addr(struct gwp_dns_resolver *gdr, const char *srv_addr)
 static int open_query_sock(struct gwp_dns_resolver *res)
 {
 	static const int type = SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC;
-	socklen_t len;
 	int f, r;
 
 	f = __sys_socket(res->srv.sa.sa_family, type, 0);
 	if (f < 0)
 		return f;
 
-	len = res->srv.sa.sa_family == AF_INET6 ? sizeof(res->srv.i6)
-						 : sizeof(res->srv.i4);
-	r = __sys_connect(f, &res->srv.sa, len);
+	r = __sys_connect(f, &res->srv.sa, gwp_sockaddr_len(&res->srv));
 	if (r < 0) {
 		__sys_close(f);
 		return r;

@@ -18,6 +18,15 @@ struct gwp_sockaddr {
 };
 
 /*
+ * The length of @a for bind(), connect() and sendmsg(). The caller holds an
+ * AF_INET or AF_INET6 address; any other family gets the IPv6 length.
+ */
+static inline socklen_t gwp_sockaddr_len(const struct gwp_sockaddr *a)
+{
+	return a->sa.sa_family == AF_INET ? sizeof(a->i4) : sizeof(a->i6);
+}
+
+/*
  * Convert address string to network address
  *
  * @param str source
