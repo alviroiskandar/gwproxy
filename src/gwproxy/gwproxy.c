@@ -6294,28 +6294,22 @@ int gwp_socks5_prepare_target_addr(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	memset(ta, 0, sizeof(*ta));
 	switch (dst->ver) {
 	case GWP_SOCKS5_ATYP_IPV4:
-		memcpy(&ta->i4.sin_addr, &dst->ip4, 4);
-		ta->i4.sin_port = dst->port;
-		ta->i4.sin_family = AF_INET;
-		gwp_conn_set_single_candidate(gcp, ta);
-		r = conn_pick_upstream(w->ctx, gcp, NULL, ta, ntohs(dst->port));
-		if (r)
-			return pick_refused(w, gcp, r);
-		return 0;
+		gwp_sockaddr_set(ta, AF_INET, dst->ip4, dst->port);
+		break;
 	case GWP_SOCKS5_ATYP_IPV6:
-		memcpy(&ta->i6.sin6_addr, &dst->ip6, 16);
-		ta->i6.sin6_port = dst->port;
-		ta->i6.sin6_family = AF_INET6;
-		gwp_conn_set_single_candidate(gcp, ta);
-		r = conn_pick_upstream(w->ctx, gcp, NULL, ta, ntohs(dst->port));
-		if (r)
-			return pick_refused(w, gcp, r);
-		return 0;
+		gwp_sockaddr_set(ta, AF_INET6, dst->ip6, dst->port);
+		break;
 	case GWP_SOCKS5_ATYP_DOMAIN:
 		return socks5_prepare_target_addr_domain(w, gcp);
+	default:
+		return -ENOSYS;
 	}
 
-	return -ENOSYS;
+	gwp_conn_set_single_candidate(gcp, ta);
+	r = conn_pick_upstream(w->ctx, gcp, NULL, ta, ntohs(dst->port));
+	if (r)
+		return pick_refused(w, gcp, r);
+	return 0;
 }
 
 int gwp_socks5_handle_data(struct gwp_conn_pair *gcp)
@@ -7066,9 +7060,7 @@ int gwp_socks5_addr_to_sockaddr(const struct gwp_socks5_addr *a, int family,
 	switch (a->ver) {
 	case GWP_SOCKS5_ATYP_IPV4:
 		if (family == AF_INET) {
-			sa->i4.sin_family = AF_INET;
-			memcpy(&sa->i4.sin_addr, a->ip4, 4);
-			sa->i4.sin_port = a->port;
+			gwp_sockaddr_set(sa, AF_INET, a->ip4, a->port);
 			*slen = sizeof(sa->i4);
 			return 0;
 		}
@@ -7086,15 +7078,11 @@ int gwp_socks5_addr_to_sockaddr(const struct gwp_socks5_addr *a, int family,
 		if (family == AF_INET) {
 			if (!IN6_IS_ADDR_V4MAPPED((const struct in6_addr *)a->ip6))
 				return -EAFNOSUPPORT;
-			sa->i4.sin_family = AF_INET;
-			memcpy(&sa->i4.sin_addr, a->ip6 + 12, 4);
-			sa->i4.sin_port = a->port;
+			gwp_sockaddr_set(sa, AF_INET, a->ip6 + 12, a->port);
 			*slen = sizeof(sa->i4);
 			return 0;
 		}
-		sa->i6.sin6_family = AF_INET6;
-		memcpy(&sa->i6.sin6_addr, a->ip6, 16);
-		sa->i6.sin6_port = a->port;
+		gwp_sockaddr_set(sa, AF_INET6, a->ip6, a->port);
 		*slen = sizeof(sa->i6);
 		return 0;
 	default:

@@ -999,24 +999,6 @@ static uint32_t cache_bucket_count(uint32_t max_entries)
 _Static_assert(GWP_DNS_CACHE_MAX_ADDRS >= GWP_DNS_MAX_ADDRS,
 	       "the cache hands back fewer addresses than a lookup returns");
 
-static void fill_i4(struct gwp_sockaddr *addr, const struct in_addr *a,
-		    uint16_t port)
-{
-	memset(addr, 0, sizeof(*addr));
-	addr->i4.sin_family = AF_INET;
-	addr->i4.sin_port = htons(port);
-	addr->i4.sin_addr = *a;
-}
-
-static void fill_i6(struct gwp_sockaddr *addr, const struct in6_addr *a,
-		    uint16_t port)
-{
-	memset(addr, 0, sizeof(*addr));
-	addr->i6.sin6_family = AF_INET6;
-	addr->i6.sin6_port = htons(port);
-	addr->i6.sin6_addr = *a;
-}
-
 int gwp_dns_cache_lookup_list(struct gwp_dns_ctx *ctx, const char *name,
 			      uint16_t port, struct gwp_sockaddr *addrs,
 			      uint8_t cap, uint8_t *nr_addrs)
@@ -1047,14 +1029,18 @@ int gwp_dns_cache_lookup_list(struct gwp_dns_ctx *ctx, const char *name,
 	for (i = 0; n < cap && (i < nr_v4 || i < nr_v6); i++) {
 		if (v6_first) {
 			if (i < nr_v6)
-				fill_i6(&addrs[n++], &ca.i6[i], port);
+				gwp_sockaddr_set(&addrs[n++], AF_INET6,
+						 &ca.i6[i], htons(port));
 			if (i < nr_v4 && n < cap)
-				fill_i4(&addrs[n++], &ca.i4[i], port);
+				gwp_sockaddr_set(&addrs[n++], AF_INET,
+						 &ca.i4[i], htons(port));
 		} else {
 			if (i < nr_v4)
-				fill_i4(&addrs[n++], &ca.i4[i], port);
+				gwp_sockaddr_set(&addrs[n++], AF_INET,
+						 &ca.i4[i], htons(port));
 			if (i < nr_v6 && n < cap)
-				fill_i6(&addrs[n++], &ca.i6[i], port);
+				gwp_sockaddr_set(&addrs[n++], AF_INET6,
+						 &ca.i6[i], htons(port));
 		}
 	}
 

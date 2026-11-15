@@ -5,6 +5,7 @@
 #include <arpa/inet.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
 
 #ifndef GWP_NET_H
 #define GWP_NET_H
@@ -26,6 +27,26 @@ struct gwp_sockaddr {
 static inline socklen_t gwp_sockaddr_len(const struct gwp_sockaddr *a)
 {
 	return a->sa.sa_family == AF_INET ? sizeof(a->i4) : sizeof(a->i6);
+}
+
+/*
+ * Set @sa to the @family address at @ip (4 bytes for AF_INET, 16 for AF_INET6)
+ * and port @port_be, in network byte order. @sa is zeroed first, and any other
+ * family leaves it all zero without reading @ip.
+ */
+static inline void gwp_sockaddr_set(struct gwp_sockaddr *sa, int family,
+				    const void *ip, uint16_t port_be)
+{
+	memset(sa, 0, sizeof(*sa));
+	if (family == AF_INET) {
+		sa->i4.sin_family = AF_INET;
+		sa->i4.sin_port = port_be;
+		memcpy(&sa->i4.sin_addr, ip, 4);
+	} else if (family == AF_INET6) {
+		sa->i6.sin6_family = AF_INET6;
+		sa->i6.sin6_port = port_be;
+		memcpy(&sa->i6.sin6_addr, ip, 16);
+	}
 }
 
 /*

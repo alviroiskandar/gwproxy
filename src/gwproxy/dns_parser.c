@@ -108,21 +108,6 @@ static int calculate_question_len(const uint8_t *in, size_t in_len)
 	return  tot_len;
 }
 
-static void put_addr(struct gwp_sockaddr *sa, int family, const uint8_t *rdata,
-		     uint16_t port)
-{
-	memset(sa, 0, sizeof(*sa));
-	if (family == AF_INET6) {
-		sa->i6.sin6_family = AF_INET6;
-		sa->i6.sin6_port = htons(port);
-		memcpy(&sa->i6.sin6_addr, rdata, 16);
-	} else {
-		sa->i4.sin_family = AF_INET;
-		sa->i4.sin_port = htons(port);
-		memcpy(&sa->i4.sin_addr, rdata, 4);
-	}
-}
-
 int gwdns_parse_query(uint16_t txid, uint16_t port, const uint8_t *in,
 		      size_t in_len, struct gwp_sockaddr *addrs, uint8_t cap,
 		      uint8_t *nr_addrs)
@@ -233,13 +218,15 @@ int gwdns_parse_query(uint16_t txid, uint16_t port, const uint8_t *in,
 			if (rdlength != 4)
 				return -EINVAL;
 			if (n < cap)
-				put_addr(&addrs[n++], AF_INET, &in[idx], port);
+				gwp_sockaddr_set(&addrs[n++], AF_INET,
+						 &in[idx], htons(port));
 			break;
 		case TYPE_AAAA:
 			if (rdlength != 16)
 				return -EINVAL;
 			if (n < cap)
-				put_addr(&addrs[n++], AF_INET6, &in[idx], port);
+				gwp_sockaddr_set(&addrs[n++], AF_INET6,
+						 &in[idx], htons(port));
 			break;
 		case TYPE_CNAME:
 			break;

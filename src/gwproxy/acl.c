@@ -4366,31 +4366,24 @@ static void apply_dnat(struct gwp_acl_req *req, const struct gwp_acl_dnat *d)
 {
 	const struct gwp_sockaddr *base = req->target;
 	struct gwp_sockaddr out;
+	const void *ip = NULL;
 	uint16_t port;
 	int fam;
 
-	memset(&out, 0, sizeof(out));
 	fam = d->set_addr ? d->family : (base ? base->sa.sa_family : 0);
 	if (d->set_port)
 		port = d->port;
 	else
 		port = base ? gwp_sockaddr_port_h(base) : 0;
 
-	if (fam == AF_INET) {
-		out.i4.sin_family = AF_INET;
-		if (d->set_addr)
-			memcpy(&out.i4.sin_addr, d->addr, 4);
-		else
-			out.i4.sin_addr = base->i4.sin_addr;
-		out.i4.sin_port = htons(port);
-	} else if (fam == AF_INET6) {
-		out.i6.sin6_family = AF_INET6;
-		if (d->set_addr)
-			memcpy(&out.i6.sin6_addr, d->addr, 16);
-		else
-			out.i6.sin6_addr = base->i6.sin6_addr;
-		out.i6.sin6_port = htons(port);
-	}
+	/* Read only for AF_INET or AF_INET6: fam is 0 when base is NULL. */
+	if (d->set_addr)
+		ip = d->addr;
+	else if (fam == AF_INET)
+		ip = &base->i4.sin_addr;
+	else if (fam == AF_INET6)
+		ip = &base->i6.sin6_addr;
+	gwp_sockaddr_set(&out, fam, ip, htons(port));
 
 	req->dnat = out;
 	req->dnat_port = d->set_port ? d->port : 0;
