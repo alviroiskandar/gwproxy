@@ -20,20 +20,15 @@
  */
 static int copy_port(char *out, size_t size, const char *port)
 {
-	size_t i, l = strlen(port);
-	unsigned int v = 0;
+	size_t l = strlen(port);
+	uint16_t v;
 
 	if (!l || l >= size)
 		return -EINVAL;
 
 	if (port[0] >= '0' && port[0] <= '9') {
-		for (i = 0; i < l; i++) {
-			if (port[i] < '0' || port[i] > '9')
-				return -EINVAL;
-			v = v * 10 + (unsigned int)(port[i] - '0');
-			if (v > 65535)
-				return -EINVAL;
-		}
+		if (gwp_parse_port(port, &v))
+			return -EINVAL;
 	} else if (!((port[0] >= 'a' && port[0] <= 'z') ||
 		     (port[0] >= 'A' && port[0] <= 'Z'))) {
 		return -EINVAL;

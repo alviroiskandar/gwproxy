@@ -3,6 +3,7 @@
  */
 
 #include <arpa/inet.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
@@ -80,6 +81,30 @@ static inline uint16_t gwp_sockaddr_port(const struct gwp_sockaddr *a)
 static inline uint16_t gwp_sockaddr_port_h(const struct gwp_sockaddr *a)
 {
 	return ntohs(gwp_sockaddr_port(a));
+}
+
+/*
+ * Parse @s, a decimal port from 0 to 65535, into *@port: digits only, at least
+ * one, leading zeros allowed, no sign. Returns 0, or -EINVAL with *@port left
+ * as it was. Callers that refuse port 0 check that themselves.
+ */
+static inline int gwp_parse_port(const char *s, uint16_t *port)
+{
+	uint32_t v = 0;
+
+	if (!*s)
+		return -EINVAL;
+
+	for (; *s; s++) {
+		if (*s < '0' || *s > '9')
+			return -EINVAL;
+		v = v * 10 + (uint32_t)(*s - '0');
+		if (v > 65535)
+			return -EINVAL;
+	}
+
+	*port = (uint16_t)v;
+	return 0;
 }
 
 /*

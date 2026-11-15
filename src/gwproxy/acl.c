@@ -985,17 +985,6 @@ static int parse_u32(const char *s, uint32_t *out)
 	return 0;
 }
 
-/* Parse a decimal port (1..65535, or 0 for "ephemeral") into @out; -1 bad. */
-static int parse_port_num(const char *s, uint16_t *out)
-{
-	unsigned long v;
-
-	if (parse_num(s, false, 65535, &v))
-		return -1;
-	*out = (uint16_t)v;
-	return 0;
-}
-
 /*
  * Parse a -j BIND --to-source argument (a literal source address, optionally
  * with a port) into @out: "ip", "ip:port", "[v6]:port", or a bare IPv6 literal.
@@ -1027,7 +1016,7 @@ int gwp_acl_parse_bind_source(const char *s, struct gwp_sockaddr *out)
 			return -EINVAL;
 		s = end + 1;
 		if (*s == ':') {
-			if (parse_port_num(s + 1, &port))
+			if (gwp_parse_port(s + 1, &port))
 				return -EINVAL;
 		} else if (*s) {
 			return -EINVAL;
@@ -1052,7 +1041,7 @@ int gwp_acl_parse_bind_source(const char *s, struct gwp_sockaddr *out)
 			return -EINVAL;
 		memcpy(host, s, n);
 		host[n] = '\0';
-		if (parse_port_num(colon + 1, &port))
+		if (gwp_parse_port(colon + 1, &port))
 			return -EINVAL;
 	} else {
 		if (strlen(s) >= sizeof(host))
@@ -1342,12 +1331,9 @@ static int check_server_url(const char *url, bool *remote_dns, bool *creds,
 	}
 
 	if (*p == ':') {
-		unsigned long port = 0;
-		const char *d;
+		uint16_t port;
 
-		for (d = p + 1; *d >= '0' && *d <= '9' && port <= 65535; d++)
-			port = port * 10 + (unsigned long)(*d - '0');
-		if (d == p + 1 || *d || !port || port > 65535) {
+		if (gwp_parse_port(p + 1, &port) || !port) {
 			*why = "the port must be a number from 1 to 65535";
 			return -EINVAL;
 		}

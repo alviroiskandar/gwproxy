@@ -2928,7 +2928,6 @@ void gwp_ctx_iplim_put(struct gwp_ctx *ctx, const struct gwp_sockaddr *addr)
 static int upstream_dst_from_sockaddr(const struct gwp_sockaddr *sa,
 				      struct gwp_socks5_addr *out);
 static int upstream_target_init(struct gwp_ctx *ctx);
-static int parse_port(const char *s, uint16_t *port);
 
 /*
  * Fill the inputs of an OUTPUT request for @target (NULL when only a domain is
@@ -5932,7 +5931,7 @@ static int upstream_dst_from_hostport(const char *hostport,
 	if (!colon)
 		return -EINVAL;
 	*colon = '\0';
-	if (parse_port(colon + 1, &port) || !port)
+	if (gwp_parse_port(colon + 1, &port) || !port)
 		return -EINVAL;
 
 	host = buf;
@@ -7740,29 +7739,6 @@ static int http_reject_bad_version(struct gwp_conn_pair *gcp)
 	return -EPROTONOSUPPORT;
 }
 
-/*
- * A port as an HTTP authority carries it: decimal digits only, no sign, no
- * service name, at most 65535.
- */
-static int parse_port(const char *s, uint16_t *port)
-{
-	uint32_t v = 0;
-
-	if (!*s)
-		return -EINVAL;
-
-	for (; *s; s++) {
-		if (*s < '0' || *s > '9')
-			return -EINVAL;
-		v = v * 10 + (uint32_t)(*s - '0');
-		if (v > 65535)
-			return -EINVAL;
-	}
-
-	*port = (uint16_t)v;
-	return 0;
-}
-
 /* Resolve and connect to @host:@port, setting the HTTP connect/DNS state. */
 static int http_connect_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			       char *host, const char *port)
@@ -7774,7 +7750,7 @@ static int http_connect_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	 * The resolver takes the port as a number; a port that is not one
 	 * used to reach getaddrinfo() and come back as a 502.
 	 */
-	if (parse_port(port, &p))
+	if (gwp_parse_port(port, &p))
 		return http_reject_bad_request(gcp);
 
 	r = prepare_target_addr_domain(w, gcp, host, p);
