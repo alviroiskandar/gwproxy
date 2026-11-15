@@ -4372,13 +4372,6 @@ static bool rule_matches(struct gwp_acl_rule *r,
 			   statistic_match(r, q->upstream_only));
 }
 
-/* Read a sockaddr's port (host byte order) regardless of family. */
-static uint16_t sa_port(const struct gwp_sockaddr *sa)
-{
-	return ntohs(sa->sa.sa_family == AF_INET ? sa->i4.sin_port
-						 : sa->i6.sin6_port);
-}
-
 /*
  * Compute the effective rewritten destination for a matched DNAT rule into
  * @req->dnat. The address and port are taken from the rule where set, otherwise
@@ -4399,7 +4392,7 @@ static void apply_dnat(struct gwp_acl_req *req, const struct gwp_acl_dnat *d)
 	if (d->set_port)
 		port = d->port;
 	else
-		port = base ? sa_port(base) : 0;
+		port = base ? gwp_sockaddr_port_h(base) : 0;
 
 	if (fam == AF_INET) {
 		out.i4.sin_family = AF_INET;

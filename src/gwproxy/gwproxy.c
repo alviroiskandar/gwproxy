@@ -2925,13 +2925,6 @@ void gwp_ctx_iplim_put(struct gwp_ctx *ctx, const struct gwp_sockaddr *addr)
  * domain is known), it is allowed here; domain-based rules are applied
  * separately once wired in.
  */
-/* Host-order port of a sockaddr, regardless of family. */
-static uint16_t sa_port_h(const struct gwp_sockaddr *s)
-{
-	return ntohs(s->sa.sa_family == AF_INET ? s->i4.sin_port
-						: s->i6.sin6_port);
-}
-
 static int upstream_dst_from_sockaddr(const struct gwp_sockaddr *sa,
 				      struct gwp_socks5_addr *out);
 static int upstream_target_init(struct gwp_ctx *ctx);
@@ -2956,8 +2949,8 @@ static void acl_out_req(struct gwp_acl_req *req,
 	req->domain = domain;
 	req->user = user;
 	req->proto = proto;
-	req->dport = target ? sa_port_h(target) : 0;
-	req->sport = client ? sa_port_h(client) : 0;
+	req->dport = target ? gwp_sockaddr_port_h(target) : 0;
+	req->sport = client ? gwp_sockaddr_port_h(client) : 0;
 }
 
 /*
@@ -3552,7 +3545,7 @@ bool gwp_ctx_acl_target_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp)
 					       NULL, ntohs(ctx->target_name.port));
 		else
 			r = conn_pick_upstream(ctx, gcp, NULL, &gcp->target_addr,
-					       sa_port_h(&gcp->target_addr));
+				gwp_sockaddr_port_h(&gcp->target_addr));
 		if (unlikely(r))
 			return false;
 	}
@@ -3639,7 +3632,7 @@ bool gwp_ctx_acl_client_allowed(struct gwp_ctx *ctx,
 	memset(&req, 0, sizeof(req));
 	req.client = client;
 	req.proto = proto;
-	req.sport = sa_port_h(client);
+	req.sport = gwp_sockaddr_port_h(client);
 	return gwp_acl_eval_input(ctx->acl, &req) == GWP_ACL_ACCEPT;
 }
 
@@ -5387,7 +5380,8 @@ int gwp_get_orig_dst(int fd, const struct gwp_sockaddr *client,
 	if (r)
 		return r;
 
-	if (gwp_sockaddr_ip_eq(dst, &local) && sa_port_h(dst) == sa_port_h(&local))
+	if (gwp_sockaddr_ip_eq(dst, &local) &&
+	    gwp_sockaddr_port_h(dst) == gwp_sockaddr_port_h(&local))
 		return -ELOOP;
 
 	return 0;
@@ -5531,8 +5525,7 @@ static int apply_conn_bind(struct gwp_wrk *w, int fd,
 		 * port range. Not fatal: only pre-4.2 kernels refuse it, and the
 		 * source is pinned either way. IPv6 sockets take it at SOL_IP too.
 		 */
-		port = (s->sa.sa_family == AF_INET) ? s->i4.sin_port
-						    : s->i6.sin6_port;
+		port = gwp_sockaddr_port(s);
 		if (!port)
 			setskopt_int(fd, IPPROTO_IP, IP_BIND_ADDRESS_NO_PORT, 1);
 
@@ -6725,7 +6718,7 @@ bool gwp_target_is_self(struct gwp_wrk *w, const struct gwp_conn_pair *gcp,
 
 	if (gcp->upstream)
 		dst = &gcp->upstream->addr;
-	if (sa_port_h(dst) != sa_port_h(lst))
+	if (gwp_sockaddr_port_h(dst) != gwp_sockaddr_port_h(lst))
 		return false;
 
 	sockaddr_canon_ip(lst, &lv4, &lip);
@@ -7219,8 +7212,7 @@ static int udp_client_bnd(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 	}
 
 	gwp_socks5_reply_addr_from_sockaddr(&local, bnd);
-	bnd->port = relay->sa.sa_family == AF_INET ? relay->i4.sin_port :
-						     relay->i6.sin6_port;
+	bnd->port = gwp_sockaddr_port(relay);
 	return 0;
 }
 
@@ -7511,8 +7503,7 @@ int gwp_upstream_udp_dst(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 	/* An IPv4 control connection names its address as IPv4. */
 	gwp_socks5_reply_addr_from_sockaddr(&local, &gcp->up_dst);
-	gcp->up_dst.port = relay.sa.sa_family == AF_INET ? relay.i4.sin_port :
-							   relay.i6.sin6_port;
+	gcp->up_dst.port = gwp_sockaddr_port(&relay);
 	return 0;
 }
 

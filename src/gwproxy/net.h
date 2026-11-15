@@ -3,6 +3,7 @@
  */
 
 #include <arpa/inet.h>
+#include <stdint.h>
 
 #ifndef GWP_NET_H
 #define GWP_NET_H
@@ -24,6 +25,18 @@ struct gwp_sockaddr {
 static inline socklen_t gwp_sockaddr_len(const struct gwp_sockaddr *a)
 {
 	return a->sa.sa_family == AF_INET ? sizeof(a->i4) : sizeof(a->i6);
+}
+
+/* The port of @a in network byte order, for AF_INET or AF_INET6. */
+static inline uint16_t gwp_sockaddr_port(const struct gwp_sockaddr *a)
+{
+	return a->sa.sa_family == AF_INET ? a->i4.sin_port : a->i6.sin6_port;
+}
+
+/* The port of @a in host byte order, for AF_INET or AF_INET6. */
+static inline uint16_t gwp_sockaddr_port_h(const struct gwp_sockaddr *a)
+{
+	return ntohs(gwp_sockaddr_port(a));
 }
 
 /*
