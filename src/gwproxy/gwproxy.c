@@ -5762,6 +5762,22 @@ int gwp_socks5_prep_connect_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	return 0;
 }
 
+/*
+ * Append the fixed HTTP reply @build makes to @t's unsent bytes. Returns 0,
+ * or the builder's error (-ENOBUFS) when the reply does not fit, in which
+ * case nothing is queued.
+ */
+static int gwp_http_queue_reply(struct gwp_conn *t,
+				int (*build)(void *out, size_t out_cap))
+{
+	int r = build(t->buf + t->len, t->cap - t->len);
+
+	if (r < 0)
+		return r;
+	t->len += (uint32_t)r;
+	return 0;
+}
+
 int gwp_conn_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int err)
 {
 	/*
@@ -5805,20 +5821,10 @@ int gwp_conn_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int err)
 	if (gcp->prot_type == GWP_PROT_TYPE_SOCKS5)
 		return gwp_socks5_prep_connect_reply(w, gcp, err);
 
-	if (gcp->prot_type == GWP_PROT_TYPE_HTTP) {
-		void *out = gcp->target.buf + gcp->target.len;
-		size_t cap = gcp->target.cap - gcp->target.len;
-		int r;
-
-		if (timed_out)
-			r = gwp_http_build_gateway_timeout_reply(out, cap);
-		else
-			r = gwp_http_build_bad_gateway_reply(out, cap);
-		if (r < 0)
-			return r;
-		gcp->target.len += (uint32_t)r;
-		return 0;
-	}
+	if (gcp->prot_type == GWP_PROT_TYPE_HTTP)
+		return gwp_http_queue_reply(&gcp->target, timed_out ?
+					    gwp_http_build_gateway_timeout_reply :
+					    gwp_http_build_bad_gateway_reply);
 
 	return 0;	/* plain/transparent forwarding speaks no protocol */
 }
@@ -5860,13 +5866,11 @@ int gwp_acl_reject_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		if (r)
 			return r;
 	} else if (gcp->prot_type == GWP_PROT_TYPE_HTTP) {
-		int r = gwp_http_build_forbidden_reply(
-				gcp->target.buf + gcp->target.len,
-				gcp->target.cap - gcp->target.len);
+		int r = gwp_http_queue_reply(&gcp->target,
+					     gwp_http_build_forbidden_reply);
 
-		if (r < 0)
+		if (r)
 			return r;
-		gcp->target.len += (uint32_t)r;
 	}
 	return -EACCES;
 }
@@ -7680,12 +7684,9 @@ int gwp_handle_conn_state_socks5(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
  */
 static int http_reject_unauthorized(struct gwp_conn_pair *gcp)
 {
-	int r = gwp_http_build_auth_required_reply(gcp->target.buf + gcp->target.len,
-						   gcp->target.cap - gcp->target.len);
-	if (r < 0)
+	if (gwp_http_queue_reply(&gcp->target,
+				 gwp_http_build_auth_required_reply))
 		return -ENOBUFS;
-
-	gcp->target.len += (uint32_t)r;
 	return -EACCES;
 }
 
@@ -7699,12 +7700,8 @@ static int http_reject_unauthorized(struct gwp_conn_pair *gcp)
  */
 static int http_reject_too_large(struct gwp_conn_pair *gcp)
 {
-	int r = gwp_http_build_too_large_reply(gcp->target.buf + gcp->target.len,
-					       gcp->target.cap - gcp->target.len);
-	if (r < 0)
-		return -E2BIG;
-
-	gcp->target.len += (uint32_t)r;
+	/* Whether the reply fits or not, the request is refused as too large. */
+	gwp_http_queue_reply(&gcp->target, gwp_http_build_too_large_reply);
 	return -E2BIG;
 }
 
@@ -7715,12 +7712,9 @@ static int http_reject_too_large(struct gwp_conn_pair *gcp)
  */
 static int http_reject_bad_request(struct gwp_conn_pair *gcp)
 {
-	int r = gwp_http_build_bad_request_reply(gcp->target.buf + gcp->target.len,
-						 gcp->target.cap - gcp->target.len);
-	if (r < 0)
+	if (gwp_http_queue_reply(&gcp->target,
+				 gwp_http_build_bad_request_reply))
 		return -ENOBUFS;
-
-	gcp->target.len += (uint32_t)r;
 	return -EBADMSG;
 }
 
@@ -7732,26 +7726,16 @@ static int http_reject_bad_request(struct gwp_conn_pair *gcp)
  */
 static int http_reject_not_implemented(struct gwp_conn_pair *gcp)
 {
-	int r = gwp_http_build_not_implemented_reply(
-			gcp->target.buf + gcp->target.len,
-			gcp->target.cap - gcp->target.len);
-	if (r < 0)
+	if (gwp_http_queue_reply(&gcp->target,
+				 gwp_http_build_not_implemented_reply))
 		return -ENOBUFS;
-
-	gcp->target.len += (uint32_t)r;
 	return -EOPNOTSUPP;
 }
 
 /* The HTTP 414 reply for a request line that is too long; as the 431. */
 static int http_reject_uri_too_long(struct gwp_conn_pair *gcp)
 {
-	int r = gwp_http_build_uri_too_long_reply(
-			gcp->target.buf + gcp->target.len,
-			gcp->target.cap - gcp->target.len);
-	if (r < 0)
-		return -E2BIG;
-
-	gcp->target.len += (uint32_t)r;
+	gwp_http_queue_reply(&gcp->target, gwp_http_build_uri_too_long_reply);
 	return -E2BIG;
 }
 
@@ -7762,24 +7746,17 @@ static int http_reject_uri_too_long(struct gwp_conn_pair *gcp)
  */
 static int http_answer_options(struct gwp_conn_pair *gcp)
 {
-	int r = gwp_http_build_options_reply(gcp->target.buf + gcp->target.len,
-					     gcp->target.cap - gcp->target.len);
-	if (r < 0)
+	if (gwp_http_queue_reply(&gcp->target,
+				 gwp_http_build_options_reply))
 		return -ENOBUFS;
-
-	gcp->target.len += (uint32_t)r;
 	return -ECANCELED;
 }
 
 static int http_reject_bad_version(struct gwp_conn_pair *gcp)
 {
-	int r = gwp_http_build_bad_version_reply(
-			gcp->target.buf + gcp->target.len,
-			gcp->target.cap - gcp->target.len);
-	if (r < 0)
+	if (gwp_http_queue_reply(&gcp->target,
+				 gwp_http_build_bad_version_reply))
 		return -ENOBUFS;
-
-	gcp->target.len += (uint32_t)r;
 	return -EPROTONOSUPPORT;
 }
 
@@ -7865,10 +7842,9 @@ static int http_fwd_res_fail(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	gwp_conn_buf_compact(t);
 	t->cap = (uint32_t)w->ctx->cfg.target_buf_size;
 	t->len = from;
-	r = gwp_http_build_bad_gateway_reply(t->buf + t->len, t->cap - t->len);
-	if (r < 0)
+	r = gwp_http_queue_reply(t, gwp_http_build_bad_gateway_reply);
+	if (r)
 		return r;
-	t->len += (uint32_t)r;
 	t->rd_eof = true;
 	return 0;
 }
