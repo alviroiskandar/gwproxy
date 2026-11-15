@@ -8,6 +8,7 @@
 #define _GNU_SOURCE
 #endif
 #include <gwproxy/acl.h>
+#include <gwproxy/ascii.h>
 #include <arpa/inet.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -652,47 +653,15 @@ static void mask_addr(uint8_t *addr, uint8_t bits, size_t len)
 		addr[i] = 0;
 }
 
-/*
- * Parse all of @s as an unsigned number of at most @max into @out; -1 if it is
- * not one. It is decimal digits, or with @hex also "0x" (or "0X") and
- * hexadecimal digits; nothing else. strtoul() is not used: it also takes
- * leading blanks and a sign, and negates a "-" value in unsigned arithmetic, so
- * "-18446744073709551535" would wrap around to 81, and " 80" and "+80" would
- * pass for 80; with base 0 it reads "010" as octal 8, and a newer C library
- * "0b10" as binary 2. Where @hex allows a prefix, a decimal number may not
- * start with 0, so "010", which meant 8 before, is refused rather than quietly
- * read as 10; without @hex it is plain decimal and "010" is 10, as it always
- * was.
- */
+/* gwp_parse_unum() into the unsigned long the rule fields take. */
 static int parse_num(const char *s, bool hex, unsigned long max,
 		     unsigned long *out)
 {
-	unsigned long v = 0, d, base = 10;
+	unsigned long long v;
 
-	if (*s < '0' || *s > '9')
+	if (gwp_parse_unum(s, hex, max, &v))
 		return -1;
-	if (hex && s[0] == '0' && s[1]) {
-		if (s[1] != 'x' && s[1] != 'X')
-			return -1;
-		base = 16;
-		s += 2;
-		if (!*s)
-			return -1;
-	}
-	for (; *s; s++) {
-		if (*s >= '0' && *s <= '9')
-			d = (unsigned long)(*s - '0');
-		else if (base == 16 && *s >= 'a' && *s <= 'f')
-			d = (unsigned long)(*s - 'a' + 10);
-		else if (base == 16 && *s >= 'A' && *s <= 'F')
-			d = (unsigned long)(*s - 'A' + 10);
-		else
-			return -1;
-		if (d > max || v > (max - d) / base)
-			return -1;
-		v = v * base + d;
-	}
-	*out = v;
+	*out = (unsigned long)v;
 	return 0;
 }
 

@@ -10,6 +10,7 @@
 #include <gwproxy/gwproxy.h>
 #include <gwproxy/upstream.h>
 #include <gwproxy/common.h>
+#include <gwproxy/ascii.h>
 #include <gwproxy/log.h>
 #include <gwproxy/acl.h>
 #include <gwproxy/ev/epoll.h>
@@ -352,7 +353,7 @@ static const char *opt_name(int c)
 static int opt_num(int c, const char *arg, long long min, long long max,
 		   bool hex, long long *out)
 {
-	unsigned long long v = 0, d, lim = (unsigned long long)max, base = 10;
+	unsigned long long v, lim = (unsigned long long)max;
 	const char *p = arg, *why = "";
 	bool neg = false;
 
@@ -361,31 +362,10 @@ static int opt_num(int c, const char *arg, long long min, long long max,
 		lim = -(unsigned long long)min;
 		p++;
 	}
-	if (*p < '0' || *p > '9')
+	if (gwp_parse_unum(p, hex, lim, &v)) {
+		if (hex && p[0] == '0' && p[1] >= '0' && p[1] <= '9')
+			why = " (no leading 0: it once meant octal)";
 		goto bad;
-	if (hex && p[0] == '0' && p[1]) {
-		if (p[1] != 'x' && p[1] != 'X') {
-			if (p[1] >= '0' && p[1] <= '9')
-				why = " (no leading 0: it once meant octal)";
-			goto bad;
-		}
-		base = 16;
-		p += 2;
-		if (!*p)
-			goto bad;
-	}
-	for (; *p; p++) {
-		if (*p >= '0' && *p <= '9')
-			d = (unsigned long long)(*p - '0');
-		else if (base == 16 && *p >= 'a' && *p <= 'f')
-			d = (unsigned long long)(*p - 'a' + 10);
-		else if (base == 16 && *p >= 'A' && *p <= 'F')
-			d = (unsigned long long)(*p - 'A' + 10);
-		else
-			goto bad;
-		if (d > lim || v > (lim - d) / base)
-			goto bad;
-		v = v * base + d;
 	}
 	if (neg) {
 		/* v is at most -@min, so -v fits even for LLONG_MIN. */
