@@ -543,14 +543,6 @@ static int drop_raw_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 }
 #endif
 
-static uint64_t now_ms(void)
-{
-	struct timespec t;
-
-	clock_gettime(CLOCK_MONOTONIC, &t);
-	return (uint64_t)t.tv_sec * 1000 + (uint64_t)t.tv_nsec / 1000000;
-}
-
 /*
  * The pairs' timers: the protocol, connect and idle timeouts and the delay
  * before the next connect attempt. They live in a binary min-heap per worker
@@ -571,7 +563,7 @@ static uint64_t now_ms(void)
 static int tmr_arm(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		   uint32_t kind, uint64_t ms)
 {
-	return gwp_tmr_arm(&w->tmrs, gcp, kind, now_ms() + ms);
+	return gwp_tmr_arm(&w->tmrs, gcp, kind, gwp_mono_ms() + ms);
 }
 
 static void tmr_disarm(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
@@ -1020,7 +1012,7 @@ static void arm_retry_at(struct gwp_wrk *w, uint64_t at_ms)
 /* Likewise, RETRY_DELAY_MS from now. */
 static void arm_retry(struct gwp_wrk *w)
 {
-	arm_retry_at(w, now_ms() + RETRY_DELAY_MS);
+	arm_retry_at(w, gwp_mono_ms() + RETRY_DELAY_MS);
 }
 
 /*
@@ -1040,7 +1032,7 @@ static int wait_timeout(const struct gwp_wrk *w)
 	if (!at)
 		return -1;
 
-	now = now_ms();
+	now = gwp_mono_ms();
 	if (now >= at)
 		return 0;
 	at -= now;
@@ -1056,7 +1048,7 @@ static int run_retries(struct gwp_wrk *w)
 	if (likely(!w->retry_at_ms))
 		return 0;
 
-	now = now_ms();
+	now = gwp_mono_ms();
 	if (now < w->retry_at_ms)
 		return 0;
 
@@ -1145,7 +1137,7 @@ static int handle_accept_error(struct gwp_wrk *w, int e)
 			return r;
 
 		atomic_fetch_add(&w->ctx->nr_accept_stopped, 1);
-		w->accept_resume_at_ms = now_ms() + ACCEPT_STOP_MAX_MS;
+		w->accept_resume_at_ms = gwp_mono_ms() + ACCEPT_STOP_MAX_MS;
 		arm_retry_at(w, w->accept_resume_at_ms);
 		return -EAGAIN;
 	}
@@ -4380,7 +4372,7 @@ static int run_timers(struct gwp_wrk *w)
 	if (likely(!t))
 		return 0;
 
-	now = now_ms();
+	now = gwp_mono_ms();
 	for (; t && t->at_ms <= now && budget; t = gwp_tmr_first(&w->tmrs)) {
 		struct gwp_conn_pair *gcp = t->gcp;
 		uint32_t kind = t->kind;
@@ -4415,7 +4407,7 @@ static int run_linger(struct gwp_wrk *w)
 {
 	uint64_t at = gwp_linger_next_ms(w->linger);
 
-	if (likely(!at) || at > now_ms())
+	if (likely(!at) || at > gwp_mono_ms())
 		return 0;
 	return credit_linger(w, gwp_linger_run(w->linger));
 }

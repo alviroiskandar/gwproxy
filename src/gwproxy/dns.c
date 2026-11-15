@@ -25,6 +25,7 @@
 #include <pthread.h>
 #include <sys/eventfd.h>
 #include <gwproxy/syscall.h>
+#include <gwproxy/common.h>
 
 /*
  * The resolver threads. @nr_workers of them (--nr-dns-workers) are started
@@ -858,14 +859,6 @@ static uint32_t nr_busy(struct gwp_dns_ctx *ctx)
 	return n;
 }
 
-static int64_t mono_ms(void)
-{
-	struct timespec ts;
-
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
-
 static bool sleep_ms(int ms, void *arg)
 {
 	struct timespec ts = { .tv_sec = 0, .tv_nsec = (long)ms * 1000000L };
@@ -886,7 +879,8 @@ static bool sleep_ms(int ms, void *arg)
 static uint32_t free_threads(struct gwp_dns_ctx *ctx, int grace_ms,
 			     gwp_dns_wait_fn wait, void *arg)
 {
-	int64_t deadline = grace_ms >= 0 ? mono_ms() + grace_ms : 0;
+	int64_t deadline = grace_ms >= 0 ?
+			   (int64_t)gwp_mono_ms() + grace_ms : 0;
 	uint32_t i, left = 0;
 
 	if (!ctx->threads)
@@ -905,7 +899,7 @@ static uint32_t free_threads(struct gwp_dns_ctx *ctx, int grace_ms,
 	if (!wait)
 		wait = sleep_ms;
 	while (grace_ms >= 0 && nr_busy(ctx)) {
-		int64_t rem = deadline - mono_ms();
+		int64_t rem = deadline - (int64_t)gwp_mono_ms();
 
 		if (rem <= 0 || wait(rem < 10 ? (int)rem : 10, arg))
 			break;

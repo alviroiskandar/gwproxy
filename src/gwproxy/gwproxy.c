@@ -2244,14 +2244,6 @@ static int gwp_reload_drain(struct gwp_ctx *ctx, char *buf, unsigned *flags)
 #define GWP_RELOAD_QUIET_MS	100
 #define GWP_RELOAD_MAX_WAIT_MS	1000
 
-static uint64_t gwp_reload_now_ms(void)
-{
-	struct timespec ts;
-
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
-}
-
 /*
  * A SIGHUP: the operator says the files are ready, so every configured file is
  * reloaded at once, with no wait for it to settle. Each failure is logged, even
@@ -2307,7 +2299,7 @@ static void *gwp_reload_thread(void *arg)
 	for (;;) {
 		uint64_t wake = pending && due < next_check ? due : next_check;
 
-		now = gwp_reload_now_ms();
+		now = gwp_mono_ms();
 		if (!watch)
 			timeout = -1;
 		else
@@ -2355,7 +2347,7 @@ static void *gwp_reload_thread(void *arg)
 				break;
 		}
 
-		now = gwp_reload_now_ms();
+		now = gwp_mono_ms();
 		if (now >= next_check) {
 			flags |= gwp_reload_check(ctx, now);
 			next_check = now + GWP_RELOAD_CHECK_MS;

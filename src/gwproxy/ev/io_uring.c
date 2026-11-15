@@ -867,25 +867,12 @@ static struct io_uring_sqe *prep_send_client(struct gwp_wrk *w,
 	return __prep_send_client(w, gcp);
 }
 
-/*
- * The precise clock, not the coarse one of gwp_now_ms(): this is compared
- * with when a kernel timer fired, and the coarse clock lags the one the
- * kernel times io_uring timeouts with by up to a tick.
- */
-static uint64_t iou_now_ms(void)
-{
-	struct timespec t;
-
-	clock_gettime(CLOCK_MONOTONIC, &t);
-	return (uint64_t)t.tv_sec * 1000ull + (uint64_t)t.tv_nsec / 1000000ull;
-}
-
 static struct io_uring_sqe *prep_timer_target(struct gwp_wrk *w,
 					      struct gwp_conn_pair *gcp,
 					      int sec)
 {
 	struct io_uring_sqe *s = get_sqe_nofail(w);
-	uint64_t now = iou_now_ms(), due = now + (uint64_t)sec * 1000ull;
+	uint64_t now = gwp_mono_ms(), due = now + (uint64_t)sec * 1000ull;
 
 	/*
 	 * The timeout runs from its submission, which is later, so it never
@@ -3004,7 +2991,7 @@ static int handle_ev_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	 * with none live, was removed: only account for it.
 	 */
 	if (!is_timer_del && res == -ETIME) {
-		uint64_t now = iou_now_ms();
+		uint64_t now = gwp_mono_ms();
 
 		if (!gcp->tmr_due || now < gcp->tmr_due) {
 			pr_dbg(&ctx->lh,
