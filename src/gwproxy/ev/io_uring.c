@@ -4526,21 +4526,14 @@ int gwp_ctx_thread_entry_io_uring(struct gwp_wrk *w)
 __cold
 void gwp_ctx_signal_all_io_uring(struct gwp_ctx *ctx)
 {
-	static const uint64_t one = 1;
 	int i;
 
 	ctx->stop = true;
 	if (atomic_exchange(&ctx->stop_signalled, true))
 		return;
 
-	for (i = 0; i < ctx->cfg.nr_workers; i++) {
-		int fd = ctx->workers[i].iou->stop_efd;
-		ssize_t r;
-
-		do {
-			r = __sys_write(fd, &one, sizeof(one));
-		} while (r == -EINTR);
-	}
+	for (i = 0; i < ctx->cfg.nr_workers; i++)
+		(void)gwp_eventfd_signal(ctx->workers[i].iou->stop_efd);
 }
 
 #endif // CONFIG_IO_URING

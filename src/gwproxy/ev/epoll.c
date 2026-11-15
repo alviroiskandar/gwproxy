@@ -4504,25 +4504,20 @@ void gwp_ctx_signal_all_epoll(struct gwp_ctx *ctx)
 	ctx->stop = true;
 	for (i = 0; i < ctx->cfg.nr_workers; i++) {
 		struct gwp_wrk *w = &ctx->workers[i];
-		const uint64_t one = 1;
 		ssize_t r;
 
 		if (w->ev_fd < 0)
 			continue;
 
 		/*
-		 * __sys_write() returns -errno, so the EINTR retry works;
-		 * glibc's eventfd_write() returns -1 and never matched it.
-		 *
-		 * The write needs no handling beyond that retry. Adding 1 to
-		 * an eventfd fails only with EAGAIN, when the counter would
+		 * The write needs no handling beyond the EINTR retry. Adding 1
+		 * to an eventfd fails only with EAGAIN, when the counter would
 		 * pass 2^64 - 2, and here it counts stop requests, which the
 		 * worker's read resets. Anything else (EBADF, EINVAL) would be
 		 * a bug: ev_fd is -1 whenever the eventfd is not open.
 		 */
-		do {
-			r = __sys_write(w->ev_fd, &one, sizeof(one));
-		} while (r == -EINTR);
-		assert(r == (ssize_t)sizeof(one));
+		r = gwp_eventfd_signal(w->ev_fd);
+		assert(r == (ssize_t)sizeof(uint64_t));
+		(void)r;
 	}
 }

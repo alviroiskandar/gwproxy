@@ -380,7 +380,6 @@ static void deliver_entry(struct gwp_dns_entry *e)
 {
 	struct gwp_dns_cq *cq = e->cq;
 	struct gwp_dns_entry *old;
-	static const uint64_t one = 1;
 	ssize_t r;
 
 	if (gwp_dns_entry_cancelled(e)) {
@@ -408,10 +407,9 @@ static void deliver_entry(struct gwp_dns_entry *e)
 	 * are joined.
 	 */
 	if (!old) {
-		do {
-			r = __sys_write(cq->efd, &one, sizeof(one));
-		} while (r == -EINTR);
-		assert(r == (ssize_t)sizeof(one));
+		r = gwp_eventfd_signal(cq->efd);
+		assert(r == (ssize_t)sizeof(uint64_t));
+		(void)r;
 	}
 }
 

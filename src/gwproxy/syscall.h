@@ -456,6 +456,25 @@ static inline void gwp_set_reset_on_close(int fd)
 	__sys_setsockopt(fd, SOL_SOCKET, SO_LINGER, &l, sizeof(l));
 }
 
+/*
+ * Add 1 to the eventfd @fd, the doorbell that wakes whoever polls it.
+ * __sys_write() returns -errno, so the EINTR retry works; glibc's
+ * eventfd_write() returns -1 and would never match it. Returns
+ * sizeof(uint64_t), or -errno: adding 1 fails only with EAGAIN, when the
+ * counter would pass 2^64 - 2, unless @fd is not an open eventfd.
+ * Async-signal-safe.
+ */
+static inline ssize_t gwp_eventfd_signal(int fd)
+{
+	static const uint64_t one = 1;
+	ssize_t r;
+
+	do {
+		r = __sys_write(fd, &one, sizeof(one));
+	} while (r == -EINTR);
+	return r;
+}
+
 /* Close *@fd if it is open and mark it closed, so a second call is a no-op. */
 static inline void gwp_close_fd(int *fd)
 {
