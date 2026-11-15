@@ -2819,23 +2819,11 @@ bool gwp_ctx_iplim_get(struct gwp_wrk *w, const struct gwp_sockaddr *addr)
 	return false;
 }
 
-/*
- * Whether a line limited by @l may be logged now. When it may, *@quiet is set
- * to the number left out since the last one, for the line to say; when not,
- * this one is counted among them.
- */
+/* gwp_log_limit_take() at the second of @w's clock, for a line @w logs. */
 bool gwp_wrk_log_limit(struct gwp_wrk *w, struct gwp_log_limit *l,
 		       uint32_t *quiet)
 {
-	if ((int32_t)(w->now - l->next) < 0) {
-		l->quiet++;
-		return false;
-	}
-
-	*quiet = l->quiet;
-	l->quiet = 0;
-	l->next = w->now + 1;
-	return true;
+	return gwp_log_limit_take(l, w->now, quiet);
 }
 
 /*
