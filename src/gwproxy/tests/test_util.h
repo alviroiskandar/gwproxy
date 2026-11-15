@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <gwproxy/auth.h>
 
 /*
  * Print a test function's pass line, the first time it gets there only. A
@@ -80,6 +81,30 @@ static inline void gwp_test_rewrite_file(const char *path, const void *buf,
 	assert(fd >= 0);
 	assert(write(fd, buf, len) == (ssize_t)len);
 	close(fd);
+}
+
+/*
+ * A credential store loaded from a new temporary file of the @len bytes at
+ * @data, named as gwp_test_write_tmp() names it; *@path gets the file's
+ * malloc'd name. Give both back with gwp_test_auth_put().
+ */
+static inline struct gwp_auth *gwp_test_auth_from_buf(const char *prefix,
+						      const void *data,
+						      size_t len, char **path)
+{
+	struct gwp_auth *auth = NULL;
+
+	assert(gwp_test_write_tmp(path, prefix, data, len) == (ssize_t)len);
+	assert(!gwp_auth_create(&auth, *path));
+	assert(auth);
+	return auth;
+}
+
+static inline void gwp_test_auth_put(struct gwp_auth *auth, char *path)
+{
+	gwp_auth_destroy(auth);
+	unlink(path);
+	free(path);
 }
 
 #endif /* #ifndef GWPROXY__TESTS__TEST_UTIL_H */
