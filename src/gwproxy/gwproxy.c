@@ -2840,11 +2840,8 @@ void gwp_wrk_acl_denied(struct gwp_wrk *w, const struct gwp_sockaddr *addr)
 	if (!gwp_wrk_log_limit(w, &w->acl_deny_log, &quiet))
 		return;
 
-	if (quiet)
-		pr_info(&ctx->lh, "ACL denied client %s (and %u more since the last such line)",
-			ip_to_str(addr), quiet);
-	else
-		pr_info(&ctx->lh, "ACL denied client %s", ip_to_str(addr));
+	pr_info_quiet(&ctx->lh, quiet, "ACL denied client %s",
+		      ip_to_str(addr));
 }
 
 /*
@@ -2863,12 +2860,9 @@ void gwp_wrk_no_orig_dst(struct gwp_wrk *w, const struct gwp_sockaddr *addr,
 	if (!gwp_wrk_log_limit(w, &w->no_orig_dst_log, &quiet))
 		return;
 
-	if (quiet)
-		pr_warn(&ctx->lh, "No original destination for %s: %s (not a redirected connection?) (and %u more since the last such line)",
-			ip_to_str(addr), why, quiet);
-	else
-		pr_warn(&ctx->lh, "No original destination for %s: %s (not a redirected connection?)",
-			ip_to_str(addr), why);
+	pr_warn_quiet(&ctx->lh, quiet,
+		      "No original destination for %s: %s (not a redirected connection?)",
+		      ip_to_str(addr), why);
 }
 
 /* Uncount a client gwp_ctx_iplim_get() admitted. */

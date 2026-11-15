@@ -62,6 +62,27 @@ do {								\
 #define pr_dbg(HANDLE, FMT, ...) pr_log(HANDLE, 4, FMT, ##__VA_ARGS__)
 
 /*
+ * A line limited by gwp_log_limit_take(): when @QUIET lines were left out
+ * since the last one, it says so at its end. A macro, so the suffix joins the
+ * caller's format literal and the format check still sees the whole format.
+ */
+#define pr_log_quiet(HANDLE, LEVEL, QUIET, FMT, ...)			\
+do {									\
+	unsigned int __quiet = (QUIET);					\
+	if (__quiet)							\
+		pr_log(HANDLE, LEVEL,					\
+		       FMT " (and %u more since the last such line)",	\
+		       ##__VA_ARGS__, __quiet);				\
+	else								\
+		pr_log(HANDLE, LEVEL, FMT, ##__VA_ARGS__);		\
+} while (0)
+
+#define pr_warn_quiet(HANDLE, QUIET, FMT, ...) \
+	pr_log_quiet(HANDLE, 2, QUIET, FMT, ##__VA_ARGS__)
+#define pr_info_quiet(HANDLE, QUIET, FMT, ...) \
+	pr_log_quiet(HANDLE, 3, QUIET, FMT, ##__VA_ARGS__)
+
+/*
  * A log line a client can trigger at will, written at most once a second: the
  * next is due from @next on, and @quiet counts the ones left out since the
  * last (gwp_log_limit_take()).
