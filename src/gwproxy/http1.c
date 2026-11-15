@@ -18,6 +18,7 @@
 
 #include <gwproxy/http1.h>
 #include "common.h"
+#include "ascii.h"
 
 static inline size_t min_st(size_t a, size_t b)
 {
@@ -1195,23 +1196,13 @@ void gwnet_http_body_pctx_free(struct gwnet_http_body_pctx *ctx)
 	memset(ctx, 0, sizeof(*ctx));
 }
 
-static int is_xdigit(int c)
-{
-	if (c >= '0' && c <= '9')
-		return 1;
-	if (c >= 'A' && c <= 'F')
-		return 1;
-	if (c >= 'a' && c <= 'f')
-		return 1;
-	return 0;
-}
-
 static int parse_chunked_len(struct gwnet_http_body_pctx *ctx)
 {
 	size_t len = ctx->len - ctx->off, off = 0, i = 0;
 	const char *buf = &ctx->buf[ctx->off];
 	uint64_t decoded_len = 0;
-	char tmp_buf[17], *e, c;
+	char c;
+	int d;
 
 	if (!len)
 		return -EAGAIN;
@@ -1223,11 +1214,13 @@ static int parse_chunked_len(struct gwnet_http_body_pctx *ctx)
 		if (i >= 16)
 			return -EINVAL;
 
-		c = buf[off];
-		if (!is_xdigit(c))
+		d = gwp_hex_val((unsigned char)buf[off]);
+		if (d < 0)
 			break;
 
-		tmp_buf[i++] = c;
+		/* At most 16 digits, so the value always fits. */
+		decoded_len = decoded_len << 4 | (uint64_t)d;
+		i++;
 		off++;
 	}
 
@@ -1262,12 +1255,6 @@ static int parse_chunked_len(struct gwnet_http_body_pctx *ctx)
 			break;
 		}
 	}
-
-	tmp_buf[i] = '\0';
-	errno = 0;
-	decoded_len = strtoull(tmp_buf, &e, 16);
-	if (errno || e == tmp_buf || *e != '\0')
-		return -EINVAL;
 
 	ctx->off += off;
 	ctx->tot_len_raw += off;

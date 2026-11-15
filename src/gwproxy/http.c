@@ -19,6 +19,7 @@
 #include "http1.h"
 #include "auth.h"
 #include "common.h"
+#include "ascii.h"
 
 struct gwp_http_conn {
 	struct gwnet_http_hdr_pctx	ctx_hdr;
@@ -1129,16 +1130,6 @@ enum {
 	CH_END_LF,	/* LF of the final CRLF */
 };
 
-static int hex_val(unsigned char c)
-{
-	if (c >= '0' && c <= '9')
-		return c - '0';
-	c |= 0x20;
-	if (c >= 'a' && c <= 'f')
-		return c - 'a' + 10;
-	return -1;
-}
-
 /*
  * Largest chunk accepted. Nothing legitimate sends a 2 GiB chunk, and a size
  * near 2^64 is where implementations that parse it into a narrower or signed
@@ -1162,7 +1153,7 @@ static int scan_chunked(struct gwp_http_conn *hc, const unsigned char *p,
 
 		switch (hc->chunk_st) {
 		case CH_SIZE:
-			d = hex_val(c);
+			d = gwp_hex_val(c);
 			if (d >= 0) {
 				/* Leading zeros count too; keep it bounded. */
 				if (++hc->chunk_digits > 16)
