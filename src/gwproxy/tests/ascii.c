@@ -35,6 +35,24 @@ static void test_hex_val(void)
 	}
 }
 
+static void test_ascii_lower(void)
+{
+	static const char upper[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+	static const char lower[] = "abcdefghijklmnopqrstuvwxyz";
+	unsigned c, want;
+	int i;
+
+	for (c = 0; c < 256; c++) {
+		want = c;
+		for (i = 0; i < 26; i++) {
+			if (c == (unsigned char)upper[i])
+				want = (unsigned char)lower[i];
+		}
+		assert(gwp_ascii_lower((unsigned char)c) == want);
+		nr_checks++;
+	}
+}
+
 static void check_unum(const char *s, bool hex, unsigned long long max,
 		       int want_r, unsigned long long want, int line)
 {
@@ -112,6 +130,7 @@ static void test_parse_unum(void)
 int main(void)
 {
 	test_hex_val();
+	test_ascii_lower();
 	test_parse_unum();
 	printf("ascii: %u checks passed\n", nr_checks);
 	return 0;

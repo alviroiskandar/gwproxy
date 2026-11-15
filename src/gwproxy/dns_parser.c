@@ -6,6 +6,7 @@
 #include <stdbool.h>
 #include <gwproxy/dns_parser.h>
 #include <gwproxy/net.h>
+#include <gwproxy/ascii.h>
 
 static ssize_t construct_qname(uint8_t *dst, size_t dst_len, const char *qname)
 {
@@ -369,11 +370,6 @@ ssize_t gwdns_build_query(uint16_t txid, const char *name, int family, uint8_t *
 	return construct_question(&q);
 }
 
-static uint8_t ascii_lower(uint8_t c)
-{
-	return (c >= 'A' && c <= 'Z') ? (uint8_t)(c + ('a' - 'A')) : c;
-}
-
 int gwdns_check_question(const uint8_t *query, size_t query_len,
 			 const uint8_t *in, size_t in_len)
 {
@@ -403,7 +399,7 @@ int gwdns_check_question(const uint8_t *query, size_t query_len,
 			return -EINVAL;
 		/* Names compare without regard to case (RFC 4343). */
 		for (i++; i < lend; i++) {
-			if (ascii_lower(in[i]) != ascii_lower(query[i]))
+			if (gwp_ascii_lower(in[i]) != gwp_ascii_lower(query[i]))
 				return -EINVAL;
 		}
 	}

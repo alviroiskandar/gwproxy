@@ -568,13 +568,8 @@ static bool is_underscore_alias(const char *k, size_t klen)
 			unsigned char a = (unsigned char)k[j];
 			unsigned char b = (unsigned char)special[i].name[j];
 
-			if (a == '_')
-				a = '-';
-			if (a >= 'A' && a <= 'Z')
-				a |= 0x20;
-			if (b >= 'A' && b <= 'Z')
-				b |= 0x20;
-			if (a != b)
+			a = gwp_ascii_lower(a == '_' ? '-' : a);
+			if (a != gwp_ascii_lower(b))
 				break;
 		}
 		if (j == klen)

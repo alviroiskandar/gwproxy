@@ -3005,21 +3005,16 @@ static int parse_line(struct acl_load *ld, char *line)
  * and the index needs the compare and the hash to fold exactly the same
  * bytes, so neither may depend on it.
  */
-static unsigned char ascii_lower(unsigned char c)
-{
-	return (c >= 'A' && c <= 'Z') ? (unsigned char)(c | 0x20) : c;
-}
-
 static int ascii_casecmp(const char *a, const char *b)
 {
 	const unsigned char *x = (const unsigned char *)a;
 	const unsigned char *y = (const unsigned char *)b;
 
-	while (*x && ascii_lower(*x) == ascii_lower(*y)) {
+	while (*x && gwp_ascii_lower(*x) == gwp_ascii_lower(*y)) {
 		x++;
 		y++;
 	}
-	return ascii_lower(*x) - ascii_lower(*y);
+	return gwp_ascii_lower(*x) - gwp_ascii_lower(*y);
 }
 
 static uint64_t mix64(uint64_t x)
@@ -3038,7 +3033,7 @@ static uint64_t dom_hash(uint64_t seed, const char *s)
 	uint64_t h = seed ^ 0xcbf29ce484222325ULL;
 
 	for (; *p; p++) {
-		h ^= ascii_lower(*p);
+		h ^= gwp_ascii_lower(*p);
 		h *= 0x100000001b3ULL;
 	}
 	return mix64(h);

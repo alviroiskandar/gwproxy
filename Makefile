@@ -236,7 +236,7 @@ $(LIBGWACL_TEST_TARGET): $(LIBGWACL_OBJECTS) $(GWPROXY_DIR)/upstream_lb.c.o $(LI
 $(LIBGWDNS_TEST_TARGET): $(LIBGWDNS_OBJECTS) $(LIBGWDNS_TEST_OBJECTS)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
 
-$(GWPROXY_DIR)/tests/dns_parser.t: $(GWPROXY_DIR)/dns_parser.c $(GWPROXY_DIR)/dns_parser.h $(GWPROXY_DIR)/net.c $(EXTRA_DEPS)
+$(GWPROXY_DIR)/tests/dns_parser.t: $(GWPROXY_DIR)/dns_parser.c $(GWPROXY_DIR)/dns_parser.h $(GWPROXY_DIR)/ascii.h $(GWPROXY_DIR)/net.c $(EXTRA_DEPS)
 	$(CC) $(CFLAGS) -DRUNTEST $(LDFLAGS) -o $@ $(GWPROXY_DIR)/dns_parser.c $(GWPROXY_DIR)/net.c $(LIBS)
 
 $(LIBGWDNS_CACHE_TEST_TARGET): $(GWPROXY_DIR)/tests/dns_cache.c $(GWPROXY_DIR)/dns_cache.c $(GWPROXY_DIR)/dns_cache.h $(EXTRA_DEPS)

@@ -24,6 +24,16 @@ static inline int gwp_hex_val(unsigned char c)
 }
 
 /*
+ * @c with A-Z lowered to a-z and every other byte left alone. tolower()
+ * follows the locale; protocol names and keys must fold the same bytes
+ * whatever it is, most of all where a compare and a hash have to agree.
+ */
+static inline unsigned char gwp_ascii_lower(unsigned char c)
+{
+	return (c >= 'A' && c <= 'Z') ? (unsigned char)(c | 0x20) : c;
+}
+
+/*
  * Parse all of @s as an unsigned number of at most @max into *@out; -1 if it
  * is not one. It is decimal digits, or with @hex also "0x" (or "0X") and
  * hexadecimal digits; nothing else. strtoul() is not used: it also takes

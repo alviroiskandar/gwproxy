@@ -17,6 +17,7 @@
 #ifdef CONFIG_HAVE_GETRANDOM
 #include <sys/random.h>
 #endif
+#include <gwproxy/ascii.h>
 
 /*
  * A random 128-bit key for gwp_siphash13(), so an attacker cannot tell
@@ -113,11 +114,9 @@ static inline size_t gwp_dns_fold_name(const char *key, char *buf, size_t cap)
 	size_t i;
 
 	for (i = 0; key[i]; i++) {
-		unsigned char c = (unsigned char)key[i];
-
 		if (i + 1 >= cap)
 			return 0;
-		buf[i] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : (char)c;
+		buf[i] = (char)gwp_ascii_lower((unsigned char)key[i]);
 	}
 	buf[i] = '\0';
 	return i + 1;
