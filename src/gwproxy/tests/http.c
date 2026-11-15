@@ -22,6 +22,7 @@
 #include <unistd.h>
 #include <signal.h>
 #include <sys/time.h>
+#include "test_util.h"
 
 #define PRTEST_OK()					\
 do {							\
@@ -31,30 +32,6 @@ do {							\
 		__printed = 1;				\
 	}						\
 } while (0)
-
-/*
- * Create a unique temporary file in $TMPDIR (or /tmp when it is not set) and
- * write @len bytes of @data to it; *@path gets its malloc'd name. See
- * tests/socks5.c for why mkstemp() is used rather than a fixed path. The
- * caller unlink()s and free()s *@path.
- */
-static ssize_t write_temp_file(char **path, const void *data, size_t len)
-{
-	const char *dir = getenv("TMPDIR");
-	ssize_t w;
-	int fd;
-
-	if (!dir || !*dir)
-		dir = "/tmp";
-	assert(asprintf(path, "%s/gwp_http_auth.XXXXXX", dir) > 0);
-	fd = mkstemp(*path);
-	if (fd < 0)
-		return -1;
-
-	w = write(fd, data, len);
-	close(fd);
-	return w;
-}
 
 /*
  * Run gwp_http_conn_process() on a copy of @buf, a whole request, in one shot.
@@ -2129,7 +2106,8 @@ static void test_auth(void)
 	ssize_t w;
 	int r;
 
-	w = write_temp_file(&cred_file, cred_data, sizeof(cred_data) - 1);
+	w = gwp_test_write_tmp(&cred_file, "gwp_http_auth",
+			       cred_data, sizeof(cred_data) - 1);
 	assert(w == (ssize_t)(sizeof(cred_data) - 1));
 	r = gwp_auth_create(&auth, cred_file);
 	assert(!r);
@@ -2211,7 +2189,7 @@ static void test_auth_store(void)
 		len += (size_t)snprintf(data + len, cap - len, "u%d:p%d\n", i, i);
 	len += (size_t)snprintf(data + len, cap - len,
 				"dup:one\ndup:two\n");
-	w = write_temp_file(&cred_file, data, len);
+	w = gwp_test_write_tmp(&cred_file, "gwp_http_auth", data, len);
 	assert(w == (ssize_t)len);
 	free(data);
 	assert(!gwp_auth_create(&auth, cred_file));
@@ -2276,7 +2254,8 @@ static void test_auth_basic_token(void)
 	size_t i;
 	ssize_t w;
 
-	w = write_temp_file(&cred_file, cred_data, sizeof(cred_data) - 1);
+	w = gwp_test_write_tmp(&cred_file, "gwp_http_auth",
+			       cred_data, sizeof(cred_data) - 1);
 	assert(w == (ssize_t)(sizeof(cred_data) - 1));
 	assert(!gwp_auth_create(&auth, cred_file));
 

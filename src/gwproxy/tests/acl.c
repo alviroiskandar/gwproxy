@@ -23,6 +23,7 @@
 #include <signal.h>
 #include <stdatomic.h>
 #include <limits.h>
+#include "test_util.h"
 
 static struct gwp_sockaddr sa4(const char *ip, uint16_t port)
 {
@@ -1566,18 +1567,11 @@ static void test_statistic_equal_every_is_uneven(void)
  */
 static char *write_tmp_rules(const char *text)
 {
-	const char *dir = getenv("TMPDIR");
-	char *path;
 	size_t len = strlen(text);
-	int fd;
+	char *path;
 
-	if (!dir || !*dir)
-		dir = "/tmp";
-	assert(asprintf(&path, "%s/gwp-acl-test.XXXXXX", dir) > 0);
-	fd = mkstemp(path);
-	assert(fd >= 0);
-	assert(write(fd, text, len) == (ssize_t)len);
-	close(fd);
+	assert(gwp_test_write_tmp(&path, "gwp-acl-test", text, len) ==
+	       (ssize_t)len);
 	return path;
 }
 
@@ -2022,12 +2016,9 @@ static void test_file_fifo(void)
 /* A new empty directory for one include test; malloc'd path. */
 static char *inc_dir(void)
 {
-	const char *tmp = getenv("TMPDIR");
 	char *dir;
 
-	if (!tmp || !*tmp)
-		tmp = "/tmp";
-	assert(asprintf(&dir, "%s/gwp-acl-inc.XXXXXX", tmp) > 0);
+	assert(asprintf(&dir, "%s/gwp-acl-inc.XXXXXX", gwp_test_tmpdir()) > 0);
 	assert(mkdtemp(dir));
 	return dir;
 }
