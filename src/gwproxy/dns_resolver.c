@@ -154,10 +154,7 @@ int gwp_dns_res_prep_query(struct gwp_dns_resolver *res,
 void gwp_dns_res_drop_query(struct gwp_dns_packet *gdp)
 {
 	/* Idempotent: teardown calls it whether or not a reply came. */
-	if (gdp->fd >= 0) {
-		__sys_close(gdp->fd);
-		gdp->fd = -1;
-	}
+	gwp_close_fd(&gdp->fd);
 }
 
 int gwp_dns_res_complete_query(struct gwp_dns_resolver *res,

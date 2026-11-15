@@ -444,4 +444,13 @@ static inline ssize_t __sys_send(int sockfd, const void *buf, size_t len,
 	return __sys_sendto(sockfd, buf, len, flags, NULL, 0);
 }
 
+/* Close *@fd if it is open and mark it closed, so a second call is a no-op. */
+static inline void gwp_close_fd(int *fd)
+{
+	if (*fd >= 0) {
+		__sys_close(*fd);
+		*fd = -1;
+	}
+}
+
 #endif /* #ifndef GWPROXY_SYSCALL_H */

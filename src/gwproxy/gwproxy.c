@@ -2469,18 +2469,9 @@ static void gwp_ctx_free_reload(struct gwp_ctx *ctx)
 		pthread_join(ctx->reload_thread, NULL);
 		ctx->reload_running = false;
 	}
-	if (ctx->reload_efd >= 0) {
-		__sys_close(ctx->reload_efd);
-		ctx->reload_efd = -1;
-	}
-	if (ctx->hup_efd >= 0) {
-		__sys_close(ctx->hup_efd);
-		ctx->hup_efd = -1;
-	}
-	if (ctx->ino_fd >= 0) {
-		__sys_close(ctx->ino_fd);
-		ctx->ino_fd = -1;
-	}
+	gwp_close_fd(&ctx->reload_efd);
+	gwp_close_fd(&ctx->hup_efd);
+	gwp_close_fd(&ctx->ino_fd);
 	ctx->auth_wd = -1;
 	for (i = 0; i < ctx->nr_acl_files; i++)
 		ctx->acl_files[i].wd = -1;
