@@ -112,7 +112,8 @@ static inline int gwp_parse_port(const char *s, uint16_t *port)
  *
  * @param str source
  * @param gs destination
- * @param default_port fill it with zero if unspecified
+ * @param default_port the port when @str has none (a port in @str wins);
+ *        zero makes a port in @str mandatory
  * @return zero on success and a negative integer on failure.
  */
 int convert_str_to_ssaddr(const char *str,

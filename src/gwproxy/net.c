@@ -48,7 +48,7 @@ int convert_str_to_ssaddr(const char *str,
 	};
 	char host[NI_MAXHOST], port[32], *p;
 	struct addrinfo *res, *ai;
-	bool found = false;
+	bool found = false, has_port;
 	size_t l;
 	int r;
 
@@ -70,7 +70,8 @@ int convert_str_to_ssaddr(const char *str,
 	 * No port in the string: fall back to the default. @l already spans
 	 * the host, without the brackets of an IPv6 literal.
 	 */
-	if ((!p || *p != ':') && !default_port)
+	has_port = p && *p == ':';
+	if (!has_port && !default_port)
 		return -EINVAL;
 
 	if (l >= sizeof(host))
@@ -89,12 +90,12 @@ int convert_str_to_ssaddr(const char *str,
 				     "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 				     "0123456789-._:%")])
 		return -EINVAL;
-	if (default_port) {
-		snprintf(port, sizeof(port), "%hu", default_port);
-	} else {
+	if (has_port) {
 		r = copy_port(port, sizeof(port), p + 1);
 		if (r)
 			return r;
+	} else {
+		snprintf(port, sizeof(port), "%hu", default_port);
 	}
 
 	r = getaddrinfo(host, port, &hints, &res);

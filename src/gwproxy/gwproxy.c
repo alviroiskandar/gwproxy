@@ -3897,7 +3897,6 @@ int gwp_parse_upstream(const char *url, struct gwp_upstream *up)
 	char buf[512], *at, *host;
 	const char *rest;
 	uint16_t def_port;
-	bool has_port;
 	size_t n;
 
 	memset(up, 0, sizeof(*up));
@@ -3965,19 +3964,7 @@ int gwp_parse_upstream(const char *url, struct gwp_upstream *up)
 	    !upstream_host_ok(up))
 		return -EINVAL;
 
-	/*
-	 * convert_str_to_ssaddr() ignores an explicit port in the string when
-	 * a non-zero default_port is passed, so only pass the default when the
-	 * host has no port of its own.
-	 */
-	if (host[0] == '[') {
-		char *rb = strchr(host, ']');
-		has_port = rb && rb[1] == ':';
-	} else {
-		has_port = strchr(host, ':') != NULL;
-	}
-
-	if (convert_str_to_ssaddr(host, &up->addr, has_port ? 0 : def_port))
+	if (convert_str_to_ssaddr(host, &up->addr, def_port))
 		return up->host_is_ip ? -EINVAL : -EHOSTUNREACH;
 	return 0;
 }
