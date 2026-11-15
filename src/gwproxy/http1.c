@@ -1535,6 +1535,25 @@ do {									\
 	gwnet_http_hdr_pctx_free(&__c);					\
 } while (0)
 
+/*
+ * Start a chunked body parse of the @len bytes at @buf into @dst, with a
+ * size limit of @max_len (zero for the parser's default), and return what
+ * the parser returns.
+ */
+static int body_parse_buf(struct gwnet_http_body_pctx *ctx, const char *buf,
+			  size_t len, uint64_t max_len, char *dst,
+			  size_t dst_len)
+{
+	int r;
+
+	r = gwnet_http_body_pctx_init(ctx);
+	assert(!r);
+	ctx->buf = buf;
+	ctx->len = len;
+	ctx->max_len = max_len;
+	return gwnet_http_body_parse_chunked(ctx, dst, dst_len);
+}
+
 static void test_req_hdr_simple(void)
 {
 	static const char buf[] =
@@ -2590,12 +2609,7 @@ static void test_body_chunked_simple(void)
 	struct gwnet_http_body_pctx ctx;
 	int r;
 
-	r = gwnet_http_body_pctx_init(&ctx);
-	assert(!r);
-
-	ctx.buf = buf;
-	ctx.len = len;
-	r = gwnet_http_body_parse_chunked(&ctx, NULL, 0);
+	r = body_parse_buf(&ctx, buf, len, 0, NULL, 0);
 	assert(!r);
 	assert(ctx.state == GWNET_HTTP_BODY_PARSE_ST_CHK_DONE);
 	assert(ctx.tot_len == strlen("Hello"));
@@ -2619,12 +2633,7 @@ static void test_body_chunked_multiple_chunks(void)
 	size_t dst_len = sizeof(dst);
 	int r;
 
-	r = gwnet_http_body_pctx_init(&ctx);
-	assert(!r);
-
-	ctx.buf = buf;
-	ctx.len = len;
-	r = gwnet_http_body_parse_chunked(&ctx, dst, dst_len);
+	r = body_parse_buf(&ctx, buf, len, 0, dst, dst_len);
 	assert(!r);
 	assert(ctx.state == GWNET_HTTP_BODY_PARSE_ST_CHK_DONE);
 	assert(ctx.tot_len == strlen("Hello World"));
@@ -2643,12 +2652,7 @@ static void test_body_chunked_empty(void)
 	struct gwnet_http_body_pctx ctx;
 	int r;
 
-	r = gwnet_http_body_pctx_init(&ctx);
-	assert(!r);
-
-	ctx.buf = buf;
-	ctx.len = len;
-	r = gwnet_http_body_parse_chunked(&ctx, NULL, 0);
+	r = body_parse_buf(&ctx, buf, len, 0, NULL, 0);
 	assert(!r);
 	assert(ctx.state == GWNET_HTTP_BODY_PARSE_ST_CHK_DONE);
 	assert(ctx.tot_len == 0);
@@ -2676,12 +2680,7 @@ static void test_body_chunked_multiple_various_lengths(void)
 	size_t dst_len = sizeof(dst) - 1;
 	int r;
 
-	r = gwnet_http_body_pctx_init(&ctx);
-	assert(!r);
-
-	ctx.buf = buf;
-	ctx.len = len;
-	r = gwnet_http_body_parse_chunked(&ctx, dst, dst_len);
+	r = body_parse_buf(&ctx, buf, len, 0, dst, dst_len);
 	assert(!r);
 	assert(ctx.state == GWNET_HTTP_BODY_PARSE_ST_CHK_DONE);
 	assert(ctx.tot_len == strlen("1234567890HelloABCDEFGHIJWorld"));
@@ -2706,13 +2705,7 @@ static void test_body_chunked_dst_buffer_too_small(void)
 	size_t dst_len = sizeof(dst) - 1;
 	int r;
 
-	r = gwnet_http_body_pctx_init(&ctx);
-	assert(!r);
-
-	ctx.buf = buf;
-	ctx.len = len;
-
-	r = gwnet_http_body_parse_chunked(&ctx, dst, dst_len);
+	r = body_parse_buf(&ctx, buf, len, 0, dst, dst_len);
 	assert(r == -ENOBUFS);
 	assert(ctx.state == GWNET_HTTP_BODY_PARSE_ST_CHK_DATA);
 	assert(ctx.tot_len == 2);
@@ -2842,13 +2835,7 @@ static void test_body_chunked_oversized(void)
 	size_t i;
 	int r;
 
-	r = gwnet_http_body_pctx_init(&ctx);
-	assert(!r);
-
-	ctx.buf = buf;
-	ctx.len = len;
-	ctx.max_len = sizeof(buf) - 1;
-	r = gwnet_http_body_parse_chunked(&ctx, dst, dst_len);
+	r = body_parse_buf(&ctx, buf, len, len, dst, dst_len);
 	assert(!r);
 	assert(ctx.state == GWNET_HTTP_BODY_PARSE_ST_CHK_DONE);
 	assert(ctx.tot_len == strlen("Hello World"));
@@ -2857,12 +2844,7 @@ static void test_body_chunked_oversized(void)
 	gwnet_http_body_pctx_free(&ctx);
 
 	for (i = 1; i <= (sizeof(buf) - 2); i++) {
-		r = gwnet_http_body_pctx_init(&ctx);
-		assert(!r);
-		ctx.buf = buf;
-		ctx.len = len;
-		ctx.max_len = i;
-		r = gwnet_http_body_parse_chunked(&ctx, dst, dst_len);
+		r = body_parse_buf(&ctx, buf, len, i, dst, dst_len);
 		assert(r == -E2BIG);
 		assert(ctx.err == GWNET_HTTP_BODY_ERR_TOO_LONG);
 		gwnet_http_body_pctx_free(&ctx);
