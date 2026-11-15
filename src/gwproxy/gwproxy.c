@@ -909,8 +909,6 @@ static int gwp_raw_dns_resolve(struct gwp_wrk __unused *w,
 }
 #endif /* #ifdef CONFIG_NEW_DNS_RESOLVER */
 
-#define FULL_ADDRSTRLEN (INET6_ADDRSTRLEN + sizeof(":65535[]") - 1)
-
 /*
  * Never NULL: the result goes straight to "%s". An address that is not set
  * yet (the target of a pair closed during its handshake) prints as "-".
