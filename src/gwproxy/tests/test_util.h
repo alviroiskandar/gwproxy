@@ -20,6 +20,19 @@
 #include <stdlib.h>
 #include <unistd.h>
 
+/*
+ * Print a test function's pass line, the first time it gets there only. A
+ * macro, as it needs the caller's __func__ and a flag of its own per test.
+ */
+#define PRTEST_OK()					\
+do {							\
+	static int __printed;				\
+	if (!__printed) {				\
+		printf("Test passed: %s\n", __func__);	\
+		__printed = 1;				\
+	}						\
+} while (0)
+
 /* The directory for temporary files: $TMPDIR, or /tmp when it is not set. */
 static inline const char *gwp_test_tmpdir(void)
 {

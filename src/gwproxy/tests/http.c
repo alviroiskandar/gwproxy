@@ -24,15 +24,6 @@
 #include <sys/time.h>
 #include "test_util.h"
 
-#define PRTEST_OK()					\
-do {							\
-	static int __printed;				\
-	if (!__printed) {				\
-		printf("Test passed: %s\n", __func__);	\
-		__printed = 1;				\
-	}						\
-} while (0)
-
 /*
  * Run gwp_http_conn_process() on a copy of @buf, a whole request, in one shot.
  * For a forwarding request *@req and *@req_len are set to the rewritten
