@@ -3,6 +3,7 @@
  */
 
 #include <arpa/inet.h>
+#include <stdbool.h>
 #include <stdint.h>
 
 #ifndef GWP_NET_H
@@ -25,6 +26,27 @@ struct gwp_sockaddr {
 static inline socklen_t gwp_sockaddr_len(const struct gwp_sockaddr *a)
 {
 	return a->sa.sa_family == AF_INET ? sizeof(a->i4) : sizeof(a->i6);
+}
+
+/*
+ * Canonicalise @a to (*@is_v4, *@ip pointing at its 4- or 16-byte address):
+ * an IPv4-mapped IPv6 address counts as the IPv4 address it maps.
+ */
+static inline void gwp_sockaddr_canon_ip(const struct gwp_sockaddr *a,
+					 bool *is_v4, const uint8_t **ip)
+{
+	if (a->sa.sa_family == AF_INET) {
+		*is_v4 = true;
+		*ip = (const uint8_t *)&a->i4.sin_addr;
+		return;
+	}
+	if (IN6_IS_ADDR_V4MAPPED(&a->i6.sin6_addr)) {
+		*is_v4 = true;
+		*ip = &a->i6.sin6_addr.s6_addr[12];
+		return;
+	}
+	*is_v4 = false;
+	*ip = a->i6.sin6_addr.s6_addr;
 }
 
 /* The port of @a in network byte order, for AF_INET or AF_INET6. */

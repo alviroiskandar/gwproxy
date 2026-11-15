@@ -607,24 +607,6 @@ static void regex_err_clear(void)
  * ------------------------------------------------------------------------
  */
 
-/* Canonicalise a sockaddr to (is_v4, pointer to its 4- or 16-byte IP). */
-static void canon_ip(const struct gwp_sockaddr *a, bool *is_v4,
-		     const uint8_t **ip)
-{
-	if (a->sa.sa_family == AF_INET) {
-		*is_v4 = true;
-		*ip = (const uint8_t *)&a->i4.sin_addr;
-		return;
-	}
-	if (IN6_IS_ADDR_V4MAPPED(&a->i6.sin6_addr)) {
-		*is_v4 = true;
-		*ip = &a->i6.sin6_addr.s6_addr[12];
-		return;
-	}
-	*is_v4 = false;
-	*ip = a->i6.sin6_addr.s6_addr;
-}
-
 /* Does @ip match the first @bits bits of network prefix @net? */
 static bool prefix_match(const uint8_t *ip, const uint8_t *net, uint8_t bits)
 {
@@ -756,7 +738,7 @@ static bool cidr_match(const struct gwp_acl_cidr *c,
 	const uint8_t *ip;
 	bool is_v4;
 
-	canon_ip(addr, &is_v4, &ip);
+	gwp_sockaddr_canon_ip(addr, &is_v4, &ip);
 	if (is_v4 != c->is_v4)
 		return false;
 	return prefix_match(ip, c->addr, c->bits);
@@ -3161,7 +3143,7 @@ static uint32_t cidr_tab_find(const struct acl_cidr_tab *t, uint64_t seed,
 	uint8_t k, nr_len;
 	bool is_v4;
 
-	canon_ip(a, &is_v4, &ip);
+	gwp_sockaddr_canon_ip(a, &is_v4, &ip);
 	lens = is_v4 ? t->len4 : t->len6;
 	nr_len = is_v4 ? t->nr_len4 : t->nr_len6;
 	for (k = 0; k < nr_len; k++) {

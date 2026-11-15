@@ -5401,24 +5401,6 @@ static void set_v4mapped(struct in6_addr *a6, const void *v4)
 	memcpy(&a6->s6_addr[12], v4, 4);
 }
 
-/* Canonicalise an address to (is_v4, pointer to its 4- or 16-byte IP). */
-static void sockaddr_canon_ip(const struct gwp_sockaddr *a, bool *is_v4,
-			      const uint8_t **ip)
-{
-	if (a->sa.sa_family == AF_INET) {
-		*is_v4 = true;
-		*ip = (const uint8_t *)&a->i4.sin_addr;
-		return;
-	}
-	if (IN6_IS_ADDR_V4MAPPED(&a->i6.sin6_addr)) {
-		*is_v4 = true;
-		*ip = &a->i6.sin6_addr.s6_addr[12];
-		return;
-	}
-	*is_v4 = false;
-	*ip = a->i6.sin6_addr.s6_addr;
-}
-
 /*
  * Write to @out the form of source @src that a socket about to dial @dst can
  * bind. An IPv4-mapped address is IPv4 traffic on an AF_INET6 socket, so what
@@ -5433,8 +5415,8 @@ static bool conn_bind_src(struct gwp_sockaddr *out,
 	const uint8_t *src_ip, *dst_ip;
 	bool src_v4, dst_v4;
 
-	sockaddr_canon_ip(src, &src_v4, &src_ip);
-	sockaddr_canon_ip(dst, &dst_v4, &dst_ip);
+	gwp_sockaddr_canon_ip(src, &src_v4, &src_ip);
+	gwp_sockaddr_canon_ip(dst, &dst_v4, &dst_ip);
 	if (src_v4 != dst_v4)
 		return false;
 
@@ -6493,7 +6475,7 @@ bool gwp_ctx_outgoing_family_ok(const struct gwp_ctx *ctx,
 	if (ctx->cfg.outgoing_family == GWP_OUT_FAMILY_ANY)
 		return true;
 
-	sockaddr_canon_ip(a, &is_v4, &ip);
+	gwp_sockaddr_canon_ip(a, &is_v4, &ip);
 	if (ctx->cfg.outgoing_family == GWP_OUT_FAMILY_IPV4)
 		return is_v4;
 	return !is_v4;
@@ -6540,8 +6522,8 @@ bool gwp_sockaddr_ip_eq(const struct gwp_sockaddr *a, const struct gwp_sockaddr 
 	const uint8_t *ai, *bi;
 	bool av4, bv4;
 
-	sockaddr_canon_ip(a, &av4, &ai);
-	sockaddr_canon_ip(b, &bv4, &bi);
+	gwp_sockaddr_canon_ip(a, &av4, &ai);
+	gwp_sockaddr_canon_ip(b, &bv4, &bi);
 	if (av4 != bv4)
 		return false;
 	return !memcmp(ai, bi, av4 ? 4 : 16);
@@ -6573,7 +6555,7 @@ static int route_is_local(const struct gwp_sockaddr *a)
 	bool v4;
 	int fd;
 
-	sockaddr_canon_ip(a, &v4, &ip);
+	gwp_sockaddr_canon_ip(a, &v4, &ip);
 	ip_len = v4 ? 4 : 16;
 
 	memset(&req, 0, sizeof(req));
@@ -6659,7 +6641,7 @@ static void target_connect_addr(const struct gwp_wrk *w,
 	bool v4;
 
 	*out = *dst;
-	sockaddr_canon_ip(dst, &v4, &ip);
+	gwp_sockaddr_canon_ip(dst, &v4, &ip);
 	if (memcmp(ip, any, v4 ? 4 : 16))
 		return;
 
@@ -6669,7 +6651,7 @@ static void target_connect_addr(const struct gwp_wrk *w,
 	}
 
 	if (b->set && b->have_src && conn_bind_src(out, &b->src, dst)) {
-		sockaddr_canon_ip(out, &v4, &ip);
+		gwp_sockaddr_canon_ip(out, &v4, &ip);
 		if (memcmp(ip, any, 4))
 			return;
 	}
@@ -6721,9 +6703,9 @@ bool gwp_target_is_self(struct gwp_wrk *w, const struct gwp_conn_pair *gcp,
 	if (gwp_sockaddr_port_h(dst) != gwp_sockaddr_port_h(lst))
 		return false;
 
-	sockaddr_canon_ip(lst, &lv4, &lip);
+	gwp_sockaddr_canon_ip(lst, &lv4, &lip);
 	target_connect_addr(w, gcp, dst, &to);
-	sockaddr_canon_ip(&to, &dv4, &dip);
+	gwp_sockaddr_canon_ip(&to, &dv4, &dip);
 	if (memcmp(lip, any, lv4 ? 4 : 16)) {
 		self = gwp_sockaddr_ip_eq(&to, lst);
 	} else if (lv4 ? !dv4 : (dv4 && w->ctx->cfg.bind_ipv6_only)) {
