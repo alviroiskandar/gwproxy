@@ -12,7 +12,6 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <fcntl.h>
 #include "test_util.h"
 
 #define test_socks5_init_ctx_no_auth(CTX)		\
@@ -583,7 +582,6 @@ static void test_auth_file_nul(void)
 	char *cred_file;
 	struct gwp_auth *auth;
 	ssize_t w;
-	int fd;
 
 	assert(try_cred_buf(lead, sizeof(lead) - 1) == -EINVAL);
 	assert(try_cred_buf(lead_only, sizeof(lead_only) - 1) == -EINVAL);
@@ -597,10 +595,7 @@ static void test_auth_file_nul(void)
 			       good, sizeof(good) - 1);
 	assert(w == (ssize_t)sizeof(good) - 1);
 	assert(!gwp_auth_create(&auth, cred_file));
-	fd = open(cred_file, O_WRONLY | O_TRUNC);
-	assert(fd >= 0);
-	assert(write(fd, lead, sizeof(lead) - 1) == (ssize_t)sizeof(lead) - 1);
-	close(fd);
+	gwp_test_rewrite_file(cred_file, lead, sizeof(lead) - 1);
 	assert(gwp_auth_reload(auth) == -EINVAL);
 	assert(gwp_auth_check(auth, "user", 4, "pw", 2));
 	assert(!gwp_auth_check(auth, "other", 5, "pw", 2));

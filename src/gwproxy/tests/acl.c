@@ -1727,13 +1727,8 @@ static void test_reload_swaps_whole_ruleset(void)
 
 	for (i = 1; i <= 200; i++) {
 		const char *txt = (i & 1) ? rb : ra;
-		size_t len = strlen(txt);
-		int fd;
 
-		fd = open(path, O_WRONLY | O_TRUNC);
-		assert(fd >= 0);
-		assert(write(fd, txt, len) == (ssize_t)len);
-		close(fd);
+		gwp_test_rewrite_file(path, txt, strlen(txt));
 		assert(!gwp_acl_reload(a));
 		assert(gwp_acl_generation(a) == i);
 	}
@@ -1756,6 +1751,12 @@ static void test_reload_swaps_whole_ruleset(void)
  */
 static void test_generation(void)
 {
+	static const char good_rules[] =
+		"-P OUTPUT REJECT\n-A OUTPUT --dports 53 -j ACCEPT\n";
+	static const char bad_rules[] = "-A OUTPUT -j BOGUS\n";
+	static const char stat_rules[] =
+		"-A OUTPUT --dports 80 -m statistic --mode nth --every 2 "
+		"-j REJECT\n";
 	struct gwp_sockaddr t = sa4("93.184.216.34", 53);
 	struct gwp_acl_req req = {
 		.target = &t, .dport = 53, .proto = GWP_ACL_PROTO_UDP,
@@ -1763,7 +1764,6 @@ static void test_generation(void)
 	struct gwp_acl *a;
 	uint32_t g0;
 	char *path;
-	int fd;
 
 	assert(gwp_acl_generation(NULL) == 0);
 	path = write_tmp_rules("-A OUTPUT --dports 53 -j REJECT\n");
@@ -1773,11 +1773,7 @@ static void test_generation(void)
 	assert(req.gen == g0 && req.cacheable);
 
 	/* A good reload moves the generation and the verdict with it. */
-	fd = open(path, O_WRONLY | O_TRUNC);
-	assert(fd >= 0);
-	assert(write(fd, "-P OUTPUT REJECT\n-A OUTPUT --dports 53 -j ACCEPT\n",
-		     49) == 49);
-	close(fd);
+	gwp_test_rewrite_file(path, good_rules, strlen(good_rules));
 	assert(!gwp_acl_reload(a));
 	assert(gwp_acl_generation(a) != g0);
 	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_ACCEPT);
@@ -1785,19 +1781,12 @@ static void test_generation(void)
 	g0 = req.gen;
 
 	/* A failed reload keeps both the rules and the generation. */
-	fd = open(path, O_WRONLY | O_TRUNC);
-	assert(fd >= 0);
-	assert(write(fd, "-A OUTPUT -j BOGUS\n", 19) == 19);
-	close(fd);
+	gwp_test_rewrite_file(path, bad_rules, strlen(bad_rules));
 	assert(gwp_acl_reload(a) < 0);
 	assert(gwp_acl_generation(a) == g0);
 
 	/* A statistic rule anywhere in OUTPUT makes verdicts uncacheable. */
-	fd = open(path, O_WRONLY | O_TRUNC);
-	assert(fd >= 0);
-	assert(write(fd, "-A OUTPUT --dports 80 -m statistic --mode nth --every 2 -j REJECT\n",
-		     66) == 66);
-	close(fd);
+	gwp_test_rewrite_file(path, stat_rules, strlen(stat_rules));
 	assert(!gwp_acl_reload(a));
 	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_ACCEPT);
 	assert(!req.cacheable);
@@ -1896,18 +1885,12 @@ static void test_empty_chain_policy(void)
 	struct gwp_acl *a;
 	char *path;
 	size_t i;
-	int fd;
 
 	path = write_tmp_rules(files[0]);
 	assert(!gwp_acl_create(&a, path));
 	for (i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
 		if (i) {
-			size_t len = strlen(files[i]);
-
-			fd = open(path, O_WRONLY | O_TRUNC);
-			assert(fd >= 0);
-			assert(write(fd, files[i], len) == (ssize_t)len);
-			close(fd);
+			gwp_test_rewrite_file(path, files[i], strlen(files[i]));
 			assert(!gwp_acl_reload(a));
 		}
 		assert(in(a, &c1, 1234, GWP_ACL_PROTO_TCP) == want[i][0]);
@@ -1920,14 +1903,9 @@ static void test_empty_chain_policy(void)
 	 * An empty file, as a writer that truncates and then refills the file
 	 * leaves it in between, is refused and the rules stay.
 	 */
-	fd = open(path, O_WRONLY | O_TRUNC);
-	assert(fd >= 0);
-	assert(write(fd, files[0], strlen(files[0])) == (ssize_t)strlen(files[0]));
-	close(fd);
+	gwp_test_rewrite_file(path, files[0], strlen(files[0]));
 	assert(!gwp_acl_reload(a));
-	fd = open(path, O_WRONLY | O_TRUNC);
-	assert(fd >= 0);
-	close(fd);
+	gwp_test_rewrite_file(path, "", 0);
 	assert(gwp_acl_reload(a) == -ENODATA);
 	assert(in(a, &c1, 1234, GWP_ACL_PROTO_TCP) == want[0][0]);
 	gwp_acl_destroy(a);
@@ -1946,32 +1924,21 @@ static void test_file_nul(void)
 		"-A OUTPUT -d 192.0.2.1 -j ACCEPT\n"
 		"\0"
 		"-P OUTPUT REJECT\n";
+	static const char reject_rules[] = "-P OUTPUT REJECT\n";
 	struct gwp_sockaddr t = sa4("93.184.216.34", 80);
 	struct gwp_acl *a;
 	char *path;
-	int fd;
 
 	path = write_tmp_rules("");
-	fd = open(path, O_WRONLY | O_TRUNC);
-	assert(fd >= 0);
-	assert(write(fd, nul_rules, sizeof(nul_rules) - 1) ==
-	       (ssize_t)sizeof(nul_rules) - 1);
-	close(fd);
+	gwp_test_rewrite_file(path, nul_rules, sizeof(nul_rules) - 1);
 	assert(gwp_acl_create(&a, path) == -EINVAL);
 
-	fd = open(path, O_WRONLY | O_TRUNC);
-	assert(fd >= 0);
-	assert(write(fd, "-P OUTPUT REJECT\n", 17) == 17);
-	close(fd);
+	gwp_test_rewrite_file(path, reject_rules, strlen(reject_rules));
 	assert(!gwp_acl_create(&a, path));
 	assert(out(a, &t, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
 
 	/* A reload that meets a NUL keeps the old rules. */
-	fd = open(path, O_WRONLY | O_TRUNC);
-	assert(fd >= 0);
-	assert(write(fd, nul_rules, sizeof(nul_rules) - 1) ==
-	       (ssize_t)sizeof(nul_rules) - 1);
-	close(fd);
+	gwp_test_rewrite_file(path, nul_rules, sizeof(nul_rules) - 1);
 	assert(gwp_acl_reload(a) == -EINVAL);
 	assert(out(a, &t, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
 
@@ -2168,7 +2135,7 @@ static noinline void test_include_errors(void)
 	static const char nul[] = "-P OUTPUT REJECT\n\0\n";
 	char *dir = inc_dir(), *path, name[32], text[64];
 	struct gwp_acl *a = NULL;
-	int fd, i;
+	int i;
 
 	inc_put(dir, "ok.acl", "-A OUTPUT -d 192.0.2.1 -j REJECT\n");
 
@@ -2208,10 +2175,7 @@ static noinline void test_include_errors(void)
 	inc_put(dir, "empty.acl", "");
 	inc_refused(dir, "include empty.acl;\n", -ENODATA);
 	path = inc_write(dir, "nul.acl", "");
-	fd = open(path, O_WRONLY | O_TRUNC);
-	assert(fd >= 0);
-	assert(write(fd, nul, sizeof(nul) - 1) == (ssize_t)sizeof(nul) - 1);
-	close(fd);
+	gwp_test_rewrite_file(path, nul, sizeof(nul) - 1);
 	free(path);
 	inc_refused(dir, "include nul.acl;\n", -EINVAL);
 
@@ -2713,7 +2677,6 @@ static noinline void test_include_optional(void)
 	char *dir = inc_dir(), *path, *said, *want;
 	struct gwp_acl *a;
 	struct stat st;
-	int fd;
 
 	inc_mkdir_put(dir, "conf");
 	inc_put(dir, "conf/a.conf", "-A OUTPUT -d 192.0.2.1 -j REJECT\n");
@@ -2785,10 +2748,7 @@ static noinline void test_include_optional(void)
 	assert(!unlink(path));
 	inc_put(dir, "opt.acl", "");
 	inc_refused(dir, "include_optional opt.acl;\n", -ENODATA);
-	fd = open(path, O_WRONLY | O_TRUNC);
-	assert(fd >= 0);
-	assert(write(fd, "#\n\0\n", 4) == 4);
-	close(fd);
+	gwp_test_rewrite_file(path, "#\n\0\n", 4);
 	inc_refused(dir, "include_optional opt.acl;\n", -EINVAL);
 	inc_put(dir, "opt.acl", "-A OUTPUT -j BOGUS\n");
 	inc_refused(dir, "include_optional opt.acl;\n", -EINVAL);
@@ -3567,15 +3527,12 @@ static void *up_reader_fn(void *arg)
 static void up_write_gen(const char *path, unsigned gen)
 {
 	char text[160];
-	int fd, len;
+	int len;
 
 	len = snprintf(text, sizeof(text),
 		       "upstream g%u {\n server http://10.0.0.1:%u;\n}\n"
 		       "-A OUTPUT -j UPSTREAM --to g%u\n", gen, gen, gen);
-	fd = open(path, O_WRONLY | O_TRUNC);
-	assert(fd >= 0);
-	assert(write(fd, text, (size_t)len) == len);
-	close(fd);
+	gwp_test_rewrite_file(path, text, (size_t)len);
 }
 
 static noinline void test_upstream_reload_readers(void)

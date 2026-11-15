@@ -15,6 +15,7 @@
 #endif
 
 #include <assert.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -50,6 +51,22 @@ static inline ssize_t gwp_test_write_tmp(char **path, const char *prefix,
 	w = write(fd, data, len);
 	close(fd);
 	return w;
+}
+
+/*
+ * Replace the contents of the existing file at @path with the @len bytes at
+ * @buf. There is no O_CREAT: a test that rewrites a file it never made
+ * fails here rather than quietly creating one.
+ */
+static inline void gwp_test_rewrite_file(const char *path, const void *buf,
+					 size_t len)
+{
+	int fd;
+
+	fd = open(path, O_WRONLY | O_TRUNC);
+	assert(fd >= 0);
+	assert(write(fd, buf, len) == (ssize_t)len);
+	close(fd);
 }
 
 #endif /* #ifndef GWPROXY__TESTS__TEST_UTIL_H */
