@@ -17,6 +17,7 @@
 #include <arpa/inet.h>
 #include <assert.h>
 #include <fcntl.h>
+#include <netdb.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -56,6 +57,18 @@ static inline struct gwp_sockaddr gwp_test_addr(const char *ip, uint16_t port)
 		assert(inet_pton(AF_INET, ip, &s.i4.sin_addr) == 1);
 	}
 	return s;
+}
+
+/* A throwaway one-address (IPv4) addrinfo for direct cache-layer tests. */
+static inline void fill_ai_v4(struct addrinfo *ai, struct sockaddr_in *sa)
+{
+	memset(sa, 0, sizeof(*sa));
+	sa->sin_family = AF_INET;
+	sa->sin_addr.s_addr = htonl(0x7f000001);	/* 127.0.0.1 */
+	memset(ai, 0, sizeof(*ai));
+	ai->ai_family = AF_INET;
+	ai->ai_addr = (struct sockaddr *)sa;
+	ai->ai_addrlen = sizeof(*sa);
 }
 
 /* The directory for temporary files: $TMPDIR, or /tmp when it is not set. */

@@ -235,7 +235,7 @@ $(LIBGWDNS_TEST_TARGET): $(LIBGWDNS_OBJECTS) $(LIBGWDNS_TEST_OBJECTS)
 $(GWPROXY_DIR)/tests/dns_parser.t: $(GWPROXY_DIR)/dns_parser.c $(GWPROXY_DIR)/dns_parser.h $(GWPROXY_DIR)/net.c $(EXTRA_DEPS)
 	$(CC) $(CFLAGS) -DRUNTEST $(LDFLAGS) -o $@ $(GWPROXY_DIR)/dns_parser.c $(GWPROXY_DIR)/net.c $(LIBS)
 
-$(LIBGWDNS_CACHE_TEST_TARGET): $(GWPROXY_DIR)/tests/dns_cache.c $(GWPROXY_DIR)/dns_cache.c $(GWPROXY_DIR)/dns_cache.h $(EXTRA_DEPS)
+$(LIBGWDNS_CACHE_TEST_TARGET): $(GWPROXY_DIR)/tests/dns_cache.c $(GWPROXY_DIR)/dns_cache.c $(GWPROXY_DIR)/dns_cache.h $(GWPROXY_DIR)/tests/test_util.h $(EXTRA_DEPS)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LIBS)
 
 $(LIBGWDNS_SCHED_TEST_TARGET): $(GWPROXY_DIR)/tests/dns_sched.c $(GWPROXY_DIR)/dns.c $(GWPROXY_DIR)/dns.h $(GWPROXY_DIR)/dns_cache.c $(GWPROXY_DIR)/dns_cache.h $(EXTRA_DEPS)
