@@ -117,13 +117,6 @@ static bool linger_rx(struct gwp_linger *l)
 	return false;
 }
 
-static void linger_reset(int fd)
-{
-	static const struct linger lg = { .l_onoff = 1, .l_linger = 0 };
-
-	__sys_setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
-}
-
 /*
  * The end of the wait: an RST for GWP_LINGER_RST, else a close with nothing
  * left unread, so that it is no reset as long as the peer sends no more.
@@ -131,7 +124,7 @@ static void linger_reset(int fd)
 static void linger_close(int fd, int mode)
 {
 	if (mode == GWP_LINGER_RST) {
-		linger_reset(fd);
+		gwp_set_reset_on_close(fd);
 	} else {
 		struct gwp_linger l = { .fd = fd };
 

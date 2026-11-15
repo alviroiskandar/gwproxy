@@ -444,6 +444,18 @@ static inline ssize_t __sys_send(int sockfd, const void *buf, size_t len,
 	return __sys_sendto(sockfd, buf, len, flags, NULL, 0);
 }
 
+/*
+ * Have the close of @fd reset the connection (SO_LINGER with a zero timeout)
+ * instead of ending the stream with a FIN. Best effort: a failure leaves the
+ * plain close.
+ */
+static inline void gwp_set_reset_on_close(int fd)
+{
+	static const struct linger l = { .l_onoff = 1, .l_linger = 0 };
+
+	__sys_setsockopt(fd, SOL_SOCKET, SO_LINGER, &l, sizeof(l));
+}
+
 /* Close *@fd if it is open and mark it closed, so a second call is a no-op. */
 static inline void gwp_close_fd(int *fd)
 {

@@ -1293,15 +1293,6 @@ static void gwp_conn_pair_drop_dns(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
  * the end of the upstream's stream, and gets a reset. Before that, the client
  * may still be owed its failure reply, which a reset would throw away.
  */
-#ifdef CONFIG_HTTPS
-static void gwp_set_reset_on_close(int fd)
-{
-	static const struct linger l = { .l_onoff = 1, .l_linger = 0 };
-
-	__sys_setsockopt(fd, SOL_SOCKET, SO_LINGER, &l, sizeof(l));
-}
-#endif
-
 void gwp_conn_pair_abort_attempts(const struct gwp_conn_pair __unused *gcp)
 {
 #ifdef CONFIG_HTTPS
