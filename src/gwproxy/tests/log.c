@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Unit tests for the logger: whatever a message carries, one call writes
- * exactly one line, with control bytes escaped; and for gwp_log_escape().
+ * exactly one line, with control bytes escaped; and for gwp_log_escape() and
+ * gwp_log_limit_take().
  */
 #ifdef NDEBUG
 #undef NDEBUG
@@ -129,6 +130,35 @@ static void test_escape(void)
 	assert(strlen(buf) == sizeof(buf) - 1);
 }
 
+static void test_limit(void)
+{
+	struct gwp_log_limit l = { .next = 100 };
+	uint32_t quiet = 77;
+
+	/* The first line of a second is logged, the rest of it counted. */
+	assert(gwp_log_limit_take(&l, 100, &quiet) && quiet == 0);
+	assert(!gwp_log_limit_take(&l, 100, &quiet));
+	assert(!gwp_log_limit_take(&l, 100, NULL));
+	/* A clock a second behind the one that logged is still this second. */
+	assert(!gwp_log_limit_take(&l, 99, &quiet));
+	assert(gwp_log_limit_take(&l, 101, &quiet) && quiet == 3);
+	/* No line for a while: the next one is logged and says none. */
+	assert(gwp_log_limit_take(&l, 5000, &quiet) && quiet == 0);
+	/* With @quiet NULL the count is still taken and starts over. */
+	assert(!gwp_log_limit_take(&l, 5000, NULL));
+	assert(gwp_log_limit_take(&l, 5001, NULL));
+	assert(gwp_log_limit_take(&l, 5002, &quiet) && quiet == 0);
+
+	/* Across the wrap of the seconds. */
+	l.next = UINT32_MAX;
+	l.quiet = 0;
+	assert(gwp_log_limit_take(&l, UINT32_MAX, &quiet) && quiet == 0);
+	assert(!gwp_log_limit_take(&l, UINT32_MAX, &quiet));
+	assert(gwp_log_limit_take(&l, 0, &quiet) && quiet == 1);
+	assert(!gwp_log_limit_take(&l, UINT32_MAX, &quiet));
+	assert(gwp_log_limit_take(&l, 1, &quiet) && quiet == 1);
+}
+
 int main(void)
 {
 	int fd = memfd_create("log-test", MFD_CLOEXEC);
@@ -141,6 +171,7 @@ int main(void)
 	test_ctl();
 	test_long();
 	test_escape();
+	test_limit();
 
 	fclose(wf);
 	printf("All log tests passed.\n");

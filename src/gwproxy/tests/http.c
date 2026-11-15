@@ -22,39 +22,7 @@
 #include <unistd.h>
 #include <signal.h>
 #include <sys/time.h>
-
-#define PRTEST_OK()					\
-do {							\
-	static int __printed;				\
-	if (!__printed) {				\
-		printf("Test passed: %s\n", __func__);	\
-		__printed = 1;				\
-	}						\
-} while (0)
-
-/*
- * Create a unique temporary file in $TMPDIR (or /tmp when it is not set) and
- * write @len bytes of @data to it; *@path gets its malloc'd name. See
- * tests/socks5.c for why mkstemp() is used rather than a fixed path. The
- * caller unlink()s and free()s *@path.
- */
-static ssize_t write_temp_file(char **path, const void *data, size_t len)
-{
-	const char *dir = getenv("TMPDIR");
-	ssize_t w;
-	int fd;
-
-	if (!dir || !*dir)
-		dir = "/tmp";
-	assert(asprintf(path, "%s/gwp_http_auth.XXXXXX", dir) > 0);
-	fd = mkstemp(*path);
-	if (fd < 0)
-		return -1;
-
-	w = write(fd, data, len);
-	close(fd);
-	return w;
-}
+#include "test_util.h"
 
 /*
  * Run gwp_http_conn_process() on a copy of @buf, a whole request, in one shot.
@@ -2126,14 +2094,10 @@ static void test_auth(void)
 	const char *req = NULL, *user;
 	size_t req_len = 0, ulen;
 	uint8_t out[128];
-	ssize_t w;
 	int r;
 
-	w = write_temp_file(&cred_file, cred_data, sizeof(cred_data) - 1);
-	assert(w == (ssize_t)(sizeof(cred_data) - 1));
-	r = gwp_auth_create(&auth, cred_file);
-	assert(!r);
-	assert(auth);
+	auth = gwp_test_auth_from_buf("gwp_http_auth", cred_data,
+				      sizeof(cred_data) - 1, &cred_file);
 
 	/* No credentials -> challenge. */
 	hc = gwp_http_conn_alloc();
@@ -2185,9 +2149,7 @@ static void test_auth(void)
 	assert(!strncmp((char *)out, "HTTP/1.1 407 ", 13));
 	assert(gwp_http_build_auth_required_reply(out, 5) == -ENOBUFS);
 
-	gwp_auth_destroy(auth);
-	unlink(cred_file);
-	free(cred_file);
+	gwp_test_auth_put(auth, cred_file);
 	PRTEST_OK();
 }
 
@@ -2202,7 +2164,6 @@ static void test_auth_store(void)
 	struct gwp_auth *auth = NULL;
 	char u[32], p[32], *data;
 	size_t len = 0, cap = 64 * 1024;
-	ssize_t w;
 	int i;
 
 	data = malloc(cap);
@@ -2211,10 +2172,8 @@ static void test_auth_store(void)
 		len += (size_t)snprintf(data + len, cap - len, "u%d:p%d\n", i, i);
 	len += (size_t)snprintf(data + len, cap - len,
 				"dup:one\ndup:two\n");
-	w = write_temp_file(&cred_file, data, len);
-	assert(w == (ssize_t)len);
+	auth = gwp_test_auth_from_buf("gwp_http_auth", data, len, &cred_file);
 	free(data);
-	assert(!gwp_auth_create(&auth, cred_file));
 
 	for (i = 0; i < 2000; i++) {
 		snprintf(u, sizeof(u), "u%d", i);
@@ -2233,9 +2192,7 @@ static void test_auth_store(void)
 	assert(!gwp_auth_check(auth, "dup", 3, "", 0));
 	assert(!gwp_auth_check(auth, "", 0, "", 0));
 
-	gwp_auth_destroy(auth);
-	unlink(cred_file);
-	free(cred_file);
+	gwp_test_auth_put(auth, cred_file);
 	PRTEST_OK();
 }
 
@@ -2274,18 +2231,14 @@ static void test_auth_basic_token(void)
 	char *cred_file;
 	struct gwp_auth *auth = NULL;
 	size_t i;
-	ssize_t w;
 
-	w = write_temp_file(&cred_file, cred_data, sizeof(cred_data) - 1);
-	assert(w == (ssize_t)(sizeof(cred_data) - 1));
-	assert(!gwp_auth_create(&auth, cred_file));
+	auth = gwp_test_auth_from_buf("gwp_http_auth", cred_data,
+				      sizeof(cred_data) - 1, &cred_file);
 
 	for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
 		assert(gwp_auth_check_basic(auth, cases[i].hdr) == cases[i].ok);
 
-	gwp_auth_destroy(auth);
-	unlink(cred_file);
-	free(cred_file);
+	gwp_test_auth_put(auth, cred_file);
 	PRTEST_OK();
 }
 

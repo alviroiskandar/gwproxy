@@ -8,6 +8,7 @@
 #define _GNU_SOURCE
 #endif
 #include <gwproxy/acl.h>
+#include <gwproxy/ascii.h>
 #include <arpa/inet.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,12 +18,12 @@
 #include <stdatomic.h>
 #include <sched.h>
 #include <time.h>
-#include <sys/random.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <dirent.h>
 #include <fnmatch.h>
+#include <gwproxy/rand.h>
 
 #ifdef CONFIG_PCRE
 #include <pcre2.h>
@@ -607,24 +608,6 @@ static void regex_err_clear(void)
  * ------------------------------------------------------------------------
  */
 
-/* Canonicalise a sockaddr to (is_v4, pointer to its 4- or 16-byte IP). */
-static void canon_ip(const struct gwp_sockaddr *a, bool *is_v4,
-		     const uint8_t **ip)
-{
-	if (a->sa.sa_family == AF_INET) {
-		*is_v4 = true;
-		*ip = (const uint8_t *)&a->i4.sin_addr;
-		return;
-	}
-	if (IN6_IS_ADDR_V4MAPPED(&a->i6.sin6_addr)) {
-		*is_v4 = true;
-		*ip = &a->i6.sin6_addr.s6_addr[12];
-		return;
-	}
-	*is_v4 = false;
-	*ip = a->i6.sin6_addr.s6_addr;
-}
-
 /* Does @ip match the first @bits bits of network prefix @net? */
 static bool prefix_match(const uint8_t *ip, const uint8_t *net, uint8_t bits)
 {
@@ -652,47 +635,15 @@ static void mask_addr(uint8_t *addr, uint8_t bits, size_t len)
 		addr[i] = 0;
 }
 
-/*
- * Parse all of @s as an unsigned number of at most @max into @out; -1 if it is
- * not one. It is decimal digits, or with @hex also "0x" (or "0X") and
- * hexadecimal digits; nothing else. strtoul() is not used: it also takes
- * leading blanks and a sign, and negates a "-" value in unsigned arithmetic, so
- * "-18446744073709551535" would wrap around to 81, and " 80" and "+80" would
- * pass for 80; with base 0 it reads "010" as octal 8, and a newer C library
- * "0b10" as binary 2. Where @hex allows a prefix, a decimal number may not
- * start with 0, so "010", which meant 8 before, is refused rather than quietly
- * read as 10; without @hex it is plain decimal and "010" is 10, as it always
- * was.
- */
+/* gwp_parse_unum() into the unsigned long the rule fields take. */
 static int parse_num(const char *s, bool hex, unsigned long max,
 		     unsigned long *out)
 {
-	unsigned long v = 0, d, base = 10;
+	unsigned long long v;
 
-	if (*s < '0' || *s > '9')
+	if (gwp_parse_unum(s, hex, max, &v))
 		return -1;
-	if (hex && s[0] == '0' && s[1]) {
-		if (s[1] != 'x' && s[1] != 'X')
-			return -1;
-		base = 16;
-		s += 2;
-		if (!*s)
-			return -1;
-	}
-	for (; *s; s++) {
-		if (*s >= '0' && *s <= '9')
-			d = (unsigned long)(*s - '0');
-		else if (base == 16 && *s >= 'a' && *s <= 'f')
-			d = (unsigned long)(*s - 'a' + 10);
-		else if (base == 16 && *s >= 'A' && *s <= 'F')
-			d = (unsigned long)(*s - 'A' + 10);
-		else
-			return -1;
-		if (d > max || v > (max - d) / base)
-			return -1;
-		v = v * base + d;
-	}
-	*out = v;
+	*out = (unsigned long)v;
 	return 0;
 }
 
@@ -756,7 +707,7 @@ static bool cidr_match(const struct gwp_acl_cidr *c,
 	const uint8_t *ip;
 	bool is_v4;
 
-	canon_ip(addr, &is_v4, &ip);
+	gwp_sockaddr_canon_ip(addr, &is_v4, &ip);
 	if (is_v4 != c->is_v4)
 		return false;
 	return prefix_match(ip, c->addr, c->bits);
@@ -1003,17 +954,6 @@ static int parse_u32(const char *s, uint32_t *out)
 	return 0;
 }
 
-/* Parse a decimal port (1..65535, or 0 for "ephemeral") into @out; -1 bad. */
-static int parse_port_num(const char *s, uint16_t *out)
-{
-	unsigned long v;
-
-	if (parse_num(s, false, 65535, &v))
-		return -1;
-	*out = (uint16_t)v;
-	return 0;
-}
-
 /*
  * Parse a -j BIND --to-source argument (a literal source address, optionally
  * with a port) into @out: "ip", "ip:port", "[v6]:port", or a bare IPv6 literal.
@@ -1045,7 +985,7 @@ int gwp_acl_parse_bind_source(const char *s, struct gwp_sockaddr *out)
 			return -EINVAL;
 		s = end + 1;
 		if (*s == ':') {
-			if (parse_port_num(s + 1, &port))
+			if (gwp_parse_port(s + 1, &port))
 				return -EINVAL;
 		} else if (*s) {
 			return -EINVAL;
@@ -1070,7 +1010,7 @@ int gwp_acl_parse_bind_source(const char *s, struct gwp_sockaddr *out)
 			return -EINVAL;
 		memcpy(host, s, n);
 		host[n] = '\0';
-		if (parse_port_num(colon + 1, &port))
+		if (gwp_parse_port(colon + 1, &port))
 			return -EINVAL;
 	} else {
 		if (strlen(s) >= sizeof(host))
@@ -1360,12 +1300,9 @@ static int check_server_url(const char *url, bool *remote_dns, bool *creds,
 	}
 
 	if (*p == ':') {
-		unsigned long port = 0;
-		const char *d;
+		uint16_t port;
 
-		for (d = p + 1; *d >= '0' && *d <= '9' && port <= 65535; d++)
-			port = port * 10 + (unsigned long)(*d - '0');
-		if (d == p + 1 || *d || !port || port > 65535) {
+		if (gwp_parse_port(p + 1, &port) || !port) {
 			*why = "the port must be a number from 1 to 65535";
 			return -EINVAL;
 		}
@@ -3036,21 +2973,16 @@ static int parse_line(struct acl_load *ld, char *line)
  * and the index needs the compare and the hash to fold exactly the same
  * bytes, so neither may depend on it.
  */
-static unsigned char ascii_lower(unsigned char c)
-{
-	return (c >= 'A' && c <= 'Z') ? (unsigned char)(c | 0x20) : c;
-}
-
 static int ascii_casecmp(const char *a, const char *b)
 {
 	const unsigned char *x = (const unsigned char *)a;
 	const unsigned char *y = (const unsigned char *)b;
 
-	while (*x && ascii_lower(*x) == ascii_lower(*y)) {
+	while (*x && gwp_ascii_lower(*x) == gwp_ascii_lower(*y)) {
 		x++;
 		y++;
 	}
-	return ascii_lower(*x) - ascii_lower(*y);
+	return gwp_ascii_lower(*x) - gwp_ascii_lower(*y);
 }
 
 static uint64_t mix64(uint64_t x)
@@ -3069,7 +3001,7 @@ static uint64_t dom_hash(uint64_t seed, const char *s)
 	uint64_t h = seed ^ 0xcbf29ce484222325ULL;
 
 	for (; *p; p++) {
-		h ^= ascii_lower(*p);
+		h ^= gwp_ascii_lower(*p);
 		h *= 0x100000001b3ULL;
 	}
 	return mix64(h);
@@ -3161,7 +3093,7 @@ static uint32_t cidr_tab_find(const struct acl_cidr_tab *t, uint64_t seed,
 	uint8_t k, nr_len;
 	bool is_v4;
 
-	canon_ip(a, &is_v4, &ip);
+	gwp_sockaddr_canon_ip(a, &is_v4, &ip);
 	lens = is_v4 ? t->len4 : t->len6;
 	nr_len = is_v4 ? t->nr_len4 : t->nr_len6;
 	for (k = 0; k < nr_len; k++) {
@@ -3379,7 +3311,7 @@ static uint64_t index_seed(const void *salt)
 	struct timespec ts;
 	uint64_t seed;
 
-	if (getrandom(&seed, sizeof(seed), GRND_NONBLOCK) == sizeof(seed))
+	if (gwp_getrandom(&seed, sizeof(seed), GRND_NONBLOCK))
 		return seed;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return mix64((uint64_t)ts.tv_nsec ^ ((uint64_t)ts.tv_sec << 32) ^
@@ -4372,13 +4304,6 @@ static bool rule_matches(struct gwp_acl_rule *r,
 			   statistic_match(r, q->upstream_only));
 }
 
-/* Read a sockaddr's port (host byte order) regardless of family. */
-static uint16_t sa_port(const struct gwp_sockaddr *sa)
-{
-	return ntohs(sa->sa.sa_family == AF_INET ? sa->i4.sin_port
-						 : sa->i6.sin6_port);
-}
-
 /*
  * Compute the effective rewritten destination for a matched DNAT rule into
  * @req->dnat. The address and port are taken from the rule where set, otherwise
@@ -4391,31 +4316,24 @@ static void apply_dnat(struct gwp_acl_req *req, const struct gwp_acl_dnat *d)
 {
 	const struct gwp_sockaddr *base = req->target;
 	struct gwp_sockaddr out;
+	const void *ip = NULL;
 	uint16_t port;
 	int fam;
 
-	memset(&out, 0, sizeof(out));
 	fam = d->set_addr ? d->family : (base ? base->sa.sa_family : 0);
 	if (d->set_port)
 		port = d->port;
 	else
-		port = base ? sa_port(base) : 0;
+		port = base ? gwp_sockaddr_port_h(base) : 0;
 
-	if (fam == AF_INET) {
-		out.i4.sin_family = AF_INET;
-		if (d->set_addr)
-			memcpy(&out.i4.sin_addr, d->addr, 4);
-		else
-			out.i4.sin_addr = base->i4.sin_addr;
-		out.i4.sin_port = htons(port);
-	} else if (fam == AF_INET6) {
-		out.i6.sin6_family = AF_INET6;
-		if (d->set_addr)
-			memcpy(&out.i6.sin6_addr, d->addr, 16);
-		else
-			out.i6.sin6_addr = base->i6.sin6_addr;
-		out.i6.sin6_port = htons(port);
-	}
+	/* Read only for AF_INET or AF_INET6: fam is 0 when base is NULL. */
+	if (d->set_addr)
+		ip = d->addr;
+	else if (fam == AF_INET)
+		ip = &base->i4.sin_addr;
+	else if (fam == AF_INET6)
+		ip = &base->i6.sin6_addr;
+	gwp_sockaddr_set(&out, fam, ip, htons(port));
 
 	req->dnat = out;
 	req->dnat_port = d->set_port ? d->port : 0;

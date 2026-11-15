@@ -50,9 +50,11 @@ static void log_write(int fd, const char *buf, size_t len)
 	}
 }
 
+/* The digits of the "\xHH" escapes. */
+static const char log_hex[] = "0123456789abcdef";
+
 char *gwp_log_escape(char *dst, const void *src, size_t len)
 {
-	static const char hex[] = "0123456789abcdef";
 	const unsigned char *s = src;
 	char *d = dst;
 	size_t i;
@@ -66,8 +68,8 @@ char *gwp_log_escape(char *dst, const void *src, size_t len)
 		}
 		*d++ = '\\';
 		*d++ = 'x';
-		*d++ = hex[c >> 4];
-		*d++ = hex[c & 0xf];
+		*d++ = log_hex[c >> 4];
+		*d++ = log_hex[c & 0xf];
 	}
 	*d = '\0';
 	return dst;
@@ -86,7 +88,6 @@ static inline bool log_is_ctl(unsigned char c)
  */
 static size_t log_escape_ctl(char *s, size_t len, size_t nr_ctl)
 {
-	static const char hex[] = "0123456789abcdef";
 	char *src = s + len, *dst = src + 3 * nr_ctl;
 
 	while (dst > src) {
@@ -96,8 +97,8 @@ static size_t log_escape_ctl(char *s, size_t len, size_t nr_ctl)
 			*--dst = (char)c;
 			continue;
 		}
-		*--dst = hex[c & 0xf];
-		*--dst = hex[c >> 4];
+		*--dst = log_hex[c & 0xf];
+		*--dst = log_hex[c >> 4];
 		*--dst = 'x';
 		*--dst = '\\';
 	}

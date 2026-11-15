@@ -10,7 +10,9 @@
 #include <gwproxy/gwproxy.h>
 #include <gwproxy/upstream.h>
 #include <gwproxy/common.h>
+#include <gwproxy/ascii.h>
 #include <gwproxy/log.h>
+#include <gwproxy/rand.h>
 #include <gwproxy/acl.h>
 #include <gwproxy/ev/epoll.h>
 #ifdef CONFIG_IO_URING
@@ -38,9 +40,6 @@
 #include <fcntl.h>
 #include <sys/types.h>
 #include <sys/socket.h>
-#ifdef CONFIG_HAVE_GETRANDOM
-#include <sys/random.h>
-#endif
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <net/if.h>
@@ -352,7 +351,7 @@ static const char *opt_name(int c)
 static int opt_num(int c, const char *arg, long long min, long long max,
 		   bool hex, long long *out)
 {
-	unsigned long long v = 0, d, lim = (unsigned long long)max, base = 10;
+	unsigned long long v, lim = (unsigned long long)max;
 	const char *p = arg, *why = "";
 	bool neg = false;
 
@@ -361,31 +360,10 @@ static int opt_num(int c, const char *arg, long long min, long long max,
 		lim = -(unsigned long long)min;
 		p++;
 	}
-	if (*p < '0' || *p > '9')
+	if (gwp_parse_unum(p, hex, lim, &v)) {
+		if (hex && p[0] == '0' && p[1] >= '0' && p[1] <= '9')
+			why = " (no leading 0: it once meant octal)";
 		goto bad;
-	if (hex && p[0] == '0' && p[1]) {
-		if (p[1] != 'x' && p[1] != 'X') {
-			if (p[1] >= '0' && p[1] <= '9')
-				why = " (no leading 0: it once meant octal)";
-			goto bad;
-		}
-		base = 16;
-		p += 2;
-		if (!*p)
-			goto bad;
-	}
-	for (; *p; p++) {
-		if (*p >= '0' && *p <= '9')
-			d = (unsigned long long)(*p - '0');
-		else if (base == 16 && *p >= 'a' && *p <= 'f')
-			d = (unsigned long long)(*p - 'a' + 10);
-		else if (base == 16 && *p >= 'A' && *p <= 'F')
-			d = (unsigned long long)(*p - 'A' + 10);
-		else
-			goto bad;
-		if (d > lim || v > (lim - d) / base)
-			goto bad;
-		v = v * base + d;
 	}
 	if (neg) {
 		/* v is at most -@min, so -v fits even for LLONG_MIN. */
@@ -430,6 +408,30 @@ __cold
 static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 {
 	#define ERR_WRAP "==============================================\n"
+	/*
+	 * A macro, not a function: it pastes the message between the
+	 * banners as one literal and jumps to this function's einval.
+	 */
+	#define OPT_FAIL(fmt, ...) do {					\
+		fprintf(stderr, ERR_WRAP "Error: " fmt "\n" ERR_WRAP,	\
+			##__VA_ARGS__);					\
+		goto einval;						\
+	} while (0)
+	/*
+	 * Macros, not functions: each holds a case label of the switch
+	 * below and jumps to einval on a bad value. Taking &cfg->fld keeps
+	 * the type check of opt_int()'s int * and opt_bool()'s bool *.
+	 */
+	#define OPT_INT_CASE(ch, lo, hi, fld)				\
+	case ch:							\
+		if (opt_int(c, optarg, lo, hi, &cfg->fld))		\
+			goto einval;					\
+		break
+	#define OPT_BOOL_CASE(ch, fld)					\
+	case ch:							\
+		if (opt_bool(c, optarg, &cfg->fld))			\
+			goto einval;					\
+		break
 	#define NR_OPTS ((sizeof(long_opts) / sizeof(long_opts[0])) - 1)
 	char short_opts[(NR_OPTS * 2) + 1], *p;
 	size_t i;
@@ -468,26 +470,11 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 		case 't':
 			cfg->target = optarg;
 			break;
-		case 'S':
-			if (opt_bool(c, optarg, &cfg->as_socks5))
-				goto einval;
-			break;
-		case 'H':
-			if (opt_bool(c, optarg, &cfg->as_http))
-				goto einval;
-			break;
-		case 'U':
-			if (opt_bool(c, optarg, &cfg->udp_associate))
-				goto einval;
-			break;
-		case 'Q':
-			if (opt_bool(c, optarg, &cfg->prefer_ipv6))
-				goto einval;
-			break;
-		case 'o':
-			if (opt_int(c, optarg, INT_MIN, INT_MAX, &cfg->protocol_timeout))
-				goto einval;
-			break;
+		OPT_BOOL_CASE('S', as_socks5);
+		OPT_BOOL_CASE('H', as_http);
+		OPT_BOOL_CASE('U', udp_associate);
+		OPT_BOOL_CASE('Q', prefer_ipv6);
+		OPT_INT_CASE('o', INT_MIN, INT_MAX, protocol_timeout);
 		case 'A':
 			cfg->auth_file = optarg;
 			break;
@@ -502,65 +489,30 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 			else if (!strcmp(optarg, "ipv6"))
 				cfg->outgoing_family = GWP_OUT_FAMILY_IPV6;
 			else
-				goto einval_outfam;
+				OPT_FAIL("--outgoing-family must be any, ipv4 or ipv6.");
 			break;
-		case OPT_BIND_IPV6_ONLY:
-			if (opt_bool(c, optarg, &cfg->bind_ipv6_only))
-				goto einval;
-			break;
+		OPT_BOOL_CASE(OPT_BIND_IPV6_ONLY, bind_ipv6_only);
 		case OPT_ACL_ALLOW_ALL:
 			cfg->acl_allow_all = true;
 			break;
-		case OPT_WATCH_FILES:
-			if (opt_bool(c, optarg, &cfg->watch_files))
-				goto einval;
-			break;
-		case 'L':
-			if (opt_int(c, optarg, INT_MIN, INT_MAX, &cfg->dns_cache_secs))
-				goto einval;
-			break;
-		case OPT_DNS_CACHE_MAX_ENTRIES:
-			if (opt_int(c, optarg, INT_MIN, INT_MAX, &cfg->dns_cache_max_entries))
-				goto einval;
-			break;
-		case 'w':
-			if (opt_int(c, optarg, 1, GWP_MAX_WORKERS, &cfg->nr_workers))
-				goto einval;
-			break;
-		case 'W':
-			if (opt_int(c, optarg, 0, GWP_MAX_WORKERS, &cfg->nr_dns_workers))
-				goto einval;
-			break;
-		case 'c':
-			if (opt_int(c, optarg, INT_MIN, INT_MAX, &cfg->connect_timeout))
-				goto einval;
-			break;
+		OPT_BOOL_CASE(OPT_WATCH_FILES, watch_files);
+		OPT_INT_CASE('L', INT_MIN, INT_MAX, dns_cache_secs);
+		OPT_INT_CASE(OPT_DNS_CACHE_MAX_ENTRIES, INT_MIN, INT_MAX,
+			     dns_cache_max_entries);
+		OPT_INT_CASE('w', 1, GWP_MAX_WORKERS, nr_workers);
+		OPT_INT_CASE('W', 0, GWP_MAX_WORKERS, nr_dns_workers);
+		OPT_INT_CASE('c', INT_MIN, INT_MAX, connect_timeout);
 		case OPT_IDLE_TIMEOUT:
 			if (opt_int(c, optarg, INT_MIN, INT_MAX, &cfg->idle_timeout))
 				goto einval;
 			if (cfg->idle_timeout < 0)
 				cfg->idle_timeout = 0;
 			break;
-		case OPT_MAX_CONNS_PER_IP:
-			if (opt_int(c, optarg, 0, INT_MAX, &cfg->max_conns_per_ip))
-				goto einval;
-			break;
-		case 'D':
-			if (opt_int(c, optarg, INT_MIN, INT_MAX, &cfg->connect_attempt_delay))
-				goto einval;
-			break;
-		case 'T':
-			if (opt_int(c, optarg, INT_MIN, INT_MAX, &cfg->target_buf_size))
-				goto einval;
-			break;
-		case 'C':
-			if (opt_int(c, optarg, INT_MIN, INT_MAX, &cfg->client_buf_size))
-				goto einval;
-			break;
-		case 'd':
-			if (opt_bool(c, optarg, &cfg->tcp_nodelay))
-				goto einval;
-			break;
+		OPT_INT_CASE(OPT_MAX_CONNS_PER_IP, 0, INT_MAX, max_conns_per_ip);
+		OPT_INT_CASE('D', INT_MIN, INT_MAX, connect_attempt_delay);
+		OPT_INT_CASE('T', INT_MIN, INT_MAX, target_buf_size);
+		OPT_INT_CASE('C', INT_MIN, INT_MAX, client_buf_size);
+		OPT_BOOL_CASE('d', tcp_nodelay);
 		case 'K':
 			/*
 			 * --tcp-quickack never did anything: no TCP_QUICKACK was
@@ -570,26 +522,11 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 			 */
 			fprintf(stderr, "Warning: --tcp-quickack has no effect and is ignored\n");
 			break;
-		case 'k':
-			if (opt_bool(c, optarg, &cfg->tcp_keepalive))
-				goto einval;
-			break;
-		case 'i':
-			if (opt_int(c, optarg, INT_MIN, INT_MAX, &cfg->tcp_keepidle))
-				goto einval;
-			break;
-		case 'l':
-			if (opt_int(c, optarg, INT_MIN, INT_MAX, &cfg->tcp_keepintvl))
-				goto einval;
-			break;
-		case 'g':
-			if (opt_int(c, optarg, INT_MIN, INT_MAX, &cfg->tcp_keepcnt))
-				goto einval;
-			break;
-		case 'm':
-			if (opt_int(c, optarg, INT_MIN, INT_MAX, &cfg->log_level))
-				goto einval;
-			break;
+		OPT_BOOL_CASE('k', tcp_keepalive);
+		OPT_INT_CASE('i', INT_MIN, INT_MAX, tcp_keepidle);
+		OPT_INT_CASE('l', INT_MIN, INT_MAX, tcp_keepintvl);
+		OPT_INT_CASE('g', INT_MIN, INT_MAX, tcp_keepcnt);
+		OPT_INT_CASE('m', INT_MIN, INT_MAX, log_level);
 		case 'f':
 			cfg->log_file = optarg;
 			break;
@@ -613,10 +550,7 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 		case 'I':
 			cfg->bind_iface = optarg;
 			break;
-		case 'R':
-			if (opt_bool(c, optarg, &cfg->as_transparent))
-				goto einval;
-			break;
+		OPT_BOOL_CASE('R', as_transparent);
 #ifdef CONFIG_HTTPS
 		case 'E':
 			cfg->tls_cert = optarg;
@@ -631,10 +565,7 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 		case 'j':
 			cfg->dns_servers = optarg;
 			break;
-		case 'r':
-			if (opt_bool(c, optarg, &cfg->use_raw_dns))
-				goto einval;
-			break;
+		OPT_BOOL_CASE('r', use_raw_dns);
 		default:
 			fprintf(stderr, "Unknown option: %c\n", c);
 			show_help(argv[0]);
@@ -643,15 +574,11 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 	}
 
 
-	if (cfg->use_raw_dns && ev_is_io_uring(cfg)) {
-		fprintf(stderr, ERR_WRAP "Error: The raw DNS feature is currently not supported with the io_uring event loop\n" ERR_WRAP);
-		goto einval;
-	}
+	if (cfg->use_raw_dns && ev_is_io_uring(cfg))
+		OPT_FAIL("The raw DNS feature is currently not supported with the io_uring event loop");
 
-	if (cfg->use_raw_dns && cfg->dns_cache_secs) {
-		fprintf(stderr, ERR_WRAP "Error: The -L/--dns-cache-secs option is not supported with the raw DNS feature\n" ERR_WRAP);
-		goto einval;
-	}
+	if (cfg->use_raw_dns && cfg->dns_cache_secs)
+		OPT_FAIL("The -L/--dns-cache-secs option is not supported with the raw DNS feature");
 
 	/*
 	 * The system resolver needs a thread to run a lookup on. --raw-dns
@@ -659,121 +586,89 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 	 * there (see gwp_ctx_init_dns()).
 	 */
 	if ((cfg->as_socks5 || cfg->as_http) && !cfg->use_raw_dns &&
-	    cfg->nr_dns_workers < 1) {
-		fprintf(stderr, ERR_WRAP "Error: -W/--nr-dns-workers must be at least 1 for SOCKS5 or HTTP with the system resolver.\n" ERR_WRAP);
-		goto einval;
-	}
+	    cfg->nr_dns_workers < 1)
+		OPT_FAIL("-W/--nr-dns-workers must be at least 1 for SOCKS5 or HTTP with the system resolver.");
 
 #ifdef CONFIG_HTTPS
-	if ((cfg->tls_cert != NULL) != (cfg->tls_key != NULL)) {
-		fprintf(stderr, ERR_WRAP "Error: --tls-cert and --tls-key must be provided together\n" ERR_WRAP);
-		goto einval;
-	}
+	if ((cfg->tls_cert != NULL) != (cfg->tls_key != NULL))
+		OPT_FAIL("--tls-cert and --tls-key must be provided together");
 
 	/*
 	 * The TLS listener detects a ClientHello in the SOCKS5 and HTTP paths
 	 * only. Elsewhere the certificate would do nothing but log that TLS is
 	 * on while the listener speaks cleartext.
 	 */
-	if (cfg->tls_cert && !cfg->as_socks5 && !cfg->as_http) {
-		fprintf(stderr, ERR_WRAP "Error: --tls-cert needs --as-socks5=1 or --as-http=1\n" ERR_WRAP);
-		goto einval;
-	}
+	if (cfg->tls_cert && !cfg->as_socks5 && !cfg->as_http)
+		OPT_FAIL("--tls-cert needs --as-socks5=1 or --as-http=1");
 #endif
 
-	if (cfg->as_transparent && (cfg->as_socks5 || cfg->as_http)) {
-		fprintf(stderr, ERR_WRAP "Error: --as-transparent cannot be combined with --as-socks5 or --as-http\n" ERR_WRAP);
-		goto einval;
-	}
+	if (cfg->as_transparent && (cfg->as_socks5 || cfg->as_http))
+		OPT_FAIL("--as-transparent cannot be combined with --as-socks5 or --as-http");
 
-	if (cfg->as_transparent && cfg->target) {
-		fprintf(stderr, ERR_WRAP "Error: --target must not be set with --as-transparent (the target comes from SO_ORIGINAL_DST)\n" ERR_WRAP);
-		goto einval;
-	}
+	if (cfg->as_transparent && cfg->target)
+		OPT_FAIL("--target must not be set with --as-transparent (the target comes from SO_ORIGINAL_DST)");
 
-	if (!cfg->as_socks5 && !cfg->as_http && !cfg->as_transparent && !cfg->target) {
-		fprintf(stderr, ERR_WRAP "Error: --target is required unless --as-socks5=1, --as-http=1 or --as-transparent=1\n" ERR_WRAP);
-		goto einval;
-	}
+	if (!cfg->as_socks5 && !cfg->as_http && !cfg->as_transparent && !cfg->target)
+		OPT_FAIL("--target is required unless --as-socks5=1, --as-http=1 or --as-transparent=1");
 
-	if (cfg->upstream_auth_file && !cfg->upstream_proxy) {
-		fprintf(stderr, ERR_WRAP "Error: --upstream-proxy-auth-file needs --upstream-proxy\n" ERR_WRAP);
-		goto einval;
-	}
+	if (cfg->upstream_auth_file && !cfg->upstream_proxy)
+		OPT_FAIL("--upstream-proxy-auth-file needs --upstream-proxy");
 
 	/*
 	 * The URL's scheme is checked once it is parsed (upstream_init_tls());
 	 * an ACL file may name https:// pool servers.
 	 */
 	if (cfg->upstream_ca_file && !cfg->upstream_proxy &&
-	    !(cfg->acl_file && *cfg->acl_file)) {
-		fprintf(stderr, ERR_WRAP "Error: --upstream-ca-file needs an https:// --upstream-proxy or an --acl-file\n" ERR_WRAP);
-		goto einval;
-	}
+	    !(cfg->acl_file && *cfg->acl_file))
+		OPT_FAIL("--upstream-ca-file needs an https:// --upstream-proxy or an --acl-file");
 
-	if (cfg->nr_workers <= 0) {
-		fprintf(stderr, ERR_WRAP "Error: --nr-workers must be at least 1.\n" ERR_WRAP);
-		goto einval;
-	}
+	if (cfg->nr_workers <= 0)
+		OPT_FAIL("--nr-workers must be at least 1.");
 
 	/*
 	 * --prefer-ipv6 asks for a family that --outgoing-family forbids. Take
 	 * it as a mistake rather than silently letting the hard restriction win
 	 * -- an operator who wrote both is describing two different intents.
 	 */
-	if (cfg->prefer_ipv6 && cfg->outgoing_family == GWP_OUT_FAMILY_IPV4) {
-		fprintf(stderr, ERR_WRAP "Error: --prefer-ipv6=1 contradicts --outgoing-family=ipv4.\n" ERR_WRAP);
-		goto einval;
-	}
+	if (cfg->prefer_ipv6 && cfg->outgoing_family == GWP_OUT_FAMILY_IPV4)
+		OPT_FAIL("--prefer-ipv6=1 contradicts --outgoing-family=ipv4.");
 
-	if (cfg->target_buf_size <= 1) {
-		fprintf(stderr, ERR_WRAP "Error: --target-buf-size must be greater than 1.\n" ERR_WRAP);
-		goto einval;
-	}
+	if (cfg->target_buf_size <= 1)
+		OPT_FAIL("--target-buf-size must be greater than 1.");
 
-	if (cfg->client_buf_size <= 1) {
-		fprintf(stderr, ERR_WRAP "Error: --client-buf-size must be greater than 1.\n" ERR_WRAP);
-		goto einval;
-	}
+	if (cfg->client_buf_size <= 1)
+		OPT_FAIL("--client-buf-size must be greater than 1.");
 
 	if (cfg->as_socks5 || cfg->as_http) {
-		if (cfg->client_buf_size < 256) {
-			fprintf(stderr, ERR_WRAP "Error: --client-buf-size must be at least 256 for SOCKS5 or HTTP.\n" ERR_WRAP);
-			goto einval;
-		}
+		if (cfg->client_buf_size < 256)
+			OPT_FAIL("--client-buf-size must be at least 256 for SOCKS5 or HTTP.");
 
-		if (cfg->target_buf_size < 256) {
-			fprintf(stderr, ERR_WRAP "Error: --target-buf-size must be at least 256 for SOCKS5 or HTTP.\n" ERR_WRAP);
-			goto einval;
-		}
+		if (cfg->target_buf_size < 256)
+			OPT_FAIL("--target-buf-size must be at least 256 for SOCKS5 or HTTP.");
 	}
 
 	/*
 	 * Each SOCKS5 message has to fit in client.buf as a whole, and the
 	 * proxy has no other way to read the rest of it.
 	 */
-	if (cfg->as_socks5 && cfg->client_buf_size < GWP_SOCKS5_MIN_CLIENT_BUF) {
-		fprintf(stderr, ERR_WRAP "Error: --client-buf-size must be at least %d for SOCKS5.\n" ERR_WRAP,
-			GWP_SOCKS5_MIN_CLIENT_BUF);
-		goto einval;
-	}
+	if (cfg->as_socks5 && cfg->client_buf_size < GWP_SOCKS5_MIN_CLIENT_BUF)
+		OPT_FAIL("--client-buf-size must be at least %d for SOCKS5.",
+			 GWP_SOCKS5_MIN_CLIENT_BUF);
 
-	if (cfg->upstream_proxy && cfg->target_buf_size < GWP_UPSTREAM_MIN_TARGET_BUF) {
-		fprintf(stderr, ERR_WRAP "Error: --target-buf-size must be at least %d with --upstream-proxy.\n" ERR_WRAP,
-			GWP_UPSTREAM_MIN_TARGET_BUF);
-		goto einval;
-	}
+	if (cfg->upstream_proxy && cfg->target_buf_size < GWP_UPSTREAM_MIN_TARGET_BUF)
+		OPT_FAIL("--target-buf-size must be at least %d with --upstream-proxy.",
+			 GWP_UPSTREAM_MIN_TARGET_BUF);
 
 	return 0;
-
-einval_outfam:
-	fprintf(stderr, ERR_WRAP "Error: --outgoing-family must be any, ipv4 or ipv6.\n" ERR_WRAP);
-	goto einval;
 
 einval:
 	fprintf(stderr, "\n");
 	show_help(argv[0]);
 	return -EINVAL;
+	#undef OPT_BOOL_CASE
+	#undef OPT_INT_CASE
+	#undef OPT_FAIL
+	#undef ERR_WRAP
 }
 
 #ifdef CONFIG_NEW_DNS_RESOLVER
@@ -908,8 +803,6 @@ static int gwp_raw_dns_resolve(struct gwp_wrk __unused *w,
 	return -ENOSYS;
 }
 #endif /* #ifdef CONFIG_NEW_DNS_RESOLVER */
-
-#define FULL_ADDRSTRLEN (INET6_ADDRSTRLEN + sizeof(":65535[]") - 1)
 
 /*
  * Never NULL: the result goes straight to "%s". An address that is not set
@@ -1295,15 +1188,6 @@ static void gwp_conn_pair_drop_dns(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
  * the end of the upstream's stream, and gets a reset. Before that, the client
  * may still be owed its failure reply, which a reset would throw away.
  */
-#ifdef CONFIG_HTTPS
-static void gwp_set_reset_on_close(int fd)
-{
-	static const struct linger l = { .l_onoff = 1, .l_linger = 0 };
-
-	__sys_setsockopt(fd, SOL_SOCKET, SO_LINGER, &l, sizeof(l));
-}
-#endif
-
 void gwp_conn_pair_abort_attempts(const struct gwp_conn_pair __unused *gcp)
 {
 #ifdef CONFIG_HTTPS
@@ -2255,14 +2139,6 @@ static int gwp_reload_drain(struct gwp_ctx *ctx, char *buf, unsigned *flags)
 #define GWP_RELOAD_QUIET_MS	100
 #define GWP_RELOAD_MAX_WAIT_MS	1000
 
-static uint64_t gwp_reload_now_ms(void)
-{
-	struct timespec ts;
-
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
-}
-
 /*
  * A SIGHUP: the operator says the files are ready, so every configured file is
  * reloaded at once, with no wait for it to settle. Each failure is logged, even
@@ -2318,7 +2194,7 @@ static void *gwp_reload_thread(void *arg)
 	for (;;) {
 		uint64_t wake = pending && due < next_check ? due : next_check;
 
-		now = gwp_reload_now_ms();
+		now = gwp_mono_ms();
 		if (!watch)
 			timeout = -1;
 		else
@@ -2366,7 +2242,7 @@ static void *gwp_reload_thread(void *arg)
 				break;
 		}
 
-		now = gwp_reload_now_ms();
+		now = gwp_mono_ms();
 		if (now >= next_check) {
 			flags |= gwp_reload_check(ctx, now);
 			next_check = now + GWP_RELOAD_CHECK_MS;
@@ -2471,18 +2347,9 @@ static void gwp_ctx_free_reload(struct gwp_ctx *ctx)
 		pthread_join(ctx->reload_thread, NULL);
 		ctx->reload_running = false;
 	}
-	if (ctx->reload_efd >= 0) {
-		__sys_close(ctx->reload_efd);
-		ctx->reload_efd = -1;
-	}
-	if (ctx->hup_efd >= 0) {
-		__sys_close(ctx->hup_efd);
-		ctx->hup_efd = -1;
-	}
-	if (ctx->ino_fd >= 0) {
-		__sys_close(ctx->ino_fd);
-		ctx->ino_fd = -1;
-	}
+	gwp_close_fd(&ctx->reload_efd);
+	gwp_close_fd(&ctx->hup_efd);
+	gwp_close_fd(&ctx->ino_fd);
 	ctx->auth_wd = -1;
 	for (i = 0; i < ctx->nr_acl_files; i++)
 		ctx->acl_files[i].wd = -1;
@@ -2847,23 +2714,11 @@ bool gwp_ctx_iplim_get(struct gwp_wrk *w, const struct gwp_sockaddr *addr)
 	return false;
 }
 
-/*
- * Whether a line limited by @l may be logged now. When it may, *@quiet is set
- * to the number left out since the last one, for the line to say; when not,
- * this one is counted among them.
- */
+/* gwp_log_limit_take() at the second of @w's clock, for a line @w logs. */
 bool gwp_wrk_log_limit(struct gwp_wrk *w, struct gwp_log_limit *l,
 		       uint32_t *quiet)
 {
-	if ((int32_t)(w->now - l->next) < 0) {
-		l->quiet++;
-		return false;
-	}
-
-	*quiet = l->quiet;
-	l->quiet = 0;
-	l->next = w->now + 1;
-	return true;
+	return gwp_log_limit_take(l, w->now, quiet);
 }
 
 /*
@@ -2880,11 +2735,8 @@ void gwp_wrk_acl_denied(struct gwp_wrk *w, const struct gwp_sockaddr *addr)
 	if (!gwp_wrk_log_limit(w, &w->acl_deny_log, &quiet))
 		return;
 
-	if (quiet)
-		pr_info(&ctx->lh, "ACL denied client %s (and %u more since the last such line)",
-			ip_to_str(addr), quiet);
-	else
-		pr_info(&ctx->lh, "ACL denied client %s", ip_to_str(addr));
+	pr_info_quiet(&ctx->lh, quiet, "ACL denied client %s",
+		      ip_to_str(addr));
 }
 
 /*
@@ -2903,12 +2755,9 @@ void gwp_wrk_no_orig_dst(struct gwp_wrk *w, const struct gwp_sockaddr *addr,
 	if (!gwp_wrk_log_limit(w, &w->no_orig_dst_log, &quiet))
 		return;
 
-	if (quiet)
-		pr_warn(&ctx->lh, "No original destination for %s: %s (not a redirected connection?) (and %u more since the last such line)",
-			ip_to_str(addr), why, quiet);
-	else
-		pr_warn(&ctx->lh, "No original destination for %s: %s (not a redirected connection?)",
-			ip_to_str(addr), why);
+	pr_warn_quiet(&ctx->lh, quiet,
+		      "No original destination for %s: %s (not a redirected connection?)",
+		      ip_to_str(addr), why);
 }
 
 /* Uncount a client gwp_ctx_iplim_get() admitted. */
@@ -2927,17 +2776,9 @@ void gwp_ctx_iplim_put(struct gwp_ctx *ctx, const struct gwp_sockaddr *addr)
  * domain is known), it is allowed here; domain-based rules are applied
  * separately once wired in.
  */
-/* Host-order port of a sockaddr, regardless of family. */
-static uint16_t sa_port_h(const struct gwp_sockaddr *s)
-{
-	return ntohs(s->sa.sa_family == AF_INET ? s->i4.sin_port
-						: s->i6.sin6_port);
-}
-
 static int upstream_dst_from_sockaddr(const struct gwp_sockaddr *sa,
 				      struct gwp_socks5_addr *out);
 static int upstream_target_init(struct gwp_ctx *ctx);
-static int parse_port(const char *s, uint16_t *port);
 
 /*
  * Fill the inputs of an OUTPUT request for @target (NULL when only a domain is
@@ -2958,8 +2799,8 @@ static void acl_out_req(struct gwp_acl_req *req,
 	req->domain = domain;
 	req->user = user;
 	req->proto = proto;
-	req->dport = target ? sa_port_h(target) : 0;
-	req->sport = client ? sa_port_h(client) : 0;
+	req->dport = target ? gwp_sockaddr_port_h(target) : 0;
+	req->sport = client ? gwp_sockaddr_port_h(client) : 0;
 }
 
 /*
@@ -3322,11 +3163,8 @@ static uint32_t pool_pick_random(void __unused *arg)
 		struct timespec ts;
 		uint32_t seed = 0;
 
-#ifdef CONFIG_HAVE_GETRANDOM
-		if (getrandom(&seed, sizeof(seed), GRND_NONBLOCK) !=
-		    (ssize_t)sizeof(seed))
+		if (!gwp_getrandom(&seed, sizeof(seed), GRND_NONBLOCK))
 			seed = 0;
-#endif
 		if (!seed) {
 			clock_gettime(CLOCK_MONOTONIC, &ts);
 			seed = (uint32_t)ts.tv_nsec ^ (uint32_t)ts.tv_sec;
@@ -3554,7 +3392,7 @@ bool gwp_ctx_acl_target_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp)
 					       NULL, ntohs(ctx->target_name.port));
 		else
 			r = conn_pick_upstream(ctx, gcp, NULL, &gcp->target_addr,
-					       sa_port_h(&gcp->target_addr));
+				gwp_sockaddr_port_h(&gcp->target_addr));
 		if (unlikely(r))
 			return false;
 	}
@@ -3641,7 +3479,7 @@ bool gwp_ctx_acl_client_allowed(struct gwp_ctx *ctx,
 	memset(&req, 0, sizeof(req));
 	req.client = client;
 	req.proto = proto;
-	req.sport = sa_port_h(client);
+	req.sport = gwp_sockaddr_port_h(client);
 	return gwp_acl_eval_input(ctx->acl, &req) == GWP_ACL_ACCEPT;
 }
 
@@ -3907,7 +3745,6 @@ int gwp_parse_upstream(const char *url, struct gwp_upstream *up)
 	char buf[512], *at, *host;
 	const char *rest;
 	uint16_t def_port;
-	bool has_port;
 	size_t n;
 
 	memset(up, 0, sizeof(*up));
@@ -3975,19 +3812,7 @@ int gwp_parse_upstream(const char *url, struct gwp_upstream *up)
 	    !upstream_host_ok(up))
 		return -EINVAL;
 
-	/*
-	 * convert_str_to_ssaddr() ignores an explicit port in the string when
-	 * a non-zero default_port is passed, so only pass the default when the
-	 * host has no port of its own.
-	 */
-	if (host[0] == '[') {
-		char *rb = strchr(host, ']');
-		has_port = rb && rb[1] == ':';
-	} else {
-		has_port = strchr(host, ':') != NULL;
-	}
-
-	if (convert_str_to_ssaddr(host, &up->addr, has_port ? 0 : def_port))
+	if (convert_str_to_ssaddr(host, &up->addr, def_port))
 		return up->host_is_ip ? -EINVAL : -EHOSTUNREACH;
 	return 0;
 }
@@ -5389,7 +5214,8 @@ int gwp_get_orig_dst(int fd, const struct gwp_sockaddr *client,
 	if (r)
 		return r;
 
-	if (gwp_sockaddr_ip_eq(dst, &local) && sa_port_h(dst) == sa_port_h(&local))
+	if (gwp_sockaddr_ip_eq(dst, &local) &&
+	    gwp_sockaddr_port_h(dst) == gwp_sockaddr_port_h(&local))
 		return -ELOOP;
 
 	return 0;
@@ -5409,24 +5235,6 @@ static void set_v4mapped(struct in6_addr *a6, const void *v4)
 	memcpy(&a6->s6_addr[12], v4, 4);
 }
 
-/* Canonicalise an address to (is_v4, pointer to its 4- or 16-byte IP). */
-static void sockaddr_canon_ip(const struct gwp_sockaddr *a, bool *is_v4,
-			      const uint8_t **ip)
-{
-	if (a->sa.sa_family == AF_INET) {
-		*is_v4 = true;
-		*ip = (const uint8_t *)&a->i4.sin_addr;
-		return;
-	}
-	if (IN6_IS_ADDR_V4MAPPED(&a->i6.sin6_addr)) {
-		*is_v4 = true;
-		*ip = &a->i6.sin6_addr.s6_addr[12];
-		return;
-	}
-	*is_v4 = false;
-	*ip = a->i6.sin6_addr.s6_addr;
-}
-
 /*
  * Write to @out the form of source @src that a socket about to dial @dst can
  * bind. An IPv4-mapped address is IPv4 traffic on an AF_INET6 socket, so what
@@ -5441,8 +5249,8 @@ static bool conn_bind_src(struct gwp_sockaddr *out,
 	const uint8_t *src_ip, *dst_ip;
 	bool src_v4, dst_v4;
 
-	sockaddr_canon_ip(src, &src_v4, &src_ip);
-	sockaddr_canon_ip(dst, &dst_v4, &dst_ip);
+	gwp_sockaddr_canon_ip(src, &src_v4, &src_ip);
+	gwp_sockaddr_canon_ip(dst, &dst_v4, &dst_ip);
 	if (src_v4 != dst_v4)
 		return false;
 
@@ -5523,8 +5331,7 @@ static int apply_conn_bind(struct gwp_wrk *w, int fd,
 			return -EAFNOSUPPORT;
 		}
 
-		len = (s->sa.sa_family == AF_INET) ? sizeof(struct sockaddr_in)
-						   : sizeof(struct sockaddr_in6);
+		len = gwp_sockaddr_len(s);
 
 		/*
 		 * With no port asked for, leave choosing one to connect(), which
@@ -5534,8 +5341,7 @@ static int apply_conn_bind(struct gwp_wrk *w, int fd,
 		 * port range. Not fatal: only pre-4.2 kernels refuse it, and the
 		 * source is pinned either way. IPv6 sockets take it at SOL_IP too.
 		 */
-		port = (s->sa.sa_family == AF_INET) ? s->i4.sin_port
-						    : s->i6.sin6_port;
+		port = gwp_sockaddr_port(s);
 		if (!port)
 			setskopt_int(fd, IPPROTO_IP, IP_BIND_ADDRESS_NO_PORT, 1);
 
@@ -5651,8 +5457,7 @@ int gwp_create_sock_target(struct gwp_wrk *w, struct gwp_sockaddr *addr,
 		return fd;
 	}
 
-	len = (addr->sa.sa_family == AF_INET) ? sizeof(struct sockaddr_in)
-					      : sizeof(struct sockaddr_in6);
+	len = gwp_sockaddr_len(addr);
 	r = __sys_connect(fd, &addr->sa, len);
 	if (likely(r)) {
 		if (r != -EINPROGRESS) {
@@ -5762,6 +5567,36 @@ int gwp_socks5_prep_connect_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	return 0;
 }
 
+/*
+ * Append the fixed HTTP reply @build makes to @t's unsent bytes. Returns 0,
+ * or the builder's error (-ENOBUFS) when the reply does not fit, in which
+ * case nothing is queued.
+ */
+static int gwp_http_queue_reply(struct gwp_conn *t,
+				int (*build)(void *out, size_t out_cap))
+{
+	int r = build(t->buf + t->len, t->cap - t->len);
+
+	if (r < 0)
+		return r;
+	t->len += (uint32_t)r;
+	return 0;
+}
+
+/*
+ * Take the pair's one final answer: false when an earlier failure or refusal
+ * has already given it (see gwp_conn_fail_reply()), otherwise mark it given
+ * and the client's reply as its last.
+ */
+static inline bool gwp_conn_claim_final_reply(struct gwp_conn_pair *gcp)
+{
+	if (gcp->flags & GWP_CONN_FLAG_FAIL_REPLIED)
+		return false;
+	gcp->flags |= GWP_CONN_FLAG_FAIL_REPLIED;
+	gcp->client.last_reply = true;
+	return true;
+}
+
 int gwp_conn_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int err)
 {
 	/*
@@ -5779,10 +5614,8 @@ int gwp_conn_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int err)
 	 * would follow it, or be written over it. The SOCKS5 reply builder
 	 * refuses a second reply by its state; the HTTP ones would not.
 	 */
-	if (gcp->flags & GWP_CONN_FLAG_FAIL_REPLIED)
+	if (!gwp_conn_claim_final_reply(gcp))
 		return 0;
-	gcp->flags |= GWP_CONN_FLAG_FAIL_REPLIED;
-	gcp->client.last_reply = true;
 	if (timed_out)
 		err = -ETIMEDOUT;
 
@@ -5805,20 +5638,10 @@ int gwp_conn_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int err)
 	if (gcp->prot_type == GWP_PROT_TYPE_SOCKS5)
 		return gwp_socks5_prep_connect_reply(w, gcp, err);
 
-	if (gcp->prot_type == GWP_PROT_TYPE_HTTP) {
-		void *out = gcp->target.buf + gcp->target.len;
-		size_t cap = gcp->target.cap - gcp->target.len;
-		int r;
-
-		if (timed_out)
-			r = gwp_http_build_gateway_timeout_reply(out, cap);
-		else
-			r = gwp_http_build_bad_gateway_reply(out, cap);
-		if (r < 0)
-			return r;
-		gcp->target.len += (uint32_t)r;
-		return 0;
-	}
+	if (gcp->prot_type == GWP_PROT_TYPE_HTTP)
+		return gwp_http_queue_reply(&gcp->target, timed_out ?
+					    gwp_http_build_gateway_timeout_reply :
+					    gwp_http_build_bad_gateway_reply);
 
 	return 0;	/* plain/transparent forwarding speaks no protocol */
 }
@@ -5845,10 +5668,8 @@ int gwp_dns_start_failed(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 int gwp_acl_reject_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	/* A final answer as well, see gwp_conn_fail_reply(). */
-	if (gcp->flags & GWP_CONN_FLAG_FAIL_REPLIED)
+	if (!gwp_conn_claim_final_reply(gcp))
 		return -EACCES;
-	gcp->flags |= GWP_CONN_FLAG_FAIL_REPLIED;
-	gcp->client.last_reply = true;
 
 	pr_info(&w->ctx->lh, "ACL denied target %s for client %s (idx=%u)",
 		gwp_upstream_dst_str(gcp), ip_to_str(&gcp->client_addr),
@@ -5860,13 +5681,11 @@ int gwp_acl_reject_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		if (r)
 			return r;
 	} else if (gcp->prot_type == GWP_PROT_TYPE_HTTP) {
-		int r = gwp_http_build_forbidden_reply(
-				gcp->target.buf + gcp->target.len,
-				gcp->target.cap - gcp->target.len);
+		int r = gwp_http_queue_reply(&gcp->target,
+					     gwp_http_build_forbidden_reply);
 
-		if (r < 0)
+		if (r)
 			return r;
-		gcp->target.len += (uint32_t)r;
 	}
 	return -EACCES;
 }
@@ -5961,7 +5780,7 @@ static int upstream_dst_from_hostport(const char *hostport,
 	if (!colon)
 		return -EINVAL;
 	*colon = '\0';
-	if (parse_port(colon + 1, &port) || !port)
+	if (gwp_parse_port(colon + 1, &port) || !port)
 		return -EINVAL;
 
 	host = buf;
@@ -6323,28 +6142,22 @@ int gwp_socks5_prepare_target_addr(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	memset(ta, 0, sizeof(*ta));
 	switch (dst->ver) {
 	case GWP_SOCKS5_ATYP_IPV4:
-		memcpy(&ta->i4.sin_addr, &dst->ip4, 4);
-		ta->i4.sin_port = dst->port;
-		ta->i4.sin_family = AF_INET;
-		gwp_conn_set_single_candidate(gcp, ta);
-		r = conn_pick_upstream(w->ctx, gcp, NULL, ta, ntohs(dst->port));
-		if (r)
-			return pick_refused(w, gcp, r);
-		return 0;
+		gwp_sockaddr_set(ta, AF_INET, dst->ip4, dst->port);
+		break;
 	case GWP_SOCKS5_ATYP_IPV6:
-		memcpy(&ta->i6.sin6_addr, &dst->ip6, 16);
-		ta->i6.sin6_port = dst->port;
-		ta->i6.sin6_family = AF_INET6;
-		gwp_conn_set_single_candidate(gcp, ta);
-		r = conn_pick_upstream(w->ctx, gcp, NULL, ta, ntohs(dst->port));
-		if (r)
-			return pick_refused(w, gcp, r);
-		return 0;
+		gwp_sockaddr_set(ta, AF_INET6, dst->ip6, dst->port);
+		break;
 	case GWP_SOCKS5_ATYP_DOMAIN:
 		return socks5_prepare_target_addr_domain(w, gcp);
+	default:
+		return -ENOSYS;
 	}
 
-	return -ENOSYS;
+	gwp_conn_set_single_candidate(gcp, ta);
+	r = conn_pick_upstream(w->ctx, gcp, NULL, ta, ntohs(dst->port));
+	if (r)
+		return pick_refused(w, gcp, r);
+	return 0;
 }
 
 int gwp_socks5_handle_data(struct gwp_conn_pair *gcp)
@@ -6504,7 +6317,7 @@ bool gwp_ctx_outgoing_family_ok(const struct gwp_ctx *ctx,
 	if (ctx->cfg.outgoing_family == GWP_OUT_FAMILY_ANY)
 		return true;
 
-	sockaddr_canon_ip(a, &is_v4, &ip);
+	gwp_sockaddr_canon_ip(a, &is_v4, &ip);
 	if (ctx->cfg.outgoing_family == GWP_OUT_FAMILY_IPV4)
 		return is_v4;
 	return !is_v4;
@@ -6551,8 +6364,8 @@ bool gwp_sockaddr_ip_eq(const struct gwp_sockaddr *a, const struct gwp_sockaddr 
 	const uint8_t *ai, *bi;
 	bool av4, bv4;
 
-	sockaddr_canon_ip(a, &av4, &ai);
-	sockaddr_canon_ip(b, &bv4, &bi);
+	gwp_sockaddr_canon_ip(a, &av4, &ai);
+	gwp_sockaddr_canon_ip(b, &bv4, &bi);
 	if (av4 != bv4)
 		return false;
 	return !memcmp(ai, bi, av4 ? 4 : 16);
@@ -6584,7 +6397,7 @@ static int route_is_local(const struct gwp_sockaddr *a)
 	bool v4;
 	int fd;
 
-	sockaddr_canon_ip(a, &v4, &ip);
+	gwp_sockaddr_canon_ip(a, &v4, &ip);
 	ip_len = v4 ? 4 : 16;
 
 	memset(&req, 0, sizeof(req));
@@ -6670,7 +6483,7 @@ static void target_connect_addr(const struct gwp_wrk *w,
 	bool v4;
 
 	*out = *dst;
-	sockaddr_canon_ip(dst, &v4, &ip);
+	gwp_sockaddr_canon_ip(dst, &v4, &ip);
 	if (memcmp(ip, any, v4 ? 4 : 16))
 		return;
 
@@ -6680,7 +6493,7 @@ static void target_connect_addr(const struct gwp_wrk *w,
 	}
 
 	if (b->set && b->have_src && conn_bind_src(out, &b->src, dst)) {
-		sockaddr_canon_ip(out, &v4, &ip);
+		gwp_sockaddr_canon_ip(out, &v4, &ip);
 		if (memcmp(ip, any, 4))
 			return;
 	}
@@ -6729,12 +6542,12 @@ bool gwp_target_is_self(struct gwp_wrk *w, const struct gwp_conn_pair *gcp,
 
 	if (gcp->upstream)
 		dst = &gcp->upstream->addr;
-	if (sa_port_h(dst) != sa_port_h(lst))
+	if (gwp_sockaddr_port_h(dst) != gwp_sockaddr_port_h(lst))
 		return false;
 
-	sockaddr_canon_ip(lst, &lv4, &lip);
+	gwp_sockaddr_canon_ip(lst, &lv4, &lip);
 	target_connect_addr(w, gcp, dst, &to);
-	sockaddr_canon_ip(&to, &dv4, &dip);
+	gwp_sockaddr_canon_ip(&to, &dv4, &dip);
 	if (memcmp(lip, any, lv4 ? 4 : 16)) {
 		self = gwp_sockaddr_ip_eq(&to, lst);
 	} else if (lv4 ? !dv4 : (dv4 && w->ctx->cfg.bind_ipv6_only)) {
@@ -7095,9 +6908,7 @@ int gwp_socks5_addr_to_sockaddr(const struct gwp_socks5_addr *a, int family,
 	switch (a->ver) {
 	case GWP_SOCKS5_ATYP_IPV4:
 		if (family == AF_INET) {
-			sa->i4.sin_family = AF_INET;
-			memcpy(&sa->i4.sin_addr, a->ip4, 4);
-			sa->i4.sin_port = a->port;
+			gwp_sockaddr_set(sa, AF_INET, a->ip4, a->port);
 			*slen = sizeof(sa->i4);
 			return 0;
 		}
@@ -7115,15 +6926,11 @@ int gwp_socks5_addr_to_sockaddr(const struct gwp_socks5_addr *a, int family,
 		if (family == AF_INET) {
 			if (!IN6_IS_ADDR_V4MAPPED((const struct in6_addr *)a->ip6))
 				return -EAFNOSUPPORT;
-			sa->i4.sin_family = AF_INET;
-			memcpy(&sa->i4.sin_addr, a->ip6 + 12, 4);
-			sa->i4.sin_port = a->port;
+			gwp_sockaddr_set(sa, AF_INET, a->ip6 + 12, a->port);
 			*slen = sizeof(sa->i4);
 			return 0;
 		}
-		sa->i6.sin6_family = AF_INET6;
-		memcpy(&sa->i6.sin6_addr, a->ip6, 16);
-		sa->i6.sin6_port = a->port;
+		gwp_sockaddr_set(sa, AF_INET6, a->ip6, a->port);
 		*slen = sizeof(sa->i6);
 		return 0;
 	default:
@@ -7223,8 +7030,7 @@ static int udp_client_bnd(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 	}
 
 	gwp_socks5_reply_addr_from_sockaddr(&local, bnd);
-	bnd->port = relay->sa.sa_family == AF_INET ? relay->i4.sin_port :
-						     relay->i6.sin6_port;
+	bnd->port = gwp_sockaddr_port(relay);
 	return 0;
 }
 
@@ -7515,8 +7321,7 @@ int gwp_upstream_udp_dst(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 	/* An IPv4 control connection names its address as IPv4. */
 	gwp_socks5_reply_addr_from_sockaddr(&local, &gcp->up_dst);
-	gcp->up_dst.port = relay.sa.sa_family == AF_INET ? relay.i4.sin_port :
-							   relay.i6.sin6_port;
+	gcp->up_dst.port = gwp_sockaddr_port(&relay);
 	return 0;
 }
 
@@ -7680,12 +7485,9 @@ int gwp_handle_conn_state_socks5(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
  */
 static int http_reject_unauthorized(struct gwp_conn_pair *gcp)
 {
-	int r = gwp_http_build_auth_required_reply(gcp->target.buf + gcp->target.len,
-						   gcp->target.cap - gcp->target.len);
-	if (r < 0)
+	if (gwp_http_queue_reply(&gcp->target,
+				 gwp_http_build_auth_required_reply))
 		return -ENOBUFS;
-
-	gcp->target.len += (uint32_t)r;
 	return -EACCES;
 }
 
@@ -7699,12 +7501,8 @@ static int http_reject_unauthorized(struct gwp_conn_pair *gcp)
  */
 static int http_reject_too_large(struct gwp_conn_pair *gcp)
 {
-	int r = gwp_http_build_too_large_reply(gcp->target.buf + gcp->target.len,
-					       gcp->target.cap - gcp->target.len);
-	if (r < 0)
-		return -E2BIG;
-
-	gcp->target.len += (uint32_t)r;
+	/* Whether the reply fits or not, the request is refused as too large. */
+	gwp_http_queue_reply(&gcp->target, gwp_http_build_too_large_reply);
 	return -E2BIG;
 }
 
@@ -7715,12 +7513,9 @@ static int http_reject_too_large(struct gwp_conn_pair *gcp)
  */
 static int http_reject_bad_request(struct gwp_conn_pair *gcp)
 {
-	int r = gwp_http_build_bad_request_reply(gcp->target.buf + gcp->target.len,
-						 gcp->target.cap - gcp->target.len);
-	if (r < 0)
+	if (gwp_http_queue_reply(&gcp->target,
+				 gwp_http_build_bad_request_reply))
 		return -ENOBUFS;
-
-	gcp->target.len += (uint32_t)r;
 	return -EBADMSG;
 }
 
@@ -7732,26 +7527,16 @@ static int http_reject_bad_request(struct gwp_conn_pair *gcp)
  */
 static int http_reject_not_implemented(struct gwp_conn_pair *gcp)
 {
-	int r = gwp_http_build_not_implemented_reply(
-			gcp->target.buf + gcp->target.len,
-			gcp->target.cap - gcp->target.len);
-	if (r < 0)
+	if (gwp_http_queue_reply(&gcp->target,
+				 gwp_http_build_not_implemented_reply))
 		return -ENOBUFS;
-
-	gcp->target.len += (uint32_t)r;
 	return -EOPNOTSUPP;
 }
 
 /* The HTTP 414 reply for a request line that is too long; as the 431. */
 static int http_reject_uri_too_long(struct gwp_conn_pair *gcp)
 {
-	int r = gwp_http_build_uri_too_long_reply(
-			gcp->target.buf + gcp->target.len,
-			gcp->target.cap - gcp->target.len);
-	if (r < 0)
-		return -E2BIG;
-
-	gcp->target.len += (uint32_t)r;
+	gwp_http_queue_reply(&gcp->target, gwp_http_build_uri_too_long_reply);
 	return -E2BIG;
 }
 
@@ -7762,48 +7547,18 @@ static int http_reject_uri_too_long(struct gwp_conn_pair *gcp)
  */
 static int http_answer_options(struct gwp_conn_pair *gcp)
 {
-	int r = gwp_http_build_options_reply(gcp->target.buf + gcp->target.len,
-					     gcp->target.cap - gcp->target.len);
-	if (r < 0)
+	if (gwp_http_queue_reply(&gcp->target,
+				 gwp_http_build_options_reply))
 		return -ENOBUFS;
-
-	gcp->target.len += (uint32_t)r;
 	return -ECANCELED;
 }
 
 static int http_reject_bad_version(struct gwp_conn_pair *gcp)
 {
-	int r = gwp_http_build_bad_version_reply(
-			gcp->target.buf + gcp->target.len,
-			gcp->target.cap - gcp->target.len);
-	if (r < 0)
+	if (gwp_http_queue_reply(&gcp->target,
+				 gwp_http_build_bad_version_reply))
 		return -ENOBUFS;
-
-	gcp->target.len += (uint32_t)r;
 	return -EPROTONOSUPPORT;
-}
-
-/*
- * A port as an HTTP authority carries it: decimal digits only, no sign, no
- * service name, at most 65535.
- */
-static int parse_port(const char *s, uint16_t *port)
-{
-	uint32_t v = 0;
-
-	if (!*s)
-		return -EINVAL;
-
-	for (; *s; s++) {
-		if (*s < '0' || *s > '9')
-			return -EINVAL;
-		v = v * 10 + (uint32_t)(*s - '0');
-		if (v > 65535)
-			return -EINVAL;
-	}
-
-	*port = (uint16_t)v;
-	return 0;
 }
 
 /* Resolve and connect to @host:@port, setting the HTTP connect/DNS state. */
@@ -7817,7 +7572,7 @@ static int http_connect_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	 * The resolver takes the port as a number; a port that is not one
 	 * used to reach getaddrinfo() and come back as a 502.
 	 */
-	if (parse_port(port, &p))
+	if (gwp_parse_port(port, &p))
 		return http_reject_bad_request(gcp);
 
 	r = prepare_target_addr_domain(w, gcp, host, p);
@@ -7865,10 +7620,9 @@ static int http_fwd_res_fail(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	gwp_conn_buf_compact(t);
 	t->cap = (uint32_t)w->ctx->cfg.target_buf_size;
 	t->len = from;
-	r = gwp_http_build_bad_gateway_reply(t->buf + t->len, t->cap - t->len);
-	if (r < 0)
+	r = gwp_http_queue_reply(t, gwp_http_build_bad_gateway_reply);
+	if (r)
 		return r;
-	t->len += (uint32_t)r;
 	t->rd_eof = true;
 	return 0;
 }

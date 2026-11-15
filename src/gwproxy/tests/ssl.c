@@ -20,15 +20,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
-
-#define PRTEST_OK()					\
-do {							\
-	static int __printed;				\
-	if (!__printed) {				\
-		printf("Test passed: %s\n", __func__);	\
-		__printed = 1;				\
-	}						\
-} while (0)
+#include "test_util.h"
 
 /* A self-signed EC (P-256) cert for CN=localhost, valid until 2126. */
 static const char TEST_CERT[] =

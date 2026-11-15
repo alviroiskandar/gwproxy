@@ -14,6 +14,7 @@
 #include <string.h>
 #include <errno.h>
 #include <time.h>
+#include <gwproxy/common.h>
 
 /*
  * A socket's checks (linger_chk()) come 10 ms after it was handed over, then
@@ -74,14 +75,6 @@ struct gwp_linger_set {
  */
 static char linger_sink[65536];
 
-static uint64_t linger_now_ms(void)
-{
-	struct timespec t;
-
-	clock_gettime(CLOCK_MONOTONIC, &t);
-	return (uint64_t)t.tv_sec * 1000ull + (uint64_t)t.tv_nsec / 1000000ull;
-}
-
 /* Bytes on @fd's send queue not yet acknowledged by the peer; 0 on error. */
 static int linger_outq(int fd)
 {
@@ -117,13 +110,6 @@ static bool linger_rx(struct gwp_linger *l)
 	return false;
 }
 
-static void linger_reset(int fd)
-{
-	static const struct linger lg = { .l_onoff = 1, .l_linger = 0 };
-
-	__sys_setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
-}
-
 /*
  * The end of the wait: an RST for GWP_LINGER_RST, else a close with nothing
  * left unread, so that it is no reset as long as the peer sends no more.
@@ -131,7 +117,7 @@ static void linger_reset(int fd)
 static void linger_close(int fd, int mode)
 {
 	if (mode == GWP_LINGER_RST) {
-		linger_reset(fd);
+		gwp_set_reset_on_close(fd);
 	} else {
 		struct gwp_linger l = { .fd = fd };
 
@@ -290,7 +276,7 @@ int gwp_linger_add(struct gwp_linger_set *s, int fd, int mode,
 		return 1;
 	}
 
-	now = linger_now_ms();
+	now = gwp_mono_ms();
 	l->fd = fd;
 	l->mode = (uint8_t)mode;
 	l->end_ms = now + bound_ms;
@@ -339,7 +325,7 @@ int gwp_linger_run(struct gwp_linger_set *s)
 		}
 	} while (n == LINGER_NR_EV && ++rounds < LINGER_MAX_ROUNDS);
 
-	now = linger_now_ms();
+	now = gwp_mono_ms();
 	for (j = 0; j < s->nr;) {
 		struct gwp_linger *l = s->ent[j];
 

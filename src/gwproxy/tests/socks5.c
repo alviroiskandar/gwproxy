@@ -12,7 +12,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <fcntl.h>
+#include "test_util.h"
 
 #define test_socks5_init_ctx_no_auth(CTX)		\
 do {							\
@@ -364,32 +364,6 @@ static void test_short_recv(void)
 	gwp_socks5_ctx_free(ctx);
 }
 
-/*
- * Create a unique temporary file in $TMPDIR (or /tmp when it is not set) and
- * write @len bytes of @data to it; *@path gets its malloc'd name. Using
- * mkstemp() rather than opening a fixed path keeps each run's file unique and
- * owned by the current user; that matters under fs.protected_regular, where
- * (re)opening another user's file for writing in the sticky, world-writable
- * /tmp is denied even for root. The caller unlink()s and free()s *@path.
- */
-static ssize_t write_temp_file(char **path, const void *data, size_t len)
-{
-	const char *dir = getenv("TMPDIR");
-	ssize_t w;
-	int fd;
-
-	if (!dir || !*dir)
-		dir = "/tmp";
-	assert(asprintf(path, "%s/gwp_socks5_auth.XXXXXX", dir) > 0);
-	fd = mkstemp(*path);
-	if (fd < 0)
-		return -1;
-
-	w = write(fd, data, len);
-	close(fd);
-	return w;
-}
-
 static void test_auth_userpass(void)
 {
 	static const uint8_t in[] = {
@@ -416,12 +390,8 @@ static void test_auth_userpass(void)
 	uint8_t out[4096];
 	ssize_t r;
 
-	r = write_temp_file(&cred_file, cred_data, sizeof(cred_data) - 1);
-	assert(r == (ssize_t)(sizeof(cred_data) - 1));
-
-	r = gwp_auth_create(&auth, cred_file);
-	assert(!r);
-	assert(auth);
+	auth = gwp_test_auth_from_buf("gwp_socks5_auth", cred_data,
+				      sizeof(cred_data) - 1, &cred_file);
 	cfg.auth = auth;
 	cfg.udp_associate = true;
 	r = gwp_socks5_ctx_init(&ctx, &cfg);
@@ -493,9 +463,7 @@ static void test_auth_userpass(void)
 	assert(conn->state == GWP_SOCKS5_ST_FORWARDING);
 	gwp_socks5_conn_free(conn);
 	gwp_socks5_ctx_free(ctx);
-	gwp_auth_destroy(auth);
-	unlink(cred_file);
-	free(cred_file);
+	gwp_test_auth_put(auth, cred_file);
 }
 
 /*
@@ -509,7 +477,7 @@ static int try_cred_buf(const char *data, size_t len)
 	ssize_t w;
 	int r;
 
-	w = write_temp_file(&cred_file, data, len);
+	w = gwp_test_write_tmp(&cred_file, "gwp_socks5_auth", data, len);
 	assert(w == (ssize_t)len);
 	r = gwp_auth_create(&auth, cred_file);
 	if (!r)
@@ -541,16 +509,13 @@ static void test_auth_check_lengths(void)
 	char *cred_file;
 	char data[16 + 256 + 1], pw[300];
 	struct gwp_auth *auth;
-	ssize_t r;
 	int n;
 
 	memset(pw, 'q', sizeof(pw));
 	n = snprintf(data, sizeof(data), "user:pass\nlong:%.*s\n", 255, pw);
 	assert(n > 0 && (size_t)n < sizeof(data));
-	r = write_temp_file(&cred_file, data, (size_t)n);
-	assert(r == n);
-	r = gwp_auth_create(&auth, cred_file);
-	assert(!r);
+	auth = gwp_test_auth_from_buf("gwp_socks5_auth", data, (size_t)n,
+				      &cred_file);
 
 	assert(gwp_auth_check(auth, "user", 4, "pass", 4));
 	assert(!gwp_auth_check(auth, "user", 4, "pas", 3));
@@ -566,9 +531,7 @@ static void test_auth_check_lengths(void)
 	pw[254] = 'r';
 	assert(!gwp_auth_check(auth, "long", 4, pw, 255));
 
-	gwp_auth_destroy(auth);
-	unlink(cred_file);
-	free(cred_file);
+	gwp_test_auth_put(auth, cred_file);
 }
 
 static void test_auth_file_lines(void)
@@ -606,8 +569,6 @@ static void test_auth_file_nul(void)
 	static const char good[] = "user:pw\n";
 	char *cred_file;
 	struct gwp_auth *auth;
-	ssize_t w;
-	int fd;
 
 	assert(try_cred_buf(lead, sizeof(lead) - 1) == -EINVAL);
 	assert(try_cred_buf(lead_only, sizeof(lead_only) - 1) == -EINVAL);
@@ -617,19 +578,13 @@ static void test_auth_file_nul(void)
 	assert(!try_cred_buf(good, sizeof(good) - 1));
 
 	/* A reload that meets one keeps the credentials in force. */
-	w = write_temp_file(&cred_file, good, sizeof(good) - 1);
-	assert(w == (ssize_t)sizeof(good) - 1);
-	assert(!gwp_auth_create(&auth, cred_file));
-	fd = open(cred_file, O_WRONLY | O_TRUNC);
-	assert(fd >= 0);
-	assert(write(fd, lead, sizeof(lead) - 1) == (ssize_t)sizeof(lead) - 1);
-	close(fd);
+	auth = gwp_test_auth_from_buf("gwp_socks5_auth", good,
+				      sizeof(good) - 1, &cred_file);
+	gwp_test_rewrite_file(cred_file, lead, sizeof(lead) - 1);
 	assert(gwp_auth_reload(auth) == -EINVAL);
 	assert(gwp_auth_check(auth, "user", 4, "pw", 2));
 	assert(!gwp_auth_check(auth, "other", 5, "pw", 2));
-	gwp_auth_destroy(auth);
-	unlink(cred_file);
-	free(cred_file);
+	gwp_test_auth_put(auth, cred_file);
 }
 
 /*
@@ -658,12 +613,8 @@ static void test_auth_userpass_empty_password(void)
 	uint8_t out[64];
 	ssize_t r;
 
-	r = write_temp_file(&cred_file, cred_data, sizeof(cred_data) - 1);
-	assert(r == (ssize_t)(sizeof(cred_data) - 1));
-
-	r = gwp_auth_create(&auth, cred_file);
-	assert(!r);
-	assert(auth);
+	auth = gwp_test_auth_from_buf("gwp_socks5_auth", cred_data,
+				      sizeof(cred_data) - 1, &cred_file);
 	cfg.auth = auth;
 	cfg.udp_associate = true;
 	r = gwp_socks5_ctx_init(&ctx, &cfg);
@@ -706,9 +657,7 @@ static void test_auth_userpass_empty_password(void)
 
 	gwp_socks5_conn_free(conn);
 	gwp_socks5_ctx_free(ctx);
-	gwp_auth_destroy(auth);
-	unlink(cred_file);
-	free(cred_file);
+	gwp_test_auth_put(auth, cred_file);
 }
 
 static void test_offered_methods_no_match(void)
@@ -1031,12 +980,8 @@ static void test_enobufs_combined_with_multi_state_at_once(void)
 	ssize_t r;
 	size_t i;
 
-	r = write_temp_file(&cred_file, cred_data, sizeof(cred_data) - 1);
-	assert(r == (ssize_t)(sizeof(cred_data) - 1));
-
-	r = gwp_auth_create(&auth, cred_file);
-	assert(!r);
-	assert(auth);
+	auth = gwp_test_auth_from_buf("gwp_socks5_auth", cred_data,
+				      sizeof(cred_data) - 1, &cred_file);
 	cfg.auth = auth;
 	cfg.udp_associate = true;
 	r = gwp_socks5_ctx_init(&ctx, &cfg);
@@ -1107,9 +1052,7 @@ static void test_enobufs_combined_with_multi_state_at_once(void)
 	assert(conn->state == GWP_SOCKS5_ST_FORWARDING);
 	gwp_socks5_conn_free(conn);
 	gwp_socks5_ctx_free(ctx);
-	gwp_auth_destroy(auth);
-	unlink(cred_file);
-	free(cred_file);
+	gwp_test_auth_put(auth, cred_file);
 }
 
 static void test_udp_associate(void)

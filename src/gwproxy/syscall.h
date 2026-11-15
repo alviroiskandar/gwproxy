@@ -201,17 +201,6 @@ static inline int __sys_close(int fd)
 	return (int) __do_syscall1(__NR_close, fd);
 }
 
-static inline ssize_t __sys_recv(int sockfd, void *buf, size_t len, int flags)
-{
-	return __sys_recvfrom(sockfd, buf, len, flags, NULL, NULL);
-}
-
-static inline ssize_t __sys_send(int sockfd, const void *buf, size_t len,
-				 int flags)
-{
-	return __sys_sendto(sockfd, buf, len, flags, NULL, 0);
-}
-
 static inline int __sys_accept4(int sockfd, struct sockaddr *addr,
 				 socklen_t *addrlen, int flags)
 {
@@ -304,55 +293,146 @@ static inline pid_t __sys_gettid(void)
 }
 #else /* #ifdef __x86_64__ */
 
-#include <errno.h>
+/*
+ * The libc calls below return -1 and set errno; the wrappers return -errno
+ * like the raw syscalls above. @r is the libc call's result, evaluated as
+ * the argument, so errno is read right after the call. A long holds every
+ * int and ssize_t result.
+ */
+static inline long __sys_ret(long r)
+{
+	return (r < 0) ? -errno : r;
+}
+
 static inline int __sys_epoll_wait(int epfd, struct epoll_event *events,
 				   int maxevents, int timeout)
 {
-	int r = epoll_wait(epfd, events, maxevents, timeout);
-	return (r < 0) ? -errno : r;
+	return (int)__sys_ret(epoll_wait(epfd, events, maxevents, timeout));
 }
 
 static inline ssize_t __sys_read(int fd, void *buf, size_t len)
 {
-	ssize_t r = read(fd, buf, len);
-	return (r < 0) ? -errno : r;
+	return __sys_ret(read(fd, buf, len));
 }
 
 static inline ssize_t __sys_write(int fd, const void *buf, size_t len)
 {
-	ssize_t r = write(fd, buf, len);
-	return (r < 0) ? -errno : r;
+	return __sys_ret(write(fd, buf, len));
 }
 
 static inline ssize_t __sys_recvfrom(int sockfd, void *buf, size_t len,
 				     int flags, struct sockaddr *src_addr,
 				     socklen_t *addrlen)
 {
-	ssize_t r = recvfrom(sockfd, buf, len, flags, src_addr, addrlen);
-	return (r < 0) ? -errno : r;
+	return __sys_ret(recvfrom(sockfd, buf, len, flags, src_addr, addrlen));
 }
 
 static inline ssize_t __sys_sendto(int sockfd, const void *buf, size_t len,
 				   int flags, const struct sockaddr *dest_addr,
 				   socklen_t addrlen)
 {
-	ssize_t r = sendto(sockfd, buf, len, flags, dest_addr, addrlen);
-	return (r < 0) ? -errno : r;
+	return __sys_ret(sendto(sockfd, buf, len, flags, dest_addr, addrlen));
 }
 
 static inline ssize_t __sys_sendmsg(int sockfd, const struct msghdr *msg,
 				    int flags)
 {
-	ssize_t r = sendmsg(sockfd, msg, flags);
-	return (r < 0) ? -errno : r;
+	return __sys_ret(sendmsg(sockfd, msg, flags));
 }
 
 static inline int __sys_close(int fd)
 {
-	int r = close(fd);
-	return (r < 0) ? -errno : r;
+	return (int)__sys_ret(close(fd));
 }
 
+static inline int __sys_accept4(int sockfd, struct sockaddr *addr,
+				 socklen_t *addrlen, int flags)
+{
+	return (int)__sys_ret(accept4(sockfd, addr, addrlen, flags));
+}
+
+static inline int __sys_epoll_ctl(int epfd, int op, int fd,
+				 struct epoll_event *event)
+{
+	return (int)__sys_ret(epoll_ctl(epfd, op, fd, event));
+}
+
+static inline int __sys_setsockopt(int sockfd, int level, int optname,
+				   const void *optval, socklen_t optlen)
+{
+	return (int)__sys_ret(setsockopt(sockfd, level, optname, optval,
+					 optlen));
+}
+
+static inline int __sys_getsockopt(int sockfd, int level, int optname,
+				   void *optval, socklen_t *optlen)
+{
+	return (int)__sys_ret(getsockopt(sockfd, level, optname, optval,
+					 optlen));
+}
+
+static inline int __sys_socket(int domain, int type, int protocol)
+{
+	return (int)__sys_ret(socket(domain, type, protocol));
+}
+
+static inline int __sys_bind(int sockfd, const struct sockaddr *addr,
+			     socklen_t addrlen)
+{
+	return (int)__sys_ret(bind(sockfd, addr, addrlen));
+}
+
+static inline int __sys_listen(int sockfd, int backlog)
+{
+	return (int)__sys_ret(listen(sockfd, backlog));
+}
+
+static inline int __sys_epoll_create1(int flags)
+{
+	return (int)__sys_ret(epoll_create1(flags));
+}
+
+static inline int __sys_eventfd(unsigned int c, int flags)
+{
+	return (int)__sys_ret(eventfd(c, flags));
+}
+
+static inline int __sys_connect(int sockfd, const struct sockaddr *addr,
+				socklen_t addrlen)
+{
+	return (int)__sys_ret(connect(sockfd, addr, addrlen));
+}
+
+static inline int __sys_getsockname(int sockfd, struct sockaddr *addr,
+				socklen_t *addrlen)
+{
+	return (int)__sys_ret(getsockname(sockfd, addr, addrlen));
+}
+
+static inline int __sys_timerfd_create(int clockid, int flags)
+{
+	return (int)__sys_ret(timerfd_create(clockid, flags));
+}
+
+static inline int __sys_timerfd_settime(int fd, int flags,
+				 const struct itimerspec *new_value,
+				 struct itimerspec *old_value)
+{
+	return (int)__sys_ret(timerfd_settime(fd, flags, new_value, old_value));
+}
+
+static inline int __sys_shutdown(int sockfd, int how)
+{
+	return (int)__sys_ret(shutdown(sockfd, how));
+}
+
+static inline pid_t __sys_gettid(void)
+{
+	return (pid_t)syscall(__NR_gettid);
+}
+#endif /* #endif __x86_64__ */
+
+/* Built on the wrappers above, the same for either branch. */
 static inline ssize_t __sys_recv(int sockfd, void *buf, size_t len, int flags)
 {
 	return __sys_recvfrom(sockfd, buf, len, flags, NULL, NULL);
@@ -364,103 +444,44 @@ static inline ssize_t __sys_send(int sockfd, const void *buf, size_t len,
 	return __sys_sendto(sockfd, buf, len, flags, NULL, 0);
 }
 
-static inline int __sys_accept4(int sockfd, struct sockaddr *addr,
-				 socklen_t *addrlen, int flags)
+/*
+ * Have the close of @fd reset the connection (SO_LINGER with a zero timeout)
+ * instead of ending the stream with a FIN. Best effort: a failure leaves the
+ * plain close.
+ */
+static inline void gwp_set_reset_on_close(int fd)
 {
-	int r = accept4(sockfd, addr, addrlen, flags);
-	return (r < 0) ? -errno : r;
+	static const struct linger l = { .l_onoff = 1, .l_linger = 0 };
+
+	__sys_setsockopt(fd, SOL_SOCKET, SO_LINGER, &l, sizeof(l));
 }
 
-static inline int __sys_epoll_ctl(int epfd, int op, int fd,
-				 struct epoll_event *event)
+/*
+ * Add 1 to the eventfd @fd, the doorbell that wakes whoever polls it.
+ * __sys_write() returns -errno, so the EINTR retry works; glibc's
+ * eventfd_write() returns -1 and would never match it. Returns
+ * sizeof(uint64_t), or -errno: adding 1 fails only with EAGAIN, when the
+ * counter would pass 2^64 - 2, unless @fd is not an open eventfd.
+ * Async-signal-safe.
+ */
+static inline ssize_t gwp_eventfd_signal(int fd)
 {
-	int r = epoll_ctl(epfd, op, fd, event);
-	return (r < 0) ? -errno : r;
+	static const uint64_t one = 1;
+	ssize_t r;
+
+	do {
+		r = __sys_write(fd, &one, sizeof(one));
+	} while (r == -EINTR);
+	return r;
 }
 
-static inline int __sys_setsockopt(int sockfd, int level, int optname,
-				   const void *optval, socklen_t optlen)
+/* Close *@fd if it is open and mark it closed, so a second call is a no-op. */
+static inline void gwp_close_fd(int *fd)
 {
-	int r = setsockopt(sockfd, level, optname, optval, optlen);
-	return (r < 0) ? -errno : r;
+	if (*fd >= 0) {
+		__sys_close(*fd);
+		*fd = -1;
+	}
 }
-
-static inline int __sys_getsockopt(int sockfd, int level, int optname,
-				   void *optval, socklen_t *optlen)
-{
-	int r = getsockopt(sockfd, level, optname, optval, optlen);
-	return (r < 0) ? -errno : r;
-}
-
-static inline int __sys_socket(int domain, int type, int protocol)
-{
-	int r = socket(domain, type, protocol);
-	return (r < 0) ? -errno : r;
-}
-
-static inline int __sys_bind(int sockfd, const struct sockaddr *addr,
-			     socklen_t addrlen)
-{
-	int r = bind(sockfd, addr, addrlen);
-	return (r < 0) ? -errno : r;
-}
-
-static inline int __sys_listen(int sockfd, int backlog)
-{
-	int r = listen(sockfd, backlog);
-	return (r < 0) ? -errno : r;
-}
-
-static inline int __sys_epoll_create1(int flags)
-{
-	int r = epoll_create1(flags);
-	return (r < 0) ? -errno : r;
-}
-
-static inline int __sys_eventfd(unsigned int c, int flags)
-{
-	int r = eventfd(c, flags);
-	return (r < 0) ? -errno : r;
-}
-
-static inline int __sys_connect(int sockfd, const struct sockaddr *addr,
-				socklen_t addrlen)
-{
-	int r = connect(sockfd, addr, addrlen);
-	return (r < 0) ? -errno : r;
-}
-
-static inline int __sys_getsockname(int sockfd, struct sockaddr *addr,
-				socklen_t *addrlen)
-{
-	int r = getsockname(sockfd, addr, addrlen);
-	return (r < 0) ? -errno : r;
-}
-
-static inline int __sys_timerfd_create(int clockid, int flags)
-{
-	int r = timerfd_create(clockid, flags);
-	return (r < 0) ? -errno : r;
-}
-
-static inline int __sys_timerfd_settime(int fd, int flags,
-				 const struct itimerspec *new_value,
-				 struct itimerspec *old_value)
-{
-	int r = timerfd_settime(fd, flags, new_value, old_value);
-	return (r < 0) ? -errno : r;
-}
-
-static inline int __sys_shutdown(int sockfd, int how)
-{
-	int r = shutdown(sockfd, how);
-	return (r < 0) ? -errno : r;
-}
-
-static inline pid_t __sys_gettid(void)
-{
-	return (pid_t)syscall(__NR_gettid);
-}
-#endif /* #endif __x86_64__ */
 
 #endif /* #ifndef GWPROXY_SYSCALL_H */

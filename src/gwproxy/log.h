@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdbool.h>
+#include <stdint.h>
 
 #ifndef GWP_STATIC_LOG_LEVEL
 #define GWP_STATIC_LOG_LEVEL 4
@@ -59,5 +60,61 @@ do {								\
 #define pr_warn(HANDLE, FMT, ...) pr_log(HANDLE, 2, FMT, ##__VA_ARGS__)
 #define pr_info(HANDLE, FMT, ...) pr_log(HANDLE, 3, FMT, ##__VA_ARGS__)
 #define pr_dbg(HANDLE, FMT, ...) pr_log(HANDLE, 4, FMT, ##__VA_ARGS__)
+
+/*
+ * A line limited by gwp_log_limit_take(): when @QUIET lines were left out
+ * since the last one, it says so at its end. A macro, so the suffix joins the
+ * caller's format literal and the format check still sees the whole format.
+ */
+#define pr_log_quiet(HANDLE, LEVEL, QUIET, FMT, ...)			\
+do {									\
+	unsigned int __quiet = (QUIET);					\
+	if (__quiet)							\
+		pr_log(HANDLE, LEVEL,					\
+		       FMT " (and %u more since the last such line)",	\
+		       ##__VA_ARGS__, __quiet);				\
+	else								\
+		pr_log(HANDLE, LEVEL, FMT, ##__VA_ARGS__);		\
+} while (0)
+
+#define pr_warn_quiet(HANDLE, QUIET, FMT, ...) \
+	pr_log_quiet(HANDLE, 2, QUIET, FMT, ##__VA_ARGS__)
+#define pr_info_quiet(HANDLE, QUIET, FMT, ...) \
+	pr_log_quiet(HANDLE, 3, QUIET, FMT, ##__VA_ARGS__)
+
+/*
+ * A log line a client can trigger at will, written at most once a second: the
+ * next is due from @next on, and @quiet counts the ones left out since the
+ * last (gwp_log_limit_take()).
+ */
+struct gwp_log_limit {
+	uint32_t	next;
+	uint32_t	quiet;
+};
+
+/*
+ * Whether a line limited by @l may be logged at second @now. When it may,
+ * *@quiet (unless @quiet is NULL) is set to the number left out since the
+ * last one, for the line to say; when not, this one is counted among them.
+ *
+ * A signed difference, not "@now == the second last logged": a limit the
+ * workers share (iplimit.c) sees their coarse clocks, each its own, so @now
+ * may come from one that is still a second behind the worker that logged. It
+ * also stays right as the seconds wrap.
+ */
+static inline bool gwp_log_limit_take(struct gwp_log_limit *l, uint32_t now,
+				      uint32_t *quiet)
+{
+	if ((int32_t)(now - l->next) < 0) {
+		l->quiet++;
+		return false;
+	}
+
+	if (quiet)
+		*quiet = l->quiet;
+	l->quiet = 0;
+	l->next = now + 1;
+	return true;
+}
 
 #endif /* #ifndef GWPROXY__LOG_H */

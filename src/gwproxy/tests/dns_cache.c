@@ -10,6 +10,7 @@
 
 #include <stdio.h>
 #include <arpa/inet.h>
+#include "test_util.h"
 
 static size_t longest_chain(const struct gwp_dns_cache *cache)
 {
@@ -53,13 +54,7 @@ static void test_hash_flood(void)
 	size_t chain;
 	int i, j, r;
 
-	memset(&sa, 0, sizeof(sa));
-	sa.sin_family = AF_INET;
-	sa.sin_addr.s_addr = htonl(0x7f000001);
-	memset(&ai, 0, sizeof(ai));
-	ai.ai_family = AF_INET;
-	ai.ai_addr = (struct sockaddr *)&sa;
-	ai.ai_addrlen = sizeof(sa);
+	fill_ai_v4(&ai, &sa);
 
 	r = gwp_dns_cache_init(&cache, NR, 0);
 	assert(!r && cache);
@@ -103,12 +98,7 @@ static void test_lookup_does_not_sweep(void)
 	size_t n;
 	int i, r;
 
-	memset(&sa, 0, sizeof(sa));
-	sa.sin_family = AF_INET;
-	memset(&ai, 0, sizeof(ai));
-	ai.ai_family = AF_INET;
-	ai.ai_addr = (struct sockaddr *)&sa;
-	ai.ai_addrlen = sizeof(sa);
+	fill_ai_v4(&ai, &sa);
 
 	/* More buckets than one housekeeping step covers. */
 	r = gwp_dns_cache_init(&cache, 4096, 0);
@@ -162,12 +152,7 @@ static void test_full_table_reclaims_expired(void)
 	int i, r, refused = 0;
 	char name[32];
 
-	memset(&sa, 0, sizeof(sa));
-	sa.sin_family = AF_INET;
-	memset(&ai, 0, sizeof(ai));
-	ai.ai_family = AF_INET;
-	ai.ai_addr = (struct sockaddr *)&sa;
-	ai.ai_addrlen = sizeof(sa);
+	fill_ai_v4(&ai, &sa);
 
 	r = gwp_dns_cache_init(&cache, BUCKETS, CAP);
 	assert(!r && cache);

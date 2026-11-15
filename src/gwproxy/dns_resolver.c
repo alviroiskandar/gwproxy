@@ -24,24 +24,7 @@ static uint16_t next_txid(struct gwp_dns_resolver *res)
 
 static int parse_srv_addr(struct gwp_dns_resolver *gdr, const char *srv_addr)
 {
-	bool has_port;
-
-	/*
-	 * convert_str_to_ssaddr() ignores an explicit port in the string when
-	 * a non-zero default_port is passed, so only pass the default when the
-	 * address has no port of its own -- the same dance
-	 * gwp_parse_upstream_socks5() does. Without it "--dns-server" silently
-	 * queried port 53 whatever the user asked for.
-	 */
-	if (srv_addr[0] == '[') {
-		const char *rb = strchr(srv_addr, ']');
-
-		has_port = rb && rb[1] == ':';
-	} else {
-		has_port = strchr(srv_addr, ':') != NULL;
-	}
-
-	return convert_str_to_ssaddr(srv_addr, &gdr->srv, has_port ? 0 : 53);
+	return convert_str_to_ssaddr(srv_addr, &gdr->srv, 53);
 }
 
 /*
@@ -53,16 +36,13 @@ static int parse_srv_addr(struct gwp_dns_resolver *gdr, const char *srv_addr)
 static int open_query_sock(struct gwp_dns_resolver *res)
 {
 	static const int type = SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC;
-	socklen_t len;
 	int f, r;
 
 	f = __sys_socket(res->srv.sa.sa_family, type, 0);
 	if (f < 0)
 		return f;
 
-	len = res->srv.sa.sa_family == AF_INET6 ? sizeof(res->srv.i6)
-						 : sizeof(res->srv.i4);
-	r = __sys_connect(f, &res->srv.sa, len);
+	r = __sys_connect(f, &res->srv.sa, gwp_sockaddr_len(&res->srv));
 	if (r < 0) {
 		__sys_close(f);
 		return r;
@@ -154,10 +134,7 @@ int gwp_dns_res_prep_query(struct gwp_dns_resolver *res,
 void gwp_dns_res_drop_query(struct gwp_dns_packet *gdp)
 {
 	/* Idempotent: teardown calls it whether or not a reply came. */
-	if (gdp->fd >= 0) {
-		__sys_close(gdp->fd);
-		gdp->fd = -1;
-	}
+	gwp_close_fd(&gdp->fd);
 }
 
 int gwp_dns_res_complete_query(struct gwp_dns_resolver *res,

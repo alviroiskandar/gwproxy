@@ -17,6 +17,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include "test_util.h"
 
 #ifndef ARRAY_SIZE
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
@@ -231,18 +232,6 @@ static void test_dns_cache(void)
 	r = gwp_dns_cache_lookup(ctx, "aaaa.com", 80, &addr);
 	assert(r == -ENOENT);
 	gwp_dns_ctx_free(ctx);
-}
-
-/* A throwaway one-address (IPv4) addrinfo for direct cache-layer tests. */
-static void fill_ai_v4(struct addrinfo *ai, struct sockaddr_in *sa)
-{
-	memset(sa, 0, sizeof(*sa));
-	sa->sin_family = AF_INET;
-	sa->sin_addr.s_addr = htonl(0x7f000001);	/* 127.0.0.1 */
-	memset(ai, 0, sizeof(*ai));
-	ai->ai_family = AF_INET;
-	ai->ai_addr = (struct sockaddr *)sa;
-	ai->ai_addrlen = sizeof(*sa);
 }
 
 /*

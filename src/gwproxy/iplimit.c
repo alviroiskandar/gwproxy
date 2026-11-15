@@ -10,6 +10,7 @@
 #endif
 #include <gwproxy/iplimit.h>
 #include <gwproxy/dns_hash.h>
+#include <gwproxy/log.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -27,9 +28,8 @@ struct iplim_ent {
 	struct iplim_ent	*next;
 	struct gwp_iplim_key	key;
 	uint32_t		count;
-	/* When a refusal for this key was last logged, and how many since. */
-	uint32_t		last_log;
-	uint32_t		nr_quiet;
+	/* The refusals for this key: one logged a second, the rest counted. */
+	struct gwp_log_limit	log;
 };
 
 struct iplim_shard {
@@ -198,27 +198,18 @@ int gwp_iplim_get(struct gwp_iplim *l, const struct gwp_iplim_key *key,
 		e->next = NULL;
 		e->key = *key;
 		e->count = 1;
-		e->last_log = now - 1;
-		e->nr_quiet = 0;
+		e->log.next = now;
+		e->log.quiet = 0;
 		*pp = e;
 		if (++s->nr > s->nr_buckets)
 			iplim_rehash(l, s, s->nr_buckets * 2);
 	} else if (e->count < l->max) {
 		e->count++;
-	} else if ((int32_t)(now - e->last_log) <= 0) {
-		/*
-		 * Logged this second already. Not just "now == last_log": the
-		 * workers' coarse clocks are their own, so @now may come from
-		 * one that is still a second behind the worker that logged.
-		 */
-		e->nr_quiet++;
-		ret = GWP_IPLIM_REFUSE;
-	} else {
-		if (nr_quiet)
-			*nr_quiet = e->nr_quiet;
-		e->nr_quiet = 0;
-		e->last_log = now;
+	} else if (gwp_log_limit_take(&e->log, now, nr_quiet)) {
 		ret = GWP_IPLIM_REFUSE_LOG;
+	} else {
+		/* Logged this second already. */
+		ret = GWP_IPLIM_REFUSE;
 	}
 out:
 	pthread_mutex_unlock(&s->lock);

@@ -25,6 +25,7 @@
 #include <pthread.h>
 #include <sys/eventfd.h>
 #include <gwproxy/syscall.h>
+#include <gwproxy/common.h>
 
 /*
  * The resolver threads. @nr_workers of them (--nr-dns-workers) are started
@@ -380,7 +381,6 @@ static void deliver_entry(struct gwp_dns_entry *e)
 {
 	struct gwp_dns_cq *cq = e->cq;
 	struct gwp_dns_entry *old;
-	static const uint64_t one = 1;
 	ssize_t r;
 
 	if (gwp_dns_entry_cancelled(e)) {
@@ -408,10 +408,9 @@ static void deliver_entry(struct gwp_dns_entry *e)
 	 * are joined.
 	 */
 	if (!old) {
-		do {
-			r = __sys_write(cq->efd, &one, sizeof(one));
-		} while (r == -EINTR);
-		assert(r == (ssize_t)sizeof(one));
+		r = gwp_eventfd_signal(cq->efd);
+		assert(r == (ssize_t)sizeof(uint64_t));
+		(void)r;
 	}
 }
 
@@ -860,14 +859,6 @@ static uint32_t nr_busy(struct gwp_dns_ctx *ctx)
 	return n;
 }
 
-static int64_t mono_ms(void)
-{
-	struct timespec ts;
-
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
-
 static bool sleep_ms(int ms, void *arg)
 {
 	struct timespec ts = { .tv_sec = 0, .tv_nsec = (long)ms * 1000000L };
@@ -888,7 +879,8 @@ static bool sleep_ms(int ms, void *arg)
 static uint32_t free_threads(struct gwp_dns_ctx *ctx, int grace_ms,
 			     gwp_dns_wait_fn wait, void *arg)
 {
-	int64_t deadline = grace_ms >= 0 ? mono_ms() + grace_ms : 0;
+	int64_t deadline = grace_ms >= 0 ?
+			   (int64_t)gwp_mono_ms() + grace_ms : 0;
 	uint32_t i, left = 0;
 
 	if (!ctx->threads)
@@ -907,7 +899,7 @@ static uint32_t free_threads(struct gwp_dns_ctx *ctx, int grace_ms,
 	if (!wait)
 		wait = sleep_ms;
 	while (grace_ms >= 0 && nr_busy(ctx)) {
-		int64_t rem = deadline - mono_ms();
+		int64_t rem = deadline - (int64_t)gwp_mono_ms();
 
 		if (rem <= 0 || wait(rem < 10 ? (int)rem : 10, arg))
 			break;
@@ -999,24 +991,6 @@ static uint32_t cache_bucket_count(uint32_t max_entries)
 _Static_assert(GWP_DNS_CACHE_MAX_ADDRS >= GWP_DNS_MAX_ADDRS,
 	       "the cache hands back fewer addresses than a lookup returns");
 
-static void fill_i4(struct gwp_sockaddr *addr, const struct in_addr *a,
-		    uint16_t port)
-{
-	memset(addr, 0, sizeof(*addr));
-	addr->i4.sin_family = AF_INET;
-	addr->i4.sin_port = htons(port);
-	addr->i4.sin_addr = *a;
-}
-
-static void fill_i6(struct gwp_sockaddr *addr, const struct in6_addr *a,
-		    uint16_t port)
-{
-	memset(addr, 0, sizeof(*addr));
-	addr->i6.sin6_family = AF_INET6;
-	addr->i6.sin6_port = htons(port);
-	addr->i6.sin6_addr = *a;
-}
-
 int gwp_dns_cache_lookup_list(struct gwp_dns_ctx *ctx, const char *name,
 			      uint16_t port, struct gwp_sockaddr *addrs,
 			      uint8_t cap, uint8_t *nr_addrs)
@@ -1047,14 +1021,18 @@ int gwp_dns_cache_lookup_list(struct gwp_dns_ctx *ctx, const char *name,
 	for (i = 0; n < cap && (i < nr_v4 || i < nr_v6); i++) {
 		if (v6_first) {
 			if (i < nr_v6)
-				fill_i6(&addrs[n++], &ca.i6[i], port);
+				gwp_sockaddr_set(&addrs[n++], AF_INET6,
+						 &ca.i6[i], htons(port));
 			if (i < nr_v4 && n < cap)
-				fill_i4(&addrs[n++], &ca.i4[i], port);
+				gwp_sockaddr_set(&addrs[n++], AF_INET,
+						 &ca.i4[i], htons(port));
 		} else {
 			if (i < nr_v4)
-				fill_i4(&addrs[n++], &ca.i4[i], port);
+				gwp_sockaddr_set(&addrs[n++], AF_INET,
+						 &ca.i4[i], htons(port));
 			if (i < nr_v6 && n < cap)
-				fill_i6(&addrs[n++], &ca.i6[i], port);
+				gwp_sockaddr_set(&addrs[n++], AF_INET6,
+						 &ca.i6[i], htons(port));
 		}
 	}
 

@@ -996,16 +996,6 @@ struct gwp_tmr_heap {
 	uint32_t		cap;
 };
 
-/*
- * A log line a client can trigger at will, written at most once a second per
- * worker: the next is due from @next on, and @quiet counts the ones left out
- * since the last (gwp_wrk_log_limit()).
- */
-struct gwp_log_limit {
-	uint32_t	next;
-	uint32_t	quiet;
-};
-
 struct gwp_wrk {
 	int			tcp_fd;
 	/* Where tcp_fd listens, see gwp_target_is_self(). */

@@ -647,7 +647,6 @@ static int start_connect_attempt(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	struct gwp_ctx *ctx = w->ctx;
 	struct gwp_sockaddr *ca;
 	struct io_uring_sqe *s;
-	socklen_t addr_len;
 	int fd;
 
 	/* Plain forwarding, see gwp_target_is_self(). */
@@ -676,13 +675,8 @@ static int start_connect_attempt(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	if (!gcp->upstream)
 		ca = &gcp->attempt_addr[slot];
 
-	if (ca->sa.sa_family == AF_INET)
-		addr_len = sizeof(struct sockaddr_in);
-	else
-		addr_len = sizeof(struct sockaddr_in6);
-
 	s = get_sqe_nofail(w);
-	io_uring_prep_connect(s, fd, &ca->sa, addr_len);
+	io_uring_prep_connect(s, fd, &ca->sa, gwp_sockaddr_len(ca));
 	io_uring_sqe_set_data(s, gcp);
 	s->user_data |= EV_BIT_TARGET_ATTEMPT + ((uint64_t)slot << 48ull);
 	get_gcp(gcp);
@@ -867,25 +861,12 @@ static struct io_uring_sqe *prep_send_client(struct gwp_wrk *w,
 	return __prep_send_client(w, gcp);
 }
 
-/*
- * The precise clock, not the coarse one of gwp_now_ms(): this is compared
- * with when a kernel timer fired, and the coarse clock lags the one the
- * kernel times io_uring timeouts with by up to a tick.
- */
-static uint64_t iou_now_ms(void)
-{
-	struct timespec t;
-
-	clock_gettime(CLOCK_MONOTONIC, &t);
-	return (uint64_t)t.tv_sec * 1000ull + (uint64_t)t.tv_nsec / 1000000ull;
-}
-
 static struct io_uring_sqe *prep_timer_target(struct gwp_wrk *w,
 					      struct gwp_conn_pair *gcp,
 					      int sec)
 {
 	struct io_uring_sqe *s = get_sqe_nofail(w);
-	uint64_t now = iou_now_ms(), due = now + (uint64_t)sec * 1000ull;
+	uint64_t now = gwp_mono_ms(), due = now + (uint64_t)sec * 1000ull;
 
 	/*
 	 * The timeout runs from its submission, which is later, so it never
@@ -3004,7 +2985,7 @@ static int handle_ev_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	 * with none live, was removed: only account for it.
 	 */
 	if (!is_timer_del && res == -ETIME) {
-		uint64_t now = iou_now_ms();
+		uint64_t now = gwp_mono_ms();
 
 		if (!gcp->tmr_due || now < gcp->tmr_due) {
 			pr_dbg(&ctx->lh,
@@ -4526,21 +4507,14 @@ int gwp_ctx_thread_entry_io_uring(struct gwp_wrk *w)
 __cold
 void gwp_ctx_signal_all_io_uring(struct gwp_ctx *ctx)
 {
-	static const uint64_t one = 1;
 	int i;
 
 	ctx->stop = true;
 	if (atomic_exchange(&ctx->stop_signalled, true))
 		return;
 
-	for (i = 0; i < ctx->cfg.nr_workers; i++) {
-		int fd = ctx->workers[i].iou->stop_efd;
-		ssize_t r;
-
-		do {
-			r = __sys_write(fd, &one, sizeof(one));
-		} while (r == -EINTR);
-	}
+	for (i = 0; i < ctx->cfg.nr_workers; i++)
+		(void)gwp_eventfd_signal(ctx->workers[i].iou->stop_efd);
 }
 
 #endif // CONFIG_IO_URING
