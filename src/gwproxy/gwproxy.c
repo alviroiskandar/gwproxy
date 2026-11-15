@@ -430,6 +430,15 @@ __cold
 static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 {
 	#define ERR_WRAP "==============================================\n"
+	/*
+	 * A macro, not a function: it pastes the message between the
+	 * banners as one literal and jumps to this function's einval.
+	 */
+	#define OPT_FAIL(fmt, ...) do {					\
+		fprintf(stderr, ERR_WRAP "Error: " fmt "\n" ERR_WRAP,	\
+			##__VA_ARGS__);					\
+		goto einval;						\
+	} while (0)
 	#define NR_OPTS ((sizeof(long_opts) / sizeof(long_opts[0])) - 1)
 	char short_opts[(NR_OPTS * 2) + 1], *p;
 	size_t i;
@@ -502,7 +511,7 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 			else if (!strcmp(optarg, "ipv6"))
 				cfg->outgoing_family = GWP_OUT_FAMILY_IPV6;
 			else
-				goto einval_outfam;
+				OPT_FAIL("--outgoing-family must be any, ipv4 or ipv6.");
 			break;
 		case OPT_BIND_IPV6_ONLY:
 			if (opt_bool(c, optarg, &cfg->bind_ipv6_only))
@@ -643,15 +652,11 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 	}
 
 
-	if (cfg->use_raw_dns && ev_is_io_uring(cfg)) {
-		fprintf(stderr, ERR_WRAP "Error: The raw DNS feature is currently not supported with the io_uring event loop\n" ERR_WRAP);
-		goto einval;
-	}
+	if (cfg->use_raw_dns && ev_is_io_uring(cfg))
+		OPT_FAIL("The raw DNS feature is currently not supported with the io_uring event loop");
 
-	if (cfg->use_raw_dns && cfg->dns_cache_secs) {
-		fprintf(stderr, ERR_WRAP "Error: The -L/--dns-cache-secs option is not supported with the raw DNS feature\n" ERR_WRAP);
-		goto einval;
-	}
+	if (cfg->use_raw_dns && cfg->dns_cache_secs)
+		OPT_FAIL("The -L/--dns-cache-secs option is not supported with the raw DNS feature");
 
 	/*
 	 * The system resolver needs a thread to run a lookup on. --raw-dns
@@ -659,121 +664,87 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 	 * there (see gwp_ctx_init_dns()).
 	 */
 	if ((cfg->as_socks5 || cfg->as_http) && !cfg->use_raw_dns &&
-	    cfg->nr_dns_workers < 1) {
-		fprintf(stderr, ERR_WRAP "Error: -W/--nr-dns-workers must be at least 1 for SOCKS5 or HTTP with the system resolver.\n" ERR_WRAP);
-		goto einval;
-	}
+	    cfg->nr_dns_workers < 1)
+		OPT_FAIL("-W/--nr-dns-workers must be at least 1 for SOCKS5 or HTTP with the system resolver.");
 
 #ifdef CONFIG_HTTPS
-	if ((cfg->tls_cert != NULL) != (cfg->tls_key != NULL)) {
-		fprintf(stderr, ERR_WRAP "Error: --tls-cert and --tls-key must be provided together\n" ERR_WRAP);
-		goto einval;
-	}
+	if ((cfg->tls_cert != NULL) != (cfg->tls_key != NULL))
+		OPT_FAIL("--tls-cert and --tls-key must be provided together");
 
 	/*
 	 * The TLS listener detects a ClientHello in the SOCKS5 and HTTP paths
 	 * only. Elsewhere the certificate would do nothing but log that TLS is
 	 * on while the listener speaks cleartext.
 	 */
-	if (cfg->tls_cert && !cfg->as_socks5 && !cfg->as_http) {
-		fprintf(stderr, ERR_WRAP "Error: --tls-cert needs --as-socks5=1 or --as-http=1\n" ERR_WRAP);
-		goto einval;
-	}
+	if (cfg->tls_cert && !cfg->as_socks5 && !cfg->as_http)
+		OPT_FAIL("--tls-cert needs --as-socks5=1 or --as-http=1");
 #endif
 
-	if (cfg->as_transparent && (cfg->as_socks5 || cfg->as_http)) {
-		fprintf(stderr, ERR_WRAP "Error: --as-transparent cannot be combined with --as-socks5 or --as-http\n" ERR_WRAP);
-		goto einval;
-	}
+	if (cfg->as_transparent && (cfg->as_socks5 || cfg->as_http))
+		OPT_FAIL("--as-transparent cannot be combined with --as-socks5 or --as-http");
 
-	if (cfg->as_transparent && cfg->target) {
-		fprintf(stderr, ERR_WRAP "Error: --target must not be set with --as-transparent (the target comes from SO_ORIGINAL_DST)\n" ERR_WRAP);
-		goto einval;
-	}
+	if (cfg->as_transparent && cfg->target)
+		OPT_FAIL("--target must not be set with --as-transparent (the target comes from SO_ORIGINAL_DST)");
 
-	if (!cfg->as_socks5 && !cfg->as_http && !cfg->as_transparent && !cfg->target) {
-		fprintf(stderr, ERR_WRAP "Error: --target is required unless --as-socks5=1, --as-http=1 or --as-transparent=1\n" ERR_WRAP);
-		goto einval;
-	}
+	if (!cfg->as_socks5 && !cfg->as_http && !cfg->as_transparent && !cfg->target)
+		OPT_FAIL("--target is required unless --as-socks5=1, --as-http=1 or --as-transparent=1");
 
-	if (cfg->upstream_auth_file && !cfg->upstream_proxy) {
-		fprintf(stderr, ERR_WRAP "Error: --upstream-proxy-auth-file needs --upstream-proxy\n" ERR_WRAP);
-		goto einval;
-	}
+	if (cfg->upstream_auth_file && !cfg->upstream_proxy)
+		OPT_FAIL("--upstream-proxy-auth-file needs --upstream-proxy");
 
 	/*
 	 * The URL's scheme is checked once it is parsed (upstream_init_tls());
 	 * an ACL file may name https:// pool servers.
 	 */
 	if (cfg->upstream_ca_file && !cfg->upstream_proxy &&
-	    !(cfg->acl_file && *cfg->acl_file)) {
-		fprintf(stderr, ERR_WRAP "Error: --upstream-ca-file needs an https:// --upstream-proxy or an --acl-file\n" ERR_WRAP);
-		goto einval;
-	}
+	    !(cfg->acl_file && *cfg->acl_file))
+		OPT_FAIL("--upstream-ca-file needs an https:// --upstream-proxy or an --acl-file");
 
-	if (cfg->nr_workers <= 0) {
-		fprintf(stderr, ERR_WRAP "Error: --nr-workers must be at least 1.\n" ERR_WRAP);
-		goto einval;
-	}
+	if (cfg->nr_workers <= 0)
+		OPT_FAIL("--nr-workers must be at least 1.");
 
 	/*
 	 * --prefer-ipv6 asks for a family that --outgoing-family forbids. Take
 	 * it as a mistake rather than silently letting the hard restriction win
 	 * -- an operator who wrote both is describing two different intents.
 	 */
-	if (cfg->prefer_ipv6 && cfg->outgoing_family == GWP_OUT_FAMILY_IPV4) {
-		fprintf(stderr, ERR_WRAP "Error: --prefer-ipv6=1 contradicts --outgoing-family=ipv4.\n" ERR_WRAP);
-		goto einval;
-	}
+	if (cfg->prefer_ipv6 && cfg->outgoing_family == GWP_OUT_FAMILY_IPV4)
+		OPT_FAIL("--prefer-ipv6=1 contradicts --outgoing-family=ipv4.");
 
-	if (cfg->target_buf_size <= 1) {
-		fprintf(stderr, ERR_WRAP "Error: --target-buf-size must be greater than 1.\n" ERR_WRAP);
-		goto einval;
-	}
+	if (cfg->target_buf_size <= 1)
+		OPT_FAIL("--target-buf-size must be greater than 1.");
 
-	if (cfg->client_buf_size <= 1) {
-		fprintf(stderr, ERR_WRAP "Error: --client-buf-size must be greater than 1.\n" ERR_WRAP);
-		goto einval;
-	}
+	if (cfg->client_buf_size <= 1)
+		OPT_FAIL("--client-buf-size must be greater than 1.");
 
 	if (cfg->as_socks5 || cfg->as_http) {
-		if (cfg->client_buf_size < 256) {
-			fprintf(stderr, ERR_WRAP "Error: --client-buf-size must be at least 256 for SOCKS5 or HTTP.\n" ERR_WRAP);
-			goto einval;
-		}
+		if (cfg->client_buf_size < 256)
+			OPT_FAIL("--client-buf-size must be at least 256 for SOCKS5 or HTTP.");
 
-		if (cfg->target_buf_size < 256) {
-			fprintf(stderr, ERR_WRAP "Error: --target-buf-size must be at least 256 for SOCKS5 or HTTP.\n" ERR_WRAP);
-			goto einval;
-		}
+		if (cfg->target_buf_size < 256)
+			OPT_FAIL("--target-buf-size must be at least 256 for SOCKS5 or HTTP.");
 	}
 
 	/*
 	 * Each SOCKS5 message has to fit in client.buf as a whole, and the
 	 * proxy has no other way to read the rest of it.
 	 */
-	if (cfg->as_socks5 && cfg->client_buf_size < GWP_SOCKS5_MIN_CLIENT_BUF) {
-		fprintf(stderr, ERR_WRAP "Error: --client-buf-size must be at least %d for SOCKS5.\n" ERR_WRAP,
-			GWP_SOCKS5_MIN_CLIENT_BUF);
-		goto einval;
-	}
+	if (cfg->as_socks5 && cfg->client_buf_size < GWP_SOCKS5_MIN_CLIENT_BUF)
+		OPT_FAIL("--client-buf-size must be at least %d for SOCKS5.",
+			 GWP_SOCKS5_MIN_CLIENT_BUF);
 
-	if (cfg->upstream_proxy && cfg->target_buf_size < GWP_UPSTREAM_MIN_TARGET_BUF) {
-		fprintf(stderr, ERR_WRAP "Error: --target-buf-size must be at least %d with --upstream-proxy.\n" ERR_WRAP,
-			GWP_UPSTREAM_MIN_TARGET_BUF);
-		goto einval;
-	}
+	if (cfg->upstream_proxy && cfg->target_buf_size < GWP_UPSTREAM_MIN_TARGET_BUF)
+		OPT_FAIL("--target-buf-size must be at least %d with --upstream-proxy.",
+			 GWP_UPSTREAM_MIN_TARGET_BUF);
 
 	return 0;
-
-einval_outfam:
-	fprintf(stderr, ERR_WRAP "Error: --outgoing-family must be any, ipv4 or ipv6.\n" ERR_WRAP);
-	goto einval;
 
 einval:
 	fprintf(stderr, "\n");
 	show_help(argv[0]);
 	return -EINVAL;
+	#undef OPT_FAIL
+	#undef ERR_WRAP
 }
 
 #ifdef CONFIG_NEW_DNS_RESOLVER
