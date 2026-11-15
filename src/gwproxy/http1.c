@@ -1498,6 +1498,43 @@ static int res_parse_buf(struct gwnet_http_hdr_pctx *ctx,
 	return gwnet_http_res_hdr_parse(ctx, hdr);
 }
 
+/*
+ * Parse @buf and check that the parser refuses it with @ret and, unless
+ * @want_err is negative, with ctx.err set to @want_err. A macro, not a
+ * function, so that a failed assert names the test and the line that made
+ * the check.
+ */
+#define REQ_EXPECT_FAIL(buf, len, ret, want_err)			\
+do {									\
+	struct gwnet_http_hdr_pctx __c;					\
+	struct gwnet_http_req_hdr __h;					\
+	int __e = (want_err);						\
+	int __r;							\
+									\
+	__r = req_parse_buf(&__c, &__h, (buf), (len), 0);		\
+	assert(__r == (ret));						\
+	if (__e >= 0)							\
+		assert(__c.err == __e);					\
+	gwnet_http_req_hdr_free(&__h);					\
+	gwnet_http_hdr_pctx_free(&__c);					\
+} while (0)
+
+/* The same for a response header. */
+#define RES_EXPECT_FAIL(buf, len, ret, want_err)			\
+do {									\
+	struct gwnet_http_hdr_pctx __c;					\
+	struct gwnet_http_res_hdr __h;					\
+	int __e = (want_err);						\
+	int __r;							\
+									\
+	__r = res_parse_buf(&__c, &__h, (buf), (len), 0);		\
+	assert(__r == (ret));						\
+	if (__e >= 0)							\
+		assert(__c.err == __e);					\
+	gwnet_http_res_hdr_free(&__h);					\
+	gwnet_http_hdr_pctx_free(&__c);					\
+} while (0)
+
 static void test_req_hdr_simple(void)
 {
 	static const char buf[] =
@@ -1563,15 +1600,8 @@ static void test_req_hdr_bare_target_rejected(void)
 		"Host: example.com\r\n"
 		"\r\n";
 	static const size_t len = sizeof(buf) - 1;
-	struct gwnet_http_hdr_pctx ctx;
-	struct gwnet_http_req_hdr hdr;
-	int r;
 
-	r = req_parse_buf(&ctx, &hdr, buf, len, 0);
-	assert(r == -EINVAL);
-	assert(ctx.err == GWNET_HTTP_HDR_ERR_MALFORMED);
-	gwnet_http_req_hdr_free(&hdr);
-	gwnet_http_hdr_pctx_free(&ctx);
+	REQ_EXPECT_FAIL(buf, len, -EINVAL, GWNET_HTTP_HDR_ERR_MALFORMED);
 	PRTEST_OK();
 }
 
@@ -1701,14 +1731,8 @@ static void test_req_hdr_invalid_req_line_sp(void)
 		"Host: example.com\r\n"
 		"\r\n";
 	static const size_t len = sizeof(buf) - 1;
-	struct gwnet_http_hdr_pctx ctx;
-	struct gwnet_http_req_hdr hdr;
-	int r;
 
-	r = req_parse_buf(&ctx, &hdr, buf, len, 0);
-	assert(r == -EINVAL);
-	gwnet_http_req_hdr_free(&hdr);
-	gwnet_http_hdr_pctx_free(&ctx);
+	REQ_EXPECT_FAIL(buf, len, -EINVAL, -1);
 	PRTEST_OK();
 }
 
@@ -1720,14 +1744,8 @@ static void test_req_hdr_invalid_res_status_line_sp(void)
 		"Server: gwhttpd\r\n"
 		"\r\n";
 	static const size_t len = sizeof(buf) - 1;
-	struct gwnet_http_hdr_pctx ctx;
-	struct gwnet_http_res_hdr hdr;
-	int r;
 
-	r = res_parse_buf(&ctx, &hdr, buf, len, 0);
-	assert(r == -EINVAL);
-	gwnet_http_res_hdr_free(&hdr);
-	gwnet_http_hdr_pctx_free(&ctx);
+	RES_EXPECT_FAIL(buf, len, -EINVAL, -1);
 	PRTEST_OK();
 }
 
@@ -1738,15 +1756,8 @@ static void test_req_hdr_invalid_uri_chars(void)
 		"Host: example.com\r\n"
 		"\r\n";
 	static const size_t len = sizeof(buf) - 1;
-	struct gwnet_http_hdr_pctx ctx;
-	struct gwnet_http_req_hdr hdr;
-	int r;
 
-	r = req_parse_buf(&ctx, &hdr, buf, len, 0);
-	assert(r == -EINVAL);
-	assert(ctx.err == GWNET_HTTP_HDR_ERR_MALFORMED);
-	gwnet_http_req_hdr_free(&hdr);
-	gwnet_http_hdr_pctx_free(&ctx);
+	REQ_EXPECT_FAIL(buf, len, -EINVAL, GWNET_HTTP_HDR_ERR_MALFORMED);
 	PRTEST_OK();
 }
 
@@ -1758,15 +1769,8 @@ static void test_req_hdr_invalid_uri_chars2(void)
 		"Invalid-Header: \r\n"
 		"\r\n";
 	static const size_t len = sizeof(buf) - 1;
-	struct gwnet_http_hdr_pctx ctx;
-	struct gwnet_http_req_hdr hdr;
-	int r;
 
-	r = req_parse_buf(&ctx, &hdr, buf, len, 0);
-	assert(r == -EINVAL);
-	assert(ctx.err == GWNET_HTTP_HDR_ERR_MALFORMED);
-	gwnet_http_req_hdr_free(&hdr);
-	gwnet_http_hdr_pctx_free(&ctx);
+	REQ_EXPECT_FAIL(buf, len, -EINVAL, GWNET_HTTP_HDR_ERR_MALFORMED);
 	PRTEST_OK();
 }
 
@@ -1830,15 +1834,9 @@ static void test_req_hdr_invalid_version(void)
 		"Host: example.com\r\n"
 		"\r\n";
 	static const size_t len = sizeof(buf) - 1;
-	struct gwnet_http_hdr_pctx ctx;
-	struct gwnet_http_req_hdr hdr;
-	int r;
 
-	r = req_parse_buf(&ctx, &hdr, buf, len, 0);
-	assert(r == -EPROTONOSUPPORT);
-	assert(ctx.err == GWNET_HTTP_HDR_ERR_MALFORMED);
-	gwnet_http_req_hdr_free(&hdr);
-	gwnet_http_hdr_pctx_free(&ctx);
+	REQ_EXPECT_FAIL(buf, len, -EPROTONOSUPPORT,
+			GWNET_HTTP_HDR_ERR_MALFORMED);
 	PRTEST_OK();
 }
 
@@ -1849,15 +1847,8 @@ static void test_res_hdr_invalid_version(void)
 		"Server: gwhttpd\r\n"
 		"\r\n";
 	static const size_t len = sizeof(buf) - 1;
-	struct gwnet_http_hdr_pctx ctx;
-	struct gwnet_http_res_hdr hdr;
-	int r;
 
-	r = res_parse_buf(&ctx, &hdr, buf, len, 0);
-	assert(r == -EINVAL);
-	assert(ctx.err == GWNET_HTTP_HDR_ERR_MALFORMED);
-	gwnet_http_res_hdr_free(&hdr);
-	gwnet_http_hdr_pctx_free(&ctx);
+	RES_EXPECT_FAIL(buf, len, -EINVAL, GWNET_HTTP_HDR_ERR_MALFORMED);
 	PRTEST_OK();
 }
 
@@ -1971,18 +1962,11 @@ static void test_req_hdr_field_value_bytes(void)
 	gwnet_http_req_hdr_free(&hdr);
 	gwnet_http_hdr_pctx_free(&ctx);
 
-	for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
-		r = req_parse_buf(&ctx, &hdr, bad[i], strlen(bad[i]), 0);
-		assert(r == -EINVAL);
-		gwnet_http_req_hdr_free(&hdr);
-		gwnet_http_hdr_pctx_free(&ctx);
-	}
+	for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++)
+		REQ_EXPECT_FAIL(bad[i], strlen(bad[i]), -EINVAL, -1);
 
 	/* A NUL does not end a value either; strlen() would not reach it. */
-	r = req_parse_buf(&ctx, &hdr, nul, sizeof(nul) - 1, 0);
-	assert(r == -EINVAL);
-	gwnet_http_req_hdr_free(&hdr);
-	gwnet_http_hdr_pctx_free(&ctx);
+	REQ_EXPECT_FAIL(nul, sizeof(nul) - 1, -EINVAL, -1);
 	PRTEST_OK();
 }
 
@@ -2017,15 +2001,8 @@ static void test_res_hdr_invalid_duplicate_fields(void)
 		"Content-Length: 2\r\n"
 		"\r\n";
 	static const size_t len = sizeof(buf) - 1;
-	struct gwnet_http_hdr_pctx ctx;
-	struct gwnet_http_res_hdr hdr;
-	int r;
 
-	r = res_parse_buf(&ctx, &hdr, buf, len, 0);
-	assert(r == -EEXIST);
-	assert(ctx.err == GWNET_HTTP_HDR_ERR_MALFORMED);
-	gwnet_http_res_hdr_free(&hdr);
-	gwnet_http_hdr_pctx_free(&ctx);
+	RES_EXPECT_FAIL(buf, len, -EEXIST, GWNET_HTTP_HDR_ERR_MALFORMED);
 	PRTEST_OK();
 }
 
@@ -2075,15 +2052,8 @@ static void test_req_hdr_invalid_space_before_colon(void)
 		"Host : example.com\r\n"
 		"\r\n";
 	static const size_t len = sizeof(buf) - 1;
-	struct gwnet_http_hdr_pctx ctx;
-	struct gwnet_http_req_hdr hdr;
-	int r;
 
-	r = req_parse_buf(&ctx, &hdr, buf, len, 0);
-	assert(r == -EINVAL);
-	assert(ctx.err == GWNET_HTTP_HDR_ERR_MALFORMED);
-	gwnet_http_req_hdr_free(&hdr);
-	gwnet_http_hdr_pctx_free(&ctx);
+	REQ_EXPECT_FAIL(buf, len, -EINVAL, GWNET_HTTP_HDR_ERR_MALFORMED);
 	PRTEST_OK();
 }
 
@@ -2095,15 +2065,8 @@ static void test_res_hdr_invalid_space_before_colon(void)
 		"Date    : Mon, 01 Jan 1999 00:00:00 GMT\r\n"
 		"\r\n";
 	static const size_t len = sizeof(buf) - 1;
-	struct gwnet_http_hdr_pctx ctx;
-	struct gwnet_http_res_hdr hdr;
-	int r;
 
-	r = res_parse_buf(&ctx, &hdr, buf, len, 0);
-	assert(r == -EINVAL);
-	assert(ctx.err == GWNET_HTTP_HDR_ERR_MALFORMED);
-	gwnet_http_res_hdr_free(&hdr);
-	gwnet_http_hdr_pctx_free(&ctx);
+	RES_EXPECT_FAIL(buf, len, -EINVAL, GWNET_HTTP_HDR_ERR_MALFORMED);
 	PRTEST_OK();
 }
 
@@ -2127,17 +2090,9 @@ static void test_req_hdr_invalid_lone_cr(void)
 	};
 	size_t i;
 
-	for (i = 0; i < sizeof(bufs) / sizeof(bufs[0]); i++) {
-		struct gwnet_http_hdr_pctx ctx;
-		struct gwnet_http_req_hdr hdr;
-		int r;
-
-		r = req_parse_buf(&ctx, &hdr, bufs[i], strlen(bufs[i]), 0);
-		assert(r == -EINVAL);
-		assert(ctx.err == GWNET_HTTP_HDR_ERR_MALFORMED);
-		gwnet_http_req_hdr_free(&hdr);
-		gwnet_http_hdr_pctx_free(&ctx);
-	}
+	for (i = 0; i < sizeof(bufs) / sizeof(bufs[0]); i++)
+		REQ_EXPECT_FAIL(bufs[i], strlen(bufs[i]), -EINVAL,
+				GWNET_HTTP_HDR_ERR_MALFORMED);
 	PRTEST_OK();
 }
 
@@ -2343,15 +2298,8 @@ static void test_req_hdr_invalid_field_val_chars(void)
 		"Invalid-Header: \x01\x02\x03\r\n"
 		"\r\n";
 	static const size_t len = sizeof(buf) - 1;
-	struct gwnet_http_hdr_pctx ctx;
-	struct gwnet_http_req_hdr hdr;
-	int r;
 
-	r = req_parse_buf(&ctx, &hdr, buf, len, 0);
-	assert(r == -EINVAL);
-	assert(ctx.err == GWNET_HTTP_HDR_ERR_MALFORMED);
-	gwnet_http_req_hdr_free(&hdr);
-	gwnet_http_hdr_pctx_free(&ctx);
+	REQ_EXPECT_FAIL(buf, len, -EINVAL, GWNET_HTTP_HDR_ERR_MALFORMED);
 	PRTEST_OK();
 }
 
@@ -2363,15 +2311,8 @@ static void test_res_hdr_invalid_field_val_chars(void)
 		"Invalid-Header: \x01\x02\x03\r\n"
 		"\r\n";
 	static const size_t len = sizeof(buf) - 1;
-	struct gwnet_http_hdr_pctx ctx;
-	struct gwnet_http_res_hdr hdr;
-	int r;
 
-	r = res_parse_buf(&ctx, &hdr, buf, len, 0);
-	assert(r == -EINVAL);
-	assert(ctx.err == GWNET_HTTP_HDR_ERR_MALFORMED);
-	gwnet_http_res_hdr_free(&hdr);
-	gwnet_http_hdr_pctx_free(&ctx);
+	RES_EXPECT_FAIL(buf, len, -EINVAL, GWNET_HTTP_HDR_ERR_MALFORMED);
 	PRTEST_OK();
 }
 
@@ -2383,15 +2324,8 @@ static void test_req_hdr_invalid_field_key_chars(void)
 		"Invalid-Header\x01\x02\x03: value\r\n"
 		"\r\n";
 	static const size_t len = sizeof(buf) - 1;
-	struct gwnet_http_hdr_pctx ctx;
-	struct gwnet_http_req_hdr hdr;
-	int r;
 
-	r = req_parse_buf(&ctx, &hdr, buf, len, 0);
-	assert(r == -EINVAL);
-	assert(ctx.err == GWNET_HTTP_HDR_ERR_MALFORMED);
-	gwnet_http_req_hdr_free(&hdr);
-	gwnet_http_hdr_pctx_free(&ctx);
+	REQ_EXPECT_FAIL(buf, len, -EINVAL, GWNET_HTTP_HDR_ERR_MALFORMED);
 	PRTEST_OK();
 }
 
@@ -2403,15 +2337,8 @@ static void test_res_hdr_invalid_field_key_chars(void)
 		"Invalid-Header\x01\x02\x03: value\r\n"
 		"\r\n";
 	static const size_t len = sizeof(buf) - 1;
-	struct gwnet_http_hdr_pctx ctx;
-	struct gwnet_http_res_hdr hdr;
-	int r;
 
-	r = res_parse_buf(&ctx, &hdr, buf, len, 0);
-	assert(r == -EINVAL);
-	assert(ctx.err == GWNET_HTTP_HDR_ERR_MALFORMED);
-	gwnet_http_res_hdr_free(&hdr);
-	gwnet_http_hdr_pctx_free(&ctx);
+	RES_EXPECT_FAIL(buf, len, -EINVAL, GWNET_HTTP_HDR_ERR_MALFORMED);
 	PRTEST_OK();
 }
 
