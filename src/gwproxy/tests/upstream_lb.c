@@ -15,28 +15,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-static struct gwp_sockaddr addr_of(const char *ip, uint16_t port)
-{
-	struct gwp_sockaddr s;
-
-	memset(&s, 0, sizeof(s));
-	if (strchr(ip, ':')) {
-		s.i6.sin6_family = AF_INET6;
-		s.i6.sin6_port = htons(port);
-		assert(inet_pton(AF_INET6, ip, &s.i6.sin6_addr) == 1);
-	} else {
-		s.i4.sin_family = AF_INET;
-		s.i4.sin_port = htons(port);
-		assert(inet_pton(AF_INET, ip, &s.i4.sin_addr) == 1);
-	}
-	return s;
-}
+#include "test_util.h"
 
 static struct gwp_up_key key_of(enum gwp_up_scheme scheme, const char *ip,
 				uint16_t port, const char *user)
 {
-	struct gwp_sockaddr a = addr_of(ip, port);
+	struct gwp_sockaddr a = gwp_test_addr(ip, port);
 	struct gwp_up_key k;
 
 	/* Garbage first: the key must not depend on what was there. */

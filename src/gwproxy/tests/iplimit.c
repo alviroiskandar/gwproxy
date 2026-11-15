@@ -16,22 +16,13 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+#include "test_util.h"
 
 static struct gwp_iplim_key key_of(const char *ip)
 {
+	struct gwp_sockaddr s = gwp_test_addr(ip, 1234);
 	struct gwp_iplim_key k;
-	struct gwp_sockaddr s;
 
-	memset(&s, 0, sizeof(s));
-	if (strchr(ip, ':')) {
-		s.i6.sin6_family = AF_INET6;
-		s.i6.sin6_port = htons(1234);
-		assert(inet_pton(AF_INET6, ip, &s.i6.sin6_addr) == 1);
-	} else {
-		s.i4.sin_family = AF_INET;
-		s.i4.sin_port = htons(1234);
-		assert(inet_pton(AF_INET, ip, &s.i4.sin_addr) == 1);
-	}
 	gwp_iplim_key(&s, &k);
 	return k;
 }

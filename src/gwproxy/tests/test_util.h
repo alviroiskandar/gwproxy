@@ -14,12 +14,15 @@
 #error "include test_util.h after #undef NDEBUG"
 #endif
 
+#include <arpa/inet.h>
 #include <assert.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <gwproxy/auth.h>
+#include <gwproxy/net.h>
 
 /*
  * Print a test function's pass line, the first time it gets there only. A
@@ -33,6 +36,27 @@ do {							\
 		__printed = 1;				\
 	}						\
 } while (0)
+
+/*
+ * The socket address of @ip, an IPv4 or IPv6 literal, and @port, with every
+ * other byte zero; an IPv6 literal is told by its ':'.
+ */
+static inline struct gwp_sockaddr gwp_test_addr(const char *ip, uint16_t port)
+{
+	struct gwp_sockaddr s;
+
+	memset(&s, 0, sizeof(s));
+	if (strchr(ip, ':')) {
+		s.i6.sin6_family = AF_INET6;
+		s.i6.sin6_port = htons(port);
+		assert(inet_pton(AF_INET6, ip, &s.i6.sin6_addr) == 1);
+	} else {
+		s.i4.sin_family = AF_INET;
+		s.i4.sin_port = htons(port);
+		assert(inet_pton(AF_INET, ip, &s.i4.sin_addr) == 1);
+	}
+	return s;
+}
 
 /* The directory for temporary files: $TMPDIR, or /tmp when it is not set. */
 static inline const char *gwp_test_tmpdir(void)
