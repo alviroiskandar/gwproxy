@@ -3530,39 +3530,27 @@ static int handle_udp_associate(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		      PTR_TO_U64(gcp) | EV_BIT_UDP_RELAY);
 }
 
-static int chk_socks5(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int r)
+/*
+ * Act on what a SOCKS5 or HTTP parser returned, @r, by the state it left
+ * the pair in: start the lookup of the target's name, the connect, or the UDP
+ * association. The states of the two front-ends are disjoint, so one check
+ * serves both.
+ */
+static int chk_prot_result(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int r)
 {
-	if (r == -EINPROGRESS && gcp->conn_state == CONN_STATE_SOCKS5_DNS_QUERY)
+	int ct = gcp->conn_state;
+
+	if (r == -EINPROGRESS && gwp_in_dns_lookup(gcp))
 		return chk_handle_dns_query(w, gcp);
 
-	if (r == 0 && gcp->conn_state == CONN_STATE_SOCKS5_CONNECT)
+	if (r == 0 && (ct == CONN_STATE_SOCKS5_CONNECT ||
+		       ct == CONN_STATE_HTTP_CONNECT))
 		return handle_connect(w, gcp);
 
-	if (r == 0 && gcp->conn_state == CONN_STATE_SOCKS5_UDP_ASSOCIATE)
+	if (r == 0 && ct == CONN_STATE_SOCKS5_UDP_ASSOCIATE)
 		return handle_udp_associate(w, gcp);
 
 	return r;
-}
-
-static int handle_conn_state_socks5(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
-{
-	return chk_socks5(w, gcp, gwp_handle_conn_state_socks5(w, gcp));
-}
-
-static int chk_http(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int r)
-{
-	if (r == -EINPROGRESS && gcp->conn_state == CONN_STATE_HTTP_DNS_QUERY)
-		return chk_handle_dns_query(w, gcp);
-
-	if (r == 0 && gcp->conn_state == CONN_STATE_HTTP_CONNECT)
-		return handle_connect(w, gcp);
-
-	return r;
-}
-
-static int handle_conn_state_http(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
-{
-	return chk_http(w, gcp, gwp_handle_conn_state_http(w, gcp));
 }
 
 static int handle_conn_state_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
@@ -3588,14 +3576,13 @@ static int handle_conn_state_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	}
 	if (CONN_STATE_HTTP_MIN < ct && ct < CONN_STATE_HTTP_MAX) {
 		assert(w->ctx->cfg.as_http);
-		return chk_http(w, gcp, r);
 	} else if (CONN_STATE_SOCKS5_MIN < ct && ct < CONN_STATE_SOCKS5_MAX) {
 		assert(w->ctx->cfg.as_socks5);
-		return chk_socks5(w, gcp, r);
 	} else {
 		assert(0 && "Invalid connection state!");
 		return -EINVAL;
 	}
+	return chk_prot_result(w, gcp, r);
 }
 
 /*
@@ -3709,10 +3696,11 @@ static int handle_ev_client_prot_in(struct gwp_wrk *w, struct gwp_conn_pair *gcp
 		r = handle_conn_state_prot(w, gcp);
 	} else if (CONN_STATE_HTTP_MIN < ct && ct < CONN_STATE_HTTP_MAX) {
 		assert(w->ctx->cfg.as_http);
-		r = handle_conn_state_http(w, gcp);
+		r = chk_prot_result(w, gcp, gwp_handle_conn_state_http(w, gcp));
 	} else if (CONN_STATE_SOCKS5_MIN < ct && ct < CONN_STATE_SOCKS5_MAX) {
 		assert(w->ctx->cfg.as_socks5);
-		r = handle_conn_state_socks5(w, gcp);
+		r = chk_prot_result(w, gcp,
+				    gwp_handle_conn_state_socks5(w, gcp));
 	} else {
 		assert(0 && "Invalid connection state!");
 		return -EINVAL;
