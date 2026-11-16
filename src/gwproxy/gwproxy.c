@@ -5024,19 +5024,13 @@ static int expand_conn_slot(struct gwp_wrk *w)
 {
 	struct gwp_conn_slot *gcs = &w->conn_slot;
 	struct gwp_ctx *ctx = w->ctx;
+	int r;
 
-	if (gcs->nr >= gcs->cap) {
-		uint32_t new_cap = gcs->cap ? gcs->cap * 2 : 16;
-		struct gwp_conn_pair **new_pairs;
-
-		new_pairs = realloc(gcs->pairs, new_cap * sizeof(*new_pairs));
-		if (!new_pairs)
-			return -ENOMEM;
-
-		gcs->pairs = new_pairs;
-		gcs->cap = new_cap;
+	r = GWP_GROW_ARRAY(gcs->pairs, gcs->nr, gcs->cap, 16);
+	if (r < 0)
+		return -ENOMEM;
+	if (r)
 		pr_dbg(&ctx->lh, "Increased connection slot capacity to %u", gcs->cap);
-	}
 
 	return 0;
 }
