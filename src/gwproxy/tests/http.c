@@ -23,6 +23,7 @@
 #include <signal.h>
 #include <sys/time.h>
 #include "test_util.h"
+#include <gwproxy/common.h>
 
 /*
  * Run gwp_http_conn_process() on a copy of @buf, a whole request, in one shot.
@@ -413,7 +414,7 @@ static void test_forward_conn_lists_framing(void)
 	uint8_t out[128];
 	int r;
 
-	for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++)
+	for (i = 0; i < ARRAY_SIZE(bad); i++)
 		expect_code(bad[i], true, GWP_HTTP_BAD_REQUEST);
 
 	r = gwp_http_build_bad_request_reply(out, sizeof(out));
@@ -591,14 +592,13 @@ static void test_req_framing(void)
 				 step, &fwd));
 		assert(fwd == strlen(chunked));
 
-		for (i = 0; i < sizeof(bad_chunked) / sizeof(bad_chunked[0]);
-		     i++)
+		for (i = 0; i < ARRAY_SIZE(bad_chunked); i++)
 			assert(req_body("POST http://h/ HTTP/1.1\r\n"
 					"Transfer-Encoding: chunked\r\n\r\n",
 					bad_chunked[i], step, &fwd) == -EBADMSG);
 	}
 
-	for (i = 0; i < sizeof(bad_hdr) / sizeof(bad_hdr[0]); i++)
+	for (i = 0; i < ARRAY_SIZE(bad_hdr); i++)
 		expect_code(bad_hdr[i], true, GWP_HTTP_BAD_REQUEST);
 	PRTEST_OK();
 }
@@ -678,7 +678,7 @@ static void test_res_framing(void)
 	size_t i, out_len;
 	int r;
 
-	for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
 		hc = gwp_http_conn_alloc();
 		assert(hc);
 		r = res_feed(hc, 1024, cases[i].in, false, out, sizeof(out),
@@ -914,10 +914,10 @@ static void test_via(void)
 	char out[1024];
 	size_t i, out_len;
 
-	for (i = 0; i < sizeof(req_cases) / sizeof(req_cases[0]); i++)
+	for (i = 0; i < ARRAY_SIZE(req_cases); i++)
 		expect_forward(req_cases[i].in, req_cases[i].out);
 
-	for (i = 0; i < sizeof(res_cases) / sizeof(res_cases[0]); i++) {
+	for (i = 0; i < ARRAY_SIZE(res_cases); i++) {
 		hc = gwp_http_conn_alloc();
 		assert(hc);
 		assert(!res_feed(hc, 1024, res_cases[i].in, false, out,
@@ -1013,7 +1013,7 @@ static void test_res_reject(void)
 	size_t out_len, i;
 
 	assert(hc);
-	for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+	for (i = 0; i < ARRAY_SIZE(bad); i++) {
 		assert(res_feed(hc, 1024, bad[i], false, out, sizeof(out),
 				&out_len) < 0);
 		assert(gwp_http_fwd_res_state(hc) == GWP_HTTP_RES_FAILED);
@@ -1152,11 +1152,11 @@ static void test_incremental(void)
 	memset(longfield + n, 'a', 16500);
 	sprintf(longfield + n + 16500, "\r\n\r\n");
 
-	for (i = 0; i < sizeof(reqs) / sizeof(reqs[0]); i++) {
+	for (i = 0; i < ARRAY_SIZE(reqs); i++) {
 		size_t len = strlen(reqs[i]);
 
 		r1 = feed_steps(reqs[i], len, len, fwd1, &l1, hp1, &t1);
-		for (s = 0; s < sizeof(steps) / sizeof(steps[0]); s++) {
+		for (s = 0; s < ARRAY_SIZE(steps); s++) {
 			r2 = feed_steps(reqs[i], len, steps[s], fwd2, &l2,
 					hp2, &t2);
 			assert(r1 == r2);
@@ -1263,7 +1263,7 @@ static void test_req_errors(void)
 	size_t i, req_len;
 	int r;
 
-	for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
 		hc = gwp_http_conn_alloc();
 		assert(hc);
 		r = proc(hc, NULL, cases[i].in, &host, &port, &req, &req_len,
@@ -1351,7 +1351,7 @@ static void test_max_forwards(void)
 	};
 	size_t i;
 
-	for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
 		/* Only a forwarded request has an output to compare. */
 		if (cases[i].out) {
 			assert(cases[i].want == GWP_HTTP_FORWARD);
@@ -1438,7 +1438,7 @@ static void test_req_start(void)
 #undef RS
 	size_t i;
 
-	for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
 		assert(feed_raw(cases[i].in, cases[i].len, false) ==
 		       cases[i].want);
 		assert(feed_raw(cases[i].in, cases[i].len, true) ==
@@ -1512,7 +1512,7 @@ static void test_field_obs_text(void)
 		"Via: 1.1 gwproxy\r\nConnection: close\r\n\r\n";
 	size_t i;
 
-	for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++)
+	for (i = 0; i < ARRAY_SIZE(bad); i++)
 		expect_code(bad[i], false, GWP_HTTP_BAD_REQUEST);
 	expect_forward(good, want);
 	PRTEST_OK();
@@ -1650,7 +1650,7 @@ static void test_underscore_alias(void)
 	char buf[256];
 	size_t i;
 
-	for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+	for (i = 0; i < ARRAY_SIZE(bad); i++) {
 		snprintf(buf, sizeof(buf), "POST http://e/ HTTP/1.1\r\n"
 			 "X-A: 1\r\n%s\r\nContent-Length: 4\r\n\r\n",
 			 bad[i]);
@@ -1719,7 +1719,7 @@ static void test_duplicate_field(void)
 	size_t req_len = 0, i;
 
 	/* Not whole: the request is refused before it is all read. */
-	for (i = 0; i < sizeof(dups) / sizeof(dups[0]); i++)
+	for (i = 0; i < ARRAY_SIZE(dups); i++)
 		expect_code(dups[i], false, GWP_HTTP_BAD_REQUEST);
 
 	hc = gwp_http_conn_alloc();
@@ -1891,7 +1891,7 @@ static void test_upstream_reply(void)
 	size_t i, n, len, scan, consumed;
 	int status, r;
 
-	for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
 		len = strlen(cases[i].in);
 		consumed = 0;
 		status = 0;
@@ -2138,7 +2138,7 @@ static void test_auth_basic_token(void)
 	auth = gwp_test_auth_from_buf("gwp_http_auth", cred_data,
 				      sizeof(cred_data) - 1, &cred_file);
 
-	for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+	for (i = 0; i < ARRAY_SIZE(cases); i++)
 		assert(gwp_auth_check_basic(auth, cases[i].hdr) == cases[i].ok);
 
 	gwp_test_auth_put(auth, cred_file);

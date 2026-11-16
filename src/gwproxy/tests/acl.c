@@ -797,7 +797,7 @@ static noinline void test_parse_errors(void)
 	};
 	size_t i;
 
-	for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+	for (i = 0; i < ARRAY_SIZE(bad); i++) {
 		a = (void *)0x1;
 		assert(parse_quiet(&a, bad[i]) < 0);
 	}
@@ -955,8 +955,6 @@ static const char *const rnd_doms[] = {
 	"xn--bcher-kva.example", "e.example",
 };
 
-#define NELEM(x) (sizeof(x) / sizeof((x)[0]))
-
 static const char *rnd_case(const char *s, char *buf)
 {
 	size_t i;
@@ -976,8 +974,8 @@ static const char *rnd_case(const char *s, char *buf)
 
 static const char *rnd_net(void)
 {
-	return rnd(4) ? rnd_v4_nets[rnd(NELEM(rnd_v4_nets))]
-		      : rnd_v6_nets[rnd(NELEM(rnd_v6_nets))];
+	return rnd(4) ? rnd_v4_nets[rnd(ARRAY_SIZE(rnd_v4_nets))]
+		      : rnd_v6_nets[rnd(ARRAY_SIZE(rnd_v6_nets))];
 }
 
 static const char *rnd_action(char *buf, bool output, bool terminal)
@@ -992,7 +990,8 @@ static const char *rnd_action(char *buf, bool output, bool terminal)
 
 	if (!output)
 		return rnd(2) ? "-j ACCEPT" : "-j REJECT";
-	strcpy(buf, out_acts[rnd(terminal || rnd(4) ? 7 : NELEM(out_acts))]);
+	strcpy(buf,
+	       out_acts[rnd(terminal || rnd(4) ? 7 : ARRAY_SIZE(out_acts))]);
 	return buf;
 }
 
@@ -1009,7 +1008,7 @@ static char *rnd_rule(char *p, bool output, bool indexable)
 	uint32_t kind;
 
 	if (indexable)
-		kind = output ? ikinds[rnd(NELEM(ikinds))] : 0;
+		kind = output ? ikinds[rnd(ARRAY_SIZE(ikinds))] : 0;
 	else
 		kind = rnd(output ? 11 : 6);
 
@@ -1037,7 +1036,8 @@ static char *rnd_rule(char *p, bool output, bool indexable)
 		break;
 	case 8:
 		p += sprintf(p, "-m domain --domain %s ",
-			     rnd_case(rnd_doms[rnd(NELEM(rnd_doms))], cbuf));
+			     rnd_case(rnd_doms[rnd(ARRAY_SIZE(rnd_doms))],
+				      cbuf));
 		break;
 	case 9:
 		p += sprintf(p, "! -d %s ", rnd_net());
@@ -1048,7 +1048,7 @@ static char *rnd_rule(char *p, bool output, bool indexable)
 				     rnd(2) ? 80 : 443);
 		else
 			p += sprintf(p, "-m domain ! --domain %s ",
-				     rnd_doms[rnd(NELEM(rnd_doms))]);
+				     rnd_doms[rnd(ARRAY_SIZE(rnd_doms))]);
 		break;
 	}
 	p += sprintf(p, "%s\n", act);
@@ -1060,11 +1060,12 @@ static void rnd_addr(struct gwp_sockaddr *s)
 	uint32_t k = rnd(5);
 
 	if (k < 2)
-		*s = sa4(rnd_v4_addrs[rnd(NELEM(rnd_v4_addrs))], 443);
+		*s = sa4(rnd_v4_addrs[rnd(ARRAY_SIZE(rnd_v4_addrs))], 443);
 	else if (k < 3)
-		*s = sa4mapped(rnd_v4_addrs[rnd(NELEM(rnd_v4_addrs))], 443);
+		*s = sa4mapped(rnd_v4_addrs[rnd(ARRAY_SIZE(rnd_v4_addrs))],
+			       443);
 	else
-		*s = sa6(rnd_v6_addrs[rnd(NELEM(rnd_v6_addrs))], 443);
+		*s = sa6(rnd_v6_addrs[rnd(ARRAY_SIZE(rnd_v6_addrs))], 443);
 	s->i4.sin_port = htons((uint16_t)(rnd(2) ? 80 : 443));
 }
 
@@ -1145,8 +1146,10 @@ static noinline void test_index_matches_linear(void)
 			memset(&x, 0, sizeof(x));
 			x.target = rnd(6) ? &t : NULL;
 			x.client = rnd(6) ? &c : NULL;
-			x.domain = rnd(3) ? rnd_case(rnd_doms[rnd(NELEM(rnd_doms))], dbuf)
-					  : NULL;
+			x.domain = rnd(3)
+				? rnd_case(rnd_doms[rnd(ARRAY_SIZE(rnd_doms))],
+					   dbuf)
+				: NULL;
 			x.dport = (uint16_t)(rnd(2) ? 80 : 443);
 			x.sport = (uint16_t)rnd(3000);
 			x.proto = (uint8_t)rnd(2);
@@ -1786,7 +1789,7 @@ static void test_empty_chain_policy(void)
 
 	path = write_tmp_rules(files[0]);
 	assert(!gwp_acl_create(&a, path));
-	for (i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+	for (i = 0; i < ARRAY_SIZE(files); i++) {
 		if (i) {
 			gwp_test_rewrite_file(path, files[i], strlen(files[i]));
 			assert(!gwp_acl_reload(a));
@@ -3340,7 +3343,7 @@ static noinline void test_upstream_url_redact(void)
 	char buf[64];
 	size_t i;
 
-	for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
 		assert(!gwp_acl_url_redact(cases[i].in, buf, sizeof(buf)));
 		assert(!strcmp(buf, cases[i].out));
 	}
@@ -3883,7 +3886,7 @@ static noinline void test_upstream_udp_refused(void)
 	struct gwp_acl *a = NULL;
 	size_t i;
 
-	for (i = 0; i < sizeof(rules) / sizeof(rules[0]); i++) {
+	for (i = 0; i < ARRAY_SIZE(rules); i++) {
 		snprintf(text, sizeof(text), "%s%s", pool, rules[i]);
 		up_refused(text, -EINVAL, "line 4: -j UPSTREAM applies to TCP; UDP never goes through an upstream");
 	}
@@ -3955,7 +3958,7 @@ static noinline void test_upstream_methods(void)
 	char text[256];
 	size_t i;
 
-	for (i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
+	for (i = 0; i < ARRAY_SIZE(c); i++) {
 		snprintf(text, sizeof(text),
 			 "upstream p {\n server http://h:1;\n%s"
 			 " server http://h:2 weight=2;\n}\n"

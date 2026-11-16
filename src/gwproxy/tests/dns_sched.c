@@ -458,7 +458,7 @@ static void test_limits(void)
 			pthread_mutex_unlock(&ctx->lock);
 			if (full)
 				break;
-			assert(n < sizeof(q) / sizeof(q[0]));
+			assert(n < ARRAY_SIZE(q));
 			ask(ctx, client, "hold-fill-%u", n, &q[n]);
 			n++;
 		}
@@ -474,7 +474,7 @@ static void test_limits(void)
 	 * refusal can complete, and there are few threads to make room.
 	 */
 	for (client++; ; client++) {
-		assert(n < sizeof(q) / sizeof(q[0]));
+		assert(n < ARRAY_SIZE(q));
 		ask(ctx, client, "hold-late-%u", client, &q[n]);
 		if (cq_ready(ctx))
 			break;
