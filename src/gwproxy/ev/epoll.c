@@ -38,6 +38,25 @@ static void ep_del(struct gwp_wrk *w, int fd)
 		__sys_epoll_ctl(w->ep_fd, EPOLL_CTL_DEL, fd, NULL);
 }
 
+/* Add @fd to the epoll set (EPOLL_CTL_ADD), or change it (EPOLL_CTL_MOD). */
+static inline int ep_ctl(struct gwp_wrk *w, int op, int fd, uint32_t events,
+			 uint64_t data)
+{
+	struct epoll_event ev;
+
+	ev.events = events;
+	ev.data.u64 = data;
+	return __sys_epoll_ctl(w->ep_fd, op, fd, &ev);
+}
+
+/* The same for @c of @gcp, with its ep_mask and tagged with @ev_bit. */
+static inline int ep_ctl_conn(struct gwp_wrk *w, int op,
+			      struct gwp_conn_pair *gcp, struct gwp_conn *c,
+			      uint64_t ev_bit)
+{
+	return ep_ctl(w, op, c->fd, c->ep_mask, PTR_TO_U64(gcp) | ev_bit);
+}
+
 #ifdef CONFIG_HTTPS
 static int tls_flush_hs(struct gwp_conn *c);
 #endif
@@ -99,13 +118,11 @@ static int chk_handle_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	struct gwp_cfg *cfg = &w->ctx->cfg;
 
 	if (cfg->use_raw_dns) {
-		struct epoll_event ev;
 		int r;
 
 		/* The reply comes back on the query's own socket. */
-		ev.events = EPOLLIN;
-		ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_RAW_DNS_QUERY;
-		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, gcp->gdp->fd, &ev);
+		r = ep_ctl(w, EPOLL_CTL_ADD, gcp->gdp->fd, EPOLLIN,
+			   PTR_TO_U64(gcp) | EV_BIT_RAW_DNS_QUERY);
 		if (likely(!r))
 			r = send_dns_payload(w, gcp);
 		/*
@@ -293,7 +310,7 @@ static int forward_progress(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 __cold
 int gwp_ctx_init_thread_epoll(struct gwp_wrk *w)
 {
-	struct epoll_event ev, *events;
+	struct epoll_event *events;
 	struct gwp_ctx *ctx = w->ctx;
 	int ep_fd, ev_fd, r;
 
@@ -333,32 +350,24 @@ int gwp_ctx_init_thread_epoll(struct gwp_wrk *w)
 	w->ep_fd = ep_fd;
 	w->events = events;
 
-	memset(&ev, 0, sizeof(ev));
-	ev.events = EPOLLIN;
-	ev.data.u64 = EV_BIT_EVENTFD;
-	r = __sys_epoll_ctl(ep_fd, EPOLL_CTL_ADD, ev_fd, &ev);
+	r = ep_ctl(w, EPOLL_CTL_ADD, ev_fd, EPOLLIN, EV_BIT_EVENTFD);
 	if (unlikely(r))
 		goto out_free_events;
 
-	ev.events = EPOLLIN;
-	ev.data.u64 = EV_BIT_ACCEPT;
-	r = __sys_epoll_ctl(ep_fd, EPOLL_CTL_ADD, w->tcp_fd, &ev);
+	r = ep_ctl(w, EPOLL_CTL_ADD, w->tcp_fd, EPOLLIN, EV_BIT_ACCEPT);
 	if (unlikely(r))
 		goto out_free_events;
 
 	/* Sockets of finished pairs that are still being closed. */
-	ev.events = EPOLLIN;
-	ev.data.u64 = EV_BIT_LINGER;
-	r = __sys_epoll_ctl(ep_fd, EPOLL_CTL_ADD, gwp_linger_fd(w->linger), &ev);
+	r = ep_ctl(w, EPOLL_CTL_ADD, gwp_linger_fd(w->linger), EPOLLIN,
+		   EV_BIT_LINGER);
 	if (unlikely(r))
 		goto out_free_events;
 
 	/* Results of this worker's getaddrinfo() lookups. */
 	if (ctx->dns) {
-		ev.events = EPOLLIN;
-		ev.data.u64 = EV_BIT_DNS_QUERY;
-		r = __sys_epoll_ctl(ep_fd, EPOLL_CTL_ADD,
-				    gwp_dns_cq_fd(ctx->dns, w->idx), &ev);
+		r = ep_ctl(w, EPOLL_CTL_ADD, gwp_dns_cq_fd(ctx->dns, w->idx),
+			   EPOLLIN, EV_BIT_DNS_QUERY);
 		if (unlikely(r))
 			goto out_free_events;
 	}
@@ -424,12 +433,9 @@ static void arm_retry(struct gwp_wrk *w);
  */
 static int add_listener(struct gwp_wrk *w)
 {
-	struct epoll_event ev;
 	int r;
 
-	ev.events = EPOLLIN;
-	ev.data.u64 = EV_BIT_ACCEPT;
-	r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, w->tcp_fd, &ev);
+	r = ep_ctl(w, EPOLL_CTL_ADD, w->tcp_fd, EPOLLIN, EV_BIT_ACCEPT);
 	if (likely(!r)) {
 		w->accept_add_failed = false;
 		return 0;
@@ -762,7 +768,6 @@ static int new_client_timeout(const struct gwp_cfg *cfg)
 static int register_new_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			       uint64_t cl_ev_bit, bool cl_watched)
 {
-	struct epoll_event ev;
 	int r;
 
 	/*
@@ -774,9 +779,8 @@ static int register_new_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 
 	if (gcp->target.fd >= 0) {
 		gcp->target.ep_mask = EPOLLOUT | EPOLLIN | EPOLLRDHUP;
-		ev.events = gcp->target.ep_mask;
-		ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_TARGET;
-		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, gcp->target.fd, &ev);
+		r = ep_ctl_conn(w, EPOLL_CTL_ADD, gcp, &gcp->target,
+				EV_BIT_TARGET);
 		if (unlikely(r))
 			return r;
 	} else {
@@ -784,10 +788,7 @@ static int register_new_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	}
 
 	if (!cl_watched) {
-		ev.events = gcp->client.ep_mask;
-		ev.data.u64 = PTR_TO_U64(gcp) | cl_ev_bit;
-		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, gcp->client.fd,
-				    &ev);
+		r = ep_ctl_conn(w, EPOLL_CTL_ADD, gcp, &gcp->client, cl_ev_bit);
 		if (unlikely(r))
 			return r;
 	}
@@ -867,7 +868,6 @@ static int start_new_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 static int wait_for_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			   int e)
 {
-	struct epoll_event ev;
 	int r;
 
 	if (w->nr_tgt_wait == w->tgt_wait_cap) {
@@ -883,9 +883,7 @@ static int wait_for_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 
 	gcp->client.ep_mask = EPOLLIN | EPOLLRDHUP;
 	gcp->target.ep_mask = 0;
-	ev.events = gcp->client.ep_mask;
-	ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_CLIENT;
-	r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, gcp->client.fd, &ev);
+	r = ep_ctl_conn(w, EPOLL_CTL_ADD, gcp, &gcp->client, EV_BIT_CLIENT);
 	if (unlikely(r))
 		return r;
 
@@ -1366,7 +1364,6 @@ static int __adjust_epl_mask(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 {
 	bool client_need_ctl = false;
 	bool target_need_ctl = force_target;
-	struct epoll_event ev;
 	int r;
 
 	client_need_ctl |= adj_epl_out(&gcp->target, &gcp->client);
@@ -1390,19 +1387,15 @@ static int __adjust_epl_mask(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	}
 
 	if (client_need_ctl) {
-		ev.events = gcp->client.ep_mask;
-		ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_CLIENT;
-
-		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_MOD, gcp->client.fd, &ev);
+		r = ep_ctl_conn(w, EPOLL_CTL_MOD, gcp, &gcp->client,
+				EV_BIT_CLIENT);
 		if (unlikely(r))
 			return r;
 	}
 
 	if (target_need_ctl) {
-		ev.events = gcp->target.ep_mask;
-		ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_TARGET;
-
-		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_MOD, gcp->target.fd, &ev);
+		r = ep_ctl_conn(w, EPOLL_CTL_MOD, gcp, &gcp->target,
+				EV_BIT_TARGET);
 		if (unlikely(r))
 			return r;
 	}
@@ -1834,7 +1827,6 @@ static int prep_and_send_socks5_rep_connect(struct gwp_wrk *w,
 static int redial_plain(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_sockaddr *ca;
-	struct epoll_event ev;
 	int fd;
 
 	fd = gwp_conn_dial_addr(w->ctx, gcp, &ca);
@@ -1852,9 +1844,7 @@ static int redial_plain(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	/* The handshake runs from the connect result, as for the first. */
 	gcp->is_target_alive = false;
 	gcp->target.ep_mask = EPOLLOUT | EPOLLIN | EPOLLRDHUP;
-	ev.events = gcp->target.ep_mask;
-	ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_TARGET;
-	return __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, fd, &ev);
+	return ep_ctl_conn(w, EPOLL_CTL_ADD, gcp, &gcp->target, EV_BIT_TARGET);
 }
 
 /*
@@ -1934,8 +1924,6 @@ static int upstream_fail(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 static int upstream_arm(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			uint32_t mask)
 {
-	struct epoll_event ev;
-
 	/*
 	 * Nothing to tell the kernel if the mask is what it already has. A
 	 * target just adopted from an attempt has ep_mask 0, which no caller
@@ -1945,9 +1933,7 @@ static int upstream_arm(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		return 0;
 
 	gcp->target.ep_mask = mask;
-	ev.events = mask;
-	ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_TARGET;
-	return __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_MOD, gcp->target.fd, &ev);
+	return ep_ctl_conn(w, EPOLL_CTL_MOD, gcp, &gcp->target, EV_BIT_TARGET);
 }
 
 /*
@@ -2002,7 +1988,6 @@ static int handle_ev_client_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
  */
 static int udp_up_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
-	struct epoll_event ev;
 	ssize_t sr;
 	int r;
 
@@ -2023,9 +2008,8 @@ static int udp_up_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	gcp->client.ep_mask = EPOLLIN | EPOLLRDHUP;
 	if (client_reply_pending(gcp))
 		gcp->client.ep_mask |= EPOLLOUT;
-	ev.events = gcp->client.ep_mask;
-	ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_CLIENT_PROT;
-	r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_MOD, gcp->client.fd, &ev);
+	r = ep_ctl_conn(w, EPOLL_CTL_MOD, gcp, &gcp->client,
+			EV_BIT_CLIENT_PROT);
 	if (unlikely(r))
 		return r;
 
@@ -2207,7 +2191,6 @@ static bool client_reply_pending(struct gwp_conn_pair *gcp)
  */
 static int upstream_hold(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
-	struct epoll_event ev;
 	int r;
 
 	r = upstream_arm(w, gcp, EPOLLRDHUP);
@@ -2217,9 +2200,7 @@ static int upstream_hold(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	if (!adj_epl_out(&gcp->target, &gcp->client))
 		return 0;
 
-	ev.events = gcp->client.ep_mask;
-	ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_CLIENT;
-	return __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_MOD, gcp->client.fd, &ev);
+	return ep_ctl_conn(w, EPOLL_CTL_MOD, gcp, &gcp->client, EV_BIT_CLIENT);
 }
 
 static int upstream_io(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
@@ -2901,7 +2882,6 @@ static int handle_ev_client_upstream_hs(struct gwp_wrk *w,
 					struct gwp_conn_pair *gcp,
 					struct epoll_event *ev)
 {
-	struct epoll_event cev;
 	int r;
 
 	if (ev->events & (EPOLLIN | EPOLLHUP)) {
@@ -2923,9 +2903,7 @@ static int handle_ev_client_upstream_hs(struct gwp_wrk *w,
 			fin_unbounded(w, gcp)))
 		return 0;
 
-	cev.events = gcp->client.ep_mask;
-	cev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_CLIENT;
-	return __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_MOD, gcp->client.fd, &cev);
+	return ep_ctl_conn(w, EPOLL_CTL_MOD, gcp, &gcp->client, EV_BIT_CLIENT);
 }
 
 /*
@@ -2936,7 +2914,6 @@ static int handle_ev_client_upstream_hs(struct gwp_wrk *w,
 static int handle_ev_client_held(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				 struct epoll_event *ev)
 {
-	struct epoll_event cev;
 	ssize_t sr;
 	int r;
 
@@ -2948,10 +2925,8 @@ static int handle_ev_client_held(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 
 	if (!client_reply_pending(gcp)) {
 		gcp->client.ep_mask &= ~EPOLLOUT;
-		cev.events = gcp->client.ep_mask;
-		cev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_CLIENT;
-		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_MOD, gcp->client.fd,
-				    &cev);
+		r = ep_ctl_conn(w, EPOLL_CTL_MOD, gcp, &gcp->client,
+				EV_BIT_CLIENT);
 		if (unlikely(r))
 			return r;
 
@@ -3124,7 +3099,6 @@ static int start_connect_attempt(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				 uint8_t slot)
 {
 	struct gwp_sockaddr *ca;
-	struct epoll_event ev;
 	bool alive = false;
 	int tfd, r;
 
@@ -3145,9 +3119,8 @@ static int start_connect_attempt(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	 * Even a connect that completed synchronously is reported through the
 	 * event loop, so the winner is picked in exactly one place.
 	 */
-	ev.events = EPOLLOUT | EPOLLRDHUP;
-	ev.data.u64 = PTR_TO_U64(gcp) | gwp_ev_bit_attempt(slot);
-	r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, tfd, &ev);
+	r = ep_ctl(w, EPOLL_CTL_ADD, tfd, EPOLLOUT | EPOLLRDHUP,
+		   PTR_TO_U64(gcp) | gwp_ev_bit_attempt(slot));
 	if (unlikely(r)) {
 		__sys_close(tfd);
 		gcp->attempt_fd[slot] = -1;
@@ -3242,12 +3215,8 @@ static int handle_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	if ((gcp->client.ep_mask & EPOLLET) &&
 	    adj_epl_in(&gcp->client, client_rx_held(gcp),
 		       fin_unbounded(w, gcp))) {
-		struct epoll_event cev;
-
-		cev.events = gcp->client.ep_mask;
-		cev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_CLIENT_PROT;
-		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_MOD, gcp->client.fd,
-				    &cev);
+		r = ep_ctl_conn(w, EPOLL_CTL_MOD, gcp, &gcp->client,
+				EV_BIT_CLIENT_PROT);
 		if (unlikely(r))
 			return r;
 	}
@@ -3304,7 +3273,7 @@ static bool hold_for_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				int err)
 {
 	struct gwp_conn *c = &gcp->client;
-	struct epoll_event ev;
+	uint64_t data = PTR_TO_U64(gcp) | EV_BIT_CLIENT;
 	uint8_t i;
 	int r;
 
@@ -3312,11 +3281,10 @@ static bool hold_for_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	    c->wr_shut || !client_reply_pending(gcp) || fail_reply_stuck(gcp))
 		return false;
 
-	ev.events = EPOLLOUT;
-	ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_CLIENT;
-	r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_MOD, c->fd, &ev);
+	/* Not with ep_ctl_conn(): ep_mask changes only once this holds. */
+	r = ep_ctl(w, EPOLL_CTL_MOD, c->fd, EPOLLOUT, data);
 	if (r == -ENOENT)
-		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, c->fd, &ev);
+		r = ep_ctl(w, EPOLL_CTL_ADD, c->fd, EPOLLOUT, data);
 	if (unlikely(r))
 		return false;
 
@@ -3549,7 +3517,6 @@ static int handle_ev_udp_relay(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
  */
 static int handle_udp_associate(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
-	struct epoll_event ev;
 	int r;
 
 	/*
@@ -3561,9 +3528,8 @@ static int handle_udp_associate(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	if (unlikely(r))
 		return r;
 
-	ev.events = EPOLLIN;
-	ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_UDP_RELAY;
-	return __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, gcp->udp_fd, &ev);
+	return ep_ctl(w, EPOLL_CTL_ADD, gcp->udp_fd, EPOLLIN,
+		      PTR_TO_U64(gcp) | EV_BIT_UDP_RELAY);
 }
 
 static int chk_socks5(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int r)
@@ -3673,15 +3639,12 @@ static int client_prot_eof(const struct gwp_conn_pair *gcp)
  */
 static int arm_client_prot_out(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
-	struct epoll_event evl;
-
 	if (likely(!adj_epl_out(&gcp->target, &gcp->client)))
 		return 0;
 
 	pr_dbg(&w->ctx->lh, "Handling short send on client prot data");
-	evl.events = gcp->client.ep_mask;
-	evl.data.u64 = PTR_TO_U64(gcp) | EV_BIT_CLIENT_PROT;
-	return __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_MOD, gcp->client.fd, &evl);
+	return ep_ctl_conn(w, EPOLL_CTL_MOD, gcp, &gcp->client,
+			   EV_BIT_CLIENT_PROT);
 }
 
 /*
@@ -3834,12 +3797,9 @@ static int client_prot_in(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 static int tls_arm_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			  uint32_t mask)
 {
-	struct epoll_event ev;
-
 	gcp->client.ep_mask = mask;
-	ev.events = mask;
-	ev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_CLIENT_PROT;
-	return __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_MOD, gcp->client.fd, &ev);
+	return ep_ctl_conn(w, EPOLL_CTL_MOD, gcp, &gcp->client,
+			   EV_BIT_CLIENT_PROT);
 }
 
 /* Flush queued handshake/alert ciphertext to the client, best effort. */
@@ -3977,14 +3937,9 @@ static int handle_ev_client_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	 * buffer drains.
 	 */
 	if (adj_epl_in(&gcp->client, client_rx_held(gcp),
-		       fin_unbounded(w, gcp))) {
-		struct epoll_event cev;
-
-		cev.events = gcp->client.ep_mask;
-		cev.data.u64 = PTR_TO_U64(gcp) | EV_BIT_CLIENT_PROT;
-		return __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_MOD, gcp->client.fd,
-				       &cev);
-	}
+		       fin_unbounded(w, gcp)))
+		return ep_ctl_conn(w, EPOLL_CTL_MOD, gcp, &gcp->client,
+				   EV_BIT_CLIENT_PROT);
 
 	return 0;
 }
