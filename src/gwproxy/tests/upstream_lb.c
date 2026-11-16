@@ -247,6 +247,14 @@ static uint32_t tp_random(void *arg)
 	return gwp_up_rand(&p->xs);
 }
 
+/* Draw @vals[0..@nr) in turn from now on, starting at the first. */
+static void tp_fake(struct tpool *p, const uint32_t *vals, uint32_t nr)
+{
+	p->fake = vals;
+	p->nr_fake = nr;
+	p->ifake = 0;
+}
+
 /* The random value whose probe lands on server @j of @nr. */
 static uint32_t tp_at(uint32_t nr, uint32_t j)
 {
@@ -909,9 +917,7 @@ static void test_pick_probe(void)
 	assert(GWP_UP_PICK_PROBES == 4);
 	tp_init(&p, 8);
 	vals[0] = tp_at(8, 6);
-	p.fake = vals;
-	p.nr_fake = 1;
-	p.ifake = 0;
+	tp_fake(&p, vals, 1);
 	assert(tp_pick(&p, false, 2, NONE) == 2);
 	assert(!p.nr_random);
 
@@ -925,16 +931,14 @@ static void test_pick_probe(void)
 	vals[0] = tp_at(8, 5);
 	vals[1] = tp_at(8, 2);
 	vals[2] = tp_at(8, 7);
-	p.nr_fake = 3;
-	p.ifake = 0;
+	tp_fake(&p, vals, 3);
 	n = p.nr_random;
 	assert(tp_pick(&p, false, 10, NONE) == 7);
 	assert(p.nr_random - n == 3);
 
 	/* Every probe misses: the next in service after the cursor. */
 	vals[0] = vals[1] = vals[2] = vals[3] = tp_at(8, 5);
-	p.nr_fake = 4;
-	p.ifake = 0;
+	tp_fake(&p, vals, 4);
 	n = p.nr_random;
 	assert(tp_pick(&p, false, 2, NONE) == 3);
 	assert(p.nr_random - n == GWP_UP_PICK_PROBES);
@@ -942,8 +946,7 @@ static void test_pick_probe(void)
 	/* A retry: the one after the failed server, else probes, never it. */
 	vals[0] = tp_at(8, 1);
 	vals[1] = tp_at(8, 4);
-	p.nr_fake = 2;
-	p.ifake = 0;
+	tp_fake(&p, vals, 2);
 	n = p.nr_random;
 	assert(tp_pick(&p, false, 99, 0) == 1);
 	assert(p.nr_random == n);
@@ -969,8 +972,7 @@ static void test_pick_probe(void)
 	 */
 	vals[0] = tp_at(8, 5);
 	vals[1] = tp_at(8, 6);
-	p.nr_fake = 2;
-	p.ifake = 0;
+	tp_fake(&p, vals, 2);
 	n = p.nr_random;
 	assert(tp_pick(&p, true, 2, NONE) == 6);
 	assert(p.nr_random - n == 2);
@@ -1005,9 +1007,7 @@ static void test_pick_probe(void)
 	tp_free(&p);
 	tp_init(&p, 3);
 	vals[0] = tp_at(3, 1);
-	p.fake = vals;
-	p.nr_fake = 1;
-	p.ifake = 0;
+	tp_fake(&p, vals, 1);
 	tp_eject(&p, 0, 300);
 	tp_eject(&p, 1, 100);
 	tp_eject(&p, 2, 200);
@@ -1347,8 +1347,7 @@ static void test_max_conns(void)
 	assert(tp_pick(&p, false, 0, 0) == 2);
 	/* A probe that lands on it misses. */
 	vals[0] = tp_at(4, 1);
-	p.fake = vals;
-	p.nr_fake = 1;
+	tp_fake(&p, vals, 1);
 	assert(tp_pick(&p, false, 1, NONE) == 2);
 	assert(p.nr_random == GWP_UP_PICK_PROBES);
 	vals[0] = tp_at(4, 3);
@@ -1720,19 +1719,16 @@ static void test_slow_pick(void)
 	tp_ramp(&p, 1, 40000, 1, 4);
 	/* No random source: its turns as usual. */
 	assert(tp_pick(&p, false, 1, NONE) == 1);
-	p.fake = vals;
 	/* A number under a quarter takes the turn, over it lets it pass. */
 	vals[0] = 0x3fff0000u;
-	p.nr_fake = 1;
-	p.ifake = 0;
+	tp_fake(&p, vals, 1);
 	n = p.nr_random;
 	assert(tp_pick(&p, false, 1, NONE) == 1);
 	assert(p.nr_random - n == 1);
 	/* Passed, then a probe on 3, in service. */
 	vals[0] = 0x40000000u;
 	vals[1] = tp_at(4, 3);
-	p.nr_fake = 2;
-	p.ifake = 0;
+	tp_fake(&p, vals, 2);
 	assert(tp_pick(&p, false, 1, NONE) == 3);
 	/* The others' turns draw nothing. */
 	n = p.nr_random;
@@ -1744,8 +1740,7 @@ static void test_slow_pick(void)
 		vals[1 + 2 * i] = tp_at(4, 1);
 		vals[2 + 2 * i] = 0xffffffffu;
 	}
-	p.nr_fake = 2 * GWP_UP_PICK_PROBES + 1;
-	p.ifake = 0;
+	tp_fake(&p, vals, 2 * GWP_UP_PICK_PROBES + 1);
 	n = p.nr_random;
 	assert(tp_pick(&p, false, 1, NONE) == 2);
 	assert(p.nr_random - n == 2 * GWP_UP_PICK_PROBES + 1);
@@ -1895,11 +1890,10 @@ static void test_random_pick(void)
 	uint32_t i, n;
 
 	tp_init(&p, 4);
-	p.fake = vals;
 
 	/* random: the one drawn, whatever the counts and the cursor. */
 	vals[0] = tp_at(4, 2);
-	p.nr_fake = 1;
+	tp_fake(&p, vals, 1);
 	tp_open(&p, 2, 9);
 	for (i = 0; i < 3; i++) {
 		p.ifake = 0;
@@ -1910,8 +1904,7 @@ static void test_random_pick(void)
 	/* random two: the fewer open of the two drawn; ties to the first. */
 	vals[0] = tp_at(4, 2);
 	vals[1] = tp_at(4, 1);
-	p.nr_fake = 2;
-	p.ifake = 0;
+	tp_fake(&p, vals, 2);
 	assert(tp_pick(&p, RND2, 0, NONE) == 1);
 	assert(p.nr_random == 5);
 	tp_open(&p, 1, 9);
@@ -1923,8 +1916,7 @@ static void test_random_pick(void)
 	/* The same one twice: drawn again. */
 	vals[0] = vals[1] = tp_at(4, 1);
 	vals[2] = tp_at(4, 3);
-	p.nr_fake = 3;
-	p.ifake = 0;
+	tp_fake(&p, vals, 3);
 	n = p.nr_random;
 	assert(tp_pick(&p, RND2, 0, NONE) == 3);
 	assert(p.nr_random - n == 3);
@@ -1938,8 +1930,7 @@ static void test_random_pick(void)
 	p.ifake = 0;
 	assert(tp_pick(&p, RND, 0, NONE) == 2);
 	vals[3] = tp_at(4, 1);
-	p.nr_fake = 4;
-	p.ifake = 0;
+	tp_fake(&p, vals, 4);
 	assert(tp_pick(&p, RND2, 0, NONE) == 2);
 	/*
 	 * With weights: 10 open on weight 3 are fewer per weight than 9 on
@@ -1949,8 +1940,7 @@ static void test_random_pick(void)
 	tp_weights(&p, w);
 	vals[0] = tp_at(6, 0);		/* by weight: 0 1 2 3 3 3 */
 	vals[1] = tp_at(6, 1);
-	p.nr_fake = 2;
-	p.ifake = 0;
+	tp_fake(&p, vals, 2);
 	assert(tp_pick(&p, RND2, 0, NONE) == 0);
 	p.ifake = 0;
 	tp_open(&p, 0, 0);
@@ -1974,14 +1964,12 @@ static void test_random_pick(void)
 	 * good one for random two: that one.
 	 */
 	tp_init(&p, 6);
-	p.fake = vals;
 	tp_eject(&p, 1, 100);
 	tp_eject(&p, 2, 100);
 	tp_eject(&p, 4, 100);
 	for (i = 0; i < 2 + GWP_UP_PICK_PROBES; i++)
 		vals[i] = tp_at(6, i % 2 ? 2 : 1);
-	p.nr_fake = 2 + GWP_UP_PICK_PROBES;
-	p.ifake = 0;
+	tp_fake(&p, vals, 2 + GWP_UP_PICK_PROBES);
 	n = p.nr_random;
 	assert(tp_pick(&p, RND2, 0, NONE) == 3);
 	assert(p.nr_random - n == 2 + GWP_UP_PICK_PROBES);
@@ -2008,8 +1996,7 @@ static void test_random_pick(void)
 	vals[1] = 0x40000000u;		/* over a quarter: passed */
 	vals[2] = tp_at(6, 0);
 	vals[3] = 0x3fff0000u;		/* under it: taken */
-	p.nr_fake = 4;
-	p.ifake = 0;
+	tp_fake(&p, vals, 4);
 	n = p.nr_random;
 	assert(tp_pick(&p, RND, 0, NONE) == 0);
 	assert(p.nr_random - n == 4);
@@ -2019,8 +2006,7 @@ static void test_random_pick(void)
 	vals[0] = tp_at(6, 3);
 	vals[1] = tp_at(6, 0);
 	vals[2] = 0;
-	p.nr_fake = 3;
-	p.ifake = 0;
+	tp_fake(&p, vals, 3);
 	assert(tp_pick(&p, RND2, 0, NONE) == 3);
 	tp_open(&p, 3, 4);
 	p.ifake = 0;
@@ -2035,14 +2021,12 @@ static void test_random_pick(void)
 	/* A retry: never the failed one, though drawn. */
 	vals[0] = tp_at(6, 3);
 	vals[1] = tp_at(6, 5);
-	p.nr_fake = 2;
-	p.ifake = 0;
+	tp_fake(&p, vals, 2);
 	assert(tp_pick(&p, RND, 0, 3) == 5);
 	p.ifake = 0;
 	assert(tp_pick(&p, RND2, 0, 3) == 5);
 	/* Drawn every time: the next in service after it. */
-	p.nr_fake = 1;
-	p.ifake = 0;
+	tp_fake(&p, vals, 1);
 	assert(tp_pick(&p, RND, 0, 3) == 5);
 	/* One other drawn, every time: that one. */
 	p.ifake = 0;
