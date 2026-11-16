@@ -260,7 +260,7 @@ $(LIBGWIPLIM_TEST_TARGET): $(GWPROXY_DIR)/iplimit.c.o $(LIBGWIPLIM_TEST_OBJECTS)
 $(GWUPLB_TEST_TARGET): $(GWPROXY_DIR)/upstream_lb.c.o $(GWUPLB_TEST_OBJECTS)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
 
-$(GWTMR_TEST_TARGET): $(GWPROXY_DIR)/tests/tmr.c $(GWPROXY_DIR)/ev/tmr.h $(GWPROXY_DIR)/gwproxy.h $(EXTRA_DEPS)
+$(GWTMR_TEST_TARGET): $(GWPROXY_DIR)/tests/tmr.c $(GWPROXY_DIR)/ev/tmr.h $(GWPROXY_DIR)/gwproxy.h $(GWPROXY_DIR)/common.h $(EXTRA_DEPS)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LIBS)
 
 $(GWUPSTREAM_TEST_TARGET): $(GWPROXY_DIR)/tests/upstream.c $(GWPROXY_DIR)/upstream.h $(EXTRA_DEPS)

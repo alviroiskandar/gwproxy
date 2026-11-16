@@ -873,16 +873,9 @@ static int wait_for_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 {
 	int r;
 
-	if (w->nr_tgt_wait == w->tgt_wait_cap) {
-		uint32_t cap = w->tgt_wait_cap ? w->tgt_wait_cap * 2 : 16;
-		struct gwp_conn_pair **p;
-
-		p = realloc(w->tgt_wait, cap * sizeof(*p));
-		if (unlikely(!p))
-			return e;
-		w->tgt_wait = p;
-		w->tgt_wait_cap = cap;
-	}
+	if (unlikely(GWP_GROW_ARRAY(w->tgt_wait, w->nr_tgt_wait,
+				    w->tgt_wait_cap, 16) < 0))
+		return e;
 
 	gcp->client.ep_mask = EPOLLIN | EPOLLRDHUP;
 	gcp->target.ep_mask = 0;

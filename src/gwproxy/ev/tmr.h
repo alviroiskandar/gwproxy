@@ -13,6 +13,7 @@
 #include <gwproxy/gwproxy.h>
 #include <errno.h>
 #include <stdlib.h>
+#include <gwproxy/common.h>
 
 static inline void gwp_tmr_place(struct gwp_tmr_heap *h, uint32_t i,
 				 const struct gwp_tmr *t)
@@ -68,16 +69,8 @@ static inline int gwp_tmr_arm(struct gwp_tmr_heap *h,
 		return 0;
 	}
 
-	if (h->nr == h->cap) {
-		uint32_t cap = h->cap ? h->cap * 2 : 64;
-		struct gwp_tmr *p;
-
-		p = realloc(h->tmr, cap * sizeof(*p));
-		if (!p)
-			return -ENOMEM;
-		h->tmr = p;
-		h->cap = cap;
-	}
+	if (GWP_GROW_ARRAY(h->tmr, h->nr, h->cap, 64) < 0)
+		return -ENOMEM;
 
 	gwp_tmr_settle(h, h->nr++, &t);
 	return 0;

@@ -5,7 +5,9 @@
 #ifndef GWPROXY__COMMON_H
 #define GWPROXY__COMMON_H
 
+#include <errno.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <time.h>
 
 #ifndef likely
@@ -67,5 +69,38 @@ static inline uint64_t gwp_mono_ms(void)
 	clock_gettime(CLOCK_MONOTONIC, &t);
 	return (uint64_t)t.tv_sec * 1000 + (uint64_t)t.tv_nsec / 1000000;
 }
+
+/*
+ * Make room for one more element of the array @arr, which holds @nr of @cap:
+ * when it is full, double @cap (from @init when it is 0) and realloc @arr to
+ * it. Yields 0 when there was room, 1 when it grew, or -ENOMEM when the new
+ * size would overflow @cap or realloc() fails; @arr and @cap are then left
+ * as they were, and the old array stays valid.
+ *
+ * A macro, so that it stores the caller's own typed pointer and a capacity
+ * of whatever integer type it has; a function taking a void ** would break
+ * strict aliasing. Every argument must be an lvalue without side effects:
+ * each is evaluated more than once.
+ */
+#define GWP_GROW_ARRAY(arr, nr, cap, init) ({				\
+	int __gr = 0;							\
+									\
+	if (unlikely((nr) >= (cap))) {					\
+		__typeof__(cap) __gn = (cap) ? (cap) * 2 : (init);	\
+		__typeof__(arr) __gp = NULL;				\
+									\
+		if (__gn > (cap))					\
+			__gp = realloc((arr),				\
+				       (size_t)__gn * sizeof(*(arr)));	\
+		if (__gp) {						\
+			(arr) = __gp;					\
+			(cap) = __gn;					\
+			__gr = 1;					\
+		} else {						\
+			__gr = -ENOMEM;					\
+		}							\
+	}								\
+	__gr;								\
+})
 
 #endif /* #ifndef GWPROXY__COMMON_H */

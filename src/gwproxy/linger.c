@@ -242,19 +242,7 @@ uint64_t gwp_linger_next_ms(const struct gwp_linger_set *s)
 
 static bool linger_grow(struct gwp_linger_set *s)
 {
-	struct gwp_linger **ent;
-	uint32_t cap;
-
-	if (s->nr < s->cap)
-		return true;
-
-	cap = s->cap ? s->cap * 2 : 16;
-	ent = realloc(s->ent, cap * sizeof(*ent));
-	if (!ent)
-		return false;
-	s->ent = ent;
-	s->cap = cap;
-	return true;
+	return GWP_GROW_ARRAY(s->ent, s->nr, s->cap, 16) >= 0;
 }
 
 int gwp_linger_add(struct gwp_linger_set *s, int fd, int mode,
