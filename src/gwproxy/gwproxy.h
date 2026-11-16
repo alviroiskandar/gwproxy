@@ -1514,6 +1514,68 @@ void gwp_conn_set_single_candidate(struct gwp_conn_pair *gcp,
 				   const struct gwp_sockaddr *addr);
 
 /*
+ * What gwp_conn_next_candidate() needs from the event loop that runs it.
+ * Each returns 0 or a negative errno unless it says otherwise.
+ */
+struct gwp_connect_ops {
+	/*
+	 * Start one connect attempt to gcp->target_addr, which the ACL has
+	 * approved, in attempt slot @slot.
+	 */
+	int (*start)(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+		     uint8_t slot);
+	/* An attempt is running: arm the delay before the next one joins. */
+	int (*arm_race)(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
+	/*
+	 * An attempt could not start with @err: true when the loop takes
+	 * that as a wait for a free descriptor instead, to try again later.
+	 * NULL for a loop that does not wait.
+	 */
+	bool (*wait_fd)(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int err);
+	/*
+	 * Every candidate was denied: answer the client with the ACL's
+	 * rejection; returns the error that ends the pair.
+	 */
+	int (*acl_reject)(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
+	/* Send the failure reply gwp_conn_fail_reply() put in target.buf. */
+	int (*send_reply)(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
+};
+
+/*
+ * Start the next candidate address, having already tried (or not yet started)
+ * the others. @err is why the previous attempt failed, reported to the client
+ * if no candidate is left. Returns 0 once an attempt is in flight, or a
+ * negative errno once they are exhausted.
+ *
+ * A candidate the ACL rejects is skipped rather than being fatal: the rule
+ * denied that address, not the name, and another address of the same host may
+ * well be permitted. Only when every candidate is denied does the client get
+ * the ACL rejection.
+ *
+ * Both event loops walk the candidates here, with their own I/O in @ops.
+ */
+int gwp_conn_next_candidate(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			    int err, const struct gwp_connect_ops *ops);
+
+/*
+ * The delay, in ms, after which the next candidate of @gcp joins the race,
+ * or 0 when no attempt timer is to be armed. Racing is what makes a
+ * black-holed address cheap: without it a target that silently drops SYNs
+ * costs the whole connect timeout before anything else is tried.
+ */
+static inline int gwp_conn_race_delay_ms(const struct gwp_ctx *ctx,
+					 const struct gwp_conn_pair *gcp)
+{
+	if (gcp->next_cand >= gcp->nr_cand)
+		return 0;		/* nothing left to start */
+	if (ctx->cfg.connect_attempt_delay <= 0)
+		return 0;		/* racing disabled: fall back only */
+	if (gcp->upstream)
+		return 0;		/* one proxy, nothing to race */
+	return ctx->cfg.connect_attempt_delay;
+}
+
+/*
  * Close every connect attempt still in flight, e.g. once one attempt has won
  * the race or the pair is being torn down. Returns how many descriptors were
  * closed, which the epoll loop credits to its accept-rearm accounting.

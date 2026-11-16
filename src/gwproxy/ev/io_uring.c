@@ -997,20 +997,17 @@ static void __arm_attempt_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		gcp->idx, gcp->ats.tv_sec, gcp->ats.tv_nsec, gcp->ref_cnt);
 }
 
-static void arm_attempt_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+/* Arm the delay after which the next candidate joins the race, if any. */
+static int arm_attempt_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
-	struct gwp_ctx *ctx = w->ctx;
+	int ms;
 
 	if (gcp->attempt_timer_armed)
-		return;
-	if (gcp->next_cand >= gcp->nr_cand)
-		return;			/* nothing left to start */
-	if (ctx->cfg.connect_attempt_delay <= 0)
-		return;			/* racing disabled: fall back only */
-	if (gcp->upstream)
-		return;			/* one proxy, nothing to race */
-
-	__arm_attempt_timer(w, gcp, ctx->cfg.connect_attempt_delay);
+		return 0;
+	ms = gwp_conn_race_delay_ms(w->ctx, gcp);
+	if (ms)
+		__arm_attempt_timer(w, gcp, ms);
+	return 0;
 }
 
 /* How long a connect waits for a free descriptor before it tries again, in ms. */
@@ -3407,119 +3404,25 @@ static int acl_reject_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	return -EACCES;
 }
 
-/*
- * Start the next candidate address, having already tried (or not yet started)
- * the others. @err is why the previous attempt failed, reported to the client
- * if no candidate is left. Returns 0 once an attempt is in flight, or a
- * negative errno once they are exhausted.
- *
- * A candidate the ACL rejects is skipped rather than being fatal: the rule
- * denied that address, not the name, and another address of the same host may
- * well be permitted. Only when every candidate is denied does the client get
- * the ACL rejection.
- */
+/* Queue the client's failure reply, as acl_reject_target() does. */
+static int send_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	prep_send_client(w, gcp);
+	return 0;
+}
+
+static const struct gwp_connect_ops connect_ops = {
+	.start		= start_connect_attempt,
+	.arm_race	= arm_attempt_timer,
+	.wait_fd	= wait_for_fd,
+	.acl_reject	= acl_reject_target,
+	.send_reply	= send_fail_reply,
+};
+
 static int connect_next_candidate(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				  int err)
 {
-	bool acl_denied = false;
-
-	/*
-	 * No candidate list at all: socks5h:// hands the hostname to the
-	 * upstream proxy and never resolves it here, so target_addr stays
-	 * unset and there is exactly one connect to make -- to the upstream.
-	 * Attempt it once, leaving target_addr untouched so the ACL keeps
-	 * seeing "no resolved IP" and matches on -m domain as before.
-	 */
-	if (!gcp->nr_cand) {
-		if (gcp->next_cand)
-			goto exhausted;
-
-		gcp->next_cand = 1;
-		if (!gwp_ctx_acl_target_allowed(w->ctx, gcp))
-			return acl_reject_target(w, gcp);
-
-		err = start_connect_attempt(w, gcp, 0);
-		if (!err)
-			return 0;
-		goto exhausted;
-	}
-
-	while (gcp->next_cand < gcp->nr_cand) {
-		uint8_t slot = gcp->next_cand;
-
-		gcp->target_addr = gcp->cand[gcp->next_cand++];
-
-		if (!gwp_ctx_acl_target_allowed(w->ctx, gcp)) {
-			acl_denied = true;
-			continue;
-		}
-
-		gcp->flags |= GWP_CONN_FLAG_ACL_CAND_OK;
-		err = start_connect_attempt(w, gcp, slot);
-		if (!err) {
-			/*
-			 * Racing: do not wait for this attempt to resolve
-			 * before queueing the next one.
-			 */
-			arm_attempt_timer(w, gcp);
-			return 0;
-		}
-
-		pr_dbg(&w->ctx->lh, "Target %s did not start: %s (idx=%u)",
-			ip_to_str(&gcp->target_addr), strerror(-err), gcp->idx);
-
-		if (wait_for_fd(w, gcp, err))
-			return 0;
-
-		/*
-		 * Chaining: every attempt dials the same upstream proxy, so
-		 * walking the target's addresses would just repeat the same
-		 * failure. The candidates still matter for the ACL above and
-		 * for the destination named to the upstream. Not so for a
-		 * -j MARK or -j BIND, which is this candidate's alone: the
-		 * next one may well carry another, or none.
-		 */
-		if (gcp->upstream && !gcp->acl_sockopt.mark_set &&
-		    !gcp->acl_sockopt.bind.set)
-			break;
-	}
-
-	/*
-	 * Nothing new could be started. If earlier attempts are still racing,
-	 * one of them may yet succeed -- wait for it rather than failing now.
-	 */
-	if (gwp_has_inflight_attempt(gcp))
-		return 0;
-
-	/*
-	 * The ACL is the reason this request failed only if it denied every
-	 * candidate. Once any address was allowed -- possibly on an earlier
-	 * walk, whose attempt has since failed -- the honest answer is that
-	 * attempt's error, not a rejection that applies to the addresses we
-	 * merely skipped.
-	 */
-	if (acl_denied && !(gcp->flags & GWP_CONN_FLAG_ACL_CAND_OK))
-		return acl_reject_target(w, gcp);
-
-exhausted:
-	pr_dbg(&w->ctx->lh, "No target address left to try (idx=%u): %s",
-		gcp->idx, strerror(-err));
-	/* No socket left to close: the retry walks the candidates again. */
-	if (gwp_conn_upstream_failed(w, gcp, err, true)) {
-		gcp->next_cand = 0;
-		return connect_next_candidate(w, gcp, err);
-	}
-
-	/*
-	 * Report the failure instead of just hanging up, so the client learns
-	 * the target refused rather than guessing: a SOCKS5 REP (RFC 1928 s6)
-	 * or an HTTP 502. Queued before the error return tears the pair down,
-	 * as acl_reject_target() does.
-	 */
-	if (!gwp_conn_fail_reply(w, gcp, err) && gcp->target.len)
-		prep_send_client(w, gcp);
-
-	return err;
+	return gwp_conn_next_candidate(w, gcp, err, &connect_ops);
 }
 
 /*
