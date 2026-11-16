@@ -1703,7 +1703,7 @@ static int tls_hs_step(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_iou_tls *t = gcp->tls_io;
 	struct gwp_ssl *ssl = gcp->client.tls;
-	int hs, n;
+	int hs;
 
 	hs = gwp_ssl_handshake(ssl);
 	if (hs == GWP_SSL_ERROR) {
@@ -1714,12 +1714,8 @@ static int tls_hs_step(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		 * looked at. Nothing else uses the scratch at this point, since
 		 * a handshake step only runs once the last flight has gone out.
 		 */
-		n = gwp_ssl_bio_read(ssl, t->tx, sizeof(t->tx));
-		if (n > 0) {
-			t->tx_len = (uint32_t)n;
-			t->tx_sent = 0;
+		if (tls_cipher_next(t, ssl))
 			prep_send_client_cipher(w, gcp, EV_BIT_IOU_TLS_HS_SEND);
-		}
 		return -ECONNRESET;
 	}
 
