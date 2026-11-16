@@ -542,7 +542,7 @@ static int base64_decode(const char *in, size_t inlen, unsigned char *out,
 		unsigned char c = (unsigned char)in[i];
 		int v;
 
-		if (c == '=' || c == ' ' || c == '\t' || c == '\r' || c == '\n')
+		if (c == '=' || is_space(c))
 			break;
 
 		v = b64_val(c);
@@ -573,8 +573,7 @@ static int base64_decode(const char *in, size_t inlen, unsigned char *out,
 
 	/* Only whitespace may follow; "<b64>=<garbage>" is not a token. */
 	for (; i < inlen; i++) {
-		if (in[i] != ' ' && in[i] != '\t' && in[i] != '\r' &&
-		    in[i] != '\n')
+		if (!is_space((unsigned char)in[i]))
 			return -1;
 	}
 
