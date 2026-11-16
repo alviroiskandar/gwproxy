@@ -701,8 +701,8 @@ static int start_connect_attempt(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 static struct io_uring_sqe *prep_recv_target(struct gwp_wrk *w,
 					     struct gwp_conn_pair *gcp)
 {
-	size_t len = gcp->target.cap - gcp->target.len;
-	char *buf = gcp->target.buf + gcp->target.len;
+	size_t len = gwp_conn_buf_room(&gcp->target);
+	char *buf = gwp_conn_buf_tail(&gcp->target);
 	int fd = gcp->target.fd;
 	struct io_uring_sqe *s;
 
@@ -753,8 +753,8 @@ static struct io_uring_sqe *prep_recv_target(struct gwp_wrk *w,
 static int __prep_recv_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			      uint64_t ev_bit)
 {
-	size_t len = gcp->client.cap - gcp->client.len;
-	char *buf = gcp->client.buf + gcp->client.len;
+	size_t len = gwp_conn_buf_room(&gcp->client);
+	char *buf = gwp_conn_buf_tail(&gcp->client);
 	int fd = gcp->client.fd;
 	struct io_uring_sqe *s;
 
@@ -1301,19 +1301,20 @@ static int tls_forward_pump(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	int sr;
 
 	do {
-		size_t space = c->cap - c->len, got = 0;
+		size_t space = gwp_conn_buf_room(c), got = 0;
 		uint32_t from = c->len;
 
 		sr = GWP_SSL_WANT_READ;
 		if (space) {
-			sr = gwp_ssl_read(c->tls, c->buf + c->len, space, &got);
+			sr = gwp_ssl_read(c->tls, gwp_conn_buf_tail(c), space,
+					  &got);
 			if (sr == GWP_SSL_ERROR)
 				return -EIO;
 			if (sr == GWP_SSL_OK && got == 0) {	/* clean close_notify */
 				c->rd_eof = true;
 				return iou_forward_progress(w, gcp);
 			}
-			c->len += (uint32_t)got;
+			gwp_conn_buf_commit(c, got);
 		}
 
 		if (gwp_http_fwd_active(gcp)) {
@@ -1412,12 +1413,13 @@ static int target_tls_pump(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	int sr;
 
 	for (;;) {
-		size_t space = c->cap - c->len, got = 0;
+		size_t space = gwp_conn_buf_room(c), got = 0;
 		uint32_t from = c->len;
 
 		sr = GWP_SSL_WANT_READ;
 		if (space && gwp_ssl_rx_more(c->tls)) {
-			sr = gwp_ssl_read(c->tls, c->buf + c->len, space, &got);
+			sr = gwp_ssl_read(c->tls, gwp_conn_buf_tail(c), space,
+					  &got);
 			if (sr == GWP_SSL_ERROR) {
 				if (!c->len)
 					return -EIO;
@@ -1425,7 +1427,7 @@ static int target_tls_pump(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 			} else if (sr == GWP_SSL_OK && !got) {
 				c->rd_eof = true;	/* close_notify */
 			}
-			c->len += (uint32_t)got;
+			gwp_conn_buf_commit(c, got);
 		}
 
 		if (gwp_http_fwd_active(gcp) && (c->len > from || c->rd_eof)) {
@@ -1628,8 +1630,8 @@ again:
 
 	while (c->len < c->cap) {
 		got = 0;
-		sr = gwp_ssl_read(c->tls, c->buf + c->len, c->cap - c->len,
-				  &got);
+		sr = gwp_ssl_read(c->tls, gwp_conn_buf_tail(c),
+				  gwp_conn_buf_room(c), &got);
 		if (sr == GWP_SSL_ERROR)
 			return -EIO;
 		if (!got) {
@@ -1641,7 +1643,7 @@ again:
 			c->rd_eof = sr == GWP_SSL_OK;
 			break;
 		}
-		c->len += (uint32_t)got;
+		gwp_conn_buf_commit(c, got);
 	}
 
 	if (gcp->conn_state == CONN_STATE_SOCKS5_UDP_ASSOCIATE && c->len)
@@ -2151,8 +2153,8 @@ static struct io_uring_sqe *prep_upstream_send(struct gwp_wrk *w,
 static struct io_uring_sqe *prep_upstream_recv(struct gwp_wrk *w,
 					       struct gwp_conn_pair *gcp)
 {
-	size_t len = gcp->target.cap - gcp->target.len;
-	char *buf = gcp->target.buf + gcp->target.len;
+	size_t len = gwp_conn_buf_room(&gcp->target);
+	char *buf = gwp_conn_buf_tail(&gcp->target);
 	struct io_uring_sqe *s;
 
 #ifdef CONFIG_HTTPS
@@ -2367,7 +2369,8 @@ static int upstream_tls_rx(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 	while (c->len < c->cap) {
 		got = 0;
-		sr = gwp_ssl_read(c->tls, c->buf + c->len, c->cap - c->len, &got);
+		sr = gwp_ssl_read(c->tls, gwp_conn_buf_tail(c),
+				  gwp_conn_buf_room(c), &got);
 		if (sr == GWP_SSL_ERROR) {
 			gwp_upstream_tls_rx_fail(w, gcp);
 			return -EPROTO;
@@ -2377,7 +2380,7 @@ static int upstream_tls_rx(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 				c->rd_eof = true;
 			break;
 		}
-		c->len += (uint32_t)got;
+		gwp_conn_buf_commit(c, got);
 	}
 	return 0;
 }
@@ -2550,7 +2553,7 @@ static int handle_ev_upstream_s5(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 
 	/* A reply recv completed. */
 	if (r > 0)
-		gcp->target.len += (uint32_t)r;
+		gwp_conn_buf_commit(&gcp->target, (size_t)r);
 
 #ifdef CONFIG_HTTPS
 parse:
@@ -3700,7 +3703,7 @@ static int handle_ev_client_prot(struct gwp_wrk *w,
 		return prep_recv_client_prot(w, gcp);
 	}
 
-	gcp->client.len += (uint32_t)r;
+	gwp_conn_buf_commit(&gcp->client, (size_t)r);
 	return process_client_prot(w, gcp);
 }
 

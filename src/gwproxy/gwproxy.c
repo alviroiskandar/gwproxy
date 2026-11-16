@@ -5024,19 +5024,13 @@ static int expand_conn_slot(struct gwp_wrk *w)
 {
 	struct gwp_conn_slot *gcs = &w->conn_slot;
 	struct gwp_ctx *ctx = w->ctx;
+	int r;
 
-	if (gcs->nr >= gcs->cap) {
-		uint32_t new_cap = gcs->cap ? gcs->cap * 2 : 16;
-		struct gwp_conn_pair **new_pairs;
-
-		new_pairs = realloc(gcs->pairs, new_cap * sizeof(*new_pairs));
-		if (!new_pairs)
-			return -ENOMEM;
-
-		gcs->pairs = new_pairs;
-		gcs->cap = new_cap;
+	r = GWP_GROW_ARRAY(gcs->pairs, gcs->nr, gcs->cap, 16);
+	if (r < 0)
+		return -ENOMEM;
+	if (r)
 		pr_dbg(&ctx->lh, "Increased connection slot capacity to %u", gcs->cap);
-	}
 
 	return 0;
 }
@@ -5683,15 +5677,15 @@ __hot
 int gwp_socks5_prep_connect_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				  int err)
 {
-	size_t out_len = gcp->target.cap - gcp->target.len;
-	void *out = gcp->target.buf + gcp->target.len;
+	size_t out_len = gwp_conn_buf_room(&gcp->target);
+	void *out = gwp_conn_buf_tail(&gcp->target);
 	int r;
 
 	r = gwp_socks5_build_connect_reply(w, gcp, err, out, &out_len);
 	if (r < 0)
 		return r;
 
-	gcp->target.len += out_len;
+	gwp_conn_buf_commit(&gcp->target, out_len);
 	return 0;
 }
 
@@ -5703,11 +5697,11 @@ int gwp_socks5_prep_connect_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 static int gwp_http_queue_reply(struct gwp_conn *t,
 				int (*build)(void *out, size_t out_cap))
 {
-	int r = build(t->buf + t->len, t->cap - t->len);
+	int r = build(gwp_conn_buf_tail(t), gwp_conn_buf_room(t));
 
 	if (r < 0)
 		return r;
-	t->len += (uint32_t)r;
+	gwp_conn_buf_commit(t, (size_t)r);
 	return 0;
 }
 
@@ -6375,13 +6369,13 @@ int gwp_socks5_handle_data(struct gwp_conn_pair *gcp)
 
 	in = gcp->client.buf;
 	in_len = gcp->client.len;
-	out = gcp->target.buf + gcp->target.len;
-	out_len = gcp->target.cap - gcp->target.len;
+	out = gwp_conn_buf_tail(&gcp->target);
+	out_len = gwp_conn_buf_room(&gcp->target);
 	r = gwp_socks5_conn_handle_data(sc, in, &in_len, out, &out_len);
 	if (r == -ENOBUFS)
 		return r;
 	gwp_conn_buf_advance(&gcp->client, in_len);
-	gcp->target.len += out_len;
+	gwp_conn_buf_commit(&gcp->target, out_len);
 	return (r == -EAGAIN) ? 0 : r;
 }
 
@@ -7381,13 +7375,13 @@ int gwp_socks5_udp_associate_setup(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		gcp->idx, gcp->client.fd, fd);
 
 reply:
-	out_len = gcp->target.cap - gcp->target.len;
+	out_len = gwp_conn_buf_room(&gcp->target);
 	r = gwp_socks5_conn_cmd_udp_associate_res(gcp->s5_conn,
 			(rep == GWP_SOCKS5_REP_SUCCESS) ? &bnd : NULL, rep,
-			gcp->target.buf + gcp->target.len, &out_len);
+			gwp_conn_buf_tail(&gcp->target), &out_len);
 	if (r < 0)
 		return r;
-	gcp->target.len += (uint32_t)out_len;
+	gwp_conn_buf_commit(&gcp->target, out_len);
 
 	return (rep == GWP_SOCKS5_REP_SUCCESS) ? 0 : -ECONNREFUSED;
 

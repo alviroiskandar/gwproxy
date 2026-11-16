@@ -1043,15 +1043,8 @@ static int add_field(struct gwnet_http_hdr_fields *ff, uint32_t koff,
 		return -EEXIST;
 
 	if (idx < 0 || !is_field_merged_list(k, klen)) {
-		if (ff->nr == ff->cap) {
-			size_t cap = ff->cap ? ff->cap * 2 : 16;
-
-			f = realloc(ff->ff, cap * sizeof(*f));
-			if (!f)
-				return -ENOMEM;
-			ff->ff = f;
-			ff->cap = cap;
-		}
+		if (GWP_GROW_ARRAY(ff->ff, ff->nr, ff->cap, 16) < 0)
+			return -ENOMEM;
 
 		f = &ff->ff[ff->nr++];
 		f->koff = koff;
