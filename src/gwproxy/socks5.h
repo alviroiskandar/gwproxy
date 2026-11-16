@@ -187,7 +187,8 @@ int gwp_socks5_conn_handle_data(struct gwp_socks5_conn *conn,
  * to GWP_SOCKS5_ST_ERR.
  *
  * @param conn		The SOCKS5 connection to handle data for.
- * @param bind_addr	The local address to bind to (from getsockname()).
+ * @param bind_addr	The local address to bind to (from getsockname()),
+ * 			or NULL for the all-zero IPv4 address.
  * @param rep		The SOCKS5 reply code.
  * @param out_buf	Buffer to store the outgoing data.
  * @param out_len	Pointer to the size of the outgoing data buffer.

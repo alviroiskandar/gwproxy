@@ -353,18 +353,17 @@ static int handle_state_auth_userpass(struct data_arg *d)
 	return 0;
 }
 
+static inline int socks5_put_hdr(uint8_t *b, uint8_t code,
+				 const struct gwp_socks5_addr *a);
+
 static int set_err_reply(struct data_arg *d, uint8_t err_code)
 {
 	uint8_t resp[10];
+	int n = socks5_put_hdr(resp, err_code, NULL);
 
-	resp[0] = 0x05; /* VER */
-	resp[1] = err_code; /* REP */
-	resp[2] = 0x00; /* RSV */
-	resp[3] = 0x01; /* ATYP: IPv4 address */
-	memset(&resp[4], 0, 6); /* BND.ADDR + BND.PORT */
 	d->conn->state = GWP_SOCKS5_ST_ERR;
 
-	if (append_out_buf(d, resp, sizeof(resp)))
+	if (append_out_buf(d, resp, (size_t)n))
 		return -ENOBUFS;
 
 	return -EINVAL;
@@ -767,35 +766,22 @@ out:
 	return r;
 }
 
-static int gwp_socks5_addr_encode(uint8_t *b, const struct gwp_socks5_addr *a);
-
 static int __gwp_socks5_conn_cmd_connect_res(struct data_arg *arg,
 					     const struct gwp_socks5_addr *ba,
 					     uint8_t rep)
 {
-	size_t resp_len = 0;
 	uint8_t resp[1024];
+	int resp_len;
 
 	if (arg->conn->state != GWP_SOCKS5_ST_CMD_CONNECT &&
 	    arg->conn->state != GWP_SOCKS5_ST_CMD_UDP_ASSOCIATE)
 		return -EINVAL;
 
-	resp[0] = 0x05; /* VER */
-	resp[1] = rep; /* REP */
-	resp[2] = 0x00; /* RSV */
-	resp_len = 4;
-	if (ba) {
-		int al = gwp_socks5_addr_encode(&resp[3], ba);
-		if (al < 0)
-			return al;
-		resp_len += al - 1; /* al includes the ATYP byte counted above */
-	} else {
-		resp[3] = GWP_SOCKS5_ATYP_IPV4; /* ATYP: IPv4 address */
-		memset(&resp[4], 0, 6); /* BND.ADDR + BND.PORT */
-		resp_len += 4 + 2;
-	}
+	resp_len = socks5_put_hdr(resp, rep, ba);
+	if (resp_len < 0)
+		return resp_len;
 
-	if (append_out_buf(arg, resp, resp_len))
+	if (append_out_buf(arg, resp, (size_t)resp_len))
 		return -ENOBUFS;
 
 	return 0;
@@ -874,6 +860,29 @@ static int gwp_socks5_addr_encode(uint8_t *b, const struct gwp_socks5_addr *a)
 	default:
 		return -EINVAL;
 	}
+}
+
+/*
+ * Write VER, @code (REP in a reply, CMD in a request), RSV and the address
+ * field of @a at @b, or the all-zero IPv4 address error replies carry when @a
+ * is NULL. Returns the number of bytes written, or -EINVAL for an unknown ATYP.
+ */
+static inline int socks5_put_hdr(uint8_t *b, uint8_t code,
+				 const struct gwp_socks5_addr *a)
+{
+	int al;
+
+	b[0] = 0x05; /* VER */
+	b[1] = code; /* REP or CMD */
+	b[2] = 0x00; /* RSV */
+	if (!a) {
+		b[3] = GWP_SOCKS5_ATYP_IPV4; /* ATYP: IPv4 address */
+		memset(&b[4], 0, 4 + 2); /* BND.ADDR + BND.PORT */
+		return 3 + 1 + 4 + 2;
+	}
+
+	al = gwp_socks5_addr_encode(&b[3], a);
+	return al < 0 ? al : 3 + al;
 }
 
 int gwp_socks5_cli_build_greeting(bool have_auth, void *buf, size_t *len)
@@ -974,10 +983,7 @@ static int cli_build_cmd(uint8_t cmd, const struct gwp_socks5_addr *dst,
 		return -ENOBUFS;
 	}
 
-	b[0] = 0x05; /* VER */
-	b[1] = cmd;  /* CMD */
-	b[2] = 0x00; /* RSV */
-	gwp_socks5_addr_encode(&b[3], dst);
+	socks5_put_hdr(b, cmd, dst);
 
 	*len = need;
 	return 0;

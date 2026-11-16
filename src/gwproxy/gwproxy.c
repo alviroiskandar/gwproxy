@@ -5649,20 +5649,19 @@ int gwp_socks5_build_connect_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				   int err, void *out, size_t *out_len)
 {
 	struct gwp_socks5_conn *sc = gcp->s5_conn;
-	struct gwp_socks5_addr ba;
+	struct gwp_socks5_addr ba, *bap = NULL;
 	int r;
 
+	/* A failure reply carries the all-zero IPv4 address (NULL). */
 	if (err == 0) {
 		r = get_local_addr_for_socks5(w->ctx, gcp->target.fd, &ba);
 		if (unlikely(r))
 			return r;
-	} else {
-		memset(&ba, 0, sizeof(ba));
-		ba.ver = GWP_SOCKS5_ATYP_IPV4;
+		bap = &ba;
 	}
 
 	err = socks5_translate_err(err);
-	return gwp_socks5_conn_cmd_connect_res(sc, &ba, err, out, out_len);
+	return gwp_socks5_conn_cmd_connect_res(sc, bap, err, out, out_len);
 }
 
 __hot
