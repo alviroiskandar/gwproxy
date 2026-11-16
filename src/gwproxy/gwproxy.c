@@ -1138,6 +1138,7 @@ out_err:
 }
 
 static void free_conn(struct gwp_conn *conn);
+static void gwp_conn_pair_release(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 
 static void log_conn_pair_close(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
@@ -1321,52 +1322,8 @@ static void gwp_ctx_free_thread_sock_pairs(struct gwp_wrk *w)
 		return;
 
 	for (i = 0; i < gcs->nr; i++) {
-		struct gwp_conn_pair *gcp = gcs->pairs[i];
-		if (!gcp)
-			continue;
-
-		log_conn_pair_close(w, gcp);
-		gwp_conn_pair_abort_target(gcp);
-		if (gcp->flags & GWP_CONN_FLAG_IPLIM)
-			gwp_ctx_iplim_put(w->ctx, &gcp->client_addr);
-		free_conn(&gcp->target);
-		free_conn(&gcp->client);
-		if (gcp->timer_fd >= 0)
-			__sys_close(gcp->timer_fd);
-		if (gcp->udp_fd >= 0)
-			__sys_close(gcp->udp_fd);
-		gwp_conn_close_attempts(gcp);
-		gwp_conn_pair_drop_dns(w, gcp);
-		free(gcp->udp_iou);	/* io_uring relay scratch, else NULL */
-		free(gcp->udp_peers);
-		free(gcp->udp_up);
-		free(gcp->udp_eg);
-		gwp_conn_set_upstream(w->ctx, gcp, NULL);
-
-		/*
-		 * s5_conn and http_conn share a union, so the protocol object
-		 * must be freed through the correct type; freeing an http_conn
-		 * as a SOCKS5 conn corrupts memory. Mirror gwp_free_conn_pair().
-		 */
-		switch (gcp->prot_type) {
-		case GWP_PROT_TYPE_SOCKS5:
-			gwp_socks5_conn_free(gcp->s5_conn);
-			break;
-		case GWP_PROT_TYPE_HTTP:
-			gwp_http_conn_free(gcp->http_conn);
-			break;
-		}
-
-#ifdef CONFIG_HTTPS
-		gwp_ssl_free(gcp->client.tls);
-		gwp_ssl_free(gcp->target.tls);
-#if defined(CONFIG_IO_URING)
-		free(gcp->tls_io);
-		free(gcp->up_tls_io);
-#endif
-#endif
-
-		free(gcp);
+		if (gcs->pairs[i])
+			gwp_conn_pair_release(w, gcs->pairs[i]);
 	}
 
 	free(gcs->pairs);
@@ -5110,35 +5067,32 @@ static int shrink_conn_slot(struct gwp_wrk *w)
 	return 0;
 }
 
-__hot
-int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+/*
+ * Close and free everything connection pair @gcp holds, and @gcp itself. Its
+ * slot is the caller's: gwp_free_conn_pair() takes the pair out of it, and
+ * at shutdown gwp_ctx_free_thread_sock_pairs() drops the whole array.
+ */
+static void gwp_conn_pair_release(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
-	struct gwp_conn_slot *gcs = &w->conn_slot;
-	struct gwp_conn_pair *tmp;
-	uint32_t i = gcp->idx;
-
-	tmp = gcs->pairs[i];
-	assert(tmp == gcp);
-	if (unlikely(tmp != gcp))
-		return -EINVAL;
-
 	log_conn_pair_close(w, gcp);
 	gwp_conn_pair_abort_target(gcp);
 
 	/*
-	 * Every way a client goes away ends here (or, at shutdown, in
-	 * gwp_ctx_free_thread_sock_pairs()), so the count cannot leak.
+	 * Every way a client goes away ends here (from gwp_free_conn_pair()
+	 * or, at shutdown, gwp_ctx_free_thread_sock_pairs()), so the count
+	 * cannot leak.
 	 */
 	if (gcp->flags & GWP_CONN_FLAG_IPLIM)
 		gwp_ctx_iplim_put(w->ctx, &gcp->client_addr);
 
+	/*
+	 * The io_uring loop closes the fds itself, once the pair is gone. It
+	 * sets the flag just before it frees the pair, so a pair still in a
+	 * slot at shutdown never has it; it is tested after the log and the
+	 * aborts above, which want the real fds.
+	 */
 	if (gcp->flags & GWP_CONN_FLAG_NO_CLOSE_FD)
 		gcp->target.fd = gcp->client.fd = gcp->timer_fd = gcp->udp_fd = -1;
-
-	tmp = gcs->pairs[--gcs->nr];
-	gcs->pairs[gcs->nr] = NULL;
-	gcs->pairs[i] = tmp;
-	tmp->idx = i;
 
 	free_conn(&gcp->target);
 	free_conn(&gcp->client);
@@ -5148,6 +5102,11 @@ int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	if (gcp->udp_fd >= 0)
 		__sys_close(gcp->udp_fd);
 	gwp_conn_close_attempts(gcp);
+	/*
+	 * The io_uring relay scratch, else NULL. Its loop frees it before
+	 * gwp_free_conn_pair(), once no SQE uses it; at shutdown it is here.
+	 */
+	free(gcp->udp_iou);
 	free(gcp->udp_peers);
 	free(gcp->udp_up);
 	free(gcp->udp_eg);
@@ -5155,6 +5114,11 @@ int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 	gwp_conn_pair_drop_dns(w, gcp);
 
+	/*
+	 * s5_conn and http_conn share a union, so the protocol object must be
+	 * freed through the correct type; freeing an http_conn as a SOCKS5
+	 * conn corrupts memory.
+	 */
 	switch (gcp->prot_type) {
 	case GWP_PROT_TYPE_SOCKS5:
 		gwp_socks5_conn_free(gcp->s5_conn);
@@ -5174,6 +5138,31 @@ int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 #endif
 
 	free(gcp);
+}
+
+__hot
+int gwp_free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	struct gwp_conn_slot *gcs = &w->conn_slot;
+	struct gwp_conn_pair *tmp;
+	uint32_t i = gcp->idx;
+
+	tmp = gcs->pairs[i];
+	assert(tmp == gcp);
+	if (unlikely(tmp != gcp))
+		return -EINVAL;
+
+	/*
+	 * Out of the slot first: the last pair takes its place. Only the slot
+	 * array and tmp->idx change, and tmp->idx is still i when tmp is
+	 * @gcp, so the release below logs the same index.
+	 */
+	tmp = gcs->pairs[--gcs->nr];
+	gcs->pairs[gcs->nr] = NULL;
+	gcs->pairs[i] = tmp;
+	tmp->idx = i;
+
+	gwp_conn_pair_release(w, gcp);
 	shrink_conn_slot(w);
 	return 0;
 }
