@@ -1568,6 +1568,20 @@ static inline bool gwp_in_upstream_hs(const struct gwp_conn_pair *gcp)
 }
 
 /*
+ * Connected to the upstream proxy, but the handshake with it has not begun:
+ * the loop left that until the client has its reply (upstream_hold() on
+ * epoll; on io_uring, finish_target_connect() left it to the completion of
+ * a client send).
+ */
+static inline bool gwp_upstream_start_held(const struct gwp_conn_pair *gcp)
+{
+	int cs = gcp->conn_state;
+
+	return gcp->upstream && gcp->target.fd >= 0 &&
+	       (cs == CONN_STATE_SOCKS5_CONNECT || cs == CONN_STATE_HTTP_CONNECT);
+}
+
+/*
  * The value of a GWP_UPSTREAM_END_TIMEOUT for @gcp's attempt (see enum
  * gwp_upstream_end): 0 while the upstream owes us its part, the connect or
  * the handshake up to our CONNECT request; 1 once that request is out and
@@ -1583,9 +1597,8 @@ static inline int gwp_upstream_timeout_val(const struct gwp_conn_pair *gcp)
 		return !gcp->up_tx;
 	if (gwp_in_upstream_hs(gcp))
 		return 0;
-	/* Connected, but held for the client (upstream_start_held()). */
-	return gcp->upstream && gcp->target.fd >= 0 &&
-	       (cs == CONN_STATE_SOCKS5_CONNECT || cs == CONN_STATE_HTTP_CONNECT);
+	/* Connected, but held for the client. */
+	return gwp_upstream_start_held(gcp);
 }
 
 /*

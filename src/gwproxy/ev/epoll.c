@@ -2235,18 +2235,6 @@ static bool client_reply_pending(struct gwp_conn_pair *gcp)
 }
 
 /*
- * Connected to the upstream proxy, but the handshake with it has not begun:
- * upstream_hold() left that until the client has its reply.
- */
-static bool upstream_start_held(struct gwp_conn_pair *gcp)
-{
-	int cs = gcp->conn_state;
-
-	return gcp->upstream && gcp->target.fd >= 0 &&
-	       (cs == CONN_STATE_SOCKS5_CONNECT || cs == CONN_STATE_HTTP_CONNECT);
-}
-
-/*
  * The handshake builds its requests in target.buf, which still holds part
  * of a SOCKS5 method or auth reply to the client: the client was answered
  * and asked to connect in one go, and the reply's send came up short. Have
@@ -2905,7 +2893,7 @@ static int handle_ev_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	 * holds the rest of the client's method or auth reply, which that
 	 * would drop: the failure reply goes after it.
 	 */
-	if (unlikely(upstream_start_held(gcp))) {
+	if (unlikely(gwp_upstream_start_held(gcp))) {
 		gwp_upstream_note_end(gcp, GWP_UPSTREAM_END_HUP, 0);
 		if (gwp_conn_upstream_failed(w, gcp, -ECONNRESET, true))
 			return upstream_redial(w, gcp, -ECONNRESET);
@@ -3093,7 +3081,7 @@ static int handle_ev_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	if (gwp_in_upstream_hs(gcp))
 		return handle_ev_client_upstream_hs(w, gcp, ev);
 
-	if (unlikely(upstream_start_held(gcp)))
+	if (unlikely(gwp_upstream_start_held(gcp)))
 		return handle_ev_client_held(w, gcp, ev);
 
 	if (ev->events & (EPOLLIN | EPOLLHUP | EPOLLERR)) {

@@ -2469,18 +2469,6 @@ static bool client_send_busy(struct gwp_conn_pair *gcp)
 }
 
 /*
- * Connected to the upstream proxy, but the handshake with it has not begun:
- * finish_target_connect() left that to the completion of a client send.
- */
-static bool upstream_start_held(struct gwp_conn_pair *gcp)
-{
-	int cs = gcp->conn_state;
-
-	return gcp->upstream && gcp->target.fd >= 0 &&
-	       (cs == CONN_STATE_SOCKS5_CONNECT || cs == CONN_STATE_HTTP_CONNECT);
-}
-
-/*
  * Answer the client that its request timed out (SOCKS5 REP 0x06, HTTP 504),
  * by @err, the timer's -ETIME.
  *
@@ -3428,7 +3416,7 @@ static int handle_ev_client_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		if (gcp->target.len > 0 ||
 		    gwp_ssl_bio_pending(gcp->client.tls) > 0) {
 			send_client_tls(w, gcp);
-		} else if (upstream_start_held(gcp)) {
+		} else if (gwp_upstream_start_held(gcp)) {
 			return upstream_iou_start(w, gcp);
 		} else if (t->prot_resume) {
 			t->prot_resume = false;
@@ -3465,7 +3453,7 @@ static int handle_ev_client_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		return gcp->fail_err;
 
 	/* The reply is out; the upstream handshake may use target.buf now. */
-	if (upstream_start_held(gcp))
+	if (gwp_upstream_start_held(gcp))
 		return upstream_iou_start(w, gcp);
 
 	/*
@@ -4005,8 +3993,9 @@ static int handle_ev_dns_query(struct gwp_wrk *w, void *udata)
 	 * named an address does from the start, and says so, as on epoll
 	 * (handle_connect()). What asks whether a connect is under way goes
 	 * by the state: the handshake held for the client's reply
-	 * (upstream_start_held()) would never start, and a connect timeout
-	 * would be taken for the lookup's and not charged to an upstream.
+	 * (gwp_upstream_start_held()) would never start, and a connect
+	 * timeout would be taken for the lookup's and not charged to an
+	 * upstream.
 	 */
 	if (gcp->conn_state == CONN_STATE_SOCKS5_DNS_QUERY)
 		gcp->conn_state = CONN_STATE_SOCKS5_CONNECT;
