@@ -596,6 +596,30 @@ enum req_body {
 };
 
 /*
+ * Read the run of decimal digits from @p up to at most @end into *@val, and
+ * return where it ends (@p itself if there is none), or NULL if the number is
+ * larger than a signed 64-bit integer holds. That is what most origins parse
+ * a Content-Length into: past it one may wrap around and read a short body
+ * where this proxy forwards a long one. A body of many GiB is still well
+ * below.
+ */
+static const char *parse_dec_i64(const char *p, const char *end,
+				 uint64_t *val)
+{
+	uint64_t x = 0;
+
+	for (; p < end && *p >= '0' && *p <= '9'; p++) {
+		uint64_t d = (uint64_t)(*p - '0');
+
+		if (x > ((uint64_t)INT64_MAX - d) / 10)
+			return NULL;
+		x = x * 10 + d;
+	}
+	*val = x;
+	return p;
+}
+
+/*
  * Work out how the request body is delimited (RFC 9112 Section 6.3), so that
  * exactly that body follows the header to the origin and nothing after it
  * does. Anything the origin might delimit differently from us is refused
@@ -607,7 +631,7 @@ enum req_body {
 static int set_req_framing(struct gwp_http_conn *hc)
 {
 	const struct gwnet_http_hdr_fields *ff = &hc->req_hdr.fields;
-	size_t tel, cll, i;
+	size_t tel, cll;
 	const char *te = gwnet_http_hdr_fields_get(ff, "Transfer-Encoding",
 						   &tel);
 	const char *cl = gwnet_http_hdr_fields_get(ff, "Content-Length", &cll);
@@ -625,24 +649,18 @@ static int set_req_framing(struct gwp_http_conn *hc)
 	}
 
 	if (cl) {
+		const char *q;
+
 		if (!cll)
 			return -EBADMSG;
 		/*
 		 * Digits only: no sign, no white space between them (around
-		 * them it is OWS, already trimmed), no list. And no more than
-		 * a signed 64-bit integer holds, which is what most origins
-		 * parse it into: past that one may wrap around and read a
-		 * short body where this proxy forwards a long one. A body of
-		 * many GiB is still well below.
+		 * them it is OWS, already trimmed), no list; and no more than
+		 * parse_dec_i64() takes.
 		 */
-		for (i = 0; i < cll; i++) {
-			uint64_t d = (uint64_t)(cl[i] - '0');
-
-			if (cl[i] < '0' || cl[i] > '9' ||
-			    len > ((uint64_t)INT64_MAX - d) / 10)
-				return -EBADMSG;
-			len = len * 10 + d;
-		}
+		q = parse_dec_i64(cl, cl + cll, &len);
+		if (!q || q != cl + cll)
+			return -EBADMSG;
 	}
 
 	hc->req_rem = len;
@@ -1367,7 +1385,7 @@ struct res_line {
  * Take the Content-Length value at @v (@len bytes, from just after the colon)
  * into *@val and count its elements in *@nr: a single non-negative decimal,
  * or a list of them, which must all be the same (RFC 9110 Section 8.6). The
- * value is held to the limit of a request's (set_req_framing()). Returns 0,
+ * value is held to the limit of a request's (parse_dec_i64()). Returns 0,
  * or -EBADMSG for anything else: the origin can then not be told to have
  * meant one length.
  */
@@ -1382,14 +1400,9 @@ static int res_cl_value(const char *v, size_t len, bool *have, uint64_t *val,
 
 		while (p < end && (*p == ' ' || *p == '\t'))
 			p++;
-		for (d = p; p < end && *p >= '0' && *p <= '9'; p++) {
-			uint64_t n = (uint64_t)(*p - '0');
-
-			if (x > ((uint64_t)INT64_MAX - n) / 10)
-				return -EBADMSG;
-			x = x * 10 + n;
-		}
-		if (p == d || (*have && x != *val))
+		d = p;
+		p = parse_dec_i64(p, end, &x);
+		if (!p || p == d || (*have && x != *val))
 			return -EBADMSG;
 		*have = true;
 		*val = x;
