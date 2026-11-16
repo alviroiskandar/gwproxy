@@ -6149,14 +6149,17 @@ static int socks5_prepare_target_addr_domain(struct gwp_wrk *w,
 					       ntohs(dst->port));
 	/* The name may have lost its trailing dot. */
 	dst->domain.len = (uint8_t)strlen(dst->domain.str);
-	if (r == -EINPROGRESS)
-		gcp->conn_state = CONN_STATE_SOCKS5_DNS_QUERY;
-	else if (r == -EINVAL && !gwp_conn_fail_reply(w, gcp, r))
+	if (r == -EINVAL && !gwp_conn_fail_reply(w, gcp, r))
 		return -EBADMSG;	/* the REP 0x01 goes out first */
 
 	return r;
 }
 
+/*
+ * Resolve the SOCKS5 CONNECT destination into the candidates. -EINPROGRESS
+ * means a DNS lookup is under way; the caller owns the state change that
+ * follows (CONN_STATE_SOCKS5_DNS_QUERY then, CONN_STATE_SOCKS5_CONNECT on 0).
+ */
 int gwp_socks5_prepare_target_addr(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_sockaddr *ta = &gcp->target_addr;
