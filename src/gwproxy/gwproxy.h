@@ -1934,6 +1934,28 @@ static inline void gwp_conn_buf_consume(struct gwp_conn *conn, size_t len)
 }
 
 /*
+ * The produce side: a writer appends at gwp_conn_buf_tail(), at most
+ * gwp_conn_buf_room() bytes, and then gwp_conn_buf_commit()s what it wrote.
+ * Keeping the buf + len and cap - len arithmetic here means a change of the
+ * buffer layout (as when @off came in) is made in one place.
+ */
+static inline char *gwp_conn_buf_tail(const struct gwp_conn *conn)
+{
+	return conn->buf + conn->len;
+}
+
+static inline size_t gwp_conn_buf_room(const struct gwp_conn *conn)
+{
+	return conn->cap - conn->len;
+}
+
+static inline void gwp_conn_buf_commit(struct gwp_conn *conn, size_t len)
+{
+	assert(len <= gwp_conn_buf_room(conn));
+	conn->len += (uint32_t)len;
+}
+
+/*
  * Debug, not info: at the default level every connection already logs
  * "Target socket connected" (fds, both addresses) and "Closing connection
  * pair" (idx, fds, both addresses), so this line only repeated them.
