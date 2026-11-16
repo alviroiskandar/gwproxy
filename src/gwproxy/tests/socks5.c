@@ -878,9 +878,34 @@ static void test_udp_hdr_codec(void)
 	r = gwp_socks5_udp_parse_hdr(dg, 3, &got, &plen);
 	assert(r == -EAGAIN);
 
-	/* Unknown ATYP -> malformed. */
+	/* Each address type cut short anywhere -> need more, @got untouched. */
+	memcpy(dg, "\x00\x00\x00\x01\x08\x08\x08\x08\x00\x35", 10);
+	memset(&got, 0xa5, sizeof(got));
+	plen = 0;
+	for (hlen = 4; hlen < 10; hlen++) {
+		r = gwp_socks5_udp_parse_hdr(dg, hlen, &got, &plen);
+		assert(r == -EAGAIN && got.ver == 0xa5 && !plen);
+	}
+	memcpy(dg, "\x00\x00\x00\x04", 4);
+	for (hlen = 4; hlen < 22; hlen++) {
+		r = gwp_socks5_udp_parse_hdr(dg, hlen, &got, &plen);
+		assert(r == -EAGAIN && got.ver == 0xa5 && !plen);
+	}
+	memcpy(dg, "\x00\x00\x00\x03\x04host\x00\x50", 12);
+	for (hlen = 4; hlen < 11; hlen++) {
+		r = gwp_socks5_udp_parse_hdr(dg, hlen, &got, &plen);
+		assert(r == -EAGAIN && got.ver == 0xa5 && !plen);
+	}
+	r = gwp_socks5_udp_parse_hdr(dg, 11, &got, &plen);
+	assert(!r && plen == 11 && got.ver == GWP_SOCKS5_ATYP_DOMAIN);
+	assert(got.domain.len == 4 && !strcmp(got.domain.str, "host"));
+	assert(!memcmp(&got.port, "\x00\x50", 2));
+
+	/* Unknown ATYP -> malformed, even before its address could be there. */
 	memcpy(dg, "\x00\x00\x00\x09\x00\x00\x00\x00", 8);
 	r = gwp_socks5_udp_parse_hdr(dg, 8, &got, &plen);
+	assert(r == -EINVAL);
+	r = gwp_socks5_udp_parse_hdr(dg, 4, &got, &plen);
 	assert(r == -EINVAL);
 
 	/* Build into too small a buffer. */
