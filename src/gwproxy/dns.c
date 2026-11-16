@@ -195,6 +195,59 @@ static void copy_ai_addr(struct gwp_sockaddr *gs, const struct addrinfo *ai,
 }
 
 /*
+ * One address of an ordered list: the @idx-th of its family.
+ */
+struct dns_pick {
+	bool	v6;
+	uint8_t	idx;
+};
+
+/*
+ * The order collect_addr_list() describes, for @nr_v4 IPv4 and @nr_v6 IPv6
+ * addresses each in the resolver's order: drop the family @rt leaves out, lead
+ * with the preferred one, then alternate. A fresh lookup and a cache hit both
+ * order through here, so they agree on the first address and on the rest.
+ *
+ * Fills up to @cap entries of @pick and returns how many.
+ */
+static uint8_t dns_interleave(uint8_t nr_v4, uint8_t nr_v6, uint8_t cap,
+			      uint32_t rt,
+			      struct dns_pick pick[GWP_DNS_MAX_ADDRS])
+{
+	uint8_t nr_a, nr_b, n = 0, i;
+	bool v6_first;
+
+	if (rt == GWP_DNS_RESTYP_IPV6_ONLY)
+		nr_v4 = 0;
+	else if (rt == GWP_DNS_RESTYP_IPV4_ONLY)
+		nr_v6 = 0;
+
+	if (cap > GWP_DNS_MAX_ADDRS)
+		cap = GWP_DNS_MAX_ADDRS;
+
+	/*
+	 * DEFAULT leads with IPv4 to match fetch_addr()'s DEFAULT handling, so
+	 * a cache hit and a cache miss agree on the first address.
+	 */
+	v6_first = (rt == GWP_DNS_RESTYP_PREFER_IPV6);
+	nr_a = v6_first ? nr_v6 : nr_v4;
+	nr_b = v6_first ? nr_v4 : nr_v6;
+
+	for (i = 0; n < cap && (i < nr_a || i < nr_b); i++) {
+		if (i < nr_a) {
+			pick[n].v6 = v6_first;
+			pick[n++].idx = i;
+		}
+		if (i < nr_b && n < cap) {
+			pick[n].v6 = !v6_first;
+			pick[n++].idx = i;
+		}
+	}
+
+	return n;
+}
+
+/*
  * Collect up to @cap addresses from @res into @out, ordered the way the connect
  * path wants to try them: the preferred family first, then the two families
  * alternating. Alternating matters -- when a family is broken end to end (a
@@ -217,9 +270,9 @@ static uint8_t collect_addr_list(struct addrinfo *res, struct gwp_sockaddr *out,
 {
 	const struct addrinfo *v4[GWP_DNS_MAX_ADDRS];
 	const struct addrinfo *v6[GWP_DNS_MAX_ADDRS];
-	uint8_t nr_v4 = 0, nr_v6 = 0, n = 0, i;
+	struct dns_pick pick[GWP_DNS_MAX_ADDRS];
+	uint8_t nr_v4 = 0, nr_v6 = 0, n, i;
 	const struct addrinfo *ai;
-	bool v6_first;
 
 	if (!res || !cap)
 		return 0;
@@ -229,32 +282,19 @@ static uint8_t collect_addr_list(struct addrinfo *res, struct gwp_sockaddr *out,
 
 	for (ai = res; ai; ai = ai->ai_next) {
 		if (ai->ai_family == AF_INET) {
-			if (rt != GWP_DNS_RESTYP_IPV6_ONLY && nr_v4 < cap)
+			if (nr_v4 < cap)
 				v4[nr_v4++] = ai;
 		} else if (ai->ai_family == AF_INET6) {
-			if (rt != GWP_DNS_RESTYP_IPV4_ONLY && nr_v6 < cap)
+			if (nr_v6 < cap)
 				v6[nr_v6++] = ai;
 		}
 	}
 
-	/*
-	 * DEFAULT leads with IPv4 to match fetch_addr()'s DEFAULT handling, so
-	 * a cache hit and a cache miss agree on the first address.
-	 */
-	v6_first = (rt == GWP_DNS_RESTYP_PREFER_IPV6);
+	n = dns_interleave(nr_v4, nr_v6, cap, rt, pick);
+	for (i = 0; i < n; i++) {
+		const struct addrinfo **fam = pick[i].v6 ? v6 : v4;
 
-	for (i = 0; n < cap && (i < nr_v4 || i < nr_v6); i++) {
-		const struct addrinfo *a, *b;
-
-		a = v6_first ? (i < nr_v6 ? v6[i] : NULL)
-			     : (i < nr_v4 ? v4[i] : NULL);
-		b = v6_first ? (i < nr_v4 ? v4[i] : NULL)
-			     : (i < nr_v6 ? v6[i] : NULL);
-
-		if (a)
-			copy_ai_addr(&out[n++], a, port);
-		if (b && n < cap)
-			copy_ai_addr(&out[n++], b, port);
+		copy_ai_addr(&out[i], fam[pick[i].idx], port);
 	}
 
 	return n;
@@ -995,45 +1035,28 @@ int gwp_dns_cache_lookup_list(struct gwp_dns_ctx *ctx, const char *name,
 			      uint16_t port, struct gwp_sockaddr *addrs,
 			      uint8_t cap, uint8_t *nr_addrs)
 {
+	struct dns_pick pick[GWP_DNS_MAX_ADDRS];
 	struct gwp_dns_cache_addrs ca;
-	uint8_t nr_v4, nr_v6, n = 0, i;
-	uint32_t rt = ctx->cfg.restyp;
-	bool v6_first;
+	uint8_t n, i;
 	int r;
 
 	if (!ctx->cache)
 		return -ENOSYS;
 	if (!cap)
 		return -EINVAL;
-	if (cap > GWP_DNS_MAX_ADDRS)
-		cap = GWP_DNS_MAX_ADDRS;
 
 	r = gwp_dns_cache_lookup_addrs(ctx->cache, name, &ca);
 	if (r)
 		return r;
 
-	nr_v4 = (rt == GWP_DNS_RESTYP_IPV6_ONLY) ? 0 : ca.nr_i4;
-	nr_v6 = (rt == GWP_DNS_RESTYP_IPV4_ONLY) ? 0 : ca.nr_i6;
-
-	/* Same interleave and the same leading family as collect_addr_list(). */
-	v6_first = (rt == GWP_DNS_RESTYP_PREFER_IPV6);
-
-	for (i = 0; n < cap && (i < nr_v4 || i < nr_v6); i++) {
-		if (v6_first) {
-			if (i < nr_v6)
-				gwp_sockaddr_set(&addrs[n++], AF_INET6,
-						 &ca.i6[i], htons(port));
-			if (i < nr_v4 && n < cap)
-				gwp_sockaddr_set(&addrs[n++], AF_INET,
-						 &ca.i4[i], htons(port));
-		} else {
-			if (i < nr_v4)
-				gwp_sockaddr_set(&addrs[n++], AF_INET,
-						 &ca.i4[i], htons(port));
-			if (i < nr_v6 && n < cap)
-				gwp_sockaddr_set(&addrs[n++], AF_INET6,
-						 &ca.i6[i], htons(port));
-		}
+	n = dns_interleave(ca.nr_i4, ca.nr_i6, cap, ctx->cfg.restyp, pick);
+	for (i = 0; i < n; i++) {
+		if (pick[i].v6)
+			gwp_sockaddr_set(&addrs[i], AF_INET6,
+					 &ca.i6[pick[i].idx], htons(port));
+		else
+			gwp_sockaddr_set(&addrs[i], AF_INET,
+					 &ca.i4[pick[i].idx], htons(port));
 	}
 
 	*nr_addrs = n;
