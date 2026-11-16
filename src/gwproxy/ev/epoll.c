@@ -1441,19 +1441,19 @@ static inline ssize_t tls_recv_cipher(struct gwp_conn *c)
  */
 static ssize_t tls_decrypt(struct gwp_conn *src)
 {
-	size_t space = src->cap - src->len, got = 0;
+	size_t space = gwp_conn_buf_room(src), got = 0;
 	int sr;
 
 	while (space) {
 		size_t out = 0;
 
-		sr = gwp_ssl_read(src->tls, src->buf + src->len, space, &out);
+		sr = gwp_ssl_read(src->tls, gwp_conn_buf_tail(src), space, &out);
 		if (sr == GWP_SSL_OK) {
 			if (out == 0) {		/* clean close_notify */
 				src->rd_eof = true;
 				break;
 			}
-			src->len += (uint32_t)out;
+			gwp_conn_buf_commit(src, out);
 			got += out;
 			space -= out;
 			continue;
@@ -1643,11 +1643,11 @@ static ssize_t __do_recv(struct gwp_conn *src)
 		return do_recv_tls(src);
 #endif
 
-	len = src->cap - src->len;
+	len = gwp_conn_buf_room(src);
 	if (unlikely(len == 0))
 		return 0;
 
-	buf = src->buf + src->len;
+	buf = gwp_conn_buf_tail(src);
 	ret = __sys_recv(src->fd, buf, len, MSG_NOSIGNAL);
 	if (unlikely(ret < 0)) {
 		if (ret != -EAGAIN && ret != -EINTR)
@@ -1663,8 +1663,7 @@ static ssize_t __do_recv(struct gwp_conn *src)
 		return 0;
 	}
 
-	src->len += (size_t)ret;
-	assert(src->len <= src->cap);
+	gwp_conn_buf_commit(src, (size_t)ret);
 	return ret;
 }
 
