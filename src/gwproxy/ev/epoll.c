@@ -1482,11 +1482,11 @@ static ssize_t do_recv_tls(struct gwp_conn *src)
 		return -ENOMEM;
 
 	n = __sys_recv(src->fd, p, len, MSG_NOSIGNAL);
-	if (n > 0) {
-		gwp_ssl_rx_commit(src->tls, (size_t)n);
-	} else if (n == 0) {
+	/* Committing 0 gives the space back, see gwp_ssl_rx_space(). */
+	gwp_ssl_rx_commit(src->tls, n > 0 ? (size_t)n : 0);
+	if (n == 0) {
 		src->rd_eof = true;
-	} else if (n != -EAGAIN && n != -EINTR) {
+	} else if (n < 0 && n != -EAGAIN && n != -EINTR) {
 		if (!src->len)
 			return n;
 		/* As in tls_decrypt(), with what that has just decrypted. */
@@ -3839,13 +3839,12 @@ static int handle_ev_tls_handshake(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		return -ENOMEM;
 
 	n = __sys_recv(c->fd, p, len, MSG_NOSIGNAL);
-	if (n > 0) {
-		gwp_ssl_rx_commit(c->tls, (size_t)n);
-	} else if (n == 0) {
+	/* Committing 0 gives the space back, see gwp_ssl_rx_space(). */
+	gwp_ssl_rx_commit(c->tls, n > 0 ? (size_t)n : 0);
+	if (n == 0)
 		return -ECONNRESET;		/* peer closed mid-handshake */
-	} else if (n != -EAGAIN && n != -EINTR) {
+	if (n < 0 && n != -EAGAIN && n != -EINTR)
 		return (int)n;
-	}
 
 	hs = gwp_ssl_handshake(c->tls);
 	if (hs == GWP_SSL_ERROR) {
