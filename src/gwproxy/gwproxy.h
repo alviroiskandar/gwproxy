@@ -1600,6 +1600,18 @@ static inline bool gwp_in_dns_lookup(const struct gwp_conn_pair *gcp)
 	       cs == CONN_STATE_HTTP_DNS_QUERY;
 }
 
+/* Are any connect attempts of this pair still waiting for a result? */
+static inline bool gwp_has_inflight_attempt(const struct gwp_conn_pair *gcp)
+{
+	uint8_t i;
+
+	for (i = 0; i < GWP_MAX_CONN_CAND; i++) {
+		if (gcp->attempt_fd[i] >= 0)
+			return true;
+	}
+	return false;
+}
+
 /* Move the data back to the start of the buffer, regaining the room in front. */
 static inline void gwp_conn_buf_compact(struct gwp_conn *conn)
 {

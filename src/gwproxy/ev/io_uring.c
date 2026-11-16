@@ -623,17 +623,6 @@ static bool put_gcp(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	return true;
 }
 
-static bool has_inflight_attempt(const struct gwp_conn_pair *gcp)
-{
-	uint8_t i;
-
-	for (i = 0; i < GWP_MAX_CONN_CAND; i++) {
-		if (gcp->attempt_fd[i] >= 0)
-			return true;
-	}
-	return false;
-}
-
 /*
  * Start one connect attempt to gcp->target_addr, which the caller has already
  * selected and had the ACL approve. The socket goes into attempt slot @slot and
@@ -1046,7 +1035,7 @@ static bool wait_for_fd(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int err)
 		return false;
 	if (gcp->prot_type != GWP_PROT_TYPE_NONE)
 		return false;
-	if (has_inflight_attempt(gcp) || gcp->attempt_timer_armed)
+	if (gwp_has_inflight_attempt(gcp) || gcp->attempt_timer_armed)
 		return false;
 
 	if (!(gcp->flags & GWP_CONN_FLAG_FD_WAIT)) {
@@ -2884,7 +2873,7 @@ static int handle_ev_target_attempt(struct gwp_wrk *w, void *udata,
 		 * candidate once nothing is outstanding, so a slow-but-working
 		 * address is not abandoned because a faster one was refused.
 		 */
-		if (has_inflight_attempt(gcp))
+		if (gwp_has_inflight_attempt(gcp))
 			return 0;
 
 		return connect_next_candidate(w, gcp, res);
@@ -3044,7 +3033,7 @@ static int handle_ev_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		 * being looked up, and during a race, where there is no target
 		 * fd yet, so the in-flight attempts count as one.
 		 */
-		if (gcp->target.fd >= 0 || has_inflight_attempt(gcp) ||
+		if (gcp->target.fd >= 0 || gwp_has_inflight_attempt(gcp) ||
 		    gwp_in_dns_lookup(gcp)) {
 			/* Not while the name resolves: no upstream yet. */
 			if (!gwp_in_dns_lookup(gcp)) {
@@ -3632,7 +3621,7 @@ static int connect_next_candidate(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	 * Nothing new could be started. If earlier attempts are still racing,
 	 * one of them may yet succeed -- wait for it rather than failing now.
 	 */
-	if (has_inflight_attempt(gcp))
+	if (gwp_has_inflight_attempt(gcp))
 		return 0;
 
 	/*

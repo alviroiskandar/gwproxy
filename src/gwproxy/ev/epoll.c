@@ -285,7 +285,6 @@ static int handle_ev_raw_dns_query(struct gwp_wrk __unused *w,
 
 static int connect_next_candidate(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				  int err);
-static bool has_inflight_attempt(const struct gwp_conn_pair *gcp);
 static int __forward_progress(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			      struct gwp_conn *hup, bool force_target);
 static int forward_progress(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
@@ -2540,7 +2539,7 @@ static int handle_ev_target_attempt(struct gwp_wrk *w,
 		 * candidate once nothing is outstanding, so a slow-but-working
 		 * address is not abandoned because a faster one was refused.
 		 */
-		if (has_inflight_attempt(gcp))
+		if (gwp_has_inflight_attempt(gcp))
 			return 0;
 
 		return connect_next_candidate(w, gcp, -err);
@@ -3168,7 +3167,7 @@ static int handle_conn_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	 * reply to give, and a stalled upstream handshake leaves its own bytes
 	 * in target.buf, which are dropped first.
 	 */
-	if ((gcp->target.fd >= 0 || has_inflight_attempt(gcp) ||
+	if ((gcp->target.fd >= 0 || gwp_has_inflight_attempt(gcp) ||
 	     gwp_in_dns_lookup(gcp)) && !gcp->is_target_alive) {
 		uint32_t len;
 
@@ -3215,25 +3214,6 @@ static int acl_reject_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 			return (int)sr;
 	}
 	return -EACCES;
-}
-
-/*
- * Start one connect attempt to gcp->target_addr, which the caller has already
- * selected and had the ACL approve. Registers the new target fd with epoll.
- * Returns 0 once the attempt is in flight (or has already completed), or a
- * negative errno if this attempt could not be started at all -- the caller
- * decides whether another candidate is worth trying.
- */
-/* Are any connect attempts of this pair still waiting for a result? */
-static bool has_inflight_attempt(const struct gwp_conn_pair *gcp)
-{
-	uint8_t i;
-
-	for (i = 0; i < GWP_MAX_CONN_CAND; i++) {
-		if (gcp->attempt_fd[i] >= 0)
-			return true;
-	}
-	return false;
 }
 
 /*
@@ -3382,7 +3362,7 @@ static int connect_next_candidate(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	 * Nothing new could be started. If earlier attempts are still racing,
 	 * one of them may yet succeed -- wait for it rather than failing now.
 	 */
-	if (has_inflight_attempt(gcp))
+	if (gwp_has_inflight_attempt(gcp))
 		return 0;
 
 	/*
