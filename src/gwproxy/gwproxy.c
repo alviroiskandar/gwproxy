@@ -3677,6 +3677,53 @@ static void gwp_ctx_free_prot(struct gwp_ctx *ctx)
 }
 
 /*
+ * Whether the first @n characters of @host, any trailing root dot already
+ * left out of @n, spell a DNS name: 1 to 253 characters in non-empty labels
+ * of letters, digits, '-' and '_', separated by dots. With @ldh, no label
+ * may start or end with a '-' either. Both the upstream proxy's host and a
+ * client-requested one are checked by it, each with its own rule for '-'.
+ */
+static bool dns_name_ok(const char *host, size_t n, bool ldh)
+{
+	size_t label = 0, i;
+	char c, prev = '.';
+
+	/*
+	 * At most 253 characters, 254 with the root's dot: on the wire a name
+	 * takes a length byte per label and the root's zero, two more than its
+	 * text without that dot, and may not exceed 255 octets (RFC 1035
+	 * 2.3.4). A longer one can never resolve, so it is malformed, whichever
+	 * resolver would look it up.
+	 */
+	if (!n || n > 253)
+		return false;
+
+	for (i = 0; i < n; i++) {
+		c = host[i];
+		if (c == '.') {
+			if (!label || (ldh && prev == '-'))
+				return false;
+			label = 0;
+		} else if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			   (c >= '0' && c <= '9') || c == '_' ||
+			   (c == '-' && (label || !ldh))) {
+			label++;
+		} else {
+			return false;
+		}
+		/*
+		 * A label's length byte leaves room for 63 octets (RFC 1035
+		 * 2.3.4): a longer one can never resolve either.
+		 */
+		if (label > 63)
+			return false;
+		prev = c;
+	}
+
+	return label && !(ldh && prev == '-');
+}
+
+/*
  * Is the host of @up, as its URL names it, worth resolving? An address literal
  * is (gwp_upstream_url_host() has set @host_is_ip), and so is a DNS name:
  * labels of 1 to 63 letters, digits, '-' and '_', none at either end of a
@@ -3688,8 +3735,8 @@ static void gwp_ctx_free_prot(struct gwp_ctx *ctx)
  */
 static bool upstream_host_ok(struct gwp_upstream *up)
 {
-	char c, prev = '.', *host = up->host;
-	size_t n = strlen(host), label = 0, i;
+	char *host = up->host;
+	size_t n = strlen(host);
 	struct in_addr a4;
 
 	if (up->host_is_ip)
@@ -3707,24 +3754,7 @@ static bool upstream_host_ok(struct gwp_upstream *up)
 		return true;
 	}
 
-	for (i = 0; (c = host[i]); i++) {
-		if (c == '.') {
-			if (!label || prev == '-')
-				return false;
-			label = 0;
-		} else if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-			   (c >= '0' && c <= '9') || c == '_' ||
-			   (c == '-' && label)) {
-			label++;
-		} else {
-			return false;
-		}
-		if (label > 63)
-			return false;
-		prev = c;
-	}
-
-	return label && prev != '-';
+	return dns_name_ok(host, n, true);
 }
 
 /*
@@ -5803,43 +5833,16 @@ static int upstream_dst_from_hostport(const char *hostport,
  */
 static bool req_host_valid(const char *host)
 {
+	size_t n = strlen(host);
 	struct in6_addr a6;
-	size_t label = 0;
-	size_t n = 0;
 
 	if (inet_pton(AF_INET6, host, &a6) == 1)
 		return true;
 
-	for (; host[n]; n++) {
-		unsigned char c = (unsigned char)host[n];
-
-		if (c == '.') {
-			if (!label)
-				return false;
-			label = 0;
-			continue;
-		}
-		if (!(c >= 'a' && c <= 'z') && !(c >= 'A' && c <= 'Z') &&
-		    !(c >= '0' && c <= '9') && c != '-' && c != '_')
-			return false;
-		/*
-		 * A label's length byte leaves room for 63 octets (RFC 1035
-		 * 2.3.4): a longer one can never resolve either.
-		 */
-		if (++label > 63)
-			return false;
-	}
-
-	/*
-	 * At most 253 characters, 254 with the root's dot: on the wire a name
-	 * takes a length byte per label and the root's zero, two more than its
-	 * text without that dot, and may not exceed 255 octets (RFC 1035
-	 * 2.3.4). A longer one can never resolve, so it is malformed, whichever
-	 * resolver would look it up.
-	 */
+	/* The root's dot may end the name; it is not part of a label. */
 	if (n && host[n - 1] == '.')
 		n--;
-	return n > 0 && n <= 253;
+	return dns_name_ok(host, n, false);
 }
 
 /*
