@@ -38,6 +38,25 @@ static void ep_del(struct gwp_wrk *w, int fd)
 		__sys_epoll_ctl(w->ep_fd, EPOLL_CTL_DEL, fd, NULL);
 }
 
+/*
+ * Take the sockets of @gcp's connect attempts out of the epoll set, see
+ * ep_del(). Returns how many there were.
+ */
+static int ep_del_attempts(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	int n = 0;
+	uint8_t i;
+
+	for (i = 0; i < GWP_MAX_CONN_CAND; i++) {
+		if (gcp->attempt_fd[i] >= 0) {
+			ep_del(w, gcp->attempt_fd[i]);
+			n++;
+		}
+	}
+
+	return n;
+}
+
 /* Add @fd to the epoll set (EPOLL_CTL_ADD), or change it (EPOLL_CTL_MOD). */
 static inline int ep_ctl(struct gwp_wrk *w, int op, int fd, uint32_t events,
 			 uint64_t data)
@@ -641,29 +660,16 @@ static int __free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 #endif
 
 	/*
-	 * A race that was still running when the pair went away: those sockets
-	 * count too, or the accept path under-credits them and stays throttled.
-	 */
-	{
-		uint8_t i;
-
-		for (i = 0; i < GWP_MAX_CONN_CAND; i++)
-			if (gcp->attempt_fd[i] >= 0)
-				nr_fd_closed++;
-	}
-
-	/*
 	 * gwp_free_conn_pair() closes them; out of the epoll set first, see
 	 * ep_del(). The raw DNS query's socket is out already, see
 	 * free_conn_pair().
 	 */
 	ep_del(w, gcp->udp_fd);
-	{
-		uint8_t i;
-
-		for (i = 0; i < GWP_MAX_CONN_CAND; i++)
-			ep_del(w, gcp->attempt_fd[i]);
-	}
+	/*
+	 * A race that was still running when the pair went away: those sockets
+	 * count too, or the accept path under-credits them and stays throttled.
+	 */
+	nr_fd_closed += ep_del_attempts(w, gcp);
 
 	r = gwp_free_conn_pair(w, gcp);
 	if (unlikely(r)) {
@@ -2326,12 +2332,10 @@ static int adopt_winning_attempt(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 {
 	int fd = gcp->attempt_fd[slot];
 	int closed, r;
-	uint8_t i;
 
 	gcp->attempt_fd[slot] = -1;
 	tmr_disarm(w, gcp, GWP_TMR_ATTEMPT);
-	for (i = 0; i < GWP_MAX_CONN_CAND; i++)
-		ep_del(w, gcp->attempt_fd[i]);	/* the losers; see ep_del() */
+	ep_del_attempts(w, gcp);	/* the losers; see ep_del() */
 	closed = gwp_conn_close_attempts(gcp);
 	if (closed) {
 		/*
@@ -3276,7 +3280,6 @@ static bool hold_for_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 {
 	struct gwp_conn *c = &gcp->client;
 	uint64_t data = PTR_TO_U64(gcp) | EV_BIT_CLIENT;
-	uint8_t i;
 	int r;
 
 	if (gcp->fail_err || !c->last_reply || c->fd < 0 || c->rst ||
@@ -3300,8 +3303,7 @@ static bool hold_for_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	drop_tgt_wait(w, gcp);
 	ep_del(w, gcp->target.fd);
 	ep_del(w, gcp->udp_fd);
-	for (i = 0; i < GWP_MAX_CONN_CAND; i++)
-		ep_del(w, gcp->attempt_fd[i]);
+	ep_del_attempts(w, gcp);
 #ifdef CONFIG_NEW_DNS_RESOLVER
 	r = drop_raw_dns_query(w, gcp);
 	if (unlikely(r))
