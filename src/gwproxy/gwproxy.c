@@ -2939,8 +2939,11 @@ static bool udp_target_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 		struct gwp_conn_sockopt *so = &gcp->udp_eg->so;
 
 		memset(so, 0, sizeof(*so));
-		so->mark_set = req.mark_set;
-		so->mark = req.mark;
+		/* req.mark is only set, and valid, with req.mark_set. */
+		if (req.mark_set) {
+			so->mark_set = true;
+			so->mark = req.mark;
+		}
 		if (req.bind.set)
 			so->bind = req.bind;
 	}
