@@ -2780,6 +2780,36 @@ void gwp_wrk_no_orig_dst(struct gwp_wrk *w, const struct gwp_sockaddr *addr,
 		      ip_to_str(addr), why);
 }
 
+/*
+ * Log that worker @w pauses accepting after accept failed with @e, once per
+ * pause: *@logged is the loop's own flag for that, which
+ * gwp_wrk_accept_resumed() clears. Both loops say it in the same words.
+ */
+__cold
+void gwp_wrk_accept_paused(struct gwp_wrk *w, int e, bool *logged)
+{
+	if (*logged)
+		return;
+	*logged = true;
+	if (e == -EMFILE || e == -ENFILE || e == -ENOMEM)
+		pr_warn(&w->ctx->lh,
+			"Too many open files, pausing accept (tidx=%u)",
+			w->idx);
+	else
+		pr_warn(&w->ctx->lh,
+			"Failed to accept new connection: %s, pausing accept (tidx=%u)",
+			strerror(-e), w->idx);
+}
+
+/* An accept worked again after a pause gwp_wrk_accept_paused() logged. */
+__cold
+void gwp_wrk_accept_resumed(struct gwp_wrk *w, bool *logged)
+{
+	*logged = false;
+	pr_info(&w->ctx->lh, "Resumed accepting new connections (tidx=%u)",
+		w->idx);
+}
+
 /* Uncount a client gwp_ctx_iplim_get() admitted. */
 void gwp_ctx_iplim_put(struct gwp_ctx *ctx, const struct gwp_sockaddr *addr)
 {

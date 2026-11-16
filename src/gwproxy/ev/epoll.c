@@ -1078,12 +1078,7 @@ static int handle_accept_error(struct gwp_wrk *w, int e)
 		 * does not help either. Take it out of the epoll set and try
 		 * again a little later, until a connection is accepted.
 		 */
-		if (!w->accept_paused) {
-			w->accept_paused = true;
-			pr_warn(&w->ctx->lh,
-				"Failed to accept new connection: %s, pausing accept (tidx=%u)",
-				strerror(-e), w->idx);
-		}
+		gwp_wrk_accept_paused(w, e, &w->accept_paused);
 		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_DEL, w->tcp_fd, NULL);
 		if (unlikely(r))
 			return r;
@@ -1108,14 +1103,9 @@ static int handle_accept_error(struct gwp_wrk *w, int e)
 		 * may leave too few descriptors to ever add up.
 		 *
 		 * The pause is logged once, until a connection is accepted
-		 * again, in the same words as the io_uring loop uses.
+		 * again.
 		 */
-		if (!w->accept_paused) {
-			w->accept_paused = true;
-			pr_warn(&w->ctx->lh,
-				"Too many open files, pausing accept (tidx=%u)",
-				w->idx);
-		}
+		gwp_wrk_accept_paused(w, e, &w->accept_paused);
 		w->accept_is_stopped = true;
 		r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_DEL, w->tcp_fd, NULL);
 		if (unlikely(r))
@@ -1147,11 +1137,8 @@ static int __handle_ev_accept(struct gwp_wrk *w)
 	if (fd < 0)
 		return handle_accept_error(w, fd);
 
-	if (unlikely(w->accept_paused)) {
-		w->accept_paused = false;
-		pr_info(&ctx->lh, "Resumed accepting new connections (tidx=%u)",
-			w->idx);
-	}
+	if (unlikely(w->accept_paused))
+		gwp_wrk_accept_resumed(w, &w->accept_paused);
 
 	pr_dbg(&ctx->lh, "New connection from %s (fd=%d)", ip_to_str(&addr),
 		fd);

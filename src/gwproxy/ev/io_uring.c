@@ -2047,12 +2047,7 @@ static int handle_ev_accept(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 		 * handle_accept_error().
 		 */
 		if (r == -EMFILE || r == -ENFILE || r == -ENOMEM) {
-			if (!w->accept_is_stopped) {
-				w->accept_is_stopped = true;
-				pr_warn(&w->ctx->lh,
-					"Too many open files, pausing accept (tidx=%u)",
-					w->idx);
-			}
+			gwp_wrk_accept_paused(w, r, &w->accept_is_stopped);
 			arm_accept_retry(w);
 			return 0;
 		}
@@ -2068,12 +2063,7 @@ static int handle_ev_accept(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 		 */
 		if (cqe->res < 0 &&
 		    (r == -ENOBUFS || r == -EPERM || r == -EACCES)) {
-			if (!w->accept_is_stopped) {
-				w->accept_is_stopped = true;
-				pr_warn(&w->ctx->lh,
-					"Failed to accept new connection: %s, pausing accept (tidx=%u)",
-					strerror(-r), w->idx);
-			}
+			gwp_wrk_accept_paused(w, r, &w->accept_is_stopped);
 			arm_accept_retry(w);
 			return 0;
 		}
@@ -2104,11 +2094,8 @@ static int handle_ev_accept(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 		return 0;
 	}
 
-	if (unlikely(w->accept_is_stopped)) {
-		w->accept_is_stopped = false;
-		pr_info(&w->ctx->lh, "Resumed accepting new connections (tidx=%u)",
-			w->idx);
-	}
+	if (unlikely(w->accept_is_stopped))
+		gwp_wrk_accept_resumed(w, &w->accept_is_stopped);
 
 	arm_accept(w);
 	return 0;

@@ -1267,6 +1267,8 @@ bool gwp_ctx_iplim_get(struct gwp_wrk *w, const struct gwp_sockaddr *addr);
 bool gwp_wrk_log_limit(struct gwp_wrk *w, struct gwp_log_limit *l,
 		       uint32_t *quiet);
 void gwp_wrk_acl_denied(struct gwp_wrk *w, const struct gwp_sockaddr *addr);
+void gwp_wrk_accept_paused(struct gwp_wrk *w, int e, bool *logged);
+void gwp_wrk_accept_resumed(struct gwp_wrk *w, bool *logged);
 void gwp_wrk_no_orig_dst(struct gwp_wrk *w, const struct gwp_sockaddr *addr,
 			 int err);
 void gwp_ctx_iplim_put(struct gwp_ctx *ctx, const struct gwp_sockaddr *addr);
