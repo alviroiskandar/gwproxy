@@ -62,11 +62,8 @@ static inline int is_alpha(int c)
  */
 static bool is_field_merged_list(const char *key, size_t n)
 {
-#define LH(s)	{ s, sizeof(s) - 1 }
-	static const struct {
-		const char	*name;
-		size_t		len;
-	} comma_separated_list_headers[] = {
+#define LH(s)	GWNET_HTTP_NAME(s)
+	static const struct gwnet_http_name comma_separated_list_headers[] = {
 		/* RFC 7231, Section 5.3.2 */
 		LH("Accept"),
 		/* RFC 7231, Section 5.3.3 */
@@ -111,16 +108,10 @@ static bool is_field_merged_list(const char *key, size_t n)
 		LH("WWW-Authenticate"),
 	};
 #undef LH
-	size_t i;
 
-	for (i = 0; i < sizeof(comma_separated_list_headers) /
-			 sizeof(comma_separated_list_headers[0]); i++) {
-		if (n == comma_separated_list_headers[i].len &&
-		    !strncasecmp(key, comma_separated_list_headers[i].name, n))
-			return true;
-	}
-
-	return false;
+	return gwnet_http_name_in(comma_separated_list_headers,
+				  ARRAY_SIZE(comma_separated_list_headers),
+				  key, n);
 }
 
 /**
@@ -138,11 +129,8 @@ static bool is_field_merged_list(const char *key, size_t n)
  */
 static bool is_field_singular(const char *key, size_t n)
 {
-#define LH(s)	{ s, sizeof(s) - 1 }
-	static const struct {
-		const char	*name;
-		size_t		len;
-	} singular_headers[] = {
+#define LH(s)	GWNET_HTTP_NAME(s)
+	static const struct gwnet_http_name singular_headers[] = {
 		LH("Authorization"),
 		LH("Content-Length"),
 		LH("Content-Location"),
@@ -163,16 +151,9 @@ static bool is_field_singular(const char *key, size_t n)
 		LH("User-Agent"),
 	};
 #undef LH
-	size_t i;
 
-	for (i = 0; i < sizeof(singular_headers) /
-			 sizeof(singular_headers[0]); i++) {
-		if (n == singular_headers[i].len &&
-		    !strncasecmp(key, singular_headers[i].name, n))
-			return true;
-	}
-
-	return false;
+	return gwnet_http_name_in(singular_headers,
+				  ARRAY_SIZE(singular_headers), key, n);
 }
 
 static int add_field(struct gwnet_http_hdr_fields *ff, uint32_t koff,

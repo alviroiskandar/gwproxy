@@ -258,26 +258,18 @@ static int set_target(struct gwp_http_conn *hc, const char *a, size_t len,
  * the client could send the origin's requests wherever it likes. Nothing
  * legitimate needs it at the origin.
  */
+#define HBH(s)	GWNET_HTTP_NAME(s)
+static const struct gwnet_http_name req_hbh[] = {
+	HBH("Connection"), HBH("Proxy-Connection"), HBH("Keep-Alive"),
+	HBH("TE"), HBH("Trailer"), HBH("Upgrade"),
+	HBH("Proxy-Authorization"), HBH("Proxy-Authenticate"),
+	HBH("Proxy"),
+};
+#undef HBH
+
 static bool is_hop_by_hop(const char *k, size_t klen)
 {
-#define HBH(s)	{ s, sizeof(s) - 1 }
-	static const struct {
-		const char	*name;
-		size_t		len;
-	} hbh[] = {
-		HBH("Connection"), HBH("Proxy-Connection"), HBH("Keep-Alive"),
-		HBH("TE"), HBH("Trailer"), HBH("Upgrade"),
-		HBH("Proxy-Authorization"), HBH("Proxy-Authenticate"),
-		HBH("Proxy"),
-	};
-#undef HBH
-	size_t i;
-
-	for (i = 0; i < sizeof(hbh) / sizeof(hbh[0]); i++) {
-		if (hbh[i].len == klen && !strncasecmp(k, hbh[i].name, klen))
-			return true;
-	}
-	return false;
+	return gwnet_http_name_in(req_hbh, ARRAY_SIZE(req_hbh), k, klen);
 }
 
 /*
@@ -532,6 +524,25 @@ too_big:
 	return -E2BIG;
 }
 
+/* Whether @k (@klen bytes), reading every '_' as '-', is the name @t. */
+static bool name_eq_folded(const char *k, size_t klen,
+			   const struct gwnet_http_name *t)
+{
+	size_t j;
+
+	if (t->len != klen)
+		return false;
+	for (j = 0; j < klen; j++) {
+		unsigned char a = (unsigned char)k[j];
+		unsigned char b = (unsigned char)t->name[j];
+
+		a = gwp_ascii_lower(a == '_' ? '-' : a);
+		if (a != gwp_ascii_lower(b))
+			return false;
+	}
+	return true;
+}
+
 /*
  * Whether the field name @k (@klen bytes) is, reading every '_' as '-', one of
  * the fields this proxy delimits, routes or drops a request by, without being
@@ -540,39 +551,28 @@ too_big:
  * server maps '-' and '_' to the same variable and may read it as the real
  * one: a second Content-Length the proxy never saw, or a hop-by-hop field it
  * believes it dropped. "Proxy", dropped too, holds no '-' and so has no such
- * alias: no other name reaches CGI as HTTP_PROXY.
+ * alias: no other name reaches CGI as HTTP_PROXY. Its entry in req_hbh[]
+ * never matches here, as a name with a '_' in it reads as one with a '-'.
  */
 static bool is_underscore_alias(const char *k, size_t klen)
 {
-#define UA(s)	{ s, sizeof(s) - 1 }
-	static const struct {
-		const char	*name;
-		size_t		len;
-	} special[] = {
-		UA("Content-Length"), UA("Transfer-Encoding"), UA("Host"),
-		/* Those is_hop_by_hop() drops. */
-		UA("Connection"), UA("Proxy-Connection"), UA("Keep-Alive"),
-		UA("TE"), UA("Trailer"), UA("Upgrade"),
-		UA("Proxy-Authorization"), UA("Proxy-Authenticate"),
+	static const struct gwnet_http_name framing[] = {
+		GWNET_HTTP_NAME("Content-Length"),
+		GWNET_HTTP_NAME("Transfer-Encoding"),
+		GWNET_HTTP_NAME("Host"),
 	};
-#undef UA
-	size_t i, j;
+	size_t i;
 
 	if (!memchr(k, '_', klen))
 		return false;
 
-	for (i = 0; i < sizeof(special) / sizeof(special[0]); i++) {
-		if (special[i].len != klen)
-			continue;
-		for (j = 0; j < klen; j++) {
-			unsigned char a = (unsigned char)k[j];
-			unsigned char b = (unsigned char)special[i].name[j];
-
-			a = gwp_ascii_lower(a == '_' ? '-' : a);
-			if (a != gwp_ascii_lower(b))
-				break;
-		}
-		if (j == klen)
+	for (i = 0; i < ARRAY_SIZE(framing); i++) {
+		if (name_eq_folded(k, klen, &framing[i]))
+			return true;
+	}
+	/* Those is_hop_by_hop() drops. */
+	for (i = 0; i < ARRAY_SIZE(req_hbh); i++) {
+		if (name_eq_folded(k, klen, &req_hbh[i]))
 			return true;
 	}
 	return false;
@@ -1053,23 +1053,15 @@ static int classify_req(struct gwp_http_conn *hc, struct gwp_auth *auth,
  */
 static bool is_res_hop_by_hop(const char *k, size_t klen)
 {
-#define HBH(s)	{ s, sizeof(s) - 1 }
-	static const struct {
-		const char	*name;
-		size_t		len;
-	} hbh[] = {
+#define HBH(s)	GWNET_HTTP_NAME(s)
+	static const struct gwnet_http_name hbh[] = {
 		HBH("Connection"), HBH("Proxy-Connection"), HBH("Keep-Alive"),
 		HBH("Upgrade"), HBH("TE"), HBH("Proxy-Authenticate"),
 		HBH("Proxy-Authentication-Info"),
 	};
 #undef HBH
-	size_t i;
 
-	for (i = 0; i < sizeof(hbh) / sizeof(hbh[0]); i++) {
-		if (hbh[i].len == klen && !strncasecmp(k, hbh[i].name, klen))
-			return true;
-	}
-	return false;
+	return gwnet_http_name_in(hbh, ARRAY_SIZE(hbh), k, klen);
 }
 
 static bool is_framing_field(const char *k, size_t klen)

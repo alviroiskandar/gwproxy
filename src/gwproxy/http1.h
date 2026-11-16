@@ -10,6 +10,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <strings.h>
 
 enum {
 	GWNET_HTTP_HDR_TYPE_REQ	= 0,
@@ -90,6 +91,31 @@ static inline bool gwnet_http_is_tchar(unsigned char c)
 static inline bool gwnet_http_is_field_char(unsigned char c)
 {
 	return c == '\t' || (c >= 0x20 && c != 0x7f);
+}
+
+/* A field name in a table of them, with its length. */
+struct gwnet_http_name {
+	const char	*name;
+	size_t		len;
+};
+
+/* A macro, not a function: the length is the sizeof of the literal. */
+#define GWNET_HTTP_NAME(s)	{ s, sizeof(s) - 1 }
+
+/*
+ * Whether the field name @k (@klen bytes) is, case-insensitively, one of the
+ * @nr names in @t. Called per field line, hence inline.
+ */
+static inline bool gwnet_http_name_in(const struct gwnet_http_name *t,
+				      size_t nr, const char *k, size_t klen)
+{
+	size_t i;
+
+	for (i = 0; i < nr; i++) {
+		if (t[i].len == klen && !strncasecmp(k, t[i].name, klen))
+			return true;
+	}
+	return false;
 }
 
 /*
