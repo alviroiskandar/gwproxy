@@ -1180,28 +1180,22 @@ int gwp_acl_url_redact(const char *url, char *buf, size_t size)
 	return (n < 0 || (size_t)n >= size) ? -ENAMETOOLONG : 0;
 }
 
+static bool host_char(char c)
+{
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+	       (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_';
+}
+
 /* A pool name: 1 to 64 of letters, digits, '_', '-' and '.'. */
 static bool pool_name_ok(const char *s)
 {
 	size_t i;
 
 	for (i = 0; s[i]; i++) {
-		char c = s[i];
-
-		if (i == ACL_POOL_NAME_MAX)
-			return false;
-		if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-		      (c >= '0' && c <= '9') || c == '_' || c == '-' ||
-		      c == '.'))
+		if (i == ACL_POOL_NAME_MAX || !host_char(s[i]))
 			return false;
 	}
 	return i > 0;
-}
-
-static bool host_char(char c)
-{
-	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-	       (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_';
 }
 
 /*
