@@ -100,6 +100,27 @@ static int wait_entries(struct gwp_dns_ctx *ctx, struct gwp_dns_entry **want,
 }
 
 /*
+ * Queue one request for @name on completion queue 0, wait up to @timeout ms
+ * for it, and check it came back with @want_res. The entry is the caller's
+ * to free. Its udata is a slot that stays valid after this returns, as
+ * wait_entries() checks udata against where the entry is kept.
+ */
+static struct gwp_dns_entry *resolve_one(struct gwp_dns_ctx *ctx,
+					 const char *name, uint16_t port,
+					 int timeout, int want_res)
+{
+	static struct gwp_dns_entry *slot;
+	int r;
+
+	slot = gwp_dns_queue(ctx, 0, name, port, NULL, &slot);
+	assert(slot);
+	r = wait_entries(ctx, &slot, 1, timeout);
+	assert(!r);
+	assert(slot->res == want_res);
+	return slot;
+}
+
+/*
  * The resolver hands a result to its client before it inserts it into the
  * cache, so a lookup right after the result arrived may still miss. Wait for
  * the insert, giving up after a second.
@@ -213,11 +234,7 @@ static void test_dns_cache(void)
 	assert(!r);
 	assert(ctx != NULL);
 
-	e = gwp_dns_queue(ctx, 0, "localhost", 80, NULL, &e);
-	assert(e != NULL);
-	r = wait_entries(ctx, &e, 1, 5000);
-	assert(r == 0);
-	assert(e->res == 0);
+	e = resolve_one(ctx, "localhost", 80, 5000, 0);
 	r = e->addrs[0].sa.sa_family;
 	assert(r == AF_INET || r == AF_INET6);
 	gwp_dns_entry_free(e);
@@ -391,11 +408,7 @@ static void test_addr_list(void)
 	r = gwp_dns_ctx_init(&ctx, &cfg);
 	assert(!r);
 
-	e = gwp_dns_queue(ctx, 0, "localhost", 80, NULL, &e);
-	assert(e != NULL);
-	r = wait_entries(ctx, &e, 1, 5000);
-	assert(r == 0);
-	assert(e->res == 0);
+	e = resolve_one(ctx, "localhost", 80, 5000, 0);
 
 	/* At least one address, and the count must match what was filled in. */
 	assert(e->nr_addrs >= 1);
@@ -468,11 +481,8 @@ static void test_cancel(void)
 	gwp_dns_entry_cancel(c2);
 
 	/* Queued after them, so it finishes after them on the one thread. */
-	e = gwp_dns_queue(ctx, 0, "localhost", 81, NULL, &e);
-	assert(e);
-	r = wait_entries(ctx, &e, 1, 5000);
-	assert(!r);
-	assert(e->res == 0 && e->addrs[0].i4.sin_port == htons(81));
+	e = resolve_one(ctx, "localhost", 81, 5000, 0);
+	assert(e->addrs[0].i4.sin_port == htons(81));
 	gwp_dns_entry_free(e);
 
 	/* Left for gwp_dns_ctx_free(): one delivered on queue 1, unpopped. */
@@ -514,11 +524,7 @@ static void test_shared_lookup(void)
 
 	memset(longname, 'a', sizeof(longname) - 1);
 	longname[sizeof(longname) - 1] = '\0';
-	bad = gwp_dns_queue(ctx, 0, longname, 80, NULL, &bad);
-	assert(bad);
-	r = wait_entries(ctx, &bad, 1, 5000);
-	assert(!r);
-	assert(bad->res == -EHOSTUNREACH);
+	bad = resolve_one(ctx, longname, 80, 5000, -EHOSTUNREACH);
 	gwp_dns_entry_free(bad);
 
 	gwp_dns_ctx_free(ctx);
@@ -553,11 +559,7 @@ static void test_negative_cache(void)
 	assert(r == -ENOENT);
 
 	/* .invalid never resolves (RFC 2606), online or not. */
-	e = gwp_dns_queue(ctx, 0, "no-such-host.invalid", 80, NULL, &e);
-	assert(e);
-	r = wait_entries(ctx, &e, 1, 30000);
-	assert(!r);
-	assert(e->res == -EHOSTUNREACH);
+	e = resolve_one(ctx, "no-such-host.invalid", 80, 30000, -EHOSTUNREACH);
 	gwp_dns_entry_free(e);
 
 	/* Inserted after delivery; wait for it. */
