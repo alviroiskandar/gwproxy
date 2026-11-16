@@ -378,6 +378,19 @@ static bool buf_add(char *buf, size_t cap, size_t *n, const char *p,
 }
 
 /*
+ * Append the field line "@k: @v" and its CRLF (@klen and @vlen bytes) to
+ * @buf as buf_add() does; false if full.
+ */
+static bool buf_add_field(char *buf, size_t cap, size_t *n, const char *k,
+			  size_t klen, const char *v, size_t vlen)
+{
+	return buf_add(buf, cap, n, k, klen) &&
+	       buf_add(buf, cap, n, ": ", 2) &&
+	       buf_add(buf, cap, n, v, vlen) &&
+	       buf_add(buf, cap, n, "\r\n", 2);
+}
+
+/*
  * Rebuild the request in origin-form into @buf (@cap bytes): the absolute-form
  * request-target is replaced by @path (a bare "?query" gets the "/" its empty
  * path stands for), hop-by-hop / connection-specific headers are dropped,
@@ -460,10 +473,7 @@ static ssize_t build_forward_request(struct gwp_http_conn *hc,
 		if (!hlen)
 			return -EINVAL;
 
-		ok = buf_add(buf, cap, &n, "Host: ", 6) &&
-		     buf_add(buf, cap, &n, host, hlen) &&
-		     buf_add(buf, cap, &n, "\r\n", 2);
-		if (!ok)
+		if (!buf_add_field(buf, cap, &n, "Host", 4, host, hlen))
 			goto too_big;
 	}
 
@@ -498,11 +508,8 @@ static ssize_t build_forward_request(struct gwp_http_conn *hc,
 			int vl = snprintf(v, sizeof(v), "%" PRId64,
 					  hc->max_fwd);
 
-			ok = buf_add(buf, cap, &n, k, f->klen) &&
-			     buf_add(buf, cap, &n, ": ", 2) &&
-			     buf_add(buf, cap, &n, v, (size_t)vl) &&
-			     buf_add(buf, cap, &n, "\r\n", 2);
-			if (!ok)
+			if (!buf_add_field(buf, cap, &n, k, f->klen, v,
+					   (size_t)vl))
 				goto too_big;
 			continue;
 		}
@@ -519,13 +526,9 @@ static ssize_t build_forward_request(struct gwp_http_conn *hc,
 			goto too_big;
 	}
 
-	if (via_at == SIZE_MAX) {
-		ok = buf_add(buf, cap, &n, "Via: ", 5) &&
-		     buf_add(buf, cap, &n, via, VIA_HOP_LEN) &&
-		     buf_add(buf, cap, &n, "\r\n", 2);
-		if (!ok)
-			goto too_big;
-	}
+	if (via_at == SIZE_MAX &&
+	    !buf_add_field(buf, cap, &n, "Via", 3, via, VIA_HOP_LEN))
+		goto too_big;
 
 	if (!buf_add(buf, cap, &n, cls, sizeof(cls) - 1))
 		goto too_big;
@@ -1457,11 +1460,10 @@ static noinline ssize_t rewrite_res_hdr(const char *hdr, size_t len, char *out,
 	}
 	*code = c;
 	via = via_hop(p[7] == '0');
-	if (n + 2 > out_cap)
+	o = 0;
+	if (!buf_add(out, out_cap, &o, p, n) ||
+	    !buf_add(out, out_cap, &o, "\r\n", 2))
 		return -E2BIG;
-	memcpy(out, p, n);
-	memcpy(out + n, "\r\n", 2);
-	o = n + 2;
 
 	/*
 	 * Validate the field lines, note where each one is and collect the
@@ -1553,54 +1555,45 @@ static noinline ssize_t rewrite_res_hdr(const char *hdr, size_t len, char *out,
 			if (has_te || cl_done)
 				continue;
 			vl = snprintf(v, sizeof(v), "%" PRIu64, cl);
-			if (o + klen + 2 + (size_t)vl + 2 > out_cap)
+			if (!buf_add_field(out, out_cap, &o, k, klen, v,
+					   (size_t)vl))
 				return -E2BIG;
-			memcpy(out + o, k, klen);
-			memcpy(out + o + klen, ": ", 2);
-			memcpy(out + o + klen + 2, v, (size_t)vl);
-			memcpy(out + o + klen + 2 + vl, "\r\n", 2);
-			o += klen + 2 + (size_t)vl + 2;
 			cl_done = true;
 			continue;
 		}
-		if (o + n + 2 > out_cap)
+		if (!buf_add(out, out_cap, &o, k, n))
 			return -E2BIG;
-		memcpy(out + o, k, n);
-		o += n;
 		if (l == via_at) {
 			const char *v = k + klen + 1;
 
 			/* An empty value (OWS only) gets no list separator. */
 			while (v < k + n && (*v == ' ' || *v == '\t'))
 				v++;
-			if (o + 2 + VIA_HOP_LEN + 2 > out_cap)
+			/*
+			 * Room for the separator is wanted even where it is
+			 * left out, as it always was: a header that did not
+			 * fit before does not fit now either.
+			 */
+			if (o + 2 + VIA_HOP_LEN + 2 > out_cap ||
+			    (v < k + n && !buf_add(out, out_cap, &o, ",", 1)) ||
+			    !buf_add(out, out_cap, &o, " ", 1) ||
+			    !buf_add(out, out_cap, &o, via, VIA_HOP_LEN))
 				return -E2BIG;
-			if (v < k + n)
-				out[o++] = ',';
-			out[o++] = ' ';
-			memcpy(out + o, via, VIA_HOP_LEN);
-			o += VIA_HOP_LEN;
 		}
-		memcpy(out + o, "\r\n", 2);
-		o += 2;
+		if (!buf_add(out, out_cap, &o, "\r\n", 2))
+			return -E2BIG;
 	}
 
-	if (*code >= 200 && via_at < 0) {
-		if (o + 5 + VIA_HOP_LEN + 2 > out_cap)
-			return -E2BIG;
-		memcpy(out + o, "Via: ", 5);
-		memcpy(out + o + 5, via, VIA_HOP_LEN);
-		memcpy(out + o + 5 + VIA_HOP_LEN, "\r\n", 2);
-		o += 5 + VIA_HOP_LEN + 2;
-	}
+	if (*code >= 200 && via_at < 0 &&
+	    !buf_add_field(out, out_cap, &o, "Via", 3, via, VIA_HOP_LEN))
+		return -E2BIG;
 
 	/* An interim response says nothing about the connection. */
 	n = (*code >= 200) ? sizeof(cls) - 1 : 0;
-	if (o + n + 2 > out_cap)
+	if (!buf_add(out, out_cap, &o, cls, n) ||
+	    !buf_add(out, out_cap, &o, "\r\n", 2))
 		return -E2BIG;
-	memcpy(out + o, cls, n);
-	memcpy(out + o + n, "\r\n", 2);
-	return (ssize_t)(o + n + 2);
+	return (ssize_t)o;
 }
 
 /*
