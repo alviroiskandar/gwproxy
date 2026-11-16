@@ -14,53 +14,66 @@
 #include <unistd.h>
 #include "test_util.h"
 
-#define test_socks5_init_ctx_no_auth(CTX)		\
-do {							\
-	struct gwp_socks5_ctx **__ctx = (CTX);		\
-	int __r;					\
-							\
-	__r = gwp_socks5_ctx_init(__ctx, NULL);		\
-	assert(!__r);					\
-	assert(*__ctx);					\
-	assert((*__ctx)->auth == NULL);			\
-} while (0)
+static void test_socks5_init_ctx_no_auth(struct gwp_socks5_ctx **ctx)
+{
+	int r;
 
-#define test_socks5_alloc_conn(CTX) ({			\
-	struct gwp_socks5_ctx *__ctx = (CTX);		\
-	struct gwp_socks5_conn *__conn;			\
-							\
-	__conn = gwp_socks5_conn_alloc(__ctx);		\
-	assert(__conn);					\
-	assert(__conn->state == GWP_SOCKS5_ST_INIT);	\
-	assert(__conn->ctx == __ctx);			\
-	(__conn);					\
-})
+	r = gwp_socks5_ctx_init(ctx, NULL);
+	assert(!r);
+	assert(*ctx);
+	assert((*ctx)->auth == NULL);
+}
 
-#define test_socks5_do_handshake_no_auth(CTX, CONN)		\
-do {								\
-	static const uint8_t in[] = {				\
-		0x05, 0x01, 0x00 /* VER, NMETHODS, METHOD */	\
-	};							\
-	struct gwp_socks5_conn *__conn = (CONN);		\
-	size_t in_len, out_len;					\
-	uint8_t out[10];					\
-	int r;							\
-								\
-	in_len = sizeof(in);					\
-	out_len = sizeof(out);					\
-	r = gwp_socks5_conn_handle_data(__conn, in,		\
-					&in_len, out,		\
-					&out_len);		\
-	assert(!r);						\
-								\
-	assert(in_len == 3);					\
-	assert(out_len == 2);					\
-	/* VER */						\
-	assert(out[0] == 0x05);					\
-	/* METHOD: NO AUTHENTICATION REQUIRED */		\
-	assert(out[1] == 0x00);					\
-	assert(conn->state == GWP_SOCKS5_ST_CMD);		\
-} while (0)
+/* A context that asks for @auth's credentials and allows UDP ASSOCIATE. */
+static void test_socks5_init_ctx_auth(struct gwp_socks5_ctx **ctx,
+				      struct gwp_auth *auth)
+{
+	const struct gwp_socks5_cfg cfg = {
+		.auth = auth,
+		.udp_associate = true,
+	};
+	int r;
+
+	r = gwp_socks5_ctx_init(ctx, &cfg);
+	assert(!r);
+	assert(*ctx);
+	assert((*ctx)->auth == auth);
+}
+
+static struct gwp_socks5_conn *
+test_socks5_alloc_conn(struct gwp_socks5_ctx *ctx)
+{
+	struct gwp_socks5_conn *conn;
+
+	conn = gwp_socks5_conn_alloc(ctx);
+	assert(conn);
+	assert(conn->state == GWP_SOCKS5_ST_INIT);
+	assert(conn->ctx == ctx);
+	return conn;
+}
+
+static void test_socks5_do_handshake_no_auth(struct gwp_socks5_conn *conn)
+{
+	static const uint8_t in[] = {
+		0x05, 0x01, 0x00 /* VER, NMETHODS, METHOD */
+	};
+	size_t in_len, out_len;
+	uint8_t out[10];
+	int r;
+
+	in_len = sizeof(in);
+	out_len = sizeof(out);
+	r = gwp_socks5_conn_handle_data(conn, in, &in_len, out, &out_len);
+	assert(!r);
+
+	assert(in_len == 3);
+	assert(out_len == 2);
+	/* VER */
+	assert(out[0] == 0x05);
+	/* METHOD: NO AUTHENTICATION REQUIRED */
+	assert(out[1] == 0x00);
+	assert(conn->state == GWP_SOCKS5_ST_CMD);
+}
 
 static void test_connect_ipv4(void)
 {
@@ -83,7 +96,7 @@ static void test_connect_ipv4(void)
 
 	test_socks5_init_ctx_no_auth(&ctx);
 	conn = test_socks5_alloc_conn(ctx);
-	test_socks5_do_handshake_no_auth(ctx, conn);
+	test_socks5_do_handshake_no_auth(conn);
 
 	in_len = sizeof(in);
 	out_len = sizeof(out);
@@ -152,7 +165,7 @@ static void test_connect_ipv6(void)
 
 	test_socks5_init_ctx_no_auth(&ctx);
 	conn = test_socks5_alloc_conn(ctx);
-	test_socks5_do_handshake_no_auth(ctx, conn);
+	test_socks5_do_handshake_no_auth(conn);
 
 	in_len = sizeof(in);
 	out_len = sizeof(out);
@@ -217,7 +230,7 @@ static int test_connect_domain(void)
 
 	test_socks5_init_ctx_no_auth(&ctx);
 	conn = test_socks5_alloc_conn(ctx);
-	test_socks5_do_handshake_no_auth(ctx, conn);
+	test_socks5_do_handshake_no_auth(conn);
 	in_len = sizeof(in);
 	out_len = sizeof(out);
 	r = gwp_socks5_conn_handle_data(conn, in, &in_len, out, &out_len);
@@ -284,16 +297,8 @@ static void test_short_recv(void)
 	size_t i;
 	int r;
 
-	ctx = NULL;
-	r = gwp_socks5_ctx_init(&ctx, NULL);
-	assert(!r);
-	assert(ctx);
-	assert(ctx->auth == NULL);
-
-	conn = gwp_socks5_conn_alloc(ctx);
-	assert(conn);
-	assert(conn->state == GWP_SOCKS5_ST_INIT);
-	assert(conn->ctx == ctx);
+	test_socks5_init_ctx_no_auth(&ctx);
+	conn = test_socks5_alloc_conn(ctx);
 
 	inb = in;
 	for (i = 0; i < 3; i++) {
@@ -383,7 +388,6 @@ static void test_auth_userpass(void)
 	char *cred_file;
 	struct gwp_socks5_conn *conn;
 	struct gwp_socks5_ctx *ctx;
-	struct gwp_socks5_cfg cfg;
 	struct gwp_auth *auth;
 	size_t in_len, out_len;
 	const uint8_t *inb;
@@ -392,17 +396,8 @@ static void test_auth_userpass(void)
 
 	auth = gwp_test_auth_from_buf("gwp_socks5_auth", cred_data,
 				      sizeof(cred_data) - 1, &cred_file);
-	cfg.auth = auth;
-	cfg.udp_associate = true;
-	r = gwp_socks5_ctx_init(&ctx, &cfg);
-	assert(!r);
-	assert(ctx);
-	assert(ctx->auth == auth);
-
-	conn = gwp_socks5_conn_alloc(ctx);
-	assert(conn);
-	assert(conn->state == GWP_SOCKS5_ST_INIT);
-	assert(conn->ctx == ctx);
+	test_socks5_init_ctx_auth(&ctx, auth);
+	conn = test_socks5_alloc_conn(ctx);
 
 	inb = in;
 	in_len = 4; /* VER, NMETHODS, {USER/PASS} */
@@ -606,7 +601,6 @@ static void test_auth_userpass_empty_password(void)
 	char *cred_file;
 	struct gwp_socks5_conn *conn;
 	struct gwp_socks5_ctx *ctx;
-	struct gwp_socks5_cfg cfg;
 	struct gwp_auth *auth;
 	size_t in_len, out_len;
 	const uint8_t *inb;
@@ -615,14 +609,8 @@ static void test_auth_userpass_empty_password(void)
 
 	auth = gwp_test_auth_from_buf("gwp_socks5_auth", cred_data,
 				      sizeof(cred_data) - 1, &cred_file);
-	cfg.auth = auth;
-	cfg.udp_associate = true;
-	r = gwp_socks5_ctx_init(&ctx, &cfg);
-	assert(!r);
-	assert(ctx);
-
-	conn = gwp_socks5_conn_alloc(ctx);
-	assert(conn);
+	test_socks5_init_ctx_auth(&ctx, auth);
+	conn = test_socks5_alloc_conn(ctx);
 
 	inb = in;
 	in_len = 3; /* greeting */
@@ -767,7 +755,7 @@ static void test_invalid_connect_addr_type(void)
 
 	test_socks5_init_ctx_no_auth(&ctx);
 	conn = test_socks5_alloc_conn(ctx);
-	test_socks5_do_handshake_no_auth(ctx, conn);
+	test_socks5_do_handshake_no_auth(conn);
 	in_len = sizeof(in);
 	out_len = sizeof(out);
 	r = gwp_socks5_conn_handle_data(conn, in, &in_len, out, &out_len);
@@ -806,7 +794,7 @@ static void test_invalid_command(void)
 
 	test_socks5_init_ctx_no_auth(&ctx);
 	conn = test_socks5_alloc_conn(ctx);
-	test_socks5_do_handshake_no_auth(ctx, conn);
+	test_socks5_do_handshake_no_auth(conn);
 	in_len = sizeof(in);
 	out_len = sizeof(out);
 	r = gwp_socks5_conn_handle_data(conn, in, &in_len, out, &out_len);
@@ -973,7 +961,6 @@ static void test_enobufs_combined_with_multi_state_at_once(void)
 	char *cred_file;
 	struct gwp_socks5_conn *conn;
 	struct gwp_socks5_ctx *ctx;
-	struct gwp_socks5_cfg cfg;
 	struct gwp_auth *auth;
 	size_t in_len, out_len;
 	uint8_t out[4096];
@@ -982,17 +969,8 @@ static void test_enobufs_combined_with_multi_state_at_once(void)
 
 	auth = gwp_test_auth_from_buf("gwp_socks5_auth", cred_data,
 				      sizeof(cred_data) - 1, &cred_file);
-	cfg.auth = auth;
-	cfg.udp_associate = true;
-	r = gwp_socks5_ctx_init(&ctx, &cfg);
-	assert(!r);
-	assert(ctx);
-	assert(ctx->auth == auth);
-
-	conn = gwp_socks5_conn_alloc(ctx);
-	assert(conn);
-	assert(conn->state == GWP_SOCKS5_ST_INIT);
-	assert(conn->ctx == ctx);
+	test_socks5_init_ctx_auth(&ctx, auth);
+	conn = test_socks5_alloc_conn(ctx);
 
 	for (i = 0; i < 4; i++) {
 		in_len = sizeof(in);
@@ -1076,7 +1054,7 @@ static void test_udp_associate(void)
 
 	test_socks5_init_ctx_no_auth(&ctx);
 	conn = test_socks5_alloc_conn(ctx);
-	test_socks5_do_handshake_no_auth(ctx, conn);
+	test_socks5_do_handshake_no_auth(conn);
 
 	in_len = sizeof(in);
 	out_len = sizeof(out);
