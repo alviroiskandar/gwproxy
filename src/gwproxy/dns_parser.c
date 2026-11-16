@@ -8,6 +8,18 @@
 #include <gwproxy/net.h>
 #include <gwproxy/ascii.h>
 
+/*
+ * A big-endian 16-bit field of a DNS message. The fields sit at any byte
+ * offset, so this loads through memcpy() rather than a uint16_t pointer.
+ */
+static inline uint16_t dns_get16(const uint8_t *p)
+{
+	uint16_t v;
+
+	memcpy(&v, p, sizeof(v));
+	return ntohs(v);
+}
+
 static ssize_t construct_qname(uint8_t *dst, size_t dst_len, const char *qname)
 {
 	const uint8_t *p = (const uint8_t *)qname;
@@ -172,13 +184,12 @@ int gwdns_parse_query(uint16_t txid, uint16_t port, const uint8_t *in,
 		return -EAGAIN;
 
 	for (i = 0; i < ancount; i++) {
-		uint16_t w, type, rdlength;
+		uint16_t type, rdlength;
 
 		if (idx + 2 > in_len)
 			return -EAGAIN;
 
-		memcpy(&w, &in[idx], 2);
-		if (DNS_IS_COMPRESSED(ntohs(w))) {
+		if (DNS_IS_COMPRESSED(dns_get16(&in[idx]))) {
 			idx += 2; // NAME
 		} else {
 			/*
@@ -201,10 +212,8 @@ int gwdns_parse_query(uint16_t txid, uint16_t port, const uint8_t *in,
 		if (idx > in_len || in_len - idx < 10)
 			return -EAGAIN;
 
-		memcpy(&type, &in[idx], 2);
-		type = ntohs(type);
-		memcpy(&rdlength, &in[idx + 8], 2);
-		rdlength = ntohs(rdlength);
+		type = dns_get16(&in[idx]);
+		rdlength = dns_get16(&in[idx + 8]);
 		idx += 10;
 
 		/*
@@ -361,14 +370,12 @@ int gwdns_check_question(const uint8_t *query, size_t query_len,
 			 const uint8_t *in, size_t in_len)
 {
 	size_t i, end, hdr = sizeof(gwdns_header_pkt);
-	uint16_t qdcount;
 	int qlen;
 
 	if (query_len <= hdr || in_len <= hdr)
 		return -EINVAL;
 
-	memcpy(&qdcount, &in[4], sizeof(qdcount));
-	if (ntohs(qdcount) != 1)
+	if (dns_get16(&in[4]) != 1)
 		return -EINVAL;
 
 	/* Our own query: a literal name, then QTYPE and QCLASS. */
