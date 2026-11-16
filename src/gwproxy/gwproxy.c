@@ -257,8 +257,9 @@ static void show_help(const char *app)
 
 /*
  * Whether --event-loop selects the io_uring backend. "iou" is an accepted
- * alias for "io_uring" (see gwp_ctx_parse_ev()), so both spellings must be
- * recognised when gating features that io_uring does not support yet.
+ * alias for "io_uring"; this is the one place that knows both spellings,
+ * so gwp_ctx_parse_ev() and the checks that gate features io_uring does
+ * not support yet all ask it.
  */
 static bool ev_is_io_uring(const struct gwp_cfg *cfg)
 {
@@ -3619,7 +3620,7 @@ static int gwp_ctx_parse_ev(struct gwp_ctx *ctx)
 	if (!strcmp(ev, "epoll")) {
 		ctx->ev_used = GWP_EV_EPOLL;
 		pr_dbg(&ctx->lh, "Using event loop: epoll");
-	} else if (!strcmp(ev, "io_uring") || !strcmp(ev, "iou")) {
+	} else if (ev_is_io_uring(&ctx->cfg)) {
 		ctx->ev_used = GWP_EV_IO_URING;
 		pr_dbg(&ctx->lh, "Using event loop: io_uring");
 	} else {
