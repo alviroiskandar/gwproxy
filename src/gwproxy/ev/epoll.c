@@ -1691,42 +1691,8 @@ static bool splice_again(const struct gwp_conn __unused *src,
 }
 
 /*
- * @c's recv() or send() failed with @err while the pair forwards. A plaintext
- * peer that reset the connection, or died otherwise, ends only its own side:
- * nothing more can be sent to it, and what was queued for it is dropped (see
- * fwd_send()), but what it sent before is still queued on its socket ahead of
- * the error and goes on to the other side, like any data before an EOF. A
- * failed recv() has returned the last of it. After a failed send() it is still
- * to be read, and recv() ends with an EOF then: the error is reported once.
- * Returns true when @err was taken so.
- *
- * TLS sides are left as they were: do_recv_tls() has its own way of ending at a
- * failed recv(), and a pair whose TLS side failed goes down at once, with
- * gwp_conn_pair_abort_target() passing the abort on.
- */
-static bool conn_note_reset(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
-			    struct gwp_conn *c, int err, bool rx)
-{
-	if (!gcp->is_target_alive || c->tls)
-		return false;
-	if (err != -ECONNRESET && err != -EPIPE && err != -ETIMEDOUT)
-		return false;
-
-	if (rx)
-		c->rd_eof = true;
-	if (!c->rst) {
-		pr_dbg(&w->ctx->lh, "%s connection ended: %s (idx=%u, fd=%d)",
-			c == &gcp->client ? "Client" : "Target",
-			strerror(-err), gcp->idx, c->fd);
-		c->rst = true;
-	}
-	c->wr_shut = true;
-	return true;
-}
-
-/*
- * Forward @src's data to @dst; once @dst was reset (conn_note_reset()), drop
- * it instead, as it can no longer be delivered.
+ * Forward @src's data to @dst; once @dst was reset (gwp_conn_note_reset()),
+ * drop it instead, as it can no longer be delivered.
  */
 static ssize_t fwd_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			struct gwp_conn *src, struct gwp_conn *dst)
@@ -1736,7 +1702,7 @@ static ssize_t fwd_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	if (likely(!dst->rst)) {
 		ret = __do_send(src, dst);
 		if (likely(ret >= 0) ||
-		    !conn_note_reset(w, gcp, dst, (int)ret, false))
+		    !gwp_conn_note_reset(w, gcp, dst, (int)ret, false))
 			return ret;
 	}
 
@@ -1759,7 +1725,7 @@ static int do_splice(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 
 			ret = splice_recv(src, first);
 			if (unlikely(ret < 0) &&
-			    !conn_note_reset(w, gcp, src, (int)ret, true))
+			    !gwp_conn_note_reset(w, gcp, src, (int)ret, true))
 				return (int)ret;
 
 			if (gwp_http_fwd_active(gcp)) {
@@ -2436,7 +2402,7 @@ static bool target_was_up(const struct gwp_conn_pair *gcp, int err)
 
 /*
  * A connect that target_was_up() took as a success. Reading SO_ERROR has
- * cleared the error, so it is recorded here, as conn_note_reset() would:
+ * cleared the error, so it is recorded here, as gwp_conn_note_reset() would:
  * forwarding then reads what the target sent, and ends there.
  */
 static void target_note_reset(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
@@ -2552,7 +2518,7 @@ static int conn_wr_flushed(struct gwp_conn __unused *c)
 /*
  * @c's stream has ended and all of it has been handed to @o's side: whether
  * @o's write side can be shut, as conn_wr_flushed() tells. When @c was reset
- * (conn_note_reset()), a TLS @o gets no close_notify, which would turn the
+ * (gwp_conn_note_reset()), a TLS @o gets no close_notify, which would turn the
  * abort into a clean end: once the ciphertext it is owed has left, the pair
  * goes down as it did at the reset before, and gwp_conn_pair_abort_target()
  * deals with it. Not when the HTTP forwarding filter answered 502 in place
@@ -2887,7 +2853,7 @@ static int handle_ev_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	 * An error before the tunnel is up ends the connect or the upstream
 	 * handshake. Once it is up, the error is read like the data before
 	 * it: what a peer sent ahead of its reset is still queued, and recv()
-	 * returns that first (see conn_note_reset()).
+	 * returns that first (see gwp_conn_note_reset()).
 	 */
 	if (unlikely(ev->events & EPOLLERR) && !gcp->is_target_alive) {
 		/*

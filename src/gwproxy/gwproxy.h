@@ -1514,6 +1514,27 @@ bool gwp_conn_reset_passed(const struct gwp_conn_pair *gcp,
 			   const struct gwp_conn *c);
 
 /*
+ * A recv from @c (@rx) or a send to it failed with @err while the pair
+ * forwards, on either event loop. A plaintext peer that reset the
+ * connection, or died otherwise, ends only its own side: nothing more can be
+ * sent to it, so its write side counts as shut and the loop drops what is
+ * queued for it (epoll's fwd_send(), io_uring's drop_for_reset()), but what
+ * it sent before is still queued on its socket ahead of the error and goes
+ * on to the other side, like any data before an EOF. A failed recv has
+ * returned the last of it, and is taken as the end of @c's stream. After a
+ * failed send it is still to be read, and the recv ends with an EOF then, as
+ * the send has taken the error off the socket: the error is reported once.
+ * The reset is recorded in gwp_conn::rst (see gwp_conn_reset_passed()).
+ * Returns true when @err was taken so.
+ *
+ * TLS sides are left as they were: a failure on one ends the pair at once,
+ * with gwp_conn_pair_abort_target() passing the abort on, and epoll's
+ * do_recv_tls() has its own way of ending at a failed recv.
+ */
+bool gwp_conn_note_reset(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			 struct gwp_conn *c, int err, bool rx);
+
+/*
  * The other side of @c was reset (gwp_conn_reset_passed()), and @c, the
  * plaintext survivor, is to be reset in turn once it has taken what it is
  * owed, so that the cut shows: the end of the pair gives it no FIN, and

@@ -1212,6 +1212,26 @@ bool gwp_conn_reset_passed(const struct gwp_conn_pair *gcp,
 	       gwp_http_fwd_res_state(gcp->http_conn) != GWP_HTTP_RES_FAILED;
 }
 
+bool gwp_conn_note_reset(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			 struct gwp_conn *c, int err, bool rx)
+{
+	if (!gcp->is_target_alive || c->tls)
+		return false;
+	if (err != -ECONNRESET && err != -EPIPE && err != -ETIMEDOUT)
+		return false;
+
+	if (rx)
+		c->rd_eof = true;
+	if (!c->rst) {
+		pr_dbg(&w->ctx->lh, "%s connection ended: %s (idx=%u, fd=%d)",
+			c == &gcp->client ? "Client" : "Target",
+			strerror(-err), gcp->idx, c->fd);
+		c->rst = true;
+	}
+	c->wr_shut = true;
+	return true;
+}
+
 /* Whether the pair resets the target, or the client, as described above. */
 static bool gwp_conn_pair_aborts_target(const struct gwp_conn_pair __unused *gcp)
 {
