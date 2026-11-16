@@ -3025,17 +3025,10 @@ static int handle_conn_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	 * reply to give, and a stalled upstream handshake leaves its own bytes
 	 * in target.buf, which are dropped first.
 	 */
-	if ((gcp->target.fd >= 0 || gwp_has_inflight_attempt(gcp) ||
-	     gwp_in_dns_lookup(gcp)) && !gcp->is_target_alive) {
+	if (gwp_conn_timeout_owed(gcp) && !gcp->is_target_alive) {
 		uint32_t len;
 
-		/* Not while the name resolves: no upstream is involved yet. */
-		if (!gwp_in_dns_lookup(gcp)) {
-			gwp_upstream_note_end(gcp, GWP_UPSTREAM_END_TIMEOUT,
-					      gwp_upstream_timeout_val(gcp));
-			/* No time left to retry in. */
-			gwp_conn_upstream_failed(w, gcp, -ETIMEDOUT, false);
-		}
+		gwp_conn_timeout_upstream(w, gcp, -ETIMEDOUT);
 		if (gwp_in_upstream_hs(gcp))
 			gcp->target.len = 0;
 		len = gcp->target.len;

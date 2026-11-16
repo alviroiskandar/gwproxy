@@ -1801,6 +1801,35 @@ static inline bool gwp_has_inflight_attempt(const struct gwp_conn_pair *gcp)
 	return false;
 }
 
+/*
+ * Whether a connect timeout finds the client's request complete, so that the
+ * client is owed an answer: while a target socket exists, while the target's
+ * name is being looked up, and during a race, where there is no target fd
+ * yet, so the in-flight attempts count as one. The other user of the timer
+ * is the protocol handshake, where nothing has been requested yet.
+ */
+static inline bool gwp_conn_timeout_owed(const struct gwp_conn_pair *gcp)
+{
+	return gcp->target.fd >= 0 || gwp_has_inflight_attempt(gcp) ||
+	       gwp_in_dns_lookup(gcp);
+}
+
+/*
+ * Charge the connect timeout @err of a pair gwp_conn_timeout_owed() an
+ * answer to its upstream, which has no time left to retry in. Not while the
+ * name resolves: no upstream is involved yet.
+ */
+static inline void gwp_conn_timeout_upstream(struct gwp_wrk *w,
+					     struct gwp_conn_pair *gcp,
+					     int err)
+{
+	if (gwp_in_dns_lookup(gcp))
+		return;
+	gwp_upstream_note_end(gcp, GWP_UPSTREAM_END_TIMEOUT,
+			      gwp_upstream_timeout_val(gcp));
+	gwp_conn_upstream_failed(w, gcp, err, false);
+}
+
 /* Move the data back to the start of the buffer, regaining the room in front. */
 static inline void gwp_conn_buf_compact(struct gwp_conn *conn)
 {
