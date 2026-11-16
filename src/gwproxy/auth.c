@@ -20,6 +20,7 @@
 #include <sys/stat.h>
 
 #include "auth.h"
+#include "common.h"
 
 struct auth_entry {
 	char	*u, *p;
@@ -152,18 +153,8 @@ static int add_auth_entry(struct auth_set *set, const char *line, size_t len)
 	size_t ulen, plen;
 	char *u, *p;
 
-	if (set->nr >= set->cap) {
-		size_t new_cap = set->cap ? set->cap * 2 : 16;
-		struct auth_entry *new_entries;
-
-		new_entries = realloc(set->entries,
-				      new_cap * sizeof(*new_entries));
-		if (!new_entries)
-			return -ENOMEM;
-
-		set->entries = new_entries;
-		set->cap = new_cap;
-	}
+	if (GWP_GROW_ARRAY(set->entries, set->nr, set->cap, 16) < 0)
+		return -ENOMEM;
 
 	u = malloc(len + 1);
 	if (!u)

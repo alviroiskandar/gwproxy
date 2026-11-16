@@ -29,6 +29,7 @@
 #ifdef CONFIG_PCRE
 #include <pcre2.h>
 #endif
+#include <gwproxy/common.h>
 
 enum gwp_acl_action {
 	GWP_ACL_ACT_ACCEPT	= 0,
@@ -742,16 +743,9 @@ static int parse_ports(const char *s, struct gwp_acl_ports *p)
 			hi = lo;
 		}
 
-		if (p->nr == cap) {
-			struct gwp_acl_prange *nv;
-
-			cap = cap ? cap * 2 : 4;
-			nv = realloc(p->v, cap * sizeof(*nv));
-			if (!nv) {
-				err = -ENOMEM;
-				goto fail;
-			}
-			p->v = nv;
+		if (GWP_GROW_ARRAY(p->v, p->nr, cap, 4) < 0) {
+			err = -ENOMEM;
+			goto fail;
 		}
 		p->v[p->nr].lo = (uint16_t)lo;
 		p->v[p->nr].hi = (uint16_t)hi;
@@ -934,18 +928,8 @@ static void ruleset_free(struct gwp_acl_ruleset *rs)
 /* Append a copy of @r to @c, which then owns what @r points to. */
 static int chain_append(struct acl_chain *c, const struct gwp_acl_rule *r)
 {
-	if (c->nr == c->cap) {
-		struct gwp_acl_rule *nv;
-		uint32_t cap = c->cap ? c->cap * 2 : 16;
-
-		if (cap < c->cap)
-			return -ENOMEM;
-		nv = realloc(c->rules, (size_t)cap * sizeof(*nv));
-		if (!nv)
-			return -ENOMEM;
-		c->rules = nv;
-		c->cap = cap;
-	}
+	if (GWP_GROW_ARRAY(c->rules, c->nr, c->cap, 16) < 0)
+		return -ENOMEM;
 	memcpy(&c->rules[c->nr++], r, sizeof(*r));
 	return 0;
 }
