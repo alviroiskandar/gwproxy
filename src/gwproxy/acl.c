@@ -1062,9 +1062,9 @@ load_warn(const struct acl_load *ld, const char *fmt, ...)
 	va_end(ap);
 }
 
-/* Report the error that fails this line; returns -EINVAL. */
-static int __attribute__((__format__(printf, 2, 3)))
-load_err(struct acl_load *ld, const char *fmt, ...)
+/* Report the error that fails this line; returns @err. */
+static int __attribute__((__format__(printf, 3, 4)))
+load_fail(struct acl_load *ld, int err, const char *fmt, ...)
 {
 	va_list ap;
 
@@ -1072,8 +1072,14 @@ load_err(struct acl_load *ld, const char *fmt, ...)
 	load_vmsg(ld, fmt, ap);
 	va_end(ap);
 	ld->reported = true;
-	return -EINVAL;
+	return err;
 }
+
+/*
+ * The same, returning -EINVAL. A macro, as a varargs function cannot pass
+ * its arguments on to load_fail(); this keeps the format checked.
+ */
+#define load_err(ld, ...) load_fail(ld, -EINVAL, __VA_ARGS__)
 
 /*
  * ------------------------------------------------------------------------
@@ -2586,9 +2592,7 @@ static int note_missing(struct acl_load *ld, const char *path,
 /* Fail the include line over @path, which the pattern walk met. */
 static int glob_fail(struct acl_load *ld, const char *path, int err)
 {
-	load_warn(ld, "%s: %s", path, strerror(-err));
-	ld->reported = true;
-	return err;
+	return load_fail(ld, err, "%s: %s", path, strerror(-err));
 }
 
 /*
@@ -2604,12 +2608,10 @@ static int glob_read_dir(struct acl_load *ld, const char *dir, const char *pat,
 	DIR *d;
 	int fd, r = 0;
 
-	if (++ld->nr_glob_dirs > ACL_MAX_GLOB_DIRS) {
-		load_warn(ld, "the include patterns read more than %d directories",
-			  ACL_MAX_GLOB_DIRS);
-		ld->reported = true;
-		return -E2BIG;
-	}
+	if (++ld->nr_glob_dirs > ACL_MAX_GLOB_DIRS)
+		return load_fail(ld, -E2BIG,
+				 "the include patterns read more than %d directories",
+				 ACL_MAX_GLOB_DIRS);
 
 	fd = open(open_path, O_RDONLY | O_DIRECTORY | O_NONBLOCK | O_CLOEXEC);
 	if (fd < 0) {
@@ -2675,10 +2677,9 @@ static int glob_read_dir(struct acl_load *ld, const char *dir, const char *pat,
 		if (r)
 			break;
 		if (last && out->nr > ACL_MAX_FILES) {
-			load_warn(ld, "the include pattern matches more than %d files",
-				  ACL_MAX_FILES);
-			ld->reported = true;
-			r = -E2BIG;
+			r = load_fail(ld, -E2BIG,
+				      "the include pattern matches more than %d files",
+				      ACL_MAX_FILES);
 			break;
 		}
 	}
@@ -2898,9 +2899,8 @@ static int parse_include(struct acl_load *ld, char **tok, int n,
 				  tok[0], inc);
 			return 0;
 		}
-		load_warn(ld, "%s %s: no file matches", tok[0], inc);
-		ld->reported = true;
-		return -ENOENT;
+		return load_fail(ld, -ENOENT, "%s %s: no file matches",
+				 tok[0], inc);
 	}
 	for (i = 0; i < res.nr && !r; i++)
 		r = load_file(ld, res.v[i], optional);
