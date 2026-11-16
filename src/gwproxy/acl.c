@@ -719,6 +719,7 @@ static int parse_ports(const char *s, struct gwp_acl_ports *p)
 	char buf[256];
 	char *save = NULL, *tok;
 	size_t cap = 0;
+	int err = -EINVAL;
 
 	if (strlen(s) >= sizeof(buf))
 		return -EINVAL;
@@ -736,10 +737,10 @@ static int parse_ports(const char *s, struct gwp_acl_ports *p)
 			*dash = '\0';
 
 		if (parse_num(tok, false, 65535, &lo))
-			goto einval;
+			goto fail;
 		if (dash) {
 			if (parse_num(dash + 1, false, 65535, &hi) || hi < lo)
-				goto einval;
+				goto fail;
 		} else {
 			hi = lo;
 		}
@@ -749,8 +750,10 @@ static int parse_ports(const char *s, struct gwp_acl_ports *p)
 
 			cap = cap ? cap * 2 : 4;
 			nv = realloc(p->v, cap * sizeof(*nv));
-			if (!nv)
-				goto enomem;
+			if (!nv) {
+				err = -ENOMEM;
+				goto fail;
+			}
 			p->v = nv;
 		}
 		p->v[p->nr].lo = (uint16_t)lo;
@@ -759,19 +762,14 @@ static int parse_ports(const char *s, struct gwp_acl_ports *p)
 	}
 
 	if (!p->nr)
-		goto einval;
+		goto fail;
 	return 0;
 
-einval:
+fail:
 	free(p->v);
 	p->v = NULL;
 	p->nr = 0;
-	return -EINVAL;
-enomem:
-	free(p->v);
-	p->v = NULL;
-	p->nr = 0;
-	return -ENOMEM;
+	return err;
 }
 
 static bool ports_match(const struct gwp_acl_ports *p, uint16_t port)
