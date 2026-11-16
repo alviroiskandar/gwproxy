@@ -4,7 +4,7 @@
  *
  * Unit tests for the upstream handshake failure classes (upstream.h): every
  * way a handshake can end, and whose fault it is. Also the host an upstream
- * URL names, as TLS checks it.
+ * URL names, as TLS checks it, and the host names it may give.
  */
 #ifdef NDEBUG
 #undef NDEBUG
@@ -194,6 +194,104 @@ static void test_url_host(void)
 	BAD_HOST("abcdefghijklmnop:1");
 }
 
+static void check_name(const char *in, bool want_ok, const char *want,
+		       bool want_v4, int line)
+{
+	struct in_addr a4 = { 0 };
+	char host[300], ip[INET_ADDRSTRLEN] = "";
+	bool ok, is_v4 = !want_v4;
+
+	assert(strlen(in) < sizeof(host));
+	strcpy(host, in);
+	ok = gwp_upstream_name_ok(host, &a4, &is_v4);
+	if (ok && is_v4)
+		assert(inet_ntop(AF_INET, &a4, ip, sizeof(ip)));
+	if (ok != want_ok ||
+	    (ok && (is_v4 != want_v4 || strcmp(is_v4 ? ip : host, want)))) {
+		fprintf(stderr, "line %d: '%s': got %d '%s' v4=%d, want %d '%s' v4=%d\n",
+			line, in, ok, is_v4 ? ip : host, is_v4, want_ok,
+			want ? want : "", want_v4);
+		assert(0);
+	}
+	nr_checks++;
+}
+
+#define NAME(in, out)	check_name((in), true, (out), false, __LINE__)
+#define V4(in, out)	check_name((in), true, (out), true, __LINE__)
+#define BAD_NAME(in)	check_name((in), false, NULL, false, __LINE__)
+
+/* Fill @buf with @n labels of @len 'a's, dot-separated, and @tail after. */
+static char *labels(char *buf, int n, int len, const char *tail)
+{
+	char *p = buf;
+	int i;
+
+	for (i = 0; i < n; i++) {
+		if (i)
+			*p++ = '.';
+		memset(p, 'a', (size_t)len);
+		p += len;
+	}
+	strcpy(p, tail);
+	return buf;
+}
+
+/*
+ * The host names an upstream URL may give: what can resolve as a DNS name,
+ * with no '-' at either end of a label, or an IPv4 address in a form
+ * inet_aton() reads.
+ */
+static void test_name(void)
+{
+	char a[300], b[300];
+
+	NAME("proxy.example", "proxy.example");
+	NAME("localhost.", "localhost");
+	NAME("a", "a");
+	NAME("a-b.c_d.E9", "a-b.c_d.E9");
+	NAME("_srv.example", "_srv.example");
+	NAME("0x7f.1", "0x7f.1");
+	NAME("1.2.3.4a", "1.2.3.4a");
+	V4("127.1", "127.0.0.1");
+	V4("10.0.0.1", "10.0.0.1");
+	V4("10.0.0.1.", "10.0.0.1");
+	V4("2130706433", "127.0.0.1");
+
+	BAD_NAME("");
+	BAD_NAME(".");
+	BAD_NAME("..");
+	BAD_NAME("a..b");
+	BAD_NAME(".a");
+	BAD_NAME("a.b..");
+	BAD_NAME("-");
+	BAD_NAME("-a.example");
+	BAD_NAME("a-.example");
+	BAD_NAME("a.-b");
+	BAD_NAME("a.b-");
+	BAD_NAME("a b");
+	BAD_NAME("a:1");
+	BAD_NAME("999.999.1.1");
+	BAD_NAME("1.2.3.4.5");
+
+	/* A label of 63 characters, but not 64. */
+	NAME(labels(a, 1, 63, ".example"), labels(b, 1, 63, ".example"));
+	BAD_NAME(labels(a, 1, 64, ".example"));
+	BAD_NAME(labels(a, 2, 64, ""));
+	/* 253 characters (and a root dot), but not 254. */
+	NAME(labels(a, 4, 62, ".a"), labels(b, 4, 62, ".a"));
+	assert(strlen(a) == 253);
+	NAME(labels(a, 4, 62, ".a."), labels(b, 4, 62, ".a"));
+	BAD_NAME(labels(a, 4, 62, ".ab"));
+	BAD_NAME(labels(a, 4, 62, ".ab."));
+
+	/* Without @ldh, a '-' may start or end a label. */
+	assert(gwp_dns_name_ok("-a-.b-", 6, false));
+	assert(!gwp_dns_name_ok("-a-.b-", 6, true));
+	assert(!gwp_dns_name_ok("a..b", 4, false));
+	assert(gwp_dns_name_ok("ab", 1, true));
+	nr_checks += 4;
+}
+
 static void check_scheme(const char *url, const char *prefix, int type,
 			 bool remote_dns, bool use_tls, uint16_t def_port)
 {
@@ -288,6 +386,7 @@ int main(void)
 	test_http();
 	test_str();
 	test_url_host();
+	test_name();
 	test_scheme();
 	test_split_creds();
 	printf("upstream: %u checks passed\n", nr_checks);

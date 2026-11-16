@@ -3717,84 +3717,26 @@ static void gwp_ctx_free_prot(struct gwp_ctx *ctx)
 }
 
 /*
- * Whether the first @n characters of @host, any trailing root dot already
- * left out of @n, spell a DNS name: 1 to 253 characters in non-empty labels
- * of letters, digits, '-' and '_', separated by dots. With @ldh, no label
- * may start or end with a '-' either. Both the upstream proxy's host and a
- * client-requested one are checked by it, each with its own rule for '-'.
- */
-static bool dns_name_ok(const char *host, size_t n, bool ldh)
-{
-	size_t label = 0, i;
-	char c, prev = '.';
-
-	/*
-	 * At most 253 characters, 254 with the root's dot: on the wire a name
-	 * takes a length byte per label and the root's zero, two more than its
-	 * text without that dot, and may not exceed 255 octets (RFC 1035
-	 * 2.3.4). A longer one can never resolve, so it is malformed, whichever
-	 * resolver would look it up.
-	 */
-	if (!n || n > 253)
-		return false;
-
-	for (i = 0; i < n; i++) {
-		c = host[i];
-		if (c == '.') {
-			if (!label || (ldh && prev == '-'))
-				return false;
-			label = 0;
-		} else if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-			   (c >= '0' && c <= '9') || c == '_' ||
-			   (c == '-' && (label || !ldh))) {
-			label++;
-		} else {
-			return false;
-		}
-		/*
-		 * A label's length byte leaves room for 63 octets (RFC 1035
-		 * 2.3.4): a longer one can never resolve either.
-		 */
-		if (label > 63)
-			return false;
-		prev = c;
-	}
-
-	return label && !(ldh && prev == '-');
-}
-
-/*
  * Is the host of @up, as its URL names it, worth resolving? An address literal
- * is (gwp_upstream_url_host() has set @host_is_ip), and so is a DNS name:
- * labels of 1 to 63 letters, digits, '-' and '_', none at either end of a
- * label with a '-', and one trailing dot, which is dropped. A name of digits
- * and dots only is an IPv4 address in one of the forms inet_aton() takes
- * ("127.1" too, which resolved before this check), and is then rewritten
- * in the usual dotted form; one that does not parse, such as "999.999.1.1",
- * is refused, where a resolver would look it up as a name.
+ * is (gwp_upstream_url_host() has set @host_is_ip), and so is what
+ * gwp_upstream_name_ok() takes; an IPv4 address in another form than the
+ * usual dotted one ("127.1") is then rewritten in that form.
  */
 static bool upstream_host_ok(struct gwp_upstream *up)
 {
-	char *host = up->host;
-	size_t n = strlen(host);
 	struct in_addr a4;
+	bool is_v4;
 
 	if (up->host_is_ip)
 		return true;
-	if (n > 1 && host[n - 1] == '.')
-		host[--n] = '\0';
-	if (!n || n > 253)
+	if (!gwp_upstream_name_ok(up->host, &a4, &is_v4))
 		return false;
-
-	if (strspn(host, "0123456789.") == n) {
-		if (!inet_aton(host, &a4) ||
-		    !inet_ntop(AF_INET, &a4, host, sizeof(up->host)))
+	if (is_v4) {
+		if (!inet_ntop(AF_INET, &a4, up->host, sizeof(up->host)))
 			return false;
 		up->host_is_ip = true;
-		return true;
 	}
-
-	return dns_name_ok(host, n, true);
+	return true;
 }
 
 /*
@@ -5921,7 +5863,7 @@ static bool req_host_valid(const char *host)
 	/* The root's dot may end the name; it is not part of a label. */
 	if (n && host[n - 1] == '.')
 		n--;
-	return dns_name_ok(host, n, false);
+	return gwp_dns_name_ok(host, n, false);
 }
 
 int gwp_socks5_addr_str(const struct gwp_socks5_addr *a, const char *pfx,

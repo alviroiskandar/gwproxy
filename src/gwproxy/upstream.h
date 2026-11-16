@@ -10,9 +10,11 @@
  * against the upstream's health.
  *
  * Also how an upstream URL is written: its schemes (gwp_upstream_scheme()),
- * its credentials (gwp_upstream_split_creds()) and how it names its host, for
- * TLS (gwp_upstream_url_host()). The --upstream-proxy parser and the ACL's
- * check of a pool server's URL share these, so they take the same URLs.
+ * its credentials (gwp_upstream_split_creds()), how it names its host, for
+ * TLS (gwp_upstream_url_host()), and which host names it may give
+ * (gwp_upstream_name_ok(), with gwp_dns_name_ok() for any DNS name). The
+ * --upstream-proxy parser and the ACL's check of a pool server's URL share
+ * these, so they take the same URLs.
  *
  * Self-contained (libc only) so it can be unit-tested alone.
  */
@@ -312,6 +314,85 @@ static inline int gwp_upstream_url_host(const char *hostport, char *out,
 	*is_ip = inet_pton(AF_INET, out, addr) == 1 ||
 		 inet_pton(AF_INET6, out, addr) == 1;
 	return 0;
+}
+
+/*
+ * Whether the first @n characters of @host, any trailing root dot already
+ * left out of @n, spell a DNS name: 1 to 253 characters in non-empty labels
+ * of letters, digits, '-' and '_', separated by dots. With @ldh, no label
+ * may start or end with a '-' either. Both the upstream proxy's host and a
+ * client-requested one are checked by it, each with its own rule for '-'.
+ */
+static inline bool gwp_dns_name_ok(const char *host, size_t n, bool ldh)
+{
+	size_t label = 0, i;
+	char c, prev = '.';
+
+	/*
+	 * At most 253 characters, 254 with the root's dot: on the wire a name
+	 * takes a length byte per label and the root's zero, two more than its
+	 * text without that dot, and may not exceed 255 octets (RFC 1035
+	 * 2.3.4). A longer one can never resolve, so it is malformed, whichever
+	 * resolver would look it up.
+	 */
+	if (!n || n > 253)
+		return false;
+
+	for (i = 0; i < n; i++) {
+		c = host[i];
+		if (c == '.') {
+			if (!label || (ldh && prev == '-'))
+				return false;
+			label = 0;
+		} else if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			   (c >= '0' && c <= '9') || c == '_' ||
+			   (c == '-' && (label || !ldh))) {
+			label++;
+		} else {
+			return false;
+		}
+		/*
+		 * A label's length byte leaves room for 63 octets (RFC 1035
+		 * 2.3.4): a longer one can never resolve either.
+		 */
+		if (label > 63)
+			return false;
+		prev = c;
+	}
+
+	return label && !(ldh && prev == '-');
+}
+
+/*
+ * Whether @host, an upstream URL's host as gwp_upstream_url_host() copies it
+ * out, is worth resolving when it is no address literal: a DNS name of labels
+ * of 1 to 63 letters, digits, '-' and '_', none at either end of a label with
+ * a '-', and one trailing dot, which is dropped from @host. A name of digits
+ * and dots only is an IPv4 address in one of the forms inet_aton() takes
+ * ("127.1" too), which is stored in *@a4, with *@is_v4 set; one that does
+ * not parse, such as "999.999.1.1", is refused, where a resolver would look
+ * it up as a name. --upstream-proxy and the ACL's pool servers share it, so
+ * an ACL file cannot load a server that its connections would refuse.
+ */
+static inline bool gwp_upstream_name_ok(char *host, struct in_addr *a4,
+					bool *is_v4)
+{
+	size_t n = strlen(host);
+
+	*is_v4 = false;
+	if (n > 1 && host[n - 1] == '.')
+		host[--n] = '\0';
+	if (!n || n > 253)
+		return false;
+
+	if (strspn(host, "0123456789.") == n) {
+		if (!inet_aton(host, a4))
+			return false;
+		*is_v4 = true;
+		return true;
+	}
+
+	return gwp_dns_name_ok(host, n, true);
 }
 
 #endif /* GWP_UPSTREAM_H */
