@@ -931,7 +931,7 @@ static int gwp_ctx_init_thread_sock(struct gwp_wrk *w,
 			(ctx->ev_used == GWP_EV_EPOLL ? SOCK_NONBLOCK : 0);
 	struct gwp_cfg *cfg = &w->ctx->cfg;
 	socklen_t slen;
-	int fd, r, v;
+	int fd, r;
 
 	r = ba->sa.sa_family;
 	if (r == AF_INET) {
@@ -949,9 +949,8 @@ static int gwp_ctx_init_thread_sock(struct gwp_wrk *w,
 		return fd;
 	}
 
-	v = 1;
-	__sys_setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &v, sizeof(v));
-	__sys_setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &v, sizeof(v));
+	setskopt_int(fd, SOL_SOCKET, SO_REUSEADDR, 1);
+	setskopt_int(fd, SOL_SOCKET, SO_REUSEPORT, 1);
 
 	/*
 	 * The client-side TCP options. An accepted socket inherits
@@ -4830,8 +4829,8 @@ static int gwp_ctx_init(struct gwp_ctx *ctx)
 		int tfd = __sys_socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
 
 		if (tfd >= 0) {
-			r = __sys_setsockopt(tfd, SOL_SOCKET, SO_MARK,
-					     &ctx->cfg.mark, sizeof(ctx->cfg.mark));
+			r = setskopt_int(tfd, SOL_SOCKET, SO_MARK,
+					 (int)ctx->cfg.mark);
 			__sys_close(tfd);
 			if (r) {
 				pr_err(&ctx->lh, "Cannot set --mark=%u (SO_MARK): %s (CAP_NET_ADMIN or CAP_NET_RAW required)",
