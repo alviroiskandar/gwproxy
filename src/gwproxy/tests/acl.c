@@ -63,6 +63,31 @@ static struct gwp_sockaddr sa4mapped(const char *ip, uint16_t port)
 	return s;
 }
 
+/*
+ * @s, read as an address of @family, is @ip, with the port @port unless @port
+ * is negative. Checking the family field itself is left to the caller.
+ */
+static void assert_addr(const struct gwp_sockaddr *s, int family,
+			const char *ip, int port)
+{
+	char got[INET6_ADDRSTRLEN];
+	uint16_t p;
+
+	if (family == AF_INET6) {
+		assert(inet_ntop(AF_INET6, &s->i6.sin6_addr, got, sizeof(got)));
+		p = ntohs(s->i6.sin6_port);
+	} else {
+		assert(family == AF_INET);
+		assert(inet_ntop(AF_INET, &s->i4.sin_addr, got, sizeof(got)));
+		p = ntohs(s->i4.sin_port);
+	}
+	if (strcmp(got, ip) || (port >= 0 && p != port)) {
+		fprintf(stderr, "got %s:%u, want %s:%d\n", got,
+			(unsigned int)p, ip, port);
+		assert(0);
+	}
+}
+
 static enum gwp_acl_verdict out(struct gwp_acl *a, struct gwp_sockaddr *t,
 				const char *dom, uint16_t dport,
 				enum gwp_acl_proto p)
@@ -439,7 +464,6 @@ static noinline void test_mark(void)
 static noinline void test_bind(void)
 {
 	struct gwp_acl_req req;
-	char ip[64];
 
 	/* BIND records a source address (with port) and interface, and keeps
 	 * matching (composable modifier). */
@@ -449,8 +473,7 @@ static noinline void test_bind(void)
 	assert(req.bind.set && req.bind.have_src);
 	assert(!strcmp(req.bind.iface, "wg0"));
 	assert(req.bind.src.i4.sin_family == AF_INET);
-	assert(inet_ntop(AF_INET, &req.bind.src.i4.sin_addr, ip, sizeof(ip)));
-	assert(!strcmp(ip, "10.0.0.2") && ntohs(req.bind.src.i4.sin_port) == 5000);
+	assert_addr(&req.bind.src, AF_INET, "10.0.0.2", 5000);
 
 	/* Interface-only bind. */
 	req = eval_rules("-A OUTPUT -j BIND --to-iface eth1\n-P OUTPUT ACCEPT\n",
@@ -490,42 +513,36 @@ static noinline void test_bind(void)
 static noinline void test_dnat(void)
 {
 	struct gwp_acl_req req;
-	char ip[64];
 
 	/* Rewrite both address and port. */
 	req = eval_rules("-A OUTPUT -d 1.2.3.4 -j DNAT --to 5.6.7.8:9999\n",
 			 "1.2.3.4", 80, GWP_ACL_ACCEPT);
 	assert(req.dnat_applied && req.dnat.i4.sin_family == AF_INET);
-	assert(inet_ntop(AF_INET, &req.dnat.i4.sin_addr, ip, sizeof(ip)));
-	assert(!strcmp(ip, "5.6.7.8") && ntohs(req.dnat.i4.sin_port) == 9999);
+	assert_addr(&req.dnat, AF_INET, "5.6.7.8", 9999);
 
 	/* Address only: port carried over from the target. */
 	req = eval_rules("-A OUTPUT -d 1.2.3.4 -j DNAT --to 5.6.7.8\n",
 			 "1.2.3.4", 80, GWP_ACL_ACCEPT);
 	assert(req.dnat_applied);
-	assert(inet_ntop(AF_INET, &req.dnat.i4.sin_addr, ip, sizeof(ip)));
-	assert(!strcmp(ip, "5.6.7.8") && ntohs(req.dnat.i4.sin_port) == 80);
+	assert_addr(&req.dnat, AF_INET, "5.6.7.8", 80);
 
 	/* Port only: address carried over from the target. */
 	req = eval_rules("-A OUTPUT -d 1.2.3.4 -j DNAT --to :4444\n",
 			 "1.2.3.4", 80, GWP_ACL_ACCEPT);
 	assert(req.dnat_applied);
-	assert(inet_ntop(AF_INET, &req.dnat.i4.sin_addr, ip, sizeof(ip)));
-	assert(!strcmp(ip, "1.2.3.4") && ntohs(req.dnat.i4.sin_port) == 4444);
+	assert_addr(&req.dnat, AF_INET, "1.2.3.4", 4444);
 
 	/* Port only on an IPv6 target: address preserved, family stays v6. */
 	req = eval_rules("-A OUTPUT -d 2001:db8::1 -j DNAT --to :4444\n",
 			 "2001:db8::1", 443, GWP_ACL_ACCEPT);
 	assert(req.dnat_applied && req.dnat.i6.sin6_family == AF_INET6);
-	assert(inet_ntop(AF_INET6, &req.dnat.i6.sin6_addr, ip, sizeof(ip)));
-	assert(!strcmp(ip, "2001:db8::1") && ntohs(req.dnat.i6.sin6_port) == 4444);
+	assert_addr(&req.dnat, AF_INET6, "2001:db8::1", 4444);
 
 	/* IPv6 address+port rewrite via bracket form. */
 	req = eval_rules("-A OUTPUT -d 1.2.3.4 -j DNAT --to [2001:db8::2]:5555\n",
 			 "1.2.3.4", 80, GWP_ACL_ACCEPT);
 	assert(req.dnat_applied && req.dnat.i6.sin6_family == AF_INET6);
-	assert(inet_ntop(AF_INET6, &req.dnat.i6.sin6_addr, ip, sizeof(ip)));
-	assert(!strcmp(ip, "2001:db8::2") && ntohs(req.dnat.i6.sin6_port) == 5555);
+	assert_addr(&req.dnat, AF_INET6, "2001:db8::2", 5555);
 
 	/* A non-matching target is not rewritten. */
 	req = eval_rules("-A OUTPUT -d 1.2.3.4 -j DNAT --to :4444\n"
@@ -540,8 +557,7 @@ static noinline void test_dnat(void)
 			 "-A OUTPUT -d 1.2.3.4 -j REJECT\n"
 			 "-P OUTPUT REJECT\n", "1.2.3.4", 80, GWP_ACL_ACCEPT);
 	assert(req.dnat_applied);
-	assert(inet_ntop(AF_INET, &req.dnat.i4.sin_addr, ip, sizeof(ip)));
-	assert(!strcmp(ip, "5.6.7.8"));
+	assert_addr(&req.dnat, AF_INET, "5.6.7.8", -1);
 
 	/*
 	 * A domain-only request (no resolved IP, as with a socks5h upstream) can
@@ -560,8 +576,7 @@ static noinline void test_dnat(void)
 		q.proto = GWP_ACL_PROTO_TCP;
 		assert(gwp_acl_eval_output(a, &q) == GWP_ACL_ACCEPT);
 		assert(q.dnat_applied && q.dnat.i4.sin_family == AF_INET);
-		assert(inet_ntop(AF_INET, &q.dnat.i4.sin_addr, ip, sizeof(ip)));
-		assert(!strcmp(ip, "10.1.2.3") && ntohs(q.dnat.i4.sin_port) == 8443);
+		assert_addr(&q.dnat, AF_INET, "10.1.2.3", 8443);
 		gwp_acl_destroy(a);
 	}
 }
