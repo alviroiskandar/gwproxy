@@ -4,14 +4,16 @@
 # proxy has looked at its connect's result, for t/0223. The connect succeeded:
 # the client must get a success reply and the banner, then an end of stream.
 # For an HTTP forwarding request the "banner" is a whole response, which the
-# client must get as the origin's answer.
+# client must get as the origin's answer; an origin that resets without a word
+# (fwd-rst) has given none, and the client must get a 502.
 #
 # Usage: accept_reset_target.py <mode> <proxy_port> <proxy_pid> \
 #     <target_port> [<rounds>]
 #
 # <mode> is how the client asks for the target: plain (the proxy runs with
-# --target pointing at <target_port>), socks5, http (CONNECT) or fwd (an HTTP
-# GET in absolute form).
+# --target pointing at <target_port>), socks5, http (CONNECT), fwd (an HTTP
+# GET in absolute form) or fwd-rst (the same GET, to an origin that sends
+# nothing before its reset).
 #
 # To have the proxy see the result only after the reset, whatever the timing:
 # the target's accept queue is kept full (listen(0) and a connection that is
@@ -84,7 +86,7 @@ def one(mode, pport, pid, ls, tport):
             raise RuntimeError("SOCKS5 greeting refused")
         c.sendall(b"\x05\x01\x00\x01" + socket.inet_aton("127.0.0.1") +
                   struct.pack("!H", tport))
-    elif mode == "fwd":
+    elif mode.startswith("fwd"):
         c.sendall(b"GET http://127.0.0.1:%d/ HTTP/1.1\r\nHost: x\r\n\r\n" %
                   tport)
     elif mode == "http":
@@ -102,7 +104,10 @@ def one(mode, pport, pid, ls, tport):
         f.close()
         filler.close()
         t, _ = ls.accept()	# the retransmitted SYN, a second later
-        t.sendall(RESPONSE if mode == "fwd" else BANNER)
+        if mode == "fwd":
+            t.sendall(RESPONSE)
+        elif mode != "fwd-rst":
+            t.sendall(BANNER)
         t.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
                      struct.pack("ii", 1, 0))
         t.close()
@@ -134,6 +139,11 @@ def one(mode, pport, pid, ls, tport):
                 not got.endswith(b"\r\n\r\nbusy") or how == "timeout"):
             errors.append("fwd: got %r, then %s, not the origin's 503" %
                           (got, how))
+        return
+    if mode == "fwd-rst":
+        if not got.startswith(b"HTTP/1.1 502 ") or how == "timeout":
+            errors.append("fwd-rst: got %r, then %s, not a 502" %
+                          (got[:40], how))
         return
     if got != BANNER or how == "timeout":
         errors.append("%s: got %r, then %s, not the banner and an end" %
