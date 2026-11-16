@@ -3053,6 +3053,27 @@ static int cidr_tab_init(struct acl_cidr_tab *t, uint32_t nr)
 	return 0;
 }
 
+/*
+ * The slot of @t that holds the prefix @key/@bits, or else the free slot
+ * where it would go. Adding and finding share this probe, so that they
+ * cannot disagree on where a prefix lives.
+ */
+static inline uint32_t cidr_tab_slot(const struct acl_cidr_tab *t,
+				     uint64_t seed, const uint8_t key[16],
+				     uint8_t bits, bool is_v4)
+{
+	uint32_t i = (uint32_t)cidr_hash(seed, key, bits, is_v4) & t->mask;
+
+	for (; t->v[i].pos != ACL_NO_POS; i = (i + 1) & t->mask) {
+		const struct acl_cidr_ent *e = &t->v[i];
+
+		if (e->bits == bits && e->is_v4 == is_v4 &&
+		    !memcmp(e->addr, key, 16))
+			break;
+	}
+	return i;
+}
+
 static void cidr_tab_add(struct acl_cidr_tab *t, uint64_t seed,
 			 const struct gwp_acl_cidr *c, uint32_t pos)
 {
@@ -3068,15 +3089,10 @@ static void cidr_tab_add(struct acl_cidr_tab *t, uint64_t seed,
 		lens[(*nr_len)++] = c->bits;
 
 	/* c->addr is already masked by parse_cidr(). */
-	i = (uint32_t)cidr_hash(seed, c->addr, c->bits, c->is_v4) & t->mask;
-	for (; t->v[i].pos != ACL_NO_POS; i = (i + 1) & t->mask) {
-		struct acl_cidr_ent *e = &t->v[i];
-
-		/* An earlier rule with the same prefix shadows this one. */
-		if (e->bits == c->bits && e->is_v4 == c->is_v4 &&
-		    !memcmp(e->addr, c->addr, 16))
-			return;
-	}
+	i = cidr_tab_slot(t, seed, c->addr, c->bits, c->is_v4);
+	/* An earlier rule with the same prefix shadows this one. */
+	if (t->v[i].pos != ACL_NO_POS)
+		return;
 	memcpy(t->v[i].addr, c->addr, 16);
 	t->v[i].bits = c->bits;
 	t->v[i].is_v4 = c->is_v4;
@@ -3097,20 +3113,13 @@ static uint32_t cidr_tab_find(const struct acl_cidr_tab *t, uint64_t seed,
 	nr_len = is_v4 ? t->nr_len4 : t->nr_len6;
 	for (k = 0; k < nr_len; k++) {
 		uint8_t key[16];
-		uint32_t i;
+		uint32_t pos;
 
 		cidr_key(key, ip, is_v4, lens[k]);
-		i = (uint32_t)cidr_hash(seed, key, lens[k], is_v4) & t->mask;
-		for (; t->v[i].pos != ACL_NO_POS; i = (i + 1) & t->mask) {
-			const struct acl_cidr_ent *e = &t->v[i];
-
-			if (e->bits == lens[k] && e->is_v4 == is_v4 &&
-			    !memcmp(e->addr, key, 16)) {
-				if (e->pos < best)
-					best = e->pos;
-				break;
-			}
-		}
+		/* A free slot holds ACL_NO_POS, which never lowers @best. */
+		pos = t->v[cidr_tab_slot(t, seed, key, lens[k], is_v4)].pos;
+		if (pos < best)
+			best = pos;
 	}
 	return best;
 }
@@ -3131,17 +3140,28 @@ static int dom_tab_init(struct acl_dom_tab *t, uint32_t nr)
 	return 0;
 }
 
+/* The same as cidr_tab_slot() for the domain @str of hash @h. */
+static inline uint32_t dom_tab_slot(const struct acl_dom_tab *t, uint64_t h,
+				    const char *str)
+{
+	uint32_t i = (uint32_t)h & t->mask;
+
+	for (; t->v[i].pos != ACL_NO_POS; i = (i + 1) & t->mask) {
+		if (t->v[i].hash == h && !ascii_casecmp(t->v[i].str, str))
+			break;
+	}
+	return i;
+}
+
 static void dom_tab_add(struct acl_dom_tab *t, uint64_t seed, const char *str,
 			uint32_t pos)
 {
 	uint64_t h = dom_hash(seed, str);
-	uint32_t i = (uint32_t)h & t->mask;
+	uint32_t i = dom_tab_slot(t, h, str);
 
-	for (; t->v[i].pos != ACL_NO_POS; i = (i + 1) & t->mask) {
-		/* An earlier rule with the same domain shadows this one. */
-		if (t->v[i].hash == h && !ascii_casecmp(t->v[i].str, str))
-			return;
-	}
+	/* An earlier rule with the same domain shadows this one. */
+	if (t->v[i].pos != ACL_NO_POS)
+		return;
 	t->v[i].str = str;
 	t->v[i].hash = h;
 	t->v[i].pos = pos;
@@ -3150,14 +3170,8 @@ static void dom_tab_add(struct acl_dom_tab *t, uint64_t seed, const char *str,
 static uint32_t dom_tab_find(const struct acl_dom_tab *t, uint64_t seed,
 			     const char *str)
 {
-	uint64_t h = dom_hash(seed, str);
-	uint32_t i = (uint32_t)h & t->mask;
-
-	for (; t->v[i].pos != ACL_NO_POS; i = (i + 1) & t->mask) {
-		if (t->v[i].hash == h && !ascii_casecmp(t->v[i].str, str))
-			return t->v[i].pos;
-	}
-	return ACL_NO_POS;
+	/* A free slot holds ACL_NO_POS: not found. */
+	return t->v[dom_tab_slot(t, dom_hash(seed, str), str)].pos;
 }
 
 /*
