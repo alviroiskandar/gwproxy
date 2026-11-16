@@ -5609,6 +5609,31 @@ static int socks5_translate_err(int err)
 	}
 }
 
+/*
+ * Fill @a (SOCKS5 address form) from an AF_INET or AF_INET6 sockaddr, as is: a
+ * v4-mapped address stays IPv6, and @a is not cleared first. Inline: the UDP
+ * relay converts one reply source per datagram. Returns 0, or -EAFNOSUPPORT
+ * for another family, leaving @a untouched.
+ */
+static inline int socks5_addr_from_sockaddr(const struct gwp_sockaddr *sa,
+					    struct gwp_socks5_addr *a)
+{
+	switch (sa->sa.sa_family) {
+	case AF_INET:
+		a->ver = GWP_SOCKS5_ATYP_IPV4;
+		memcpy(a->ip4, &sa->i4.sin_addr, 4);
+		a->port = sa->i4.sin_port;
+		return 0;
+	case AF_INET6:
+		a->ver = GWP_SOCKS5_ATYP_IPV6;
+		memcpy(a->ip6, &sa->i6.sin6_addr, 16);
+		a->port = sa->i6.sin6_port;
+		return 0;
+	default:
+		return -EAFNOSUPPORT;
+	}
+}
+
 static int get_local_addr_for_socks5(struct gwp_ctx *ctx, int fd,
 				     struct gwp_socks5_addr *ba)
 {
@@ -5622,22 +5647,12 @@ static int get_local_addr_for_socks5(struct gwp_ctx *ctx, int fd,
 		return r;
 	}
 
-	switch (t.sa.sa_family) {
-	case AF_INET:
-		ba->ver = GWP_SOCKS5_ATYP_IPV4;
-		memcpy(&ba->ip4, &t.i4.sin_addr, 4);
-		ba->port = t.i4.sin_port;
-		return 0;
-	case AF_INET6:
-		ba->ver = GWP_SOCKS5_ATYP_IPV6;
-		memcpy(&ba->ip6, &t.i6.sin6_addr, 16);
-		ba->port = t.i6.sin6_port;
-		return 0;
-	default:
+	/* Not unmapped: BND.ADDR is the local address as the socket has it. */
+	r = socks5_addr_from_sockaddr(&t, ba);
+	if (r)
 		pr_err(&ctx->lh, "Unsupported address family %d for local socket",
 			t.sa.sa_family);
-		return -EAFNOSUPPORT;
-	}
+	return r;
 }
 
 /*
@@ -5649,20 +5664,19 @@ int gwp_socks5_build_connect_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				   int err, void *out, size_t *out_len)
 {
 	struct gwp_socks5_conn *sc = gcp->s5_conn;
-	struct gwp_socks5_addr ba;
+	struct gwp_socks5_addr ba, *bap = NULL;
 	int r;
 
+	/* A failure reply carries the all-zero IPv4 address (NULL). */
 	if (err == 0) {
 		r = get_local_addr_for_socks5(w->ctx, gcp->target.fd, &ba);
 		if (unlikely(r))
 			return r;
-	} else {
-		memset(&ba, 0, sizeof(ba));
-		ba.ver = GWP_SOCKS5_ATYP_IPV4;
+		bap = &ba;
 	}
 
 	err = socks5_translate_err(err);
-	return gwp_socks5_conn_cmd_connect_res(sc, &ba, err, out, out_len);
+	return gwp_socks5_conn_cmd_connect_res(sc, bap, err, out, out_len);
 }
 
 __hot
@@ -5838,20 +5852,7 @@ static int upstream_dst_from_sockaddr(const struct gwp_sockaddr *sa,
 				      struct gwp_socks5_addr *out)
 {
 	memset(out, 0, sizeof(*out));
-	switch (sa->sa.sa_family) {
-	case AF_INET:
-		out->ver = GWP_SOCKS5_ATYP_IPV4;
-		memcpy(out->ip4, &sa->i4.sin_addr, 4);
-		out->port = sa->i4.sin_port;
-		return 0;
-	case AF_INET6:
-		out->ver = GWP_SOCKS5_ATYP_IPV6;
-		memcpy(out->ip6, &sa->i6.sin6_addr, 16);
-		out->port = sa->i6.sin6_port;
-		return 0;
-	default:
-		return -EAFNOSUPPORT;
-	}
+	return socks5_addr_from_sockaddr(sa, out);
 }
 
 /*
@@ -7090,14 +7091,14 @@ enum gwp_udp_act gwp_udp_relay_classify(struct gwp_wrk *w,
 	} else {
 		/* Target -> client: prepend a header in the front slack. */
 		struct gwp_socks5_addr sa;
-		size_t h, hlen;
+		size_t hlen;
+		int h;
 
 		if (!udp_reply_allowed(w->ctx, gcp, src))
 			return GWP_UDP_DROP;	/* not a target of this client */
 		gwp_socks5_reply_addr_from_sockaddr(src, &sa);
-		h = (sa.ver == GWP_SOCKS5_ATYP_IPV4) ? 3 + 1 + 4 + 2
-						     : 3 + 1 + 16 + 2;
-		if (gwp_socks5_udp_build_hdr(&sa, base - h, h, &hlen))
+		h = gwp_socks5_udp_hdr_len(&sa);
+		if (h < 0 || gwp_socks5_udp_build_hdr(&sa, base - h, h, &hlen))
 			return GWP_UDP_DROP;
 		return udp_out_to_client(gcp, out, base - h, h + n);
 	}
@@ -7149,21 +7150,14 @@ int gwp_socks5_addr_to_sockaddr(const struct gwp_socks5_addr *a, int family,
 void gwp_socks5_reply_addr_from_sockaddr(const struct gwp_sockaddr *src,
 					 struct gwp_socks5_addr *a)
 {
-	if (src->sa.sa_family == AF_INET) {
-		a->ver = GWP_SOCKS5_ATYP_IPV4;
-		memcpy(a->ip4, &src->i4.sin_addr, 4);
-		a->port = src->i4.sin_port;
-		return;
-	}
-	if (IN6_IS_ADDR_V4MAPPED(&src->i6.sin6_addr)) {
+	if (src->sa.sa_family == AF_INET6 &&
+	    IN6_IS_ADDR_V4MAPPED(&src->i6.sin6_addr)) {
 		a->ver = GWP_SOCKS5_ATYP_IPV4;
 		memcpy(a->ip4, &src->i6.sin6_addr.s6_addr[12], 4);
 		a->port = src->i6.sin6_port;
 		return;
 	}
-	a->ver = GWP_SOCKS5_ATYP_IPV6;
-	memcpy(a->ip6, &src->i6.sin6_addr, 16);
-	a->port = src->i6.sin6_port;
+	socks5_addr_from_sockaddr(src, a);
 }
 
 /*

@@ -353,18 +353,17 @@ static int handle_state_auth_userpass(struct data_arg *d)
 	return 0;
 }
 
+static inline int socks5_put_hdr(uint8_t *b, uint8_t code,
+				 const struct gwp_socks5_addr *a);
+
 static int set_err_reply(struct data_arg *d, uint8_t err_code)
 {
 	uint8_t resp[10];
+	int n = socks5_put_hdr(resp, err_code, NULL);
 
-	resp[0] = 0x05; /* VER */
-	resp[1] = err_code; /* REP */
-	resp[2] = 0x00; /* RSV */
-	resp[3] = 0x01; /* ATYP: IPv4 address */
-	memset(&resp[4], 0, 6); /* BND.ADDR + BND.PORT */
 	d->conn->state = GWP_SOCKS5_ST_ERR;
 
-	if (append_out_buf(d, resp, sizeof(resp)))
+	if (append_out_buf(d, resp, (size_t)n))
 		return -ENOBUFS;
 
 	return -EINVAL;
@@ -587,6 +586,61 @@ static int handle_state_cmd(struct data_arg *d)
 }
 
 /*
+ * Decode the ATYP + ADDR + PORT field at @b, with @len bytes there from the
+ * ATYP byte on, into @a, or only check and size it when @a is NULL. The field
+ * is laid out the same in a request (DST), a reply (BND) and a UDP relay
+ * header. @a is written only once the whole field is there, and is not cleared
+ * first: the UDP relay decodes one per datagram. Returns the field's length,
+ * -EAGAIN if incomplete, or -EAFNOSUPPORT for an unknown ATYP.
+ */
+static inline int socks5_addr_decode(const uint8_t *b, size_t len,
+				     struct gwp_socks5_addr *a)
+{
+	uint8_t domlen;
+	size_t need;
+
+	switch (b[0]) {
+	case GWP_SOCKS5_ATYP_IPV4:
+		need = 1 + 4 + 2;
+		if (len < need)
+			return -EAGAIN;
+		if (a) {
+			a->ver = GWP_SOCKS5_ATYP_IPV4;
+			memcpy(a->ip4, &b[1], 4);
+			memcpy(&a->port, &b[5], 2);
+		}
+		return (int)need;
+	case GWP_SOCKS5_ATYP_IPV6:
+		need = 1 + 16 + 2;
+		if (len < need)
+			return -EAGAIN;
+		if (a) {
+			a->ver = GWP_SOCKS5_ATYP_IPV6;
+			memcpy(a->ip6, &b[1], 16);
+			memcpy(&a->port, &b[17], 2);
+		}
+		return (int)need;
+	case GWP_SOCKS5_ATYP_DOMAIN:
+		if (len < 2)
+			return -EAGAIN;
+		domlen = b[1];
+		need = 1 + 1 + domlen + 2;
+		if (len < need)
+			return -EAGAIN;
+		if (a) {
+			a->ver = GWP_SOCKS5_ATYP_DOMAIN;
+			a->domain.len = domlen;
+			memcpy(a->domain.str, &b[2], domlen);
+			a->domain.str[domlen] = '\0';
+			memcpy(&a->port, &b[2 + domlen], 2);
+		}
+		return (int)need;
+	default:
+		return -EAFNOSUPPORT;
+	}
+}
+
+/*
  * Parse the ATYP + ADDR + PORT tail shared by the CONNECT and UDP ASSOCIATE
  * requests into @da, advancing the input buffer past it. @buf points at the
  * ATYP byte's request (index 3). Returns 0, -EAGAIN if incomplete, or a
@@ -594,54 +648,17 @@ static int handle_state_cmd(struct data_arg *d)
  */
 static int parse_request_addr(struct data_arg *d, struct gwp_socks5_addr *da)
 {
-	size_t len = *d->in_len, exp_len;
 	const uint8_t *buf = d->in_buf;
-	uint8_t atyp, domlen = 0;
+	int r;
 
-	exp_len = 4;
-	atyp = buf[3];
-	switch (atyp) {
-	case GWP_SOCKS5_ATYP_IPV4:
-		exp_len += 4 + 2;
-		break;
-	case GWP_SOCKS5_ATYP_IPV6:
-		exp_len += 16 + 2;
-		break;
-	case GWP_SOCKS5_ATYP_DOMAIN:
-		exp_len += 1; /* Length of domain name */
-		if (len < exp_len)
-			return -EAGAIN;
-		domlen = buf[4];
-		exp_len += domlen + 2;
-		break;
-	default:
+	/* The caller has checked that VER + CMD + RSV + ATYP are there. */
+	r = socks5_addr_decode(&buf[3], *d->in_len - 3, da);
+	if (r == -EAFNOSUPPORT)
 		return set_err_reply(d, GWP_SOCKS5_REP_ATYP_NOT_SUPPORTED);
-	}
+	if (r < 0)
+		return r;
 
-	if (len < exp_len)
-		return -EAGAIN;
-
-	switch (atyp) {
-	case GWP_SOCKS5_ATYP_IPV4:
-		da->ver = GWP_SOCKS5_ATYP_IPV4;
-		memcpy(da->ip4, &buf[4], 4);
-		memcpy(&da->port, &buf[8], 2);
-		break;
-	case GWP_SOCKS5_ATYP_IPV6:
-		da->ver = GWP_SOCKS5_ATYP_IPV6;
-		memcpy(da->ip6, &buf[4], 16);
-		memcpy(&da->port, &buf[20], 2);
-		break;
-	case GWP_SOCKS5_ATYP_DOMAIN:
-		da->ver = GWP_SOCKS5_ATYP_DOMAIN;
-		da->domain.len = domlen;
-		memcpy(da->domain.str, &buf[5], domlen);
-		da->domain.str[domlen] = '\0';
-		memcpy(&da->port, &buf[5 + domlen], 2);
-		break;
-	}
-
-	advance_in_buf(d, exp_len);
+	advance_in_buf(d, 3 + (size_t)r);
 	return 0;
 }
 
@@ -749,38 +766,53 @@ out:
 	return r;
 }
 
-static int gwp_socks5_addr_encode(uint8_t *b, const struct gwp_socks5_addr *a);
-
 static int __gwp_socks5_conn_cmd_connect_res(struct data_arg *arg,
 					     const struct gwp_socks5_addr *ba,
 					     uint8_t rep)
 {
-	size_t resp_len = 0;
 	uint8_t resp[1024];
+	int resp_len;
 
 	if (arg->conn->state != GWP_SOCKS5_ST_CMD_CONNECT &&
 	    arg->conn->state != GWP_SOCKS5_ST_CMD_UDP_ASSOCIATE)
 		return -EINVAL;
 
-	resp[0] = 0x05; /* VER */
-	resp[1] = rep; /* REP */
-	resp[2] = 0x00; /* RSV */
-	resp_len = 4;
-	if (ba) {
-		int al = gwp_socks5_addr_encode(&resp[3], ba);
-		if (al < 0)
-			return al;
-		resp_len += al - 1; /* al includes the ATYP byte counted above */
-	} else {
-		resp[3] = GWP_SOCKS5_ATYP_IPV4; /* ATYP: IPv4 address */
-		memset(&resp[4], 0, 6); /* BND.ADDR + BND.PORT */
-		resp_len += 4 + 2;
-	}
+	resp_len = socks5_put_hdr(resp, rep, ba);
+	if (resp_len < 0)
+		return resp_len;
 
-	if (append_out_buf(arg, resp, resp_len))
+	if (append_out_buf(arg, resp, (size_t)resp_len))
 		return -ENOBUFS;
 
 	return 0;
+}
+
+/*
+ * Build the reply to a CONNECT or UDP ASSOCIATE command into @out_buf and move
+ * the connection on: to @ok_state when @rep is a success, else to the error
+ * state. A reply that does not fit leaves the state as it was.
+ */
+static int socks5_cmd_res(struct gwp_socks5_conn *conn,
+			  const struct gwp_socks5_addr *bind_addr, uint8_t rep,
+			  void *out_buf, size_t *out_len, int ok_state)
+{
+	struct data_arg arg = {
+		.ctx = conn->ctx,
+		.conn = conn,
+		.in_buf = NULL,
+		.in_len = NULL,
+		.out_buf = out_buf,
+		.out_len = out_len,
+		.tot_out_len = 0,
+		.tot_advance = 0
+	};
+	int r = __gwp_socks5_conn_cmd_connect_res(&arg, bind_addr, rep);
+	*out_len = arg.tot_out_len;
+
+	if (r != -ENOBUFS)
+		conn->state = (rep == 0x00) ? ok_state : GWP_SOCKS5_ST_ERR;
+
+	return r;
 }
 
 int gwp_socks5_conn_cmd_connect_res(struct gwp_socks5_conn *conn,
@@ -788,24 +820,8 @@ int gwp_socks5_conn_cmd_connect_res(struct gwp_socks5_conn *conn,
 				    uint8_t rep, void *out_buf,
 				    size_t *out_len)
 {
-	struct data_arg arg = {
-		.ctx = conn->ctx,
-		.conn = conn,
-		.in_buf = NULL,
-		.in_len = NULL,
-		.out_buf = out_buf,
-		.out_len = out_len,
-		.tot_out_len = 0,
-		.tot_advance = 0
-	};
-	int r = __gwp_socks5_conn_cmd_connect_res(&arg, bind_addr, rep);
-	*out_len = arg.tot_out_len;
-
-	if (r != -ENOBUFS)
-		conn->state = (rep == 0x00) ? GWP_SOCKS5_ST_FORWARDING
-					    : GWP_SOCKS5_ST_ERR;
-
-	return r;
+	return socks5_cmd_res(conn, bind_addr, rep, out_buf, out_len,
+			      GWP_SOCKS5_ST_FORWARDING);
 }
 
 int gwp_socks5_conn_cmd_udp_associate_res(struct gwp_socks5_conn *conn,
@@ -813,24 +829,8 @@ int gwp_socks5_conn_cmd_udp_associate_res(struct gwp_socks5_conn *conn,
 					  uint8_t rep, void *out_buf,
 					  size_t *out_len)
 {
-	struct data_arg arg = {
-		.ctx = conn->ctx,
-		.conn = conn,
-		.in_buf = NULL,
-		.in_len = NULL,
-		.out_buf = out_buf,
-		.out_len = out_len,
-		.tot_out_len = 0,
-		.tot_advance = 0
-	};
-	int r = __gwp_socks5_conn_cmd_connect_res(&arg, bind_addr, rep);
-	*out_len = arg.tot_out_len;
-
-	if (r != -ENOBUFS)
-		conn->state = (rep == 0x00) ? GWP_SOCKS5_ST_UDP_ASSOCIATED
-					    : GWP_SOCKS5_ST_ERR;
-
-	return r;
+	return socks5_cmd_res(conn, bind_addr, rep, out_buf, out_len,
+			      GWP_SOCKS5_ST_UDP_ASSOCIATED);
 }
 
 /*
@@ -840,20 +840,6 @@ int gwp_socks5_conn_cmd_udp_associate_res(struct gwp_socks5_conn *conn,
  * client CONNECT request builder below. Returns the number of bytes written,
  * or a negative error code.
  */
-static int gwp_socks5_addr_len(const struct gwp_socks5_addr *a)
-{
-	switch (a->ver) {
-	case GWP_SOCKS5_ATYP_IPV4:
-		return 1 + 4 + 2;
-	case GWP_SOCKS5_ATYP_IPV6:
-		return 1 + 16 + 2;
-	case GWP_SOCKS5_ATYP_DOMAIN:
-		return 1 + 1 + a->domain.len + 2;
-	default:
-		return -EINVAL;
-	}
-}
-
 static int gwp_socks5_addr_encode(uint8_t *b, const struct gwp_socks5_addr *a)
 {
 	b[0] = a->ver; /* ATYP */
@@ -874,6 +860,29 @@ static int gwp_socks5_addr_encode(uint8_t *b, const struct gwp_socks5_addr *a)
 	default:
 		return -EINVAL;
 	}
+}
+
+/*
+ * Write VER, @code (REP in a reply, CMD in a request), RSV and the address
+ * field of @a at @b, or the all-zero IPv4 address error replies carry when @a
+ * is NULL. Returns the number of bytes written, or -EINVAL for an unknown ATYP.
+ */
+static inline int socks5_put_hdr(uint8_t *b, uint8_t code,
+				 const struct gwp_socks5_addr *a)
+{
+	int al;
+
+	b[0] = 0x05; /* VER */
+	b[1] = code; /* REP or CMD */
+	b[2] = 0x00; /* RSV */
+	if (!a) {
+		b[3] = GWP_SOCKS5_ATYP_IPV4; /* ATYP: IPv4 address */
+		memset(&b[4], 0, 4 + 2); /* BND.ADDR + BND.PORT */
+		return 3 + 1 + 4 + 2;
+	}
+
+	al = gwp_socks5_addr_encode(&b[3], a);
+	return al < 0 ? al : 3 + al;
 }
 
 int gwp_socks5_cli_build_greeting(bool have_auth, void *buf, size_t *len)
@@ -900,18 +909,29 @@ int gwp_socks5_cli_build_greeting(bool have_auth, void *buf, size_t *len)
 	return 0;
 }
 
-int gwp_socks5_cli_parse_method(const void *buf, size_t len, uint8_t *method)
+/*
+ * Parse a two-byte VER + value reply whose VER must be @ver: the method
+ * selection and the RFC 1929 authentication status share this layout.
+ */
+static inline int cli_parse_ver_byte(const void *buf, size_t len, uint8_t ver,
+				     uint8_t *out)
 {
 	const uint8_t *b = buf;
 
 	if (len < 2)
 		return -EAGAIN;
 
-	if (b[0] != 0x05)
+	if (b[0] != ver)
 		return -EINVAL;
 
-	*method = b[1];
+	*out = b[1];
 	return 0;
+}
+
+int gwp_socks5_cli_parse_method(const void *buf, size_t len, uint8_t *method)
+{
+	/* VER 0x05: the SOCKS version. */
+	return cli_parse_ver_byte(buf, len, 0x05, method);
 }
 
 int gwp_socks5_cli_build_userpass(const char *u, size_t ulen,
@@ -941,16 +961,8 @@ int gwp_socks5_cli_build_userpass(const char *u, size_t ulen,
 
 int gwp_socks5_cli_parse_userpass(const void *buf, size_t len, uint8_t *status)
 {
-	const uint8_t *b = buf;
-
-	if (len < 2)
-		return -EAGAIN;
-
-	if (b[0] != 0x01)
-		return -EINVAL;
-
-	*status = b[1];
-	return 0;
+	/* VER 0x01: the RFC 1929 subnegotiation version. */
+	return cli_parse_ver_byte(buf, len, 0x01, status);
 }
 
 /* Build a request for @cmd (CONNECT, UDP ASSOCIATE) to @dst. */
@@ -971,10 +983,7 @@ static int cli_build_cmd(uint8_t cmd, const struct gwp_socks5_addr *dst,
 		return -ENOBUFS;
 	}
 
-	b[0] = 0x05; /* VER */
-	b[1] = cmd;  /* CMD */
-	b[2] = 0x00; /* RSV */
-	gwp_socks5_addr_encode(&b[3], dst);
+	socks5_put_hdr(b, cmd, dst);
 
 	*len = need;
 	return 0;
@@ -996,57 +1005,27 @@ int gwp_socks5_cli_parse_reply(const void *buf, size_t len, uint8_t *rep,
 				struct gwp_socks5_addr *bnd, size_t *consumed)
 {
 	const uint8_t *b = buf;
-	size_t need = 4; /* VER + REP + RSV + ATYP */
-	size_t alen;
+	int r;
 
-	if (len < need)
+	/* VER + REP + RSV + ATYP */
+	if (len < 4)
 		return -EAGAIN;
 
 	if (b[0] != 0x05)
 		return -EINVAL;
 
-	switch (b[3]) {
-	case GWP_SOCKS5_ATYP_IPV4:
-		alen = 4;
-		break;
-	case GWP_SOCKS5_ATYP_IPV6:
-		alen = 16;
-		break;
-	case GWP_SOCKS5_ATYP_DOMAIN:
-		need += 1;
-		if (len < need)
-			return -EAGAIN;
-		alen = b[4];
-		break;
-	default:
+	r = socks5_addr_decode(&b[3], len - 3, NULL);
+	if (r == -EAFNOSUPPORT)
 		return -EINVAL;
-	}
-
-	need += alen + 2;
-	if (len < need)
-		return -EAGAIN;
+	if (r < 0)
+		return r;
 
 	*rep = b[1];
-	*consumed = need;
-	if (!bnd)
-		return 0;
-
-	memset(bnd, 0, sizeof(*bnd));
-	bnd->ver = b[3];
-	switch (b[3]) {
-	case GWP_SOCKS5_ATYP_IPV4:
-		memcpy(bnd->ip4, &b[4], 4);
-		break;
-	case GWP_SOCKS5_ATYP_IPV6:
-		memcpy(bnd->ip6, &b[4], 16);
-		break;
-	default:
-		bnd->domain.len = (uint8_t)alen;
-		memcpy(bnd->domain.str, &b[5], alen);
-		bnd->domain.str[alen] = '\0';
-		break;
+	*consumed = 3 + (size_t)r;
+	if (bnd) {
+		memset(bnd, 0, sizeof(*bnd));
+		socks5_addr_decode(&b[3], len - 3, bnd);
 	}
-	memcpy(&bnd->port, &b[need - 2], 2);
 	return 0;
 }
 
@@ -1060,8 +1039,7 @@ int gwp_socks5_udp_parse_hdr(const void *buf, size_t len,
 			     struct gwp_socks5_addr *addr, size_t *hdr_len)
 {
 	const uint8_t *b = buf;
-	uint8_t atyp;
-	size_t need;
+	int r;
 
 	/* RSV(2) + FRAG(1) + ATYP(1). */
 	if (len < 4)
@@ -1069,45 +1047,13 @@ int gwp_socks5_udp_parse_hdr(const void *buf, size_t len,
 	if (b[2] != 0x00)
 		return -ENOTSUP;	/* we do not reassemble fragments */
 
-	atyp = b[3];
-	switch (atyp) {
-	case GWP_SOCKS5_ATYP_IPV4:
-		need = 4 + 4 + 2;
-		if (len < need)
-			return -EAGAIN;
-		addr->ver = GWP_SOCKS5_ATYP_IPV4;
-		memcpy(addr->ip4, &b[4], 4);
-		memcpy(&addr->port, &b[8], 2);
-		break;
-	case GWP_SOCKS5_ATYP_IPV6:
-		need = 4 + 16 + 2;
-		if (len < need)
-			return -EAGAIN;
-		addr->ver = GWP_SOCKS5_ATYP_IPV6;
-		memcpy(addr->ip6, &b[4], 16);
-		memcpy(&addr->port, &b[20], 2);
-		break;
-	case GWP_SOCKS5_ATYP_DOMAIN: {
-		uint8_t domlen;
-
-		if (len < 5)
-			return -EAGAIN;
-		domlen = b[4];
-		need = 4 + 1 + domlen + 2;
-		if (len < need)
-			return -EAGAIN;
-		addr->ver = GWP_SOCKS5_ATYP_DOMAIN;
-		addr->domain.len = domlen;
-		memcpy(addr->domain.str, &b[5], domlen);
-		addr->domain.str[domlen] = '\0';
-		memcpy(&addr->port, &b[5 + domlen], 2);
-		break;
-	}
-	default:
+	r = socks5_addr_decode(&b[3], len - 3, addr);
+	if (r == -EAFNOSUPPORT)
 		return -EINVAL;
-	}
+	if (r < 0)
+		return r;
 
-	*hdr_len = need;
+	*hdr_len = 3 + (size_t)r;
 	return 0;
 }
 
@@ -1115,14 +1061,12 @@ int gwp_socks5_udp_build_hdr(const struct gwp_socks5_addr *addr, void *buf,
 			     size_t cap, size_t *hdr_len)
 {
 	uint8_t *b = buf;
-	int al = gwp_socks5_addr_len(addr);
-	size_t total;
+	int total = gwp_socks5_udp_hdr_len(addr);
 
-	if (al < 0)
+	if (total < 0)
 		return -EINVAL;
 
-	total = 3 + (size_t)al;	/* RSV(2) + FRAG(1) + ATYP + addr + port */
-	if (cap < total)
+	if (cap < (size_t)total)
 		return -ENOBUFS;
 
 	b[0] = 0x00;	/* RSV */

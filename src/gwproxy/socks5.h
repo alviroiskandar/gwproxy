@@ -187,7 +187,8 @@ int gwp_socks5_conn_handle_data(struct gwp_socks5_conn *conn,
  * to GWP_SOCKS5_ST_ERR.
  *
  * @param conn		The SOCKS5 connection to handle data for.
- * @param bind_addr	The local address to bind to (from getsockname()).
+ * @param bind_addr	The local address to bind to (from getsockname()),
+ * 			or NULL for the all-zero IPv4 address.
  * @param rep		The SOCKS5 reply code.
  * @param out_buf	Buffer to store the outgoing data.
  * @param out_len	Pointer to the size of the outgoing data buffer.
@@ -227,6 +228,35 @@ int gwp_socks5_conn_cmd_udp_associate_res(struct gwp_socks5_conn *conn,
  *   +----+------+------+----------+----------+----------+
  *   | 2  |  1   |  1   | Variable |    2     | Variable |
  */
+
+/*
+ * Length of the ATYP + ADDR + PORT field @a encodes to, or -EINVAL for an
+ * unknown ATYP. Inline: the UDP relay sizes one per datagram.
+ */
+static inline int gwp_socks5_addr_len(const struct gwp_socks5_addr *a)
+{
+	switch (a->ver) {
+	case GWP_SOCKS5_ATYP_IPV4:
+		return 1 + 4 + 2;
+	case GWP_SOCKS5_ATYP_IPV6:
+		return 1 + 16 + 2;
+	case GWP_SOCKS5_ATYP_DOMAIN:
+		return 1 + 1 + a->domain.len + 2;
+	default:
+		return -EINVAL;
+	}
+}
+
+/*
+ * Length of the relay header gwp_socks5_udp_build_hdr() writes for @a:
+ * RSV(2) + FRAG(1) + the address field. Negative for an unknown ATYP.
+ */
+static inline int gwp_socks5_udp_hdr_len(const struct gwp_socks5_addr *a)
+{
+	int al = gwp_socks5_addr_len(a);
+
+	return al < 0 ? al : 3 + al;
+}
 
 /**
  * Parse the relay header at the front of a datagram. On success @addr receives

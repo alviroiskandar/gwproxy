@@ -834,6 +834,7 @@ static void test_udp_hdr_codec(void)
 	memcpy(&a.port, "\x00\x35", 2);		/* 53 */
 	r = gwp_socks5_udp_build_hdr(&a, buf, sizeof(buf), &hlen);
 	assert(!r && hlen == 3 + 1 + 4 + 2);
+	assert(gwp_socks5_udp_hdr_len(&a) == (int)hlen);
 	assert(buf[0] == 0 && buf[1] == 0 && buf[2] == 0);
 	assert(buf[3] == GWP_SOCKS5_ATYP_IPV4);
 	memcpy(dg, buf, hlen);
@@ -853,6 +854,7 @@ static void test_udp_hdr_codec(void)
 	memcpy(&a.port, "\x01\xbb", 2);		/* 443 */
 	r = gwp_socks5_udp_build_hdr(&a, buf, sizeof(buf), &hlen);
 	assert(!r && hlen == 3 + 1 + 16 + 2);
+	assert(gwp_socks5_udp_hdr_len(&a) == (int)hlen);
 	r = gwp_socks5_udp_parse_hdr(buf, hlen, &got, &plen);
 	assert(!r && plen == hlen && got.ver == GWP_SOCKS5_ATYP_IPV6);
 	assert(!memcmp(got.ip6, a.ip6, 16));
@@ -865,6 +867,7 @@ static void test_udp_hdr_codec(void)
 	memcpy(&a.port, "\x00\x50", 2);
 	r = gwp_socks5_udp_build_hdr(&a, buf, sizeof(buf), &hlen);
 	assert(!r && hlen == 3 + 1 + 1 + 11 + 2);
+	assert(gwp_socks5_udp_hdr_len(&a) == (int)hlen);
 	r = gwp_socks5_udp_parse_hdr(buf, hlen, &got, &plen);
 	assert(!r && got.ver == GWP_SOCKS5_ATYP_DOMAIN && got.domain.len == 11);
 	assert(!memcmp(got.domain.str, "example.com", 11));
@@ -878,14 +881,45 @@ static void test_udp_hdr_codec(void)
 	r = gwp_socks5_udp_parse_hdr(dg, 3, &got, &plen);
 	assert(r == -EAGAIN);
 
-	/* Unknown ATYP -> malformed. */
+	/* Each address type cut short anywhere -> need more, @got untouched. */
+	memcpy(dg, "\x00\x00\x00\x01\x08\x08\x08\x08\x00\x35", 10);
+	memset(&got, 0xa5, sizeof(got));
+	plen = 0;
+	for (hlen = 4; hlen < 10; hlen++) {
+		r = gwp_socks5_udp_parse_hdr(dg, hlen, &got, &plen);
+		assert(r == -EAGAIN && got.ver == 0xa5 && !plen);
+	}
+	memcpy(dg, "\x00\x00\x00\x04", 4);
+	for (hlen = 4; hlen < 22; hlen++) {
+		r = gwp_socks5_udp_parse_hdr(dg, hlen, &got, &plen);
+		assert(r == -EAGAIN && got.ver == 0xa5 && !plen);
+	}
+	memcpy(dg, "\x00\x00\x00\x03\x04host\x00\x50", 12);
+	for (hlen = 4; hlen < 11; hlen++) {
+		r = gwp_socks5_udp_parse_hdr(dg, hlen, &got, &plen);
+		assert(r == -EAGAIN && got.ver == 0xa5 && !plen);
+	}
+	r = gwp_socks5_udp_parse_hdr(dg, 11, &got, &plen);
+	assert(!r && plen == 11 && got.ver == GWP_SOCKS5_ATYP_DOMAIN);
+	assert(got.domain.len == 4 && !strcmp(got.domain.str, "host"));
+	assert(!memcmp(&got.port, "\x00\x50", 2));
+
+	/* Unknown ATYP -> malformed, even before its address could be there. */
 	memcpy(dg, "\x00\x00\x00\x09\x00\x00\x00\x00", 8);
 	r = gwp_socks5_udp_parse_hdr(dg, 8, &got, &plen);
+	assert(r == -EINVAL);
+	r = gwp_socks5_udp_parse_hdr(dg, 4, &got, &plen);
 	assert(r == -EINVAL);
 
 	/* Build into too small a buffer. */
 	r = gwp_socks5_udp_build_hdr(&a, buf, 4, &hlen);
 	assert(r == -ENOBUFS);
+
+	/* An address type there is none of has no header length. */
+	a.ver = 0x09;
+	assert(gwp_socks5_udp_hdr_len(&a) < 0);
+	r = gwp_socks5_udp_build_hdr(&a, buf, sizeof(buf), &hlen);
+	assert(r == -EINVAL);
 }
 
 /* The client side's UDP ASSOCIATE request and the reply's BND.ADDR:PORT. */
@@ -963,6 +997,29 @@ static void test_cli_udp_associate(void)
 	assert(r == -EINVAL);
 }
 
+/* The client side's two-byte replies: method selection and RFC 1929 status. */
+static void test_cli_parse_two_byte_replies(void)
+{
+	uint8_t v;
+	int r;
+
+	v = 0xaa;
+	r = gwp_socks5_cli_parse_method("\x05", 1, &v);
+	assert(r == -EAGAIN && v == 0xaa);
+	r = gwp_socks5_cli_parse_method("\x01\x00", 2, &v);
+	assert(r == -EINVAL && v == 0xaa);
+	r = gwp_socks5_cli_parse_method("\x05\x02\xff", 3, &v);
+	assert(!r && v == 0x02);
+
+	v = 0xaa;
+	r = gwp_socks5_cli_parse_userpass("\x01", 1, &v);
+	assert(r == -EAGAIN && v == 0xaa);
+	r = gwp_socks5_cli_parse_userpass("\x05\x00", 2, &v);
+	assert(r == -EINVAL && v == 0xaa);
+	r = gwp_socks5_cli_parse_userpass("\x01\x01", 2, &v);
+	assert(!r && v == 0x01);
+}
+
 static void gwp_socks5_run_tests(void)
 {
 	size_t i;
@@ -976,6 +1033,7 @@ static void gwp_socks5_run_tests(void)
 		test_udp_associate();
 		test_udp_hdr_codec();
 		test_cli_udp_associate();
+		test_cli_parse_two_byte_replies();
 		test_connect_ipv4();
 		test_connect_ipv6();
 		test_connect_domain();
