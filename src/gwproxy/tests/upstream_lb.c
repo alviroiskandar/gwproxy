@@ -1019,6 +1019,18 @@ static void test_pick_probe(void)
 #define NR_DIST		10u
 #define NR_DIST_PICKS	200000u
 
+/* Fail unless server @i's @hits are @want within @tol; @what labels it. */
+static void check_share(const char *what, uint32_t i, uint64_t hits,
+			uint64_t want, uint64_t tol)
+{
+	if (hits + tol < want || hits > want + tol) {
+		fprintf(stderr, "%sserver %u: %llu picks, want %llu +- %llu\n",
+			what, i, (unsigned long long)hits,
+			(unsigned long long)want, (unsigned long long)tol);
+		assert(0);
+	}
+}
+
 /*
  * With a real generator, the turns of ejected servers are spread evenly:
  * every server in service gets its equal share of the picks within 3%,
@@ -1027,8 +1039,14 @@ static void test_pick_probe(void)
  * run of 3 at the cursor's path. The share of a server in service is
  * NR_DIST_PICKS / in-service; the ejected turns (a tenth or three tenths)
  * are binomial over it, so 3% is several standard deviations wide.
+ *
+ * With @least_conn, every count tied (connections short enough to have
+ * ended before the next pick): the ties' start moves off an ejected
+ * server by the same probes, so each server in service gets its equal
+ * share within 3%, the one after the run too.
  */
-static void test_pick_spread(uint32_t first, uint32_t run, uint32_t seed)
+static void test_pick_spread(bool least_conn, uint32_t first, uint32_t run,
+			     uint32_t seed)
 {
 	uint32_t hits[NR_DIST] = { 0 }, rr, i, want, tol;
 	struct tpool p;
@@ -1038,7 +1056,7 @@ static void test_pick_spread(uint32_t first, uint32_t run, uint32_t seed)
 	for (i = first; i < first + run; i++)
 		tp_eject(&p, i, 1000);
 	for (rr = 0; rr < NR_DIST_PICKS; rr++)
-		hits[tp_pick(&p, false, rr, NONE)]++;
+		hits[tp_pick(&p, least_conn, rr, NONE)]++;
 	want = NR_DIST_PICKS / (NR_DIST - run);
 	tol = want * 3 / 100;
 	for (i = 0; i < NR_DIST; i++) {
@@ -1046,48 +1064,17 @@ static void test_pick_spread(uint32_t first, uint32_t run, uint32_t seed)
 			assert(!hits[i]);
 			continue;
 		}
-		if (hits[i] + tol < want || hits[i] > want + tol) {
-			fprintf(stderr, "server %u: %u picks, want %u +- %u\n",
-				i, hits[i], want, tol);
-			assert(0);
-		}
+		check_share(least_conn ? "least_conn " : "", i, hits[i], want,
+			    tol);
 	}
-	/* Each ejected turn took one or a few draws, never more than 4. */
-	assert(p.nr_random >= run * (NR_DIST_PICKS / NR_DIST));
-	assert(p.nr_random <= GWP_UP_PICK_PROBES * run *
-			      (NR_DIST_PICKS / NR_DIST));
-	tp_free(&p);
-}
-
-/*
- * test_pick_spread() for least_conn with every count tied (connections
- * short enough to have ended before the next pick): the ties' start
- * moves off an ejected server by the same probes, so each server in
- * service gets its equal share within 3%, the one after the run too.
- */
-static void test_pick_spread_lc(uint32_t first, uint32_t run, uint32_t seed)
-{
-	uint32_t hits[NR_DIST] = { 0 }, rr, i, want, tol;
-	struct tpool p;
-
-	tp_init(&p, NR_DIST);
-	p.xs = seed;
-	for (i = first; i < first + run; i++)
-		tp_eject(&p, i, 1000);
-	for (rr = 0; rr < NR_DIST_PICKS; rr++)
-		hits[tp_pick(&p, true, rr, NONE)]++;
-	want = NR_DIST_PICKS / (NR_DIST - run);
-	tol = want * 3 / 100;
-	for (i = 0; i < NR_DIST; i++) {
-		if (i >= first && i < first + run) {
-			assert(!hits[i]);
-			continue;
-		}
-		if (hits[i] + tol < want || hits[i] > want + tol) {
-			fprintf(stderr, "least_conn server %u: %u picks, want %u +- %u\n",
-				i, hits[i], want, tol);
-			assert(0);
-		}
+	if (!least_conn) {
+		/*
+		 * Each ejected turn took one or a few draws, never more
+		 * than 4.
+		 */
+		assert(p.nr_random >= run * (NR_DIST_PICKS / NR_DIST));
+		assert(p.nr_random <= GWP_UP_PICK_PROBES * run *
+				      (NR_DIST_PICKS / NR_DIST));
 	}
 	tp_free(&p);
 }
@@ -1278,11 +1265,7 @@ static void test_weights_spread(void)
 			continue;
 		want = NR_DIST_PICKS / 8 * w[i];
 		tol = want * 3 / 100;
-		if (hits[i] + tol < want || hits[i] > want + tol) {
-			fprintf(stderr, "weighted server %u: %u picks, want %u +- %u\n",
-				i, hits[i], want, tol);
-			assert(0);
-		}
+		check_share("weighted ", i, hits[i], want, tol);
 	}
 	tp_free(&p);
 }
@@ -1688,12 +1671,7 @@ static void test_slow_rr(const uint32_t *w, const uint32_t *num, uint32_t nr,
 		uint64_t want = NR_DIST_PICKS * sw[i] / sum;
 		uint64_t tol = NR_DIST_PICKS * 3 / 100;
 
-		if (hits[i] + tol < want || hits[i] > want + tol) {
-			fprintf(stderr, "slow rr server %u: %u picks, want %llu +- %llu\n",
-				i, hits[i], (unsigned long long)want,
-				(unsigned long long)tol);
-			assert(0);
-		}
+		check_share("slow rr ", i, hits[i], want, tol);
 		if (num[i] < 8)
 			tp_unramp(&p, i);
 	}
@@ -1861,12 +1839,7 @@ static void test_random_spread(const uint32_t *w, uint32_t nr, uint32_t seed,
 			assert(!hits[i]);
 			continue;
 		}
-		if (hits[i] + tol < want || hits[i] > want + tol) {
-			fprintf(stderr, "random server %u: %u picks, want %llu +- %llu\n",
-				i, hits[i], (unsigned long long)want,
-				(unsigned long long)tol);
-			assert(0);
-		}
+		check_share("random ", i, hits[i], want, tol);
 	}
 	if (ramp < nr)
 		tp_unramp(&p, ramp);
@@ -2293,12 +2266,12 @@ int main(void)
 	test_pick_missing();
 	test_pick_big();
 	test_pick_probe();
-	test_pick_spread(3, 1, 12345);
-	test_pick_spread(3, 3, 777);
-	test_pick_spread(7, 3, 0x9e3779b9);
-	test_pick_spread_lc(3, 1, 4242);
-	test_pick_spread_lc(3, 3, 99);
-	test_pick_spread_lc(7, 3, 0x2545f491);
+	test_pick_spread(false, 3, 1, 12345);
+	test_pick_spread(false, 3, 3, 777);
+	test_pick_spread(false, 7, 3, 0x9e3779b9);
+	test_pick_spread(true, 3, 1, 4242);
+	test_pick_spread(true, 3, 3, 99);
+	test_pick_spread(true, 7, 3, 0x2545f491);
 	test_weights();
 	test_weights_least_conn();
 	test_weights_spread();
