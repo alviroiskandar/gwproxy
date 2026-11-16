@@ -2782,25 +2782,44 @@ static int upstream_target_init(struct gwp_ctx *ctx);
 
 /*
  * Fill the inputs of an OUTPUT request for @target (NULL when only a domain is
- * known) from @client, with the optional requested @domain / @user. Only the
- * inputs: gwp_acl_eval_output() resets the output flags itself, and the
- * output payloads are only read behind those flags, so zeroing the whole
+ * known) from @client, with the optional requested @domain / @user. The
+ * destination port is @target's, or @dport (host order) without one. @memo
+ * (may be NULL) carries the -m domain/-m user results between evaluations.
+ * Only the inputs: gwp_acl_eval_output() resets the output flags itself, and
+ * the output payloads are only read behind those flags, so zeroing the whole
  * request first would be done twice.
  */
 static void acl_out_req(struct gwp_acl_req *req,
 			const struct gwp_sockaddr *client,
-			const struct gwp_sockaddr *target,
+			const struct gwp_sockaddr *target, uint16_t dport,
 			const char *domain, const char *user,
-			enum gwp_acl_proto proto)
+			struct gwp_acl_memo *memo, enum gwp_acl_proto proto)
 {
-	req->memo = NULL;
+	req->memo = memo;
 	req->client = client;
 	req->target = target;
 	req->domain = domain;
 	req->user = user;
 	req->proto = proto;
-	req->dport = target ? gwp_sockaddr_port_h(target) : 0;
+	req->dport = target ? gwp_sockaddr_port_h(target) : dport;
 	req->sport = client ? gwp_sockaddr_port_h(client) : 0;
+}
+
+/*
+ * The -j MARK and -j BIND an evaluated OUTPUT request @req matched, into
+ * *@so for the socket or datagram that follows; the rest of *@so is zeroed.
+ * req->mark is only valid with req->mark_set.
+ */
+static inline void acl_req_sockopt(const struct gwp_acl_req *req,
+				   struct gwp_conn_sockopt *so)
+{
+	memset(so, 0, sizeof(*so));
+	if (req->mark_set) {
+		so->mark_set = true;
+		so->mark = req->mark;
+	}
+	if (req->bind.set)
+		so->bind = req->bind;
 }
 
 /*
@@ -2842,10 +2861,8 @@ static enum gwp_acl_verdict acl_out(struct gwp_ctx *ctx,
 	if (!have_ip && !domain)
 		return GWP_ACL_ACCEPT;
 
-	acl_out_req(&req, client, have_ip ? target : NULL, domain, user, proto);
-	if (!have_ip)
-		req.dport = dport;
-	req.memo = memo;
+	acl_out_req(&req, client, have_ip ? target : NULL, dport, domain, user,
+		    memo, proto);
 	v = gwp_acl_eval_output(ctx->acl, &req);
 	/* The -j UPSTREAM choice is not used yet; give its pool back. */
 	gwp_acl_req_release(&req);
@@ -2874,12 +2891,8 @@ static enum gwp_acl_verdict acl_out(struct gwp_ctx *ctx,
 		*dnat_port_out = req.dnat_port;
 	}
 	/* Surface composable -j MARK / -j BIND to the socket-creation path. */
-	if (so_out && req.mark_set) {
-		so_out->mark_set = true;
-		so_out->mark = req.mark;
-	}
-	if (so_out && req.bind.set)
-		so_out->bind = req.bind;
+	if (so_out)
+		acl_req_sockopt(&req, so_out);
 	return v;
 }
 
@@ -2929,24 +2942,14 @@ static bool udp_target_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 	    gwp_sockaddr_eq(&c->dst, target))
 		return c->ok;
 
-	acl_out_req(&req, &gcp->udp_peer, target, NULL, gcp_req_user(gcp),
-		    GWP_ACL_PROTO_UDP);
+	acl_out_req(&req, &gcp->udp_peer, target, 0, NULL, gcp_req_user(gcp),
+		    NULL, GWP_ACL_PROTO_UDP);
 	ok = gwp_acl_eval_output(ctx->acl, &req) == GWP_ACL_ACCEPT;
 	/* UDP is relayed direct: -j UPSTREAM does not apply to it. */
 	gwp_acl_req_release(&req);
 
-	if (gcp->udp_eg) {
-		struct gwp_conn_sockopt *so = &gcp->udp_eg->so;
-
-		memset(so, 0, sizeof(*so));
-		/* req.mark is only set, and valid, with req.mark_set. */
-		if (req.mark_set) {
-			so->mark_set = true;
-			so->mark = req.mark;
-		}
-		if (req.bind.set)
-			so->bind = req.bind;
-	}
+	if (gcp->udp_eg)
+		acl_req_sockopt(&req, &gcp->udp_eg->so);
 	c->valid = req.cacheable;
 	c->gen = req.gen;
 	c->dst = *target;
@@ -3326,11 +3329,8 @@ static int conn_pick_upstream(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 	if (!ctx->acl)
 		return 0;
 
-	acl_out_req(&req, &gcp->client_addr, lit, domain, gcp_req_user(gcp),
-		    GWP_ACL_PROTO_TCP);
-	if (!lit)
-		req.dport = port;
-	req.memo = NULL;
+	acl_out_req(&req, &gcp->client_addr, lit, port, domain,
+		    gcp_req_user(gcp), NULL, GWP_ACL_PROTO_TCP);
 	req.no_target = !domain && !lit;
 	switch (gwp_acl_eval_upstream(ctx->acl, &req)) {
 	case GWP_ACL_UPSTREAM_POOL:
@@ -6647,9 +6647,8 @@ static bool udp_up_domain_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp
 	    u->dport == d->port && !strcmp(u->dom, d->domain.str))
 		return u->ok;
 
-	acl_out_req(&req, &gcp->udp_peer, NULL, d->domain.str,
-		    gcp_req_user(gcp), GWP_ACL_PROTO_UDP);
-	req.dport = ntohs(d->port);
+	acl_out_req(&req, &gcp->udp_peer, NULL, ntohs(d->port), d->domain.str,
+		    gcp_req_user(gcp), NULL, GWP_ACL_PROTO_UDP);
 	ok = gwp_acl_eval_output(ctx->acl, &req) == GWP_ACL_ACCEPT;
 	gwp_acl_req_release(&req);
 
