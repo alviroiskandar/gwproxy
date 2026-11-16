@@ -1232,6 +1232,15 @@ bool gwp_conn_note_reset(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	return true;
 }
 
+void gwp_conn_mark_wr_shut(struct gwp_conn *c)
+{
+	c->wr_shut = true;
+#ifdef CONFIG_HTTPS
+	if (c->tls)
+		gwp_ssl_tx_close(c->tls);
+#endif
+}
+
 /* Whether the pair resets the target, or the client, as described above. */
 static bool gwp_conn_pair_aborts_target(const struct gwp_conn_pair __unused *gcp)
 {

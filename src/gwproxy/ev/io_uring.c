@@ -3099,7 +3099,7 @@ static int tls_target_cut(struct gwp_conn_pair *gcp)
 static int iou_forward_progress(struct gwp_wrk __unused *w,
 				struct gwp_conn_pair *gcp)
 {
-	bool shut_client = false, shut_target = false, done;
+	bool shut_client = false, shut_target = false;
 
 	if (target_rx_done(gcp) && gcp->target.len == 0 && !gcp->client.wr_shut) {
 #ifdef CONFIG_HTTPS
@@ -3112,11 +3112,7 @@ static int iou_forward_progress(struct gwp_wrk __unused *w,
 			return 0;
 #endif
 		shut_client = true;
-		gcp->client.wr_shut = true;
-#ifdef CONFIG_HTTPS
-		if (client_is_tls(gcp))
-			gwp_ssl_tx_close(gcp->client.tls);
-#endif
+		gwp_conn_mark_wr_shut(&gcp->client);
 	}
 
 	if (gcp->client.rd_eof && gcp->client.len == 0 && !gcp->target.wr_shut) {
@@ -3130,35 +3126,16 @@ static int iou_forward_progress(struct gwp_wrk __unused *w,
 			return 0;
 #endif
 		shut_target = true;
-		gcp->target.wr_shut = true;
-#ifdef CONFIG_HTTPS
-		if (target_is_tls(gcp))
-			gwp_ssl_tx_close(gcp->target.tls);
-#endif
+		gwp_conn_mark_wr_shut(&gcp->target);
 	}
 
 	/*
-	 * Once both directions are done the pair is torn down, and closing
-	 * its sockets sends the FINs. A shutdown() right before that close
-	 * only costs a syscall, provided nothing is left unread on the
-	 * socket: close() answers unread data with an RST instead of a FIN.
 	 * Here a write side is shut only after the other socket's read side
 	 * reached EOF, so when both are done both sockets have been read to
-	 * EOF; the test is kept explicit, as in the epoll loop. The survivor
-	 * of a reset gets no FIN at all: the teardown passes the reset on
-	 * (gwp_conn_reset_passes_to()).
+	 * EOF; gwp_conn_pair_shut_wr() keeps the test explicit all the same.
 	 */
-	done = gcp->client.wr_shut && gcp->target.wr_shut;
-	if (shut_client && !(done && (gcp->client.rd_eof ||
-		gwp_conn_reset_passes_to(gcp, &gcp->client))))
-		__sys_shutdown(gcp->client.fd, SHUT_WR);
-	if (shut_target && !(done && (gcp->target.rd_eof ||
-		gwp_conn_reset_passes_to(gcp, &gcp->target))))
-		__sys_shutdown(gcp->target.fd, SHUT_WR);
-	if (done)
-		return -ECONNRESET;
-
-	return 0;
+	return gwp_conn_pair_shut_wr(gcp, shut_client, shut_target) ?
+	       -ECONNRESET : 0;
 }
 
 static int handle_ev_client_recv(struct gwp_wrk *w, struct gwp_conn_pair *gcp,

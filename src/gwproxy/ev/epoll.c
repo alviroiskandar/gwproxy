@@ -2567,7 +2567,7 @@ static int conn_rx_resume(struct gwp_wrk __unused *w,
 static int __forward_progress(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			      struct gwp_conn *hup, bool force_target)
 {
-	bool shut_client = false, shut_target = false, done;
+	bool shut_client = false, shut_target = false;
 	int r;
 
 	r = conn_rx_resume(w, gcp, &gcp->client, &gcp->target);
@@ -2593,11 +2593,7 @@ static int __forward_progress(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		 */
 		if (r) {
 			shut_client = true;
-			gcp->client.wr_shut = true;
-#ifdef CONFIG_HTTPS
-			if (gcp->client.tls)
-				gwp_ssl_tx_close(gcp->client.tls);
-#endif
+			gwp_conn_mark_wr_shut(&gcp->client);
 		}
 	}
 
@@ -2621,11 +2617,7 @@ static int __forward_progress(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				return r;
 			if (r) {
 				shut_target = true;
-				gcp->target.wr_shut = true;
-#ifdef CONFIG_HTTPS
-				if (gcp->target.tls)
-					gwp_ssl_tx_close(gcp->target.tls);
-#endif
+				gwp_conn_mark_wr_shut(&gcp->target);
 			}
 		} else if (gcp->client.wr_shut) {
 			return -ECONNRESET;
@@ -2633,24 +2625,10 @@ static int __forward_progress(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	}
 
 	/*
-	 * Once both directions are done the pair is torn down, and closing
-	 * its sockets sends the FINs. A shutdown() right before that close()
-	 * only costs a syscall, provided nothing is left unread on the
-	 * socket: close() answers unread data with an RST instead of a FIN,
-	 * so a socket whose read side has not reached EOF still gets the
-	 * explicit shutdown(). Likewise a hung-up fd needs no EPOLL_CTL_DEL
-	 * here: the teardown takes it out (__free_conn_pair()). The survivor
-	 * of a reset gets no FIN at all: the teardown passes the reset on
-	 * (gwp_conn_reset_passes_to()).
+	 * A done pair's hung-up fd needs no EPOLL_CTL_DEL here either: the
+	 * teardown takes it out (__free_conn_pair()).
 	 */
-	done = gcp->client.wr_shut && gcp->target.wr_shut;
-	if (shut_client && !(done && (gcp->client.rd_eof ||
-		gwp_conn_reset_passes_to(gcp, &gcp->client))))
-		__sys_shutdown(gcp->client.fd, SHUT_WR);
-	if (shut_target && !(done && (gcp->target.rd_eof ||
-		gwp_conn_reset_passes_to(gcp, &gcp->target))))
-		__sys_shutdown(gcp->target.fd, SHUT_WR);
-	if (done)
+	if (gwp_conn_pair_shut_wr(gcp, shut_client, shut_target))
 		return -ECONNRESET;
 
 	/*

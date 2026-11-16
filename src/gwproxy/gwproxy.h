@@ -1593,6 +1593,41 @@ bool gwp_conn_reset_passes_to(const struct gwp_conn_pair *gcp,
 			      const struct gwp_conn *c);
 
 /*
+ * The other side's stream has ended and been flushed to @c while the pair
+ * forwards: mark @c's write side shut, and for a TLS @c queue its
+ * close_notify. The shutdown() itself is left to gwp_conn_pair_shut_wr(),
+ * which skips it if the pair is torn down anyway.
+ */
+void gwp_conn_mark_wr_shut(struct gwp_conn *c);
+
+/*
+ * After a forwarding step that marked the client's (@shut_client) or the
+ * target's (@shut_target) write side shut, issue their shutdown()s, and
+ * return whether the pair is done: both write sides are shut, and the pair
+ * is torn down without dropping any data.
+ *
+ * Closing a done pair's sockets sends the FINs. A shutdown() right before
+ * that close() only costs a syscall, provided nothing is left unread on the
+ * socket: close() answers unread data with an RST instead of a FIN, so a
+ * socket whose read side has not reached EOF still gets the explicit
+ * shutdown(). The survivor of a reset gets no FIN at all: the teardown passes
+ * the reset on (gwp_conn_reset_passes_to()).
+ */
+static inline bool gwp_conn_pair_shut_wr(struct gwp_conn_pair *gcp,
+					 bool shut_client, bool shut_target)
+{
+	bool done = gcp->client.wr_shut && gcp->target.wr_shut;
+
+	if (shut_client && !(done && (gcp->client.rd_eof ||
+		gwp_conn_reset_passes_to(gcp, &gcp->client))))
+		__sys_shutdown(gcp->client.fd, SHUT_WR);
+	if (shut_target && !(done && (gcp->target.rd_eof ||
+		gwp_conn_reset_passes_to(gcp, &gcp->target))))
+		__sys_shutdown(gcp->target.fd, SHUT_WR);
+	return done;
+}
+
+/*
  * @gcp is done and about to be freed, with no I/O left in flight on its
  * sockets and both out of the event loop's own set. Hand those that may still
  * get input to the worker's linger set (linger.h) instead of closing them, so
