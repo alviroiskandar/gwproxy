@@ -603,11 +603,14 @@ static void test_req_framing(void)
 	PRTEST_OK();
 }
 
-/* Feed @in to a fresh response filter in one go; returns its result. */
-static int res_feed(struct gwp_http_conn *hc, const char *in, bool eof,
-		    char *out, size_t out_cap, size_t *out_len)
+/*
+ * Feed @in in one go to a fresh response filter that may hold back @hold
+ * bytes; returns its result.
+ */
+static int res_feed(struct gwp_http_conn *hc, size_t hold, const char *in,
+		    bool eof, char *out, size_t out_cap, size_t *out_len)
 {
-	assert(!gwp_http_fwd_res_init(hc, 1024));
+	assert(!gwp_http_fwd_res_init(hc, hold));
 	return gwp_http_fwd_res_input(hc, in, strlen(in), eof, out, out_cap,
 				      out_len);
 }
@@ -678,7 +681,7 @@ static void test_res_framing(void)
 	for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
 		hc = gwp_http_conn_alloc();
 		assert(hc);
-		r = res_feed(hc, cases[i].in, false, out, sizeof(out),
+		r = res_feed(hc, 1024, cases[i].in, false, out, sizeof(out),
 			     &out_len);
 		assert(r == cases[i].ret);
 		if (!r)
@@ -726,7 +729,8 @@ static void test_res_rewrite(void)
 	size_t out_len, i;
 
 	assert(hc);
-	assert(res_feed(hc, in, false, out, sizeof(out), &out_len) == 0);
+	assert(res_feed(hc, 1024, in, false, out, sizeof(out),
+			&out_len) == 0);
 	assert(gwp_http_fwd_res_state(hc) == GWP_HTTP_RES_BODY);
 	assert(out_len == strlen(want) && !memcmp(out, want, out_len));
 
@@ -770,7 +774,8 @@ static void test_res_interim(void)
 	size_t out_len;
 
 	assert(hc);
-	assert(res_feed(hc, in, false, out, sizeof(out), &out_len) == 0);
+	assert(res_feed(hc, 1024, in, false, out, sizeof(out),
+			&out_len) == 0);
 	assert(gwp_http_fwd_res_state(hc) == GWP_HTTP_RES_HDR);
 	assert(out_len == 25 && !memcmp(out, "HTTP/1.1 100 Continue\r\n\r\n", 25));
 	assert(gwp_http_fwd_res_pending(hc) == 11);
@@ -806,14 +811,12 @@ static void test_res_limits(void)
 	for (i = 0; i < 256; i++)
 		n += (size_t)sprintf(in + n, "X-%d: v\r\n", i);
 	sprintf(in + n, "\r\n");
-	assert(!gwp_http_fwd_res_init(hc, sizeof(in)));
-	assert(gwp_http_fwd_res_input(hc, in, strlen(in), false, out,
-				      sizeof(out), &out_len) == 0);
+	assert(res_feed(hc, sizeof(in), in, false, out, sizeof(out),
+			&out_len) == 0);
 	assert(gwp_http_fwd_res_state(hc) == GWP_HTTP_RES_BODY);
 	sprintf(in + n, "X-x: v\r\n\r\n");
-	assert(!gwp_http_fwd_res_init(hc, sizeof(in)));
-	assert(gwp_http_fwd_res_input(hc, in, strlen(in), false, out,
-				      sizeof(out), &out_len) == -E2BIG);
+	assert(res_feed(hc, sizeof(in), in, false, out, sizeof(out),
+			&out_len) == -E2BIG);
 
 	/* 32 distinct options over two lines, each repeated: fine. */
 	n = (size_t)sprintf(in, "HTTP/1.1 200 OK\r\nX-0: drop\r\n"
@@ -825,9 +828,8 @@ static void test_res_limits(void)
 		n += (size_t)sprintf(in + n, ",, X-%d,x-%d", i, i);
 	n += (size_t)sprintf(in + n, "\r\nX-31: drop\r\n");
 	sprintf(in + n, "\r\n");
-	assert(!gwp_http_fwd_res_init(hc, sizeof(in)));
-	assert(gwp_http_fwd_res_input(hc, in, strlen(in), false, out,
-				      sizeof(out), &out_len) == 0);
+	assert(res_feed(hc, sizeof(in), in, false, out, sizeof(out),
+			&out_len) == 0);
 	{
 		static const char want[] =
 			"HTTP/1.1 200 OK\r\nKeep: me\r\n"
@@ -840,18 +842,16 @@ static void test_res_limits(void)
 
 	/* A 33rd distinct option: refused. */
 	sprintf(in + n, "Connection: X-32\r\n\r\n");
-	assert(!gwp_http_fwd_res_init(hc, sizeof(in)));
-	assert(gwp_http_fwd_res_input(hc, in, strlen(in), false, out,
-				      sizeof(out), &out_len) == -E2BIG);
+	assert(res_feed(hc, sizeof(in), in, false, out, sizeof(out),
+			&out_len) == -E2BIG);
 
 	/* A long list of one repeated option is one option. */
 	n = (size_t)sprintf(in, "HTTP/1.1 200 OK\r\nConnection: a");
 	for (i = 0; i < 5000; i++)
 		n += (size_t)sprintf(in + n, ",a");
 	sprintf(in + n, "\r\nA: x\r\nB: y\r\n\r\n");
-	assert(!gwp_http_fwd_res_init(hc, sizeof(in)));
-	assert(gwp_http_fwd_res_input(hc, in, strlen(in), false, out,
-				      sizeof(out), &out_len) == 0);
+	assert(res_feed(hc, sizeof(in), in, false, out, sizeof(out),
+			&out_len) == 0);
 	assert(out_len == strlen("HTTP/1.1 200 OK\r\nB: y\r\n"
 				 "Via: 1.1 gwproxy\r\n"
 				 "Connection: close\r\n"
@@ -920,8 +920,8 @@ static void test_via(void)
 	for (i = 0; i < sizeof(res_cases) / sizeof(res_cases[0]); i++) {
 		hc = gwp_http_conn_alloc();
 		assert(hc);
-		assert(!res_feed(hc, res_cases[i].in, false, out, sizeof(out),
-				 &out_len));
+		assert(!res_feed(hc, 1024, res_cases[i].in, false, out,
+				 sizeof(out), &out_len));
 		if (out_len != strlen(res_cases[i].out) ||
 		    memcmp(out, res_cases[i].out, out_len))
 			fprintf(stderr, "response %zu: %.*s\n", i,
@@ -983,16 +983,14 @@ static void test_res_direct(void)
 		assert(out_len == want_len && !memcmp(buf, want, want_len));
 
 		/* In one read, separate buffers. */
-		assert(!gwp_http_fwd_res_init(hc, 16384));
-		assert(!gwp_http_fwd_res_input(hc, cases[i], len, false, out,
-					       sizeof(out), &out_len));
+		assert(!res_feed(hc, 16384, cases[i], false, out, sizeof(out),
+				 &out_len));
 		assert(out_len == want_len && !memcmp(out, want, want_len));
 	}
 
 	/* Too little room for header and body: refused either way. */
-	assert(!gwp_http_fwd_res_init(hc, 16384));
-	assert(gwp_http_fwd_res_input(hc, cases[0], strlen(cases[0]), false,
-				      out, 40, &out_len) == -E2BIG);
+	assert(res_feed(hc, 16384, cases[0], false, out, 40, &out_len) ==
+	       -E2BIG);
 	gwp_http_conn_free(hc);
 	PRTEST_OK();
 }
@@ -1015,23 +1013,24 @@ static void test_res_reject(void)
 
 	assert(hc);
 	for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
-		assert(res_feed(hc, bad[i], false, out, sizeof(out),
+		assert(res_feed(hc, 1024, bad[i], false, out, sizeof(out),
 				&out_len) < 0);
 		assert(gwp_http_fwd_res_state(hc) == GWP_HTTP_RES_FAILED);
 		assert(!out_len);
 	}
-	assert(res_feed(hc, bad[0], false, out, sizeof(out), &out_len) ==
-	       -EACCES);
+	assert(res_feed(hc, 1024, bad[0], false, out, sizeof(out),
+			&out_len) == -EACCES);
 
 	/* The origin closing before the header is complete. */
-	assert(res_feed(hc, "HTTP/1.1 200 OK\r\n", true, out, sizeof(out),
-			&out_len) == -EBADMSG);
+	assert(res_feed(hc, 1024, "HTTP/1.1 200 OK\r\n", true, out,
+			sizeof(out), &out_len) == -EBADMSG);
 
 	/* A header that cannot fit in what the filter may hold back. */
 	memset(big, 'a', sizeof(big) - 1);
 	big[sizeof(big) - 1] = '\0';
 	memcpy(big, "HTTP/1.1 200 OK\r\nX: ", 20);
-	assert(res_feed(hc, big, false, out, sizeof(out), &out_len) == -E2BIG);
+	assert(res_feed(hc, 1024, big, false, out, sizeof(out),
+			&out_len) == -E2BIG);
 
 	gwp_http_conn_free(hc);
 	PRTEST_OK();
