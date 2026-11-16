@@ -41,8 +41,14 @@ do {							\
 /*
  * The socket address of @ip, an IPv4 or IPv6 literal, and @port, with every
  * other byte zero; an IPv6 literal is told by its ':'.
+ *
+ * Never inlined: the ACL tests call it at about ninety places, and gcc
+ * inlines many of those tests into main(), where every inlined copy keeps
+ * its own address on the stack. Under the sanitizers that frame then grows
+ * past -Wstack-usage=8192. (__unused__: not every test calls it.)
  */
-static inline struct gwp_sockaddr gwp_test_addr(const char *ip, uint16_t port)
+static __attribute__((__noinline__, __unused__)) struct gwp_sockaddr
+gwp_test_addr(const char *ip, uint16_t port)
 {
 	struct gwp_sockaddr s;
 

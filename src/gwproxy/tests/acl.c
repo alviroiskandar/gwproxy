@@ -26,42 +26,17 @@
 #include <limits.h>
 #include "test_util.h"
 
-static struct gwp_sockaddr sa4(const char *ip, uint16_t port)
-{
-	struct gwp_sockaddr s;
-
-	memset(&s, 0, sizeof(s));
-	s.i4.sin_family = AF_INET;
-	assert(inet_pton(AF_INET, ip, &s.i4.sin_addr) == 1);
-	s.i4.sin_port = htons(port);
-	return s;
-}
-
-static struct gwp_sockaddr sa6(const char *ip, uint16_t port)
-{
-	struct gwp_sockaddr s;
-
-	memset(&s, 0, sizeof(s));
-	s.i6.sin6_family = AF_INET6;
-	assert(inet_pton(AF_INET6, ip, &s.i6.sin6_addr) == 1);
-	s.i6.sin6_port = htons(port);
-	return s;
-}
-
-/* An IPv4 address as the v4-mapped IPv6 the dual-stack UDP relay would see. */
+/*
+ * An IPv4 address as the v4-mapped IPv6 the dual-stack UDP relay would see.
+ * A wrapper, as its callers hold the address as IPv4: some of them pick from
+ * the same list for plain IPv4 too.
+ */
 static struct gwp_sockaddr sa4mapped(const char *ip, uint16_t port)
 {
-	struct gwp_sockaddr s;
-	uint8_t v4[4];
+	char v6[INET6_ADDRSTRLEN];
 
-	memset(&s, 0, sizeof(s));
-	s.i6.sin6_family = AF_INET6;
-	assert(inet_pton(AF_INET, ip, v4) == 1);
-	s.i6.sin6_addr.s6_addr[10] = 0xff;
-	s.i6.sin6_addr.s6_addr[11] = 0xff;
-	memcpy(&s.i6.sin6_addr.s6_addr[12], v4, 4);
-	s.i6.sin6_port = htons(port);
-	return s;
+	assert(snprintf(v6, sizeof(v6), "::ffff:%s", ip) < (int)sizeof(v6));
+	return gwp_test_addr(v6, port);
 }
 
 /*
@@ -210,7 +185,7 @@ static noinline void test_v4mapped_cidr(void)
 	assert(out_ip(a, "::10.1.2.3", 80) == GWP_ACL_ACCEPT);
 	s = sa4mapped("198.51.100.9", 1234);
 	assert(in(a, &s, 1234, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
-	s = sa4("198.51.101.9", 1234);
+	s = gwp_test_addr("198.51.101.9", 1234);
 	assert(in(a, &s, 1234, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
 	gwp_acl_destroy(a);
 
@@ -238,9 +213,9 @@ static noinline void test_ports_and_negation(void)
 	a = NULL;
 	assert(!gwp_acl_parse_str(&a,
 		"-A INPUT ! -s 10.0.0.0/8 -j REJECT\n"));
-	s = sa4("10.5.5.5", 0);
+	s = gwp_test_addr("10.5.5.5", 0);
 	assert(in(a, &s, 0, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
-	s = sa4("8.8.8.8", 0);
+	s = gwp_test_addr("8.8.8.8", 0);
 	assert(in(a, &s, 0, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
 	gwp_acl_destroy(a);
 }
@@ -253,11 +228,11 @@ static noinline void test_input_and_proto(void)
 	assert(!gwp_acl_parse_str(&a,
 		"-P INPUT REJECT\n"
 		"-A INPUT -s 192.168.0.0/16 -p tcp -j ACCEPT\n"));
-	s = sa4("192.168.1.1", 0);
+	s = gwp_test_addr("192.168.1.1", 0);
 	assert(in(a, &s, 0, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
 	/* Same source but udp: the tcp rule does not match -> default REJECT. */
 	assert(in(a, &s, 0, GWP_ACL_PROTO_UDP) == GWP_ACL_REJECT);
-	s = sa4("8.8.8.8", 0);
+	s = gwp_test_addr("8.8.8.8", 0);
 	assert(in(a, &s, 0, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
 	gwp_acl_destroy(a);
 }
@@ -292,7 +267,7 @@ static noinline void test_domain(void)
 	a = NULL;
 	assert(!gwp_acl_parse_str(&a,
 		"-A OUTPUT --dports 80 -j REJECT\n-P OUTPUT ACCEPT\n"));
-	s = sa4("1.2.3.4", 80);
+	s = gwp_test_addr("1.2.3.4", 80);
 	assert(out(a, &s, "example.com", 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
 	assert(out(a, &s, "example.com", 81, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
 	gwp_acl_destroy(a);
@@ -354,7 +329,7 @@ static noinline void test_regexp_limit(void)
 static noinline void test_user(void)
 {
 	struct gwp_acl *a = NULL;
-	struct gwp_sockaddr s = sa4("1.2.3.4", 80);
+	struct gwp_sockaddr s = gwp_test_addr("1.2.3.4", 80);
 
 	/* Exact, case-sensitive username; unauthenticated never matches. */
 	assert(!gwp_acl_parse_str(&a,
@@ -593,9 +568,9 @@ static noinline void test_comments_and_default_policy(void)
 		"   \n"
 		"-P OUTPUT REJECT   # trailing comment\n"
 		"-A OUTPUT -d 8.8.8.8/32 -j ACCEPT\n"));
-	s = sa4("8.8.8.8", 53);
+	s = gwp_test_addr("8.8.8.8", 53);
 	assert(out(a, &s, NULL, 53, GWP_ACL_PROTO_UDP) == GWP_ACL_ACCEPT);
-	s = sa4("1.1.1.1", 53);		/* no match -> default REJECT */
+	s = gwp_test_addr("1.1.1.1", 53);	/* no match -> default REJECT */
 	assert(out(a, &s, NULL, 53, GWP_ACL_PROTO_UDP) == GWP_ACL_REJECT);
 	gwp_acl_destroy(a);
 
@@ -607,7 +582,7 @@ static noinline void test_comments_and_default_policy(void)
 		"-A OUTPUT -m user --user ops#1 -j REJECT #ops#1 only\n"
 		"#-A OUTPUT -j REJECT\n"
 		"\t# indented comment\n"));
-	s = sa4("1.2.3.4", 80);
+	s = gwp_test_addr("1.2.3.4", 80);
 	assert(out_user(a, &s, "ops#1", 80) == GWP_ACL_REJECT);
 	assert(out_user(a, &s, "ops", 80) == GWP_ACL_ACCEPT);
 	gwp_acl_destroy(a);
@@ -621,7 +596,7 @@ static noinline void test_comments_and_default_policy(void)
 #endif
 
 	/* NULL ACL and empty ruleset both allow everything. */
-	s = sa4("1.2.3.4", 1);
+	s = gwp_test_addr("1.2.3.4", 1);
 	assert(out(NULL, &s, NULL, 1, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
 	assert(in(NULL, &s, 1, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
 }
@@ -859,25 +834,25 @@ static noinline void test_index_first_match(void)
 	assert(out_ip(a, "198.51.101.20", 80) == GWP_ACL_ACCEPT);
 
 	/* Domains: case-insensitive, first rule wins, none without a name. */
-	t = sa4("93.184.216.34", 80);
+	t = gwp_test_addr("93.184.216.34", 80);
 	assert(out(a, &t, "BAD.example", 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
 	assert(out(a, &t, "bad.example.", 80, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
 	assert(out(a, NULL, "bad.example", 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
 
 	/* An address rule before a domain rule of the same run wins. */
-	t = sa4("192.0.2.1", 80);
+	t = gwp_test_addr("192.0.2.1", 80);
 	assert(out(a, &t, "bad.example", 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
-	t = sa4("10.0.0.1", 80);
+	t = gwp_test_addr("10.0.0.1", 80);
 	assert(out(a, &t, "bad.example", 80, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
 
 	/* DNAT and MARK --accept from an indexed rule. */
-	t = sa4("203.0.113.7", 443);
+	t = gwp_test_addr("203.0.113.7", 443);
 	memset(&req, 0, sizeof(req));
 	req.target = &t;
 	req.dport = 443;
 	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_ACCEPT);
 	assert(req.dnat_applied && req.dnat.i4.sin_port == htons(8080));
-	t = sa4("93.184.216.34", 443);
+	t = gwp_test_addr("93.184.216.34", 443);
 	memset(&req, 0, sizeof(req));
 	req.target = &t;
 	req.domain = "Marked.Example";
@@ -886,7 +861,7 @@ static noinline void test_index_first_match(void)
 	assert(req.mark_set && req.mark == 7 && !req.dnat_applied);
 
 	/* -s in OUTPUT needs the client address. */
-	c = sa4("100.64.1.1", 5555);
+	c = gwp_test_addr("100.64.1.1", 5555);
 	memset(&req, 0, sizeof(req));
 	req.target = &t;
 	req.client = &c;
@@ -896,17 +871,17 @@ static noinline void test_index_first_match(void)
 	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_ACCEPT);
 
 	/* The rule that breaks the run is still tested in its place. */
-	t = sa4("172.16.1.1", 443);
+	t = gwp_test_addr("172.16.1.1", 443);
 	assert(out(a, &t, NULL, 443, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
 	assert(out(a, &t, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
 	assert(out(a, NULL, "x.example", 80, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
 
 	/* INPUT: the broad REJECT comes first. */
-	c = sa4("10.9.1.1", 1234);
+	c = gwp_test_addr("10.9.1.1", 1234);
 	assert(in(a, &c, 1234, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
-	c = sa4("192.0.2.1", 1234);
+	c = gwp_test_addr("192.0.2.1", 1234);
 	assert(in(a, &c, 1234, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
-	c = sa4("192.0.2.2", 1234);
+	c = gwp_test_addr("192.0.2.2", 1234);
 	assert(in(a, &c, 1234, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
 	gwp_acl_destroy(a);
 
@@ -1060,12 +1035,14 @@ static void rnd_addr(struct gwp_sockaddr *s)
 	uint32_t k = rnd(5);
 
 	if (k < 2)
-		*s = sa4(rnd_v4_addrs[rnd(ARRAY_SIZE(rnd_v4_addrs))], 443);
+		*s = gwp_test_addr(rnd_v4_addrs[rnd(ARRAY_SIZE(rnd_v4_addrs))],
+				   443);
 	else if (k < 3)
 		*s = sa4mapped(rnd_v4_addrs[rnd(ARRAY_SIZE(rnd_v4_addrs))],
 			       443);
 	else
-		*s = sa6(rnd_v6_addrs[rnd(ARRAY_SIZE(rnd_v6_addrs))], 443);
+		*s = gwp_test_addr(rnd_v6_addrs[rnd(ARRAY_SIZE(rnd_v6_addrs))],
+				   443);
 	s->i4.sin_port = htons((uint16_t)(rnd(2) ? 80 : 443));
 }
 
@@ -1228,7 +1205,7 @@ static noinline uint32_t mark_of(const char *v)
  */
 static noinline uint64_t nth_hits(const char *every, const char *packet)
 {
-	struct gwp_sockaddr t = sa4("1.2.3.4", 443);
+	struct gwp_sockaddr t = gwp_test_addr("1.2.3.4", 443);
 	struct gwp_acl *a = NULL;
 	uint64_t hits = 0;
 	char *rules;
@@ -1267,7 +1244,7 @@ static uint64_t nth_mask(int n, int p)
  */
 static noinline void test_number_bases(void)
 {
-	struct gwp_sockaddr t = sa4("10.1.2.3", 80);
+	struct gwp_sockaddr t = gwp_test_addr("10.1.2.3", 80);
 	struct gwp_acl *a = NULL;
 
 	assert(mark_of("0") == 0);
@@ -1307,7 +1284,7 @@ static noinline void test_number_bases(void)
 static void test_statistic_nth(void)
 {
 	struct gwp_acl *a = NULL;
-	struct gwp_sockaddr t = sa4("1.2.3.4", 443);
+	struct gwp_sockaddr t = gwp_test_addr("1.2.3.4", 443);
 	int i, hits;
 
 	/* Every 3rd, default offset 0: exactly one third, and it leads. */
@@ -1366,7 +1343,7 @@ static void test_statistic_nth(void)
 static void test_statistic_counts_only_matches(void)
 {
 	struct gwp_acl *a = NULL;
-	struct gwp_sockaddr t = sa4("1.2.3.4", 0);
+	struct gwp_sockaddr t = gwp_test_addr("1.2.3.4", 0);
 	int i, hits = 0;
 
 	assert(!gwp_acl_parse_str(&a,
@@ -1396,7 +1373,7 @@ static void test_statistic_counts_only_matches(void)
 static void test_statistic_load_balance(void)
 {
 	struct gwp_acl *a = NULL;
-	struct gwp_sockaddr t = sa4("1.2.3.4", 443);
+	struct gwp_sockaddr t = gwp_test_addr("1.2.3.4", 443);
 	int i, seen[3] = { 0, 0, 0 };
 
 	assert(!gwp_acl_parse_str(&a,
@@ -1431,7 +1408,7 @@ static void test_statistic_load_balance(void)
 static void test_statistic_equal_every_is_uneven(void)
 {
 	struct gwp_acl *a = NULL;
-	struct gwp_sockaddr t = sa4("1.2.3.4", 443);
+	struct gwp_sockaddr t = gwp_test_addr("1.2.3.4", 443);
 	int i, first = 0, second = 0, rest = 0;
 
 	assert(!gwp_acl_parse_str(&a,
@@ -1484,7 +1461,7 @@ struct reload_reader {
 static void *reload_reader_fn(void *arg)
 {
 	struct reload_reader *rr = arg;
-	struct gwp_sockaddr t = sa4("93.184.216.34", 443);
+	struct gwp_sockaddr t = gwp_test_addr("93.184.216.34", 443);
 
 	while (!atomic_load_explicit(rr->stop, memory_order_relaxed))
 		out(rr->acl, &t, NULL, 443, GWP_ACL_PROTO_TCP);
@@ -1513,7 +1490,7 @@ static void test_reload_under_readers(void)
 	struct reload_reader rr;
 	pthread_t thr[16];
 	atomic_bool stop = false;
-	struct gwp_sockaddr t = sa4("10.1.2.3", 80);
+	struct gwp_sockaddr t = gwp_test_addr("10.1.2.3", 80);
 	struct gwp_acl *a;
 	long nr_cpu = sysconf(_SC_NPROCESSORS_ONLN);
 	size_t nr, i;
@@ -1583,7 +1560,7 @@ struct swap_reader {
 static void *swap_reader_fn(void *arg)
 {
 	struct swap_reader *sr = arg;
-	struct gwp_sockaddr t = sa4("10.1.2.3", 443);
+	struct gwp_sockaddr t = gwp_test_addr("10.1.2.3", 443);
 	while (!atomic_load_explicit(sr->stop, memory_order_relaxed)) {
 		struct gwp_acl_req req = {
 			.target = &t, .dport = 443, .proto = GWP_ACL_PROTO_TCP,
@@ -1658,7 +1635,7 @@ static void test_generation(void)
 	static const char stat_rules[] =
 		"-A OUTPUT --dports 80 -m statistic --mode nth --every 2 "
 		"-j REJECT\n";
-	struct gwp_sockaddr t = sa4("93.184.216.34", 53);
+	struct gwp_sockaddr t = gwp_test_addr("93.184.216.34", 53);
 	struct gwp_acl_req req = {
 		.target = &t, .dport = 53, .proto = GWP_ACL_PROTO_UDP,
 	};
@@ -1701,7 +1678,7 @@ static enum gwp_acl_verdict out_memo(struct gwp_acl *a, struct gwp_acl_memo *m,
 				     const char *dom, const char *ip,
 				     uint16_t port)
 {
-	struct gwp_sockaddr t = sa4(ip, port);
+	struct gwp_sockaddr t = gwp_test_addr(ip, port);
 	struct gwp_acl_req req = {
 		.target = &t, .domain = dom, .memo = m, .dport = port,
 		.proto = GWP_ACL_PROTO_TCP,
@@ -1780,9 +1757,9 @@ static void test_empty_chain_policy(void)
 		{ GWP_ACL_ACCEPT, GWP_ACL_ACCEPT, GWP_ACL_REJECT, GWP_ACL_ACCEPT },
 		{ GWP_ACL_ACCEPT, GWP_ACL_ACCEPT, GWP_ACL_ACCEPT, GWP_ACL_ACCEPT },
 	};
-	struct gwp_sockaddr c1 = sa4("10.1.1.1", 1234);
-	struct gwp_sockaddr c2 = sa4("192.0.2.1", 1234);
-	struct gwp_sockaddr t = sa4("93.184.216.34", 80);
+	struct gwp_sockaddr c1 = gwp_test_addr("10.1.1.1", 1234);
+	struct gwp_sockaddr c2 = gwp_test_addr("192.0.2.1", 1234);
+	struct gwp_sockaddr t = gwp_test_addr("93.184.216.34", 80);
 	struct gwp_acl *a;
 	char *path;
 	size_t i;
@@ -1826,7 +1803,7 @@ static void test_file_nul(void)
 		"\0"
 		"-P OUTPUT REJECT\n";
 	static const char reject_rules[] = "-P OUTPUT REJECT\n";
-	struct gwp_sockaddr t = sa4("93.184.216.34", 80);
+	struct gwp_sockaddr t = gwp_test_addr("93.184.216.34", 80);
 	struct gwp_acl *a;
 	char *path;
 
@@ -1855,7 +1832,7 @@ static void test_file_nul(void)
  */
 static void test_file_fifo(void)
 {
-	struct gwp_sockaddr t = sa4("93.184.216.34", 80);
+	struct gwp_sockaddr t = gwp_test_addr("93.184.216.34", 80);
 	char *path, *fifo;
 	struct gwp_acl *a;
 
@@ -2945,7 +2922,7 @@ static enum gwp_acl_verdict up_eval(struct gwp_acl *a, const char *user,
 {
 	static struct gwp_sockaddr t;
 
-	t = sa4("192.0.2.1", 80);
+	t = gwp_test_addr("192.0.2.1", 80);
 	memset(req, 0, sizeof(*req));
 	req->target = &t;
 	req->user = user;
@@ -3415,7 +3392,7 @@ static void *up_reader_fn(void *arg)
 {
 	struct up_reader *ur = arg;
 	struct gwp_acl_pool *held[UP_HELD] = { NULL };
-	struct gwp_sockaddr t = sa4("192.0.2.1", 80);
+	struct gwp_sockaddr t = gwp_test_addr("192.0.2.1", 80);
 	unsigned n = 0, i;
 
 	while (!atomic_load_explicit(ur->stop, memory_order_relaxed)) {
@@ -3672,7 +3649,7 @@ static const char *up_pick(struct gwp_acl *a, const char *user,
 
 	memset(&req, 0, sizeof(req));
 	if (ip) {
-		t = sa4(ip, 443);
+		t = gwp_test_addr(ip, 443);
 		req.target = &t;
 	}
 	req.domain = domain;
@@ -3694,7 +3671,7 @@ static const char *up_pick(struct gwp_acl *a, const char *user,
  */
 static noinline void test_upstream_pick(void)
 {
-	struct gwp_sockaddr t = sa4("192.0.2.1", 443);
+	struct gwp_sockaddr t = gwp_test_addr("192.0.2.1", 443);
 	struct gwp_acl *a = NULL;
 	int i;
 
@@ -3775,7 +3752,7 @@ static noinline void test_upstream_pick(void)
 /* gwp_acl_eval_upstream() for @user with no target at all (UDP ASSOCIATE). */
 static const char *up_pick_nt(struct gwp_acl *a, const char *user)
 {
-	struct gwp_sockaddr c = sa4("198.51.100.9", 40000);
+	struct gwp_sockaddr c = gwp_test_addr("198.51.100.9", 40000);
 	struct gwp_acl_req req;
 	enum gwp_acl_upstream u;
 	const char *name;
@@ -4460,7 +4437,7 @@ static noinline void test_regexp_ctx_oom_recovers(void)
 		"-A OUTPUT -m domain --domain-regexp ^blocked$ -j REJECT\n"
 		"-P OUTPUT ACCEPT\n";
 	struct gwp_acl *a = NULL;
-	struct gwp_sockaddr s = sa4("8.8.8.8", 80);
+	struct gwp_sockaddr s = gwp_test_addr("8.8.8.8", 80);
 
 	g_fail_regex_mctx = true;
 	assert(gwp_acl_parse_str(&a, rules));
