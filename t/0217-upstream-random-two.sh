@@ -6,9 +6,11 @@
 #
 #  - Ten tunnels held open through g1 (by p_h, which lists only it). Of 12
 #    more held through p_2 (random two over g1, g2 and g3), g1 takes at
-#    most one, where "random" would give it about four: of two servers drawn the one with fewer open wins, and g1
-#    loses to either idle one (it wins only when every draw but one lands
-#    on it, a chance of about 1 in 700 a tunnel).
+#    most two, where "random" would give it about four: of two servers
+#    drawn the one with fewer open wins, and g1 loses to either idle one.
+#    It wins only when all six draws land on it, a chance of 1 in 729 a
+#    tunnel, so three or more of 12 come with a chance of about 6e-7 (two
+#    or more: 1.2e-4, too often).
 #  - A SIGHUP reload adds g4 with slow_start=1h to p_r (random): of 20
 #    connections it takes at most 2 (the chance is a few thousandths each),
 #    where its draws would give it about 10.
@@ -140,7 +142,7 @@ for loop in epoll io_uring; do
 	hold "$loop h" h 10
 	hold "$loop t" t 12
 	n="$(npicks p_2 1)"
-	[ "$n" -le 1 ] || {
+	[ "$n" -le 2 ] || {
 		tail -n 40 "$log" | sed 's/^/# gwp: /' >&2
 		fail "[$loop t] the busy server took $n of 12 tunnels"
 	}
