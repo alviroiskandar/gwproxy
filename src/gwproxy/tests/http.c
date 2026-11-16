@@ -1014,6 +1014,7 @@ static void test_res_reject(void)
 		"HTTP/1.1 200 OK\r\nX: a\r\n b\r\n\r\n",	/* obs-fold */
 		"HTTP/1.1 200 OK\r\nX : a\r\n\r\n",
 		"HTTP/1.1 600 OK\r\n\r\n",
+		"HTTP/1.1 099 OK\r\n\r\n",
 	};
 	struct gwp_http_conn *hc = gwp_http_conn_alloc();
 	char out[1024], big[1100];
@@ -1977,6 +1978,9 @@ static void test_upstream_reply(void)
 		{ "HTTP/1.0 200 OK\r\nVia: x\r\n\r\ntunnel", 0, 200, 27 },
 		{ "HTTP/1.1 200\n\n", 0, 200, 14 },
 		{ "HTTP/1.1 407 Auth\nX: y\r\n\r\n", 0, 407, 26 },
+		/* Unlike an origin's response, any first digit is taken. */
+		{ "HTTP/1.1 600 X\r\n\r\n", 0, 600, 18 },
+		{ "HTTP/1.1 099\n\n", 0, 99, 14 },
 		{ "HTTP/1.1 200 OK\r\n", -EAGAIN, 0, 0 },
 		{ "HTTP/1.1 200 OK\r\n\r", -EAGAIN, 0, 0 },
 		{ "HTTP/1.x 200 OK\r\n\r\n", -EINVAL, 0, 0 },
