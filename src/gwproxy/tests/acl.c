@@ -2213,6 +2213,7 @@ static noinline void test_include_reload(void)
 
 static void up_capture(void);
 static char *up_captured(void);
+static char *up_create_said(struct gwp_acl **a, const char *path, int want);
 
 /* mkdir @dir/@name; returns the malloc'd path. */
 static char *inc_mkdir(const char *dir, const char *name)
@@ -2568,9 +2569,7 @@ static noinline void test_include_optional(void)
 	path = inc_write(dir, "main.acl", "-P OUTPUT ACCEPT\n"
 			 "include_optional opt.acl;\n"
 			 "-A OUTPUT -d 192.0.2.2 -j REJECT\n");
-	up_capture();
-	assert(!gwp_acl_create(&a, path));
-	said = up_captured();
+	said = up_create_said(&a, path, 0);
 	assert(asprintf(&want, "acl: %s: line 2: warning: include_optional %s/opt.acl: No such file or directory; nothing included",
 			path, dir) > 0);
 	if (!strstr(said, want)) {
@@ -2870,6 +2869,35 @@ static void up_check(int r, int want, const char *said)
 }
 
 /*
+ * gwp_acl_create() of @path into *@a, or gwp_acl_reload() of @a, with what it
+ * says captured: it must return @want. Returns what it said (malloc'd), for
+ * the caller to check and free.
+ */
+static char *up_create_said(struct gwp_acl **a, const char *path, int want)
+{
+	char *said;
+	int r;
+
+	up_capture();
+	r = gwp_acl_create(a, path);
+	said = up_captured();
+	up_check(r, want, said);
+	return said;
+}
+
+static char *up_reload_said(struct gwp_acl *a, int want)
+{
+	char *said;
+	int r;
+
+	up_capture();
+	r = gwp_acl_reload(a);
+	said = up_captured();
+	up_check(r, want, said);
+	return said;
+}
+
+/*
  * @text must fail to parse with @err, and the message must contain @msg (and
  * never the password "s3cret" a URL in the text may carry).
  */
@@ -3152,7 +3180,6 @@ static noinline void test_upstream_include(void)
 {
 	char *dir = inc_dir(), *path, *said;
 	struct gwp_acl *a = NULL;
-	int r;
 
 	inc_put(dir, "pools.acl",
 		"upstream inc {\n server socks5h://10.0.0.1:1080;\n}\n"
@@ -3173,20 +3200,14 @@ static noinline void test_upstream_include(void)
 	inc_put(dir, "main.acl",
 		"upstream inc {\n server http://10.0.0.2:1;\n}\n"
 		"include pools.acl;\n");
-	up_capture();
-	r = gwp_acl_create(&a, path);
-	said = up_captured();
-	up_check(r, -EINVAL, said);
+	said = up_create_said(&a, path, -EINVAL);
 	assert(strstr(said, "pools.acl: line 1: upstream pool inc is defined twice"));
 	assert(strstr(said, "main.acl: line 4: failed to include a file"));
 	free(said);
 
 	/* An undefined pool is named with the file and line that use it. */
 	inc_put(dir, "main.acl", "include pools.acl;\n");
-	up_capture();
-	r = gwp_acl_create(&a, path);
-	said = up_captured();
-	up_check(r, -EINVAL, said);
+	said = up_create_said(&a, path, -EINVAL);
 	assert(strstr(said, "pools.acl: line 4: upstream pool top is not defined"));
 	free(said);
 
@@ -3194,19 +3215,13 @@ static noinline void test_upstream_include(void)
 	inc_put(dir, "open.acl", "upstream o {\n server http://10.0.0.2:1;\n");
 	inc_put(dir, "main.acl",
 		"include open.acl;\n}\n-A OUTPUT -j UPSTREAM --to o\n");
-	up_capture();
-	r = gwp_acl_create(&a, path);
-	said = up_captured();
-	up_check(r, -EINVAL, said);
+	said = up_create_said(&a, path, -EINVAL);
 	assert(strstr(said, "open.acl: line 1: upstream pool o is not closed"));
 	free(said);
 	inc_put(dir, "main.acl",
 		"upstream o {\n server http://10.0.0.2:1;\n"
 		"include pools.acl;\n}\n");
-	up_capture();
-	r = gwp_acl_create(&a, path);
-	said = up_captured();
-	up_check(r, -EINVAL, said);
+	said = up_create_said(&a, path, -EINVAL);
 	assert(strstr(said, "main.acl: line 3: include is not allowed inside an upstream block"));
 	free(said);
 	assert(!a);
@@ -3224,7 +3239,6 @@ static noinline void test_upstream_creds_warning(void)
 	static const char warn[] = "readable by group or others";
 	char *dir = inc_dir(), *path, *inc_path, *said, *p;
 	struct gwp_acl *a;
-	int r;
 
 	inc_path = inc_write(dir, "creds.acl",
 			     "upstream c {\n server http://u:s3cret@10.0.0.1:1;\n}\n");
@@ -3234,20 +3248,14 @@ static noinline void test_upstream_creds_warning(void)
 	inc_put(dir, "none.acl", "upstream n {\n server http://10.0.0.1:1;\n}\n");
 
 	/* 0600 everywhere: nothing to say. */
-	up_capture();
-	r = gwp_acl_create(&a, path);
-	said = up_captured();
-	up_check(r, 0, said);
+	said = up_create_said(&a, path, 0);
 	assert(!strstr(said, warn));
 	free(said);
 
 	/* Readable by others: warned once per load, reload included. */
 	assert(!chmod(inc_path, 0644));
 	assert(!chmod(path, 0640));
-	up_capture();
-	r = gwp_acl_reload(a);
-	said = up_captured();
-	up_check(r, 0, said);
+	said = up_reload_said(a, 0);
 	p = strstr(said, warn);
 	assert(p && !strstr(p + 1, warn));
 	assert(strstr(said, "creds.acl: warning: holds upstream credentials"));
@@ -3261,19 +3269,13 @@ static noinline void test_upstream_creds_warning(void)
 	 */
 	assert(!chmod(path, 0644));
 	assert(!chmod(dir, 0755));
-	up_capture();
-	r = gwp_acl_reload(a);
-	said = up_captured();
-	up_check(r, 0, said);
+	said = up_reload_said(a, 0);
 	assert(!strstr(said, "none.acl"));
 	free(said);
 
 	/* Group-readable alone counts too. */
 	assert(!chmod(inc_path, 0640));
-	up_capture();
-	r = gwp_acl_reload(a);
-	said = up_captured();
-	up_check(r, 0, said);
+	said = up_reload_said(a, 0);
 	assert(strstr(said, warn));
 	free(said);
 
@@ -3546,7 +3548,6 @@ static noinline void test_upstream_server_ops(void)
 	struct gwp_acl_req req;
 	struct up_srv *held;
 	struct gwp_acl *a;
-	int r;
 
 	g_up_made = 0;
 	path = inc_write(dir, "main.acl",
@@ -3586,10 +3587,7 @@ static noinline void test_upstream_server_ops(void)
 		" server http://10.0.0.5:3128;\n"
 		" server http://u:s3cret@unresolvable.invalid:3128;\n"
 		"}\n");
-	up_capture();
-	r = gwp_acl_reload(a);
-	said = up_captured();
-	up_check(r, -EINVAL, said);
+	said = up_reload_said(a, -EINVAL);
 	assert(strstr(said, "main.acl: line 3: upstream pool p server 2 (http://unresolvable.invalid:3128): the host does not resolve"));
 	assert(!strstr(said, "s3cret"));
 	free(said);
@@ -3601,10 +3599,7 @@ static noinline void test_upstream_server_ops(void)
 
 	/* With no reason given, the errno says why. */
 	inc_put(dir, "main.acl", "upstream p {\n server http://nowhy:1;\n}\n");
-	up_capture();
-	r = gwp_acl_reload(a);
-	said = up_captured();
-	up_check(r, -EINVAL, said);
+	said = up_reload_said(a, -EINVAL);
 	assert(strstr(said, "main.acl: line 2: upstream pool p server 1 (http://nowhy:1): "));
 	assert(strstr(said, strerror(EAFNOSUPPORT)));
 	free(said);
