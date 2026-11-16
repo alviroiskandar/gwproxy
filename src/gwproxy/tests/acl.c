@@ -610,6 +610,29 @@ static noinline void test_comments_and_default_policy(void)
 	assert(in(NULL, &s, 1, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
 }
 
+/*
+ * gwp_acl_parse_str() with what it writes to stderr dropped: a text meant to
+ * fail logs its bad line, and a random -j UPSTREAM rule with a -d draws a
+ * warning each time. Expected diagnostics in "make test" output would only
+ * look like test failures.
+ */
+static int parse_quiet(struct gwp_acl **a, const char *text)
+{
+	int saved, null, r;
+
+	fflush(stderr);
+	saved = dup(STDERR_FILENO);
+	null = open("/dev/null", O_WRONLY);
+	assert(saved >= 0 && null >= 0);
+	assert(dup2(null, STDERR_FILENO) == STDERR_FILENO);
+	close(null);
+	r = gwp_acl_parse_str(a, text);
+	fflush(stderr);
+	assert(dup2(saved, STDERR_FILENO) == STDERR_FILENO);
+	close(saved);
+	return r;
+}
+
 static noinline void test_parse_errors(void)
 {
 	struct gwp_acl *a;
@@ -740,68 +763,28 @@ static noinline void test_parse_errors(void)
 		"-A OUTPUT -d 1.2.3.4 -j DNAT --to 5.6.7.8:0x50\n", /* hex DNAT port */
 		"-A WEIRD -d 1.2.3.4 -j REJECT\n",	    /* bad chain */
 		"garbage line\n",			    /* not -P/-A */
+		/* --domain-regexp still needs the -m domain module first. */
+		"-A OUTPUT --domain-regexp x -j REJECT\n",
+		/* -m user is OUTPUT-only; --user needs it and takes no dupes. */
+		"-A OUTPUT --user alice -j REJECT\n",	    /* no -m user */
+		"-A INPUT -m user --user alice -j REJECT\n",	    /* INPUT */
+		"-A OUTPUT -m user --user a --user b -j REJECT\n", /* dup */
+#ifdef CONFIG_PCRE
+		/* A malformed pattern; exact + regexp for one field. */
+		"-A OUTPUT -m domain --domain-regexp ( -j REJECT\n",
+		"-A OUTPUT -m domain --domain a --domain-regexp b -j REJECT\n",
+#else
+		/* Without --use-pcre the regexp options are rejected outright. */
+		"-A OUTPUT -m user --user-regexp x -j REJECT\n",
+		"-A OUTPUT -m domain --domain-regexp x -j REJECT\n",
+#endif
 	};
 	size_t i;
-	int saved, devnull;
-
-	/*
-	 * These cases are meant to fail parsing, and the parser logs each bad
-	 * line to stderr. Silence stderr for the loop so the expected
-	 * diagnostics do not look like test failures in "make test" output.
-	 */
-	fflush(stderr);
-	saved = dup(STDERR_FILENO);
-	devnull = open("/dev/null", O_WRONLY);
-	if (saved >= 0 && devnull >= 0)
-		dup2(devnull, STDERR_FILENO);
 
 	for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
 		a = (void *)0x1;
-		assert(gwp_acl_parse_str(&a, bad[i]) < 0);
+		assert(parse_quiet(&a, bad[i]) < 0);
 	}
-
-	/* --domain-regexp still needs the -m domain module loaded first. */
-	a = (void *)0x1;
-	assert(gwp_acl_parse_str(&a,
-		"-A OUTPUT --domain-regexp x -j REJECT\n") < 0);
-
-	/* -m user is OUTPUT-only; --user needs the module and rejects dupes. */
-	a = (void *)0x1;
-	assert(gwp_acl_parse_str(&a,
-		"-A OUTPUT --user alice -j REJECT\n") < 0);		/* no -m user */
-	a = (void *)0x1;
-	assert(gwp_acl_parse_str(&a,
-		"-A INPUT -m user --user alice -j REJECT\n") < 0);	/* INPUT */
-	a = (void *)0x1;
-	assert(gwp_acl_parse_str(&a,
-		"-A OUTPUT -m user --user a --user b -j REJECT\n") < 0);	/* dup */
-#ifndef CONFIG_PCRE
-	a = (void *)0x1;
-	assert(gwp_acl_parse_str(&a,
-		"-A OUTPUT -m user --user-regexp x -j REJECT\n") < 0);	/* no pcre */
-#endif
-#ifdef CONFIG_PCRE
-	/* A malformed pattern, and mixing exact + regexp for one field, fail. */
-	a = (void *)0x1;
-	assert(gwp_acl_parse_str(&a,
-		"-A OUTPUT -m domain --domain-regexp ( -j REJECT\n") < 0);
-	a = (void *)0x1;
-	assert(gwp_acl_parse_str(&a,
-		"-A OUTPUT -m domain --domain a --domain-regexp b -j REJECT\n") < 0);
-#else
-	/* Without --use-pcre the regexp option is rejected outright. */
-	a = (void *)0x1;
-	assert(gwp_acl_parse_str(&a,
-		"-A OUTPUT -m domain --domain-regexp x -j REJECT\n") < 0);
-#endif
-
-	fflush(stderr);
-	if (saved >= 0)
-		dup2(saved, STDERR_FILENO);
-	if (devnull >= 0)
-		close(devnull);
-	if (saved >= 0)
-		close(saved);
 }
 
 /*
@@ -1086,27 +1069,6 @@ static bool same_result(const struct gwp_acl_req *x, enum gwp_acl_verdict vx,
 	if (x->bind.set && memcmp(&x->bind, &y->bind, sizeof(x->bind)))
 		return false;
 	return true;
-}
-
-/*
- * gwp_acl_parse_str() with its warnings dropped: a random -j UPSTREAM rule
- * with a -d draws one each time.
- */
-static int parse_quiet(struct gwp_acl **a, const char *text)
-{
-	int saved, null, r;
-
-	fflush(stderr);
-	saved = dup(STDERR_FILENO);
-	null = open("/dev/null", O_WRONLY);
-	assert(saved >= 0 && null >= 0);
-	assert(dup2(null, STDERR_FILENO) == STDERR_FILENO);
-	close(null);
-	r = gwp_acl_parse_str(a, text);
-	fflush(stderr);
-	assert(dup2(saved, STDERR_FILENO) == STDERR_FILENO);
-	close(saved);
-	return r;
 }
 
 /*
