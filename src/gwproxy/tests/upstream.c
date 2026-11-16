@@ -14,6 +14,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+#include <gwproxy/common.h>
 
 #define U	GWP_UPSTREAM_FAIL_UPSTREAM
 #define D	GWP_UPSTREAM_FAIL_DESTINATION
@@ -51,11 +52,11 @@ static void test_connect(void)
 	};
 	size_t i;
 
-	for (i = 0; i < sizeof(up) / sizeof(up[0]); i++) {
+	for (i = 0; i < ARRAY_SIZE(up); i++) {
 		CHECK(CONNECT, up[i], U);
 		CHECK(CONNECT, -up[i], U);	/* either sign */
 	}
-	for (i = 0; i < sizeof(local) / sizeof(local[0]); i++) {
+	for (i = 0; i < ARRAY_SIZE(local); i++) {
 		CHECK(CONNECT, local[i], N);
 		CHECK(CONNECT, -local[i], N);
 	}

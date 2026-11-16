@@ -18,10 +18,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include "test_util.h"
-
-#ifndef ARRAY_SIZE
-#define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
-#endif
+#include <gwproxy/common.h>
 
 struct req_template {
 	const char *domain;

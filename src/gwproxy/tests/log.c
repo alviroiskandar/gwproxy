@@ -14,6 +14,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <gwproxy/common.h>
 
 static FILE *wf;
 static off_t rpos;
@@ -84,7 +85,7 @@ static void test_long(void)
 	size_t i, j, k, len;
 	char *msg, *exp, *got;
 
-	for (i = 0; i < sizeof(lens) / sizeof(lens[0]); i++) {
+	for (i = 0; i < ARRAY_SIZE(lens); i++) {
 		len = lens[i];
 		msg = malloc(len + 1);
 		exp = malloc(len * 4 + 2);
