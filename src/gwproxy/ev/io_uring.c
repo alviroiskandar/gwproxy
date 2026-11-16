@@ -577,6 +577,31 @@ static void get_gcp_io(struct gwp_conn_pair *gcp, struct io_uring_sqe *s)
 	get_gcp(gcp);
 }
 
+/*
+ * Tag request @s with the pair and its selector @ev_bit, and take the pair
+ * reference the request holds until it completes. For requests that are not
+ * I/O on one of the pair's sockets; those use iou_own_sqe_io().
+ */
+static inline void iou_own_sqe(struct io_uring_sqe *s,
+			       struct gwp_conn_pair *gcp, uint64_t ev_bit)
+{
+	io_uring_sqe_set_data(s, gcp);
+	s->user_data |= ev_bit;
+	get_gcp(gcp);
+}
+
+/*
+ * As iou_own_sqe(), for I/O on one of the pair's sockets: the request is
+ * counted against that socket too (get_gcp_io()).
+ */
+static inline void iou_own_sqe_io(struct io_uring_sqe *s,
+				  struct gwp_conn_pair *gcp, uint64_t ev_bit)
+{
+	io_uring_sqe_set_data(s, gcp);
+	s->user_data |= ev_bit;
+	get_gcp_io(gcp, s);
+}
+
 static bool put_gcp(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	int x = gcp->ref_cnt--;
@@ -666,9 +691,7 @@ static int start_connect_attempt(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 
 	s = get_sqe_nofail(w);
 	io_uring_prep_connect(s, fd, &ca->sa, gwp_sockaddr_len(ca));
-	io_uring_sqe_set_data(s, gcp);
-	s->user_data |= gwp_ev_bit_attempt(slot);
-	get_gcp(gcp);
+	iou_own_sqe(s, gcp, gwp_ev_bit_attempt(slot));
 	pr_dbg(&ctx->lh,
 		"Prepared connect attempt %u (fd=%d, addr=%s, idx=%u, ref_cnt=%d)",
 		slot, fd, ip_to_str(ca), gcp->idx, gcp->ref_cnt);
@@ -719,10 +742,8 @@ static struct io_uring_sqe *prep_recv_target(struct gwp_wrk *w,
 	} else
 #endif
 		io_uring_prep_recv(s, fd, buf, len, MSG_NOSIGNAL);
-	io_uring_sqe_set_data(s, gcp);
-	s->user_data |= EV_BIT_IOU_TARGET_RECV;
+	iou_own_sqe_io(s, gcp, EV_BIT_IOU_TARGET_RECV);
 	gcp->target_rx = true;
-	get_gcp_io(gcp, s);
 	pr_dbg(&w->ctx->lh,
 		"Prepared recv for target fd=%d, len=%zu, buf=%p, ref_cnt=%d",
 		fd, len, buf, gcp->ref_cnt);
@@ -753,9 +774,7 @@ static int __prep_recv_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 
 	s = get_sqe_nofail(w);
 	io_uring_prep_recv(s, fd, buf, len, MSG_NOSIGNAL);
-	io_uring_sqe_set_data(s, gcp);
-	s->user_data |= ev_bit;
-	get_gcp_io(gcp, s);
+	iou_own_sqe_io(s, gcp, ev_bit);
 	pr_dbg(&w->ctx->lh,
 		"Prepared recv for client fd=%d, len=%zu, buf=%p, ref_cnt=%d",
 		fd, len, buf, gcp->ref_cnt);
@@ -789,9 +808,7 @@ static struct io_uring_sqe *prep_send_target(struct gwp_wrk *w,
 #else
 	io_uring_prep_send(s, fd, buf, len, MSG_NOSIGNAL);
 #endif
-	io_uring_sqe_set_data(s, gcp);
-	s->user_data |= EV_BIT_IOU_TARGET_SEND;
-	get_gcp_io(gcp, s);
+	iou_own_sqe_io(s, gcp, EV_BIT_IOU_TARGET_SEND);
 	pr_dbg(&w->ctx->lh,
 		"Prepared send for target fd=%d, len=%zu, buf=%p, ref_cnt=%d",
 		fd, len, buf, gcp->ref_cnt);
@@ -822,10 +839,8 @@ static struct io_uring_sqe *__prep_send_client(struct gwp_wrk *w,
 #else
 	io_uring_prep_send(s, fd, buf, len, MSG_NOSIGNAL);
 #endif
-	io_uring_sqe_set_data(s, gcp);
-	s->user_data |= EV_BIT_IOU_CLIENT_SEND;
+	iou_own_sqe_io(s, gcp, EV_BIT_IOU_CLIENT_SEND);
 	gcp->client_tx = true;
-	get_gcp_io(gcp, s);
 	pr_dbg(&w->ctx->lh,
 		"Prepared send for client fd=%d, len=%zu, buf=%p, ref_cnt=%d",
 		fd, len, buf, gcp->ref_cnt);
@@ -867,9 +882,7 @@ static struct io_uring_sqe *prep_timer_target(struct gwp_wrk *w,
 	gcp->ts.tv_nsec = 0;
 	gcp->ts.tv_sec = sec;
 	io_uring_prep_timeout(s, &gcp->ts, 0, 0);
-	io_uring_sqe_set_data(s, gcp);
-	s->user_data |= EV_BIT_IOU_TIMER;
-	get_gcp(gcp);
+	iou_own_sqe(s, gcp, EV_BIT_IOU_TIMER);
 	gcp->nr_timers_armed++;
 	pr_dbg(&w->ctx->lh,
 		"Prepared timer for target fd=%d, ts=%lld.%09lld, ref_cnt=%d",
@@ -903,9 +916,7 @@ static void prep_timer_del_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	 */
 	gcp->tmr_due = 0;
 	io_uring_prep_timeout_remove(s, EV_BIT_IOU_TIMER | PTR_TO_U64(gcp), 0);
-	io_uring_sqe_set_data(s, gcp);
-	s->user_data |= EV_BIT_IOU_TIMER_DEL;
-	get_gcp(gcp);
+	iou_own_sqe(s, gcp, EV_BIT_IOU_TIMER_DEL);
 	pr_dbg(&w->ctx->lh,
 		"Prepared del timer for target fd=%d, ref_cnt=%d",
 		gcp->target.fd, gcp->ref_cnt);
@@ -931,9 +942,7 @@ static void prep_client_watch(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 	s = get_sqe_nofail(w);
 	io_uring_prep_poll_multishot(s, gcp->client.fd, POLLRDHUP);
-	io_uring_sqe_set_data(s, gcp);
-	s->user_data |= EV_BIT_IOU_CLIENT_WATCH;
-	get_gcp_io(gcp, s);
+	iou_own_sqe_io(s, gcp, EV_BIT_IOU_CLIENT_WATCH);
 	gcp->client_watch = true;
 }
 
@@ -945,9 +954,7 @@ static void prep_client_watch_del(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	gcp->client_watch = false;
 
 	io_uring_prep_poll_remove(s, EV_BIT_IOU_CLIENT_WATCH | PTR_TO_U64(gcp));
-	io_uring_sqe_set_data(s, gcp);
-	s->user_data |= EV_BIT_IOU_CLIENT_WATCH_DEL;
-	get_gcp(gcp);
+	iou_own_sqe(s, gcp, EV_BIT_IOU_CLIENT_WATCH_DEL);
 }
 
 static void prep_attempt_timer_del(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
@@ -961,9 +968,7 @@ static void prep_attempt_timer_del(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	io_uring_prep_timeout_remove(s,
 				     EV_BIT_IOU_ATTEMPT_TIMER | PTR_TO_U64(gcp),
 				     0);
-	io_uring_sqe_set_data(s, gcp);
-	s->user_data |= EV_BIT_IOU_ATTEMPT_TIMER_DEL;
-	get_gcp(gcp);
+	iou_own_sqe(s, gcp, EV_BIT_IOU_ATTEMPT_TIMER_DEL);
 	gcp->attempt_timer_armed = false;
 }
 
@@ -988,9 +993,7 @@ static void __arm_attempt_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 
 	s = get_sqe_nofail(w);
 	io_uring_prep_timeout(s, &gcp->ats, 0, 0);
-	io_uring_sqe_set_data(s, gcp);
-	s->user_data |= EV_BIT_IOU_ATTEMPT_TIMER;
-	get_gcp(gcp);
+	iou_own_sqe(s, gcp, EV_BIT_IOU_ATTEMPT_TIMER);
 	gcp->attempt_timer_armed = true;
 	pr_dbg(&ctx->lh,
 		"Prepared attempt timer (idx=%u, ts=%lld.%09lld, ref_cnt=%d)",
@@ -1061,9 +1064,7 @@ static void cancel_attempt(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 
 	io_uring_prep_cancel_fd(s, gcp->attempt_fd[slot],
 				IORING_ASYNC_CANCEL_ALL);
-	io_uring_sqe_set_data(s, gcp);
-	s->user_data |= EV_BIT_IOU_ATTEMPT_CANCEL;
-	get_gcp(gcp);
+	iou_own_sqe(s, gcp, EV_BIT_IOU_ATTEMPT_CANCEL);
 	pr_dbg(&w->ctx->lh, "Cancelling losing attempt %u (fd=%d, idx=%u)",
 		slot, gcp->attempt_fd[slot], gcp->idx);
 }
@@ -1120,9 +1121,7 @@ static void shutdown_gcp(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		       gcp->target.fd, gcp->nr_ops_target);
 		s = get_sqe_nofail(w);
 		io_uring_prep_cancel_fd(s, gcp->target.fd, IORING_ASYNC_CANCEL_ALL);
-		io_uring_sqe_set_data(s, gcp);
-		s->user_data |= EV_BIT_IOU_TARGET_CANCEL;
-		get_gcp(gcp);
+		iou_own_sqe(s, gcp, EV_BIT_IOU_TARGET_CANCEL);
 	}
 
 	if (gcp->client.fd >= 0 && gcp->nr_ops_client) {
@@ -1130,9 +1129,7 @@ static void shutdown_gcp(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		       gcp->client.fd, gcp->nr_ops_client);
 		s = get_sqe_nofail(w);
 		io_uring_prep_cancel_fd(s, gcp->client.fd, IORING_ASYNC_CANCEL_ALL);
-		io_uring_sqe_set_data(s, gcp);
-		s->user_data |= EV_BIT_IOU_CLIENT_CANCEL;
-		get_gcp(gcp);
+		iou_own_sqe(s, gcp, EV_BIT_IOU_CLIENT_CANCEL);
 	}
 
 	if (gcp->udp_fd >= 0 && gcp->nr_ops_udp) {
@@ -1140,9 +1137,7 @@ static void shutdown_gcp(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		       gcp->udp_fd, gcp->nr_ops_udp);
 		s = get_sqe_nofail(w);
 		io_uring_prep_cancel_fd(s, gcp->udp_fd, IORING_ASYNC_CANCEL_ALL);
-		io_uring_sqe_set_data(s, gcp);
-		s->user_data |= EV_BIT_IOU_UDP_CANCEL;
-		get_gcp(gcp);
+		iou_own_sqe(s, gcp, EV_BIT_IOU_UDP_CANCEL);
 	}
 
 	gcp->flags |= GWP_CONN_FLAG_IS_CANCEL;
@@ -1190,9 +1185,7 @@ static void prep_send_client_cipher(struct gwp_wrk *w, struct gwp_conn_pair *gcp
 
 	io_uring_prep_send(s, gcp->client.fd, t->tx + t->tx_sent,
 			   t->tx_len - t->tx_sent, MSG_NOSIGNAL);
-	io_uring_sqe_set_data(s, gcp);
-	s->user_data |= ev_bit;
-	get_gcp_io(gcp, s);
+	iou_own_sqe_io(s, gcp, ev_bit);
 }
 
 /*
@@ -1326,9 +1319,7 @@ static void prep_send_target_cipher(struct gwp_wrk *w, struct gwp_conn_pair *gcp
 
 	io_uring_prep_send(s, gcp->target.fd, t->tx + t->tx_sent,
 			   t->tx_len - t->tx_sent, MSG_NOSIGNAL);
-	io_uring_sqe_set_data(s, gcp);
-	s->user_data |= ev_bit;
-	get_gcp_io(gcp, s);
+	iou_own_sqe_io(s, gcp, ev_bit);
 }
 
 /* Take the next ciphertext the target's engine has to send into the scratch. */
@@ -1768,9 +1759,7 @@ static void prep_tls_detect(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	gcp->conn_state = CONN_STATE_TLS_DETECT;
 	io_uring_prep_recv(s, gcp->client.fd, gcp->client.buf, 1,
 			   MSG_PEEK | MSG_NOSIGNAL);
-	io_uring_sqe_set_data(s, gcp);
-	s->user_data |= EV_BIT_IOU_TLS_DETECT;
-	get_gcp_io(gcp, s);
+	iou_own_sqe_io(s, gcp, EV_BIT_IOU_TLS_DETECT);
 }
 
 static int handle_ev_tls_detect(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
@@ -2143,9 +2132,7 @@ static struct io_uring_sqe *prep_upstream_send(struct gwp_wrk *w,
 
 	io_uring_prep_send(s, gcp->target.fd, gcp->target.buf, gcp->target.len,
 			   MSG_NOSIGNAL);
-	io_uring_sqe_set_data(s, gcp);
-	s->user_data |= EV_BIT_IOU_UPSTREAM_S5;
-	get_gcp_io(gcp, s);
+	iou_own_sqe_io(s, gcp, EV_BIT_IOU_UPSTREAM_S5);
 	return s;
 }
 
@@ -2167,9 +2154,7 @@ static struct io_uring_sqe *prep_upstream_recv(struct gwp_wrk *w,
 
 	s = get_sqe_nofail(w);
 	io_uring_prep_recv(s, gcp->target.fd, buf, len, MSG_NOSIGNAL);
-	io_uring_sqe_set_data(s, gcp);
-	s->user_data |= EV_BIT_IOU_UPSTREAM_S5;
-	get_gcp_io(gcp, s);
+	iou_own_sqe_io(s, gcp, EV_BIT_IOU_UPSTREAM_S5);
 	return s;
 }
 
@@ -2485,9 +2470,7 @@ static bool upstream_tmo(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	gcp->flags |= GWP_CONN_FLAG_UP_TMO_WAIT;
 	s = get_sqe_nofail(w);
 	io_uring_prep_cancel_fd(s, gcp->target.fd, IORING_ASYNC_CANCEL_ALL);
-	io_uring_sqe_set_data(s, gcp);
-	s->user_data |= EV_BIT_IOU_UPSTREAM_CANCEL;
-	get_gcp(gcp);
+	iou_own_sqe(s, gcp, EV_BIT_IOU_UPSTREAM_CANCEL);
 	pr_dbg(&w->ctx->lh,
 	       "Cancelling the upstream handshake before the timeout reply (idx=%u, fd=%d)",
 	       gcp->idx, gcp->target.fd);
@@ -3506,9 +3489,7 @@ static void prep_udp_recv(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	u->mh.msg_iov = &u->iov;
 	u->mh.msg_iovlen = 1;
 	io_uring_prep_recvmsg(s, gcp->udp_fd, &u->mh, 0);
-	io_uring_sqe_set_data(s, gcp);
-	s->user_data |= EV_BIT_IOU_UDP_RX;
-	get_gcp_io(gcp, s);
+	iou_own_sqe_io(s, gcp, EV_BIT_IOU_UDP_RX);
 }
 
 /*
@@ -3525,9 +3506,7 @@ static void prep_udp_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	u->dst = out->dst;
 	gwp_udp_out_msg(&u->mh, &u->iov, &u->cb, &u->dst, out);
 	io_uring_prep_sendmsg(s, gcp->udp_fd, &u->mh, MSG_NOSIGNAL);
-	io_uring_sqe_set_data(s, gcp);
-	s->user_data |= EV_BIT_IOU_UDP_TX;
-	get_gcp_io(gcp, s);
+	iou_own_sqe_io(s, gcp, EV_BIT_IOU_UDP_TX);
 }
 
 /*
