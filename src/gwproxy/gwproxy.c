@@ -2265,6 +2265,20 @@ static void *gwp_reload_thread(void *arg)
 }
 
 /*
+ * Drop the file watch of gwp_ctx_init_watch(): the inotify instance and with
+ * it every watch descriptor, which are reset to -1.
+ */
+static void gwp_ctx_free_watch(struct gwp_ctx *ctx)
+{
+	size_t i;
+
+	gwp_close_fd(&ctx->ino_fd);
+	ctx->auth_wd = -1;
+	for (i = 0; i < ctx->nr_acl_files; i++)
+		ctx->acl_files[i].wd = -1;
+}
+
+/*
  * With --watch-files=1, one inotify instance watches the auth file and the
  * files of the ACL (the --acl-file and those it includes), so when they share a
  * directory each event is read once, not once per file. Leaves ino_fd at -1
@@ -2319,11 +2333,7 @@ static int gwp_ctx_init_watch(struct gwp_ctx *ctx)
 	return 0;
 
 out_err:
-	__sys_close(ctx->ino_fd);
-	ctx->ino_fd = -1;
-	ctx->auth_wd = -1;
-	for (i = 0; i < ctx->nr_acl_files; i++)
-		ctx->acl_files[i].wd = -1;
+	gwp_ctx_free_watch(ctx);
 	return r;
 }
 
@@ -2333,8 +2343,6 @@ out_err:
  */
 static void gwp_ctx_free_reload(struct gwp_ctx *ctx)
 {
-	size_t i;
-
 	if (ctx->reload_running) {
 		eventfd_t one = 1;
 
@@ -2346,10 +2354,7 @@ static void gwp_ctx_free_reload(struct gwp_ctx *ctx)
 	}
 	gwp_close_fd(&ctx->reload_efd);
 	gwp_close_fd(&ctx->hup_efd);
-	gwp_close_fd(&ctx->ino_fd);
-	ctx->auth_wd = -1;
-	for (i = 0; i < ctx->nr_acl_files; i++)
-		ctx->acl_files[i].wd = -1;
+	gwp_ctx_free_watch(ctx);
 }
 
 /*
