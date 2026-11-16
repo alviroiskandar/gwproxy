@@ -141,6 +141,7 @@ static int chk_handle_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 static int handle_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 static int free_conn_pair(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 static ssize_t __do_send(struct gwp_conn *src, struct gwp_conn *dst);
+static inline int flush_target_buf(struct gwp_conn_pair *gcp);
 static int drop_raw_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 
 /*
@@ -168,12 +169,8 @@ static int fail_raw_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	pr_dbg(&w->ctx->lh, "DNS query failed: %s (%s; gcp_idx=%u)",
 	       gcp->gdp->host, strerror(-err), gcp->idx);
 	r = gwp_conn_fail_reply(w, gcp, -EHOSTUNREACH);
-	if (!r && gcp->target.len) {
-		ssize_t sr = __do_send(&gcp->target, &gcp->client);
-
-		if (unlikely(sr < 0))
-			r = (int)sr;
-	}
+	if (!r)
+		r = flush_target_buf(gcp);
 
 	return r ? r : err;
 }
@@ -1697,6 +1694,23 @@ static ssize_t __do_send(struct gwp_conn *src, struct gwp_conn *dst)
 }
 
 /*
+ * Send the client what target.buf holds for it, if anything: 0, or the
+ * send's error. Only for callers that know a TLS client's engine has nothing
+ * queued of its own then, or that leave that to a later send; the others
+ * use flush_client_reply().
+ */
+static inline int flush_target_buf(struct gwp_conn_pair *gcp)
+{
+	ssize_t sr;
+
+	if (!gcp->target.len)
+		return 0;
+
+	sr = __do_send(&gcp->target, &gcp->client);
+	return unlikely(sr < 0) ? (int)sr : 0;
+}
+
+/*
  * Receive into src->buf. The first pass of do_splice() reads the socket. A TLS
  * source decrypts only as much as src->buf has room for, so when it filled up,
  * the engine may still hold plaintext, or whole records, whose ciphertext has
@@ -1788,17 +1802,10 @@ static int prep_and_send_socks5_rep_connect(struct gwp_wrk *w,
 					    struct gwp_conn_pair *gcp,
 					    int err)
 {
-	ssize_t sr;
-	int r;
+	int r = gwp_socks5_prep_connect_reply(w, gcp, err);
+	int sr = flush_target_buf(gcp);
 
-	r = gwp_socks5_prep_connect_reply(w, gcp, err);
-	if (gcp->target.len) {
-		sr = __do_send(&gcp->target, &gcp->client);
-		if (unlikely(sr < 0))
-			return (int)sr;
-	}
-
-	return r;
+	return sr ? sr : r;
 }
 
 /*
@@ -1909,16 +1916,10 @@ static int upstream_fail(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		return upstream_redial(w, gcp, err);
 	r = gwp_upstream_fail_reply(w, gcp, err);
 
-	if (r > 0) {
-		ssize_t sr = __do_send(&gcp->target, &gcp->client);
-
-		if (unlikely(sr < 0))
-			return (int)sr;
-	} else if (r < 0) {
-		return r;
-	}
-
-	return err;
+	/* A positive @r is the length of the reply queued in target.buf. */
+	if (r > 0)
+		r = flush_target_buf(gcp);
+	return r < 0 ? r : err;
 }
 
 static int upstream_arm(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
@@ -2019,7 +2020,6 @@ static int udp_up_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 /* The upstream tunnel is up (reply already spliced); start forwarding. */
 static int upstream_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
-	ssize_t sr;
 	int r;
 
 	if (gcp->flags & GWP_CONN_FLAG_UDP_UP)
@@ -2042,11 +2042,9 @@ static int upstream_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	gwp_log_upstream_established(w, gcp);
 
 	/* Flush downstream reply (+ early data) to the client. */
-	if (gcp->target.len) {
-		sr = __do_send(&gcp->target, &gcp->client);
-		if (unlikely(sr < 0))
-			return (int)sr;
-	}
+	r = flush_target_buf(gcp);
+	if (unlikely(r))
+		return r;
 
 	/* Flush any client data buffered during the handshake to the target. */
 	r = flush_early_data(w, gcp);
@@ -2180,6 +2178,21 @@ static bool client_reply_pending(struct gwp_conn_pair *gcp)
 		return true;
 #endif
 	return gcp->target.len > 0;
+}
+
+/*
+ * Send the client what is pending of a reply to it (client_reply_pending()),
+ * if anything: 0, or the send's error.
+ */
+static inline int flush_client_reply(struct gwp_conn_pair *gcp)
+{
+	ssize_t sr;
+
+	if (!client_reply_pending(gcp))
+		return 0;
+
+	sr = __do_send(&gcp->target, &gcp->client);
+	return unlikely(sr < 0) ? (int)sr : 0;
 }
 
 /*
@@ -2795,15 +2808,9 @@ static int handle_ev_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		if (gwp_conn_upstream_failed(w, gcp, -ECONNRESET, true))
 			return upstream_redial(w, gcp, -ECONNRESET);
 		r = gwp_conn_fail_reply(w, gcp, -EPROTO);
-		if (unlikely(r))
-			return r;
-		if (client_reply_pending(gcp)) {
-			ssize_t sr = __do_send(&gcp->target, &gcp->client);
-
-			if (unlikely(sr < 0))
-				return (int)sr;
-		}
-		return -ECONNRESET;
+		if (!r)
+			r = flush_client_reply(gcp);
+		return r ? r : -ECONNRESET;
 	}
 
 	/*
@@ -3055,10 +3062,10 @@ static int handle_conn_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		len = gcp->target.len;
 		if (!gwp_conn_fail_reply(w, gcp, -ETIMEDOUT) &&
 		    gcp->target.len > len) {
-			ssize_t sr = __do_send(&gcp->target, &gcp->client);
+			int r = flush_target_buf(gcp);
 
-			if (unlikely(sr < 0))
-				return (int)sr;
+			if (r)
+				return r;
 		}
 	}
 
@@ -3079,13 +3086,8 @@ static int acl_reject_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	if (r != -EACCES)
 		return r;
 
-	if (gcp->target.len) {
-		ssize_t sr = __do_send(&gcp->target, &gcp->client);
-
-		if (sr < 0)
-			return (int)sr;
-	}
-	return -EACCES;
+	r = flush_target_buf(gcp);
+	return r ? r : -EACCES;
 }
 
 /*
@@ -3371,12 +3373,8 @@ static int handle_ev_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		 * or HTTP 502) instead of hanging up silently.
 		 */
 		r = gwp_conn_fail_reply(w, gcp, gde->res);
-		if (!r && gcp->target.len) {
-			ssize_t sr = __do_send(&gcp->target, &gcp->client);
-
-			if (unlikely(sr < 0))
-				r = (int)sr;
-		}
+		if (!r)
+			r = flush_target_buf(gcp);
 		if (!r)
 			r = gde->res ? gde->res : -EIO;
 	}
@@ -3647,6 +3645,14 @@ static int arm_client_prot_out(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 			   EV_BIT_CLIENT_PROT);
 }
 
+/* Send what is pending of a reply to the client, and watch for the rest. */
+static int flush_client_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	int r = flush_client_reply(gcp);
+
+	return r ? r : arm_client_prot_out(w, gcp);
+}
+
 /*
  * Take in what the client sent, and act on it. Only the @first pass of
  * client_prot_in() reads the socket; later ones take only what a TLS
@@ -3666,12 +3672,7 @@ static int handle_ev_client_prot_in(struct gwp_wrk *w, struct gwp_conn_pair *gcp
 		if (gcp->client.rd_eof)
 			return client_prot_eof(gcp);
 		/* No plaintext, but the engine may have had something to say. */
-		if (client_reply_pending(gcp)) {
-			ret = __do_send(&gcp->target, &gcp->client);
-			if (ret < 0)
-				return (int)ret;
-		}
-		return arm_client_prot_out(w, gcp);
+		return flush_client_prot(w, gcp);
 	}
 
 	/*
@@ -3702,12 +3703,7 @@ static int handle_ev_client_prot_in(struct gwp_wrk *w, struct gwp_conn_pair *gcp
 		 * client_rx_held() parks the fd with no EPOLLOUT to drain
 		 * them, and the end of the control connection goes unseen.
 		 */
-		if (client_reply_pending(gcp)) {
-			ret = __do_send(&gcp->target, &gcp->client);
-			if (ret < 0)
-				return (int)ret;
-		}
-		return arm_client_prot_out(w, gcp);
+		return flush_client_prot(w, gcp);
 	}
 	if (ct == CONN_STATE_PROT) {
 		r = handle_conn_state_prot(w, gcp);
@@ -3728,11 +3724,9 @@ static int handle_ev_client_prot_in(struct gwp_wrk *w, struct gwp_conn_pair *gcp
 	/* Refused: what is queued is the client's last reply. */
 	if (r < 0)
 		gcp->client.last_reply = true;
-	if (client_reply_pending(gcp)) {
-		ret = __do_send(&gcp->target, &gcp->client);
-		if (ret < 0)
-			return (int)ret;
-	}
+	ret = flush_client_reply(gcp);
+	if (ret)
+		return (int)ret;
 
 	/*
 	 * A reply the socket did not take whole must not wait for the client
