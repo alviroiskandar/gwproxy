@@ -3772,37 +3772,39 @@ static bool upstream_host_ok(struct gwp_upstream *up)
 __cold
 int gwp_parse_upstream(const char *url, struct gwp_upstream *up)
 {
+	static const struct {
+		const char	*prefix;
+		uint8_t		len;
+		uint8_t		type;
+		bool		remote_dns;
+		bool		use_tls;
+		uint16_t	def_port;
+	} schemes[] = {
+		{ "socks5h://",	10, GWP_UPSTREAM_SOCKS5, true,  false, 1080 },
+		{ "socks5://",	9,  GWP_UPSTREAM_SOCKS5, false, false, 1080 },
+		/* The HTTP proxy resolves the CONNECT host. */
+		{ "https://",	8,  GWP_UPSTREAM_HTTP,   true,  true,  8080 },
+		{ "http://",	7,  GWP_UPSTREAM_HTTP,   true,  false, 8080 },
+	};
 	char buf[512], *at, *host;
-	const char *rest;
-	uint16_t def_port;
-	size_t n;
+	const char *rest = NULL;
+	uint16_t def_port = 0;
+	size_t n, i;
 
 	memset(up, 0, sizeof(*up));
 
-	if (!strncmp(url, "socks5h://", 10)) {
-		up->type = GWP_UPSTREAM_SOCKS5;
-		up->remote_dns = true;
-		rest = url + 10;
-		def_port = 1080;
-	} else if (!strncmp(url, "socks5://", 9)) {
-		up->type = GWP_UPSTREAM_SOCKS5;
-		up->remote_dns = false;
-		rest = url + 9;
-		def_port = 1080;
-	} else if (!strncmp(url, "https://", 8)) {
-		up->type = GWP_UPSTREAM_HTTP;
-		up->use_tls = true;
-		up->remote_dns = true;	/* the HTTP proxy resolves the CONNECT host */
-		rest = url + 8;
-		def_port = 8080;
-	} else if (!strncmp(url, "http://", 7)) {
-		up->type = GWP_UPSTREAM_HTTP;
-		up->remote_dns = true;
-		rest = url + 7;
-		def_port = 8080;
-	} else {
-		return -EINVAL;
+	for (i = 0; i < ARRAY_SIZE(schemes); i++) {
+		if (!strncmp(url, schemes[i].prefix, schemes[i].len)) {
+			up->type = schemes[i].type;
+			up->remote_dns = schemes[i].remote_dns;
+			up->use_tls = schemes[i].use_tls;
+			rest = url + schemes[i].len;
+			def_port = schemes[i].def_port;
+			break;
+		}
 	}
+	if (!rest)
+		return -EINVAL;
 
 	n = strlen(rest);
 	if (n == 0 || n >= sizeof(buf))
