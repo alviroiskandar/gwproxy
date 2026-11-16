@@ -834,6 +834,7 @@ static void test_udp_hdr_codec(void)
 	memcpy(&a.port, "\x00\x35", 2);		/* 53 */
 	r = gwp_socks5_udp_build_hdr(&a, buf, sizeof(buf), &hlen);
 	assert(!r && hlen == 3 + 1 + 4 + 2);
+	assert(gwp_socks5_udp_hdr_len(&a) == (int)hlen);
 	assert(buf[0] == 0 && buf[1] == 0 && buf[2] == 0);
 	assert(buf[3] == GWP_SOCKS5_ATYP_IPV4);
 	memcpy(dg, buf, hlen);
@@ -853,6 +854,7 @@ static void test_udp_hdr_codec(void)
 	memcpy(&a.port, "\x01\xbb", 2);		/* 443 */
 	r = gwp_socks5_udp_build_hdr(&a, buf, sizeof(buf), &hlen);
 	assert(!r && hlen == 3 + 1 + 16 + 2);
+	assert(gwp_socks5_udp_hdr_len(&a) == (int)hlen);
 	r = gwp_socks5_udp_parse_hdr(buf, hlen, &got, &plen);
 	assert(!r && plen == hlen && got.ver == GWP_SOCKS5_ATYP_IPV6);
 	assert(!memcmp(got.ip6, a.ip6, 16));
@@ -865,6 +867,7 @@ static void test_udp_hdr_codec(void)
 	memcpy(&a.port, "\x00\x50", 2);
 	r = gwp_socks5_udp_build_hdr(&a, buf, sizeof(buf), &hlen);
 	assert(!r && hlen == 3 + 1 + 1 + 11 + 2);
+	assert(gwp_socks5_udp_hdr_len(&a) == (int)hlen);
 	r = gwp_socks5_udp_parse_hdr(buf, hlen, &got, &plen);
 	assert(!r && got.ver == GWP_SOCKS5_ATYP_DOMAIN && got.domain.len == 11);
 	assert(!memcmp(got.domain.str, "example.com", 11));
@@ -911,6 +914,12 @@ static void test_udp_hdr_codec(void)
 	/* Build into too small a buffer. */
 	r = gwp_socks5_udp_build_hdr(&a, buf, 4, &hlen);
 	assert(r == -ENOBUFS);
+
+	/* An address type there is none of has no header length. */
+	a.ver = 0x09;
+	assert(gwp_socks5_udp_hdr_len(&a) < 0);
+	r = gwp_socks5_udp_build_hdr(&a, buf, sizeof(buf), &hlen);
+	assert(r == -EINVAL);
 }
 
 /* The client side's UDP ASSOCIATE request and the reply's BND.ADDR:PORT. */

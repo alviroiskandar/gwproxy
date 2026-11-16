@@ -7090,14 +7090,14 @@ enum gwp_udp_act gwp_udp_relay_classify(struct gwp_wrk *w,
 	} else {
 		/* Target -> client: prepend a header in the front slack. */
 		struct gwp_socks5_addr sa;
-		size_t h, hlen;
+		size_t hlen;
+		int h;
 
 		if (!udp_reply_allowed(w->ctx, gcp, src))
 			return GWP_UDP_DROP;	/* not a target of this client */
 		gwp_socks5_reply_addr_from_sockaddr(src, &sa);
-		h = (sa.ver == GWP_SOCKS5_ATYP_IPV4) ? 3 + 1 + 4 + 2
-						     : 3 + 1 + 16 + 2;
-		if (gwp_socks5_udp_build_hdr(&sa, base - h, h, &hlen))
+		h = gwp_socks5_udp_hdr_len(&sa);
+		if (h < 0 || gwp_socks5_udp_build_hdr(&sa, base - h, h, &hlen))
 			return GWP_UDP_DROP;
 		return udp_out_to_client(gcp, out, base - h, h + n);
 	}

@@ -854,20 +854,6 @@ int gwp_socks5_conn_cmd_udp_associate_res(struct gwp_socks5_conn *conn,
  * client CONNECT request builder below. Returns the number of bytes written,
  * or a negative error code.
  */
-static int gwp_socks5_addr_len(const struct gwp_socks5_addr *a)
-{
-	switch (a->ver) {
-	case GWP_SOCKS5_ATYP_IPV4:
-		return 1 + 4 + 2;
-	case GWP_SOCKS5_ATYP_IPV6:
-		return 1 + 16 + 2;
-	case GWP_SOCKS5_ATYP_DOMAIN:
-		return 1 + 1 + a->domain.len + 2;
-	default:
-		return -EINVAL;
-	}
-}
-
 static int gwp_socks5_addr_encode(uint8_t *b, const struct gwp_socks5_addr *a)
 {
 	b[0] = a->ver; /* ATYP */
@@ -1069,14 +1055,12 @@ int gwp_socks5_udp_build_hdr(const struct gwp_socks5_addr *addr, void *buf,
 			     size_t cap, size_t *hdr_len)
 {
 	uint8_t *b = buf;
-	int al = gwp_socks5_addr_len(addr);
-	size_t total;
+	int total = gwp_socks5_udp_hdr_len(addr);
 
-	if (al < 0)
+	if (total < 0)
 		return -EINVAL;
 
-	total = 3 + (size_t)al;	/* RSV(2) + FRAG(1) + ATYP + addr + port */
-	if (cap < total)
+	if (cap < (size_t)total)
 		return -ENOBUFS;
 
 	b[0] = 0x00;	/* RSV */
