@@ -3237,8 +3237,7 @@ static int start_connect_attempt(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	 * event loop, so the winner is picked in exactly one place.
 	 */
 	ev.events = EPOLLOUT | EPOLLRDHUP;
-	ev.data.u64 = PTR_TO_U64(gcp) |
-		      (EV_BIT_TARGET_ATTEMPT + ((uint64_t)slot << 48ull));
+	ev.data.u64 = PTR_TO_U64(gcp) | gwp_ev_bit_attempt(slot);
 	r = __sys_epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, tfd, &ev);
 	if (unlikely(r)) {
 		__sys_close(tfd);
@@ -3652,9 +3651,7 @@ static int handle_ev_dns_cq(struct gwp_wrk *w)
 static bool is_ev_bit_conn_pair(uint64_t ev_bit)
 {
 	/* Every attempt slot of a Happy Eyeballs race points at the pair. */
-	if (ev_bit >= EV_BIT_TARGET_ATTEMPT &&
-	    ev_bit < EV_BIT_TARGET_ATTEMPT +
-		     ((uint64_t)GWP_MAX_CONN_CAND << 48ull))
+	if (gwp_ev_bit_is_attempt(ev_bit))
 		return true;
 
 	switch (ev_bit) {
@@ -4262,10 +4259,8 @@ static int handle_event(struct gwp_wrk *w, struct epoll_event *ev)
 	 * A racing connect attempt: the slot index rides in the tag, so the
 	 * pair pointer in the low bits is untouched.
 	 */
-	if (ev_bit >= EV_BIT_TARGET_ATTEMPT &&
-	    ev_bit < EV_BIT_TARGET_ATTEMPT +
-		     ((uint64_t)GWP_MAX_CONN_CAND << 48ull)) {
-		uint8_t slot = (ev_bit - EV_BIT_TARGET_ATTEMPT) >> 48ull;
+	if (gwp_ev_bit_is_attempt(ev_bit)) {
+		uint8_t slot = gwp_ev_bit_attempt_slot(ev_bit);
 
 		r = handle_ev_target_attempt(w, udata, slot);
 		goto out;

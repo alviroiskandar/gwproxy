@@ -667,7 +667,7 @@ static int start_connect_attempt(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	s = get_sqe_nofail(w);
 	io_uring_prep_connect(s, fd, &ca->sa, gwp_sockaddr_len(ca));
 	io_uring_sqe_set_data(s, gcp);
-	s->user_data |= EV_BIT_TARGET_ATTEMPT + ((uint64_t)slot << 48ull);
+	s->user_data |= gwp_ev_bit_attempt(slot);
 	get_gcp(gcp);
 	pr_dbg(&ctx->lh,
 		"Prepared connect attempt %u (fd=%d, addr=%s, idx=%u, ref_cnt=%d)",
@@ -4179,10 +4179,8 @@ static int handle_event(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 	 * the common teardown below expects it. A block of selectors rather
 	 * than one value, hence the range test ahead of the switch.
 	 */
-	if (ev_bit >= EV_BIT_TARGET_ATTEMPT &&
-	    ev_bit < EV_BIT_TARGET_ATTEMPT +
-		     ((uint64_t)GWP_MAX_CONN_CAND << 48ull)) {
-		uint8_t slot = (uint8_t)((ev_bit - EV_BIT_TARGET_ATTEMPT) >> 48ull);
+	if (gwp_ev_bit_is_attempt(ev_bit)) {
+		uint8_t slot = gwp_ev_bit_attempt_slot(ev_bit);
 
 		pr_dbg(&ctx->lh, "Handling target attempt %u event: %d", slot,
 			cqe->res);

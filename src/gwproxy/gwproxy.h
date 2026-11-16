@@ -366,6 +366,28 @@ enum {
 static_assert((EV_BIT_CLIENT_PROT & ~EV_BIT_ALL) == 0,
 	      "the largest event selector must fit inside EV_BIT_ALL");
 
+/*
+ * The selector of connect attempt slot @slot (EV_BIT_TARGET_ATTEMPT), its
+ * range test and the slot it carries. Both loops tag a racing attempt this
+ * way; the caller ORs in the pair pointer.
+ */
+static inline uint64_t gwp_ev_bit_attempt(uint8_t slot)
+{
+	return EV_BIT_TARGET_ATTEMPT + ((uint64_t)slot << 48ull);
+}
+
+static inline bool gwp_ev_bit_is_attempt(uint64_t ev_bit)
+{
+	return ev_bit >= EV_BIT_TARGET_ATTEMPT &&
+	       ev_bit < EV_BIT_TARGET_ATTEMPT +
+			((uint64_t)GWP_MAX_CONN_CAND << 48ull);
+}
+
+static inline uint8_t gwp_ev_bit_attempt_slot(uint64_t ev_bit)
+{
+	return (uint8_t)((ev_bit - EV_BIT_TARGET_ATTEMPT) >> 48ull);
+}
+
 enum {
 	CONN_STATE_INIT			= 0,
 	CONN_STATE_FORWARDING		= 1,
