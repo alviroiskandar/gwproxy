@@ -900,18 +900,29 @@ int gwp_socks5_cli_build_greeting(bool have_auth, void *buf, size_t *len)
 	return 0;
 }
 
-int gwp_socks5_cli_parse_method(const void *buf, size_t len, uint8_t *method)
+/*
+ * Parse a two-byte VER + value reply whose VER must be @ver: the method
+ * selection and the RFC 1929 authentication status share this layout.
+ */
+static inline int cli_parse_ver_byte(const void *buf, size_t len, uint8_t ver,
+				     uint8_t *out)
 {
 	const uint8_t *b = buf;
 
 	if (len < 2)
 		return -EAGAIN;
 
-	if (b[0] != 0x05)
+	if (b[0] != ver)
 		return -EINVAL;
 
-	*method = b[1];
+	*out = b[1];
 	return 0;
+}
+
+int gwp_socks5_cli_parse_method(const void *buf, size_t len, uint8_t *method)
+{
+	/* VER 0x05: the SOCKS version. */
+	return cli_parse_ver_byte(buf, len, 0x05, method);
 }
 
 int gwp_socks5_cli_build_userpass(const char *u, size_t ulen,
@@ -941,16 +952,8 @@ int gwp_socks5_cli_build_userpass(const char *u, size_t ulen,
 
 int gwp_socks5_cli_parse_userpass(const void *buf, size_t len, uint8_t *status)
 {
-	const uint8_t *b = buf;
-
-	if (len < 2)
-		return -EAGAIN;
-
-	if (b[0] != 0x01)
-		return -EINVAL;
-
-	*status = b[1];
-	return 0;
+	/* VER 0x01: the RFC 1929 subnegotiation version. */
+	return cli_parse_ver_byte(buf, len, 0x01, status);
 }
 
 /* Build a request for @cmd (CONNECT, UDP ASSOCIATE) to @dst. */
