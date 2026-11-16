@@ -123,11 +123,6 @@ struct gwp_cfg {
 
 struct gwp_ctx;
 
-enum {
-	GWP_UPSTREAM_SOCKS5	= 0,
-	GWP_UPSTREAM_HTTP	= 1,
-};
-
 /*
  * One upstream proxy server, parsed from a URL such as --upstream-proxy's. A
  * connection that chains through it holds a reference (gwp_conn_pair::upstream)

@@ -269,9 +269,10 @@ static bool ev_is_io_uring(const struct gwp_cfg *cfg)
 
 /*
  * Locate the password of an --upstream-proxy URL the way gwp_parse_upstream()
- * splits it: the "user:pass" before the last '@' after the scheme, the
- * password after its first ':'. Works on malformed URLs too, so an error
- * message can leave the password out. Returns false when there is none;
+ * splits it (gwp_upstream_split_creds()): the "user:pass" before the last '@'
+ * after the scheme, the password after its first ':'. Works on malformed URLs
+ * too (any scheme, any length), so an error message can leave the password
+ * out. Returns false when there is none;
  * otherwise the password spans @url[*off, *off + *len), possibly empty.
  */
 static bool upstream_pass_span(const char *url, size_t *off, size_t *len)
@@ -3772,71 +3773,39 @@ static bool upstream_host_ok(struct gwp_upstream *up)
 __cold
 int gwp_parse_upstream(const char *url, struct gwp_upstream *up)
 {
-	static const struct {
-		const char	*prefix;
-		uint8_t		len;
-		uint8_t		type;
-		bool		remote_dns;
-		bool		use_tls;
-		uint16_t	def_port;
-	} schemes[] = {
-		{ "socks5h://",	10, GWP_UPSTREAM_SOCKS5, true,  false, 1080 },
-		{ "socks5://",	9,  GWP_UPSTREAM_SOCKS5, false, false, 1080 },
-		/* The HTTP proxy resolves the CONNECT host. */
-		{ "https://",	8,  GWP_UPSTREAM_HTTP,   true,  true,  8080 },
-		{ "http://",	7,  GWP_UPSTREAM_HTTP,   true,  false, 8080 },
-	};
-	char buf[512], *at, *host;
-	const char *rest = NULL;
-	uint16_t def_port = 0;
-	size_t n, i;
+	const struct gwp_upstream_scheme *sc;
+	const char *rest, *at, *host;
+	size_t n, ul, pl;
 
 	memset(up, 0, sizeof(*up));
 
-	for (i = 0; i < ARRAY_SIZE(schemes); i++) {
-		if (!strncmp(url, schemes[i].prefix, schemes[i].len)) {
-			up->type = schemes[i].type;
-			up->remote_dns = schemes[i].remote_dns;
-			up->use_tls = schemes[i].use_tls;
-			rest = url + schemes[i].len;
-			def_port = schemes[i].def_port;
-			break;
-		}
-	}
-	if (!rest)
+	sc = gwp_upstream_scheme(url, &rest);
+	if (!sc)
 		return -EINVAL;
+	up->type = sc->type;
+	up->remote_dns = sc->remote_dns;
+	up->use_tls = sc->use_tls;
 
 	n = strlen(rest);
-	if (n == 0 || n >= sizeof(buf))
+	if (n == 0 || n >= GWP_UPSTREAM_REST_MAX)
 		return -EINVAL;
-	memcpy(buf, rest, n + 1);
 
-	/* Optional "user:pass@" credentials; split at the last '@'. */
-	at = strrchr(buf, '@');
-	if (at) {
-		char *creds = buf, *pass;
-		size_t ul, pl;
-
-		*at = '\0';
-		host = at + 1;
-
-		pass = strchr(creds, ':');
-		if (pass)
-			*pass++ = '\0';
-
-		ul = strlen(creds);
-		pl = pass ? strlen(pass) : 0;
-		if (ul == 0 || ul > 255 || pl > 255)
+	/* Optional "user:pass@" credentials. */
+	if (gwp_upstream_split_creds(rest, &at, &ul, &pl)) {
+		if (ul == 0 || ul > GWP_UPSTREAM_CRED_MAX ||
+		    pl > GWP_UPSTREAM_CRED_MAX)
 			return -EINVAL;
 
 		up->has_auth = true;
 		up->ulen = (uint8_t)ul;
 		up->plen = (uint8_t)pl;
-		memcpy(up->user, creds, ul + 1);
-		if (pass)
-			memcpy(up->pass, pass, pl + 1);
+		memcpy(up->user, rest, ul);
+		up->user[ul] = '\0';
+		memcpy(up->pass, rest + ul + 1, pl);
+		up->pass[pl] = '\0';
+		host = at + 1;
 	} else {
-		host = buf;
+		host = rest;
 	}
 
 	if (gwp_upstream_url_host(host, up->host, sizeof(up->host),
@@ -3844,7 +3813,7 @@ int gwp_parse_upstream(const char *url, struct gwp_upstream *up)
 	    !upstream_host_ok(up))
 		return -EINVAL;
 
-	if (convert_str_to_ssaddr(host, &up->addr, def_port))
+	if (convert_str_to_ssaddr(host, &up->addr, sc->def_port))
 		return up->host_is_ip ? -EINVAL : -EHOSTUNREACH;
 	return 0;
 }

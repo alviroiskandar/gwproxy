@@ -4497,6 +4497,51 @@ static noinline void test_upstream_errors(void)
 	gwp_acl_destroy(a);
 }
 
+/*
+ * A pool server's URL takes what --upstream-proxy takes, up to its limits: a
+ * user name and a password of 255 bytes each, and 511 bytes after the scheme.
+ */
+static noinline void test_upstream_url_limits(void)
+{
+	char cred[257], *text, *p;
+	struct gwp_acl *a = NULL;
+
+	/* Both at 255 bytes would not fit in the 511: one at a time. */
+	memset(cred, 'u', 255);
+	cred[255] = '\0';
+	assert(asprintf(&text, "upstream p {\n server http://%s:p@h:1;\n}\n",
+			cred) > 0);
+	assert(!gwp_acl_parse_str(&a, text));
+	gwp_acl_destroy(a);
+	a = NULL;
+	free(text);
+	assert(asprintf(&text, "upstream p {\n server http://u:%s@h:1;\n}\n",
+			cred) > 0);
+	assert(!gwp_acl_parse_str(&a, text));
+	gwp_acl_destroy(a);
+	a = NULL;
+	free(text);
+
+	strcpy(cred + 255, "u");
+	assert(asprintf(&text, "upstream p {\n server http://%s@h:1;\n}\n",
+			cred) > 0);
+	up_refused(text, -EINVAL, "longer than 255 bytes");
+	free(text);
+
+	/* 511 bytes after "http://", then 512. */
+	text = malloc(700);
+	assert(text);
+	p = text + sprintf(text, "upstream p {\n server http://");
+	memset(p, 'h', 509);
+	strcpy(p + 509, ":1;\n}\n");
+	assert(!gwp_acl_parse_str(&a, text));
+	gwp_acl_destroy(a);
+	memset(p, 'h', 510);
+	strcpy(p + 510, ":1;\n}\n");
+	up_refused(text, -EINVAL, "the URL is too long");
+	free(text);
+}
+
 #ifdef CONFIG_PCRE
 /* Linked with --wrap, so a test can fail the context's allocation. */
 void *__real_pcre2_match_context_create_8(void *gcontext);
@@ -4562,6 +4607,7 @@ static void run_tests(void)
 	test_include_optional();
 	test_include_dirs();
 	test_upstream_errors();
+	test_upstream_url_limits();
 	test_upstream_server_opts();
 	test_upstream_methods();
 	test_upstream_pool_https();

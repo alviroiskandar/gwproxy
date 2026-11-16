@@ -9,7 +9,10 @@
  * either (a policy refusal, a generic error). Only the first kind should count
  * against the upstream's health.
  *
- * Also how an upstream URL names its host, for TLS (gwp_upstream_url_host()).
+ * Also how an upstream URL is written: its schemes (gwp_upstream_scheme()),
+ * its credentials (gwp_upstream_split_creds()) and how it names its host, for
+ * TLS (gwp_upstream_url_host()). The --upstream-proxy parser and the ACL's
+ * check of a pool server's URL share these, so they take the same URLs.
  *
  * Self-contained (libc only) so it can be unit-tested alone.
  */
@@ -19,6 +22,7 @@
 #include <errno.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <string.h>
 #include <arpa/inet.h>
 
@@ -203,6 +207,76 @@ gwp_upstream_fail_class_str(enum gwp_upstream_fail_class c)
 	default:
 		return "neutral";
 	}
+}
+
+enum {
+	GWP_UPSTREAM_SOCKS5	= 0,
+	GWP_UPSTREAM_HTTP	= 1,
+};
+
+/* What an upstream URL's scheme says about the proxy it names. */
+struct gwp_upstream_scheme {
+	const char	*prefix;	/* "socks5://" and so on */
+	uint8_t		len;		/* strlen(@prefix) */
+	uint8_t		type;		/* GWP_UPSTREAM_SOCKS5 / HTTP */
+	bool		remote_dns;	/* the proxy resolves the target */
+	bool		use_tls;	/* TLS to the proxy */
+	uint16_t	def_port;	/* when the URL names none */
+};
+
+/*
+ * The longest user name and password an upstream URL or auth file may give:
+ * SOCKS5 user/password authentication (RFC 1929) has a length byte for each.
+ */
+#define GWP_UPSTREAM_CRED_MAX	255
+
+/* The room for what follows an upstream URL's scheme, NUL included. */
+#define GWP_UPSTREAM_REST_MAX	512
+
+/*
+ * The scheme @url starts with, and *@rest set to what follows it; NULL when
+ * it is none of socks5://, socks5h://, http:// and https://.
+ */
+static inline const struct gwp_upstream_scheme *
+gwp_upstream_scheme(const char *url, const char **rest)
+{
+	static const struct gwp_upstream_scheme schemes[] = {
+		{ "socks5h://",	10, GWP_UPSTREAM_SOCKS5, true,  false, 1080 },
+		{ "socks5://",	9,  GWP_UPSTREAM_SOCKS5, false, false, 1080 },
+		/* The HTTP proxy resolves the CONNECT host. */
+		{ "https://",	8,  GWP_UPSTREAM_HTTP,   true,  true,  8080 },
+		{ "http://",	7,  GWP_UPSTREAM_HTTP,   true,  false, 8080 },
+	};
+	size_t i;
+
+	for (i = 0; i < sizeof(schemes) / sizeof(schemes[0]); i++) {
+		if (!strncmp(url, schemes[i].prefix, schemes[i].len)) {
+			*rest = url + schemes[i].len;
+			return &schemes[i];
+		}
+	}
+	return NULL;
+}
+
+/*
+ * Find the credentials in @rest, an upstream URL after its scheme: the
+ * "user[:pass]" before its last '@', the password after the first ':' in it.
+ * Returns false when there is no '@'; otherwise sets *@at to the '@', and
+ * *@ul and *@pl to the lengths of the user name at @rest and of the password
+ * at @rest + *@ul + 1 (0 when there is none). Nothing is checked or copied.
+ */
+static inline bool gwp_upstream_split_creds(const char *rest, const char **at,
+					    size_t *ul, size_t *pl)
+{
+	const char *colon;
+
+	*at = strrchr(rest, '@');
+	if (!*at)
+		return false;
+	colon = memchr(rest, ':', (size_t)(*at - rest));
+	*ul = colon ? (size_t)(colon - rest) : (size_t)(*at - rest);
+	*pl = colon ? (size_t)(*at - colon - 1) : 0;
+	return true;
 }
 
 /*

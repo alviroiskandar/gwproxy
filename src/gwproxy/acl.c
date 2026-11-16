@@ -24,6 +24,7 @@
 #include <dirent.h>
 #include <fnmatch.h>
 #include <gwproxy/rand.h>
+#include <gwproxy/upstream.h>
 
 #ifdef CONFIG_PCRE
 #include <pcre2.h>
@@ -81,8 +82,6 @@ struct gwp_acl_dnat {
 /* Limits of the upstream pools of one rule set. */
 #define ACL_POOL_NAME_MAX	64
 #define ACL_MAX_POOLS		1024
-/* What gwp_parse_upstream() takes after the scheme, NUL included. */
-#define ACL_URL_REST_MAX	512
 
 /*
  * An "upstream NAME { ... }" block. Built while its file is parsed, then
@@ -1222,48 +1221,28 @@ static bool host_char(char c)
 static int check_server_url(const char *url, bool *remote_dns, bool *creds,
 			    const char **why)
 {
-	static const struct {
-		const char	*scheme;
-		bool		remote_dns;
-	} schemes[] = {
-		{ "socks5://",	false },
-		{ "socks5h://",	true },
-		{ "http://",	true },
-		{ "https://",	true },
-	};
-	const char *rest = NULL, *host, *at, *p;
-	size_t i;
+	const struct gwp_upstream_scheme *sc;
+	const char *rest, *host, *at, *p;
+	size_t ul, pl;
 
-	for (i = 0; i < sizeof(schemes) / sizeof(schemes[0]); i++) {
-		size_t len = strlen(schemes[i].scheme);
-
-		if (!strncmp(url, schemes[i].scheme, len)) {
-			rest = url + len;
-			*remote_dns = schemes[i].remote_dns;
-			break;
-		}
-	}
-	if (!rest) {
+	sc = gwp_upstream_scheme(url, &rest);
+	if (!sc) {
 		*why = "the scheme must be socks5://, socks5h://, http:// or https://";
 		return -EINVAL;
 	}
-	if (strlen(rest) >= ACL_URL_REST_MAX) {
+	*remote_dns = sc->remote_dns;
+	if (strlen(rest) >= GWP_UPSTREAM_REST_MAX) {
 		*why = "the URL is too long";
 		return -EINVAL;
 	}
 
-	at = strrchr(rest, '@');
-	*creds = at != NULL;
-	if (at) {
-		const char *colon = memchr(rest, ':', (size_t)(at - rest));
-		size_t ul = colon ? (size_t)(colon - rest) : (size_t)(at - rest);
-		size_t pl = colon ? (size_t)(at - colon - 1) : 0;
-
+	*creds = gwp_upstream_split_creds(rest, &at, &ul, &pl);
+	if (*creds) {
 		if (!ul) {
 			*why = "the user name is empty";
 			return -EINVAL;
 		}
-		if (ul > 255 || pl > 255) {
+		if (ul > GWP_UPSTREAM_CRED_MAX || pl > GWP_UPSTREAM_CRED_MAX) {
 			*why = "the user name or password is longer than 255 bytes";
 			return -EINVAL;
 		}
