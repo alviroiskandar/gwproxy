@@ -6624,6 +6624,23 @@ static bool udp_up_domain_allowed(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp
 }
 
 /*
+ * Send the @len bytes at @buf to @gcp's client, from the address it sent its
+ * UDP ASSOCIATE to.
+ */
+static inline enum gwp_udp_act udp_out_to_client(struct gwp_conn_pair *gcp,
+						 struct gwp_udp_out *out,
+						 unsigned char *buf,
+						 size_t len)
+{
+	out->buf = buf;
+	out->len = len;
+	out->dst = gcp->udp_peer;
+	out->dstlen = gwp_sockaddr_len(&gcp->udp_peer);
+	out->from = &gcp->udp_local;
+	return GWP_UDP_TO_CLIENT;
+}
+
+/*
  * gwp_udp_relay_classify() for a UDP association through the upstream. The
  * datagrams go to the upstream's relay as the client sent them, header and
  * all, and the relay's come back to the client as they are: the upstream
@@ -6693,13 +6710,7 @@ from_relay:
 	if (!gwp_sockaddr_eq(src, &u->relay) ||
 	    gwp_socks5_udp_parse_hdr(base, n, &dst, &hdr_len))
 		return GWP_UDP_DROP;
-	out->buf = base;
-	out->len = n;
-	out->dst = gcp->udp_peer;
-	out->dstlen = gcp->udp_peer.sa.sa_family == AF_INET ?
-		      sizeof(gcp->udp_peer.i4) : sizeof(gcp->udp_peer.i6);
-	out->from = &gcp->udp_local;
-	return GWP_UDP_TO_CLIENT;
+	return udp_out_to_client(gcp, out, base, n);
 }
 
 /* The failures of udp_egress() an association has logged, once each. */
@@ -6902,13 +6913,7 @@ enum gwp_udp_act gwp_udp_relay_classify(struct gwp_wrk *w,
 						     : 3 + 1 + 16 + 2;
 		if (gwp_socks5_udp_build_hdr(&sa, base - h, h, &hlen))
 			return GWP_UDP_DROP;
-		out->buf = base - h;
-		out->len = h + n;
-		out->dst = gcp->udp_peer;
-		out->dstlen = gcp->udp_peer.sa.sa_family == AF_INET ?
-			      sizeof(gcp->udp_peer.i4) : sizeof(gcp->udp_peer.i6);
-		out->from = &gcp->udp_local;
-		return GWP_UDP_TO_CLIENT;
+		return udp_out_to_client(gcp, out, base - h, h + n);
 	}
 }
 
