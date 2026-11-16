@@ -403,12 +403,31 @@ int gwdns_check_question(const uint8_t *query, size_t query_len,
 
 #ifdef RUNTEST
 
-static void test_parse_ipv4(void)
+/*
+ * Parse a reply to one name with port 80 and room for 8 addresses, and check
+ * that it gives @want_nr addresses, all of @family.
+ */
+static void check_parse(const uint8_t *pkt, size_t len, uint8_t want_nr,
+			int family, const char *tag)
 {
 	struct gwp_sockaddr addrs[8];
 	uint8_t nr, i;
 	uint16_t txid;
 
+	memcpy(&txid, pkt, sizeof(txid));
+	assert(!gwdns_parse_query(txid, 80, pkt, len, addrs, 8, &nr));
+	assert(nr == want_nr);
+	for (i = 0; i < nr; i++) {
+		char buff[FULL_ADDRSTRLEN];
+
+		assert(addrs[i].sa.sa_family == family);
+		convert_ssaddr_to_str(buff, &addrs[i]);
+		printf("%s: %s\n", tag, buff);
+	}
+}
+
+static void test_parse_ipv4(void)
+{
 	uint8_t recv_pkt[] = {
 		0x23, 0xc6, 0x81, 0x80, 0x00, 0x01, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00,
 		0x06, 0x67, 0x6f, 0x6f, 0x67, 0x6c, 0x65, 0x03, 0x63, 0x6f, 0x6d, 0x00,
@@ -423,24 +442,11 @@ static void test_parse_ipv4(void)
 		0x4a, 0x7d, 0x18, 0x71
 	};
 
-	memcpy(&txid, recv_pkt, 2);
-	assert(!gwdns_parse_query(txid, 80, recv_pkt, sizeof(recv_pkt), addrs, 8, &nr));
-	assert(nr == 6);
-	for (i = 0; i < nr; i++) {
-		char buff[FULL_ADDRSTRLEN];
-
-		assert(addrs[i].sa.sa_family == AF_INET);
-		convert_ssaddr_to_str(buff, &addrs[i]);
-		printf("IPv4: %s\n", buff);
-	}
+	check_parse(recv_pkt, sizeof(recv_pkt), 6, AF_INET, "IPv4");
 }
 
 static void test_parse_ipv6(void)
 {
-	struct gwp_sockaddr addrs[8];
-	uint8_t nr, i;
-	uint16_t txid;
-
 	uint8_t recv_pkt[] = {
 		0x45, 0x67,
 		0x81, 0x80,
@@ -482,20 +488,11 @@ static void test_parse_ipv6(void)
 		0x24, 0x04, 0x68, 0x00, 0x40, 0x03, 0x0c, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x71
 	};
 
-	memcpy(&txid, recv_pkt, sizeof(txid));
-
-	assert(!gwdns_parse_query(txid, 80, recv_pkt, sizeof(recv_pkt), addrs, 8, &nr));
-	assert(nr == 4);
-	for (i = 0; i < nr; i++) {
-		char buff[FULL_ADDRSTRLEN];
-
-		assert(addrs[i].sa.sa_family == AF_INET6);
-		convert_ssaddr_to_str(buff, &addrs[i]);
-		printf("IPv6: %s\n", buff);
-	}
+	check_parse(recv_pkt, sizeof(recv_pkt), 4, AF_INET6, "IPv6");
 }
 
-static void test_build_ipv4(void)
+/* Build a query for "google.com" and check its header and QTYPE. */
+static void check_build(int family, uint16_t qtype)
 {
 	uint8_t buff[UDP_MSG_LIMIT];
 	gwdns_header_pkt *hdr;
@@ -503,7 +500,7 @@ static void test_build_ipv4(void)
 	ssize_t r;
 
 	c = 0xFFFF;
-	r = gwdns_build_query(c, "google.com", AF_INET, buff, sizeof(buff));
+	r = gwdns_build_query(c, "google.com", family, buff, sizeof(buff));
 	assert(r > 0);
 
 	hdr = (void *)buff;
@@ -511,27 +508,7 @@ static void test_build_ipv4(void)
 	assert(!hdr->nscount);
 	assert(!DNS_QR(hdr->flags));
 	assert(DNS_OPCODE(hdr->flags) == OPCODE_QUERY);
-	c = htons(TYPE_A);
-	assert(!memcmp(buff + 12 + 12, &c, 2));
-}
-
-static void test_build_ipv6(void)
-{
-	uint8_t buff[UDP_MSG_LIMIT];
-	gwdns_header_pkt *hdr;
-	uint16_t c;
-	ssize_t r;
-
-	c = 0xFFFF;
-	r = gwdns_build_query(c, "google.com", AF_INET6, buff, sizeof(buff));
-	assert(r > 0);
-
-	hdr = (void *)buff;
-	assert(ntohs(hdr->qdcount) == 1);
-	assert(!hdr->nscount);
-	assert(!DNS_QR(hdr->flags));
-	assert(DNS_OPCODE(hdr->flags) == OPCODE_QUERY);
-	c = htons(TYPE_AAAA);
+	c = htons(qtype);
 	assert(!memcmp(buff + 12 + 12, &c, 2));
 }
 
@@ -732,9 +709,9 @@ static void run_all_tests(void)
 	 * response.
 	 */
 	fprintf(stderr, "test constructing DNS standard query packet for TYPE_A!\n");
-	test_build_ipv4();
+	check_build(AF_INET, TYPE_A);
 	fprintf(stderr, "test constructing DNS standard query packet for TYPE_AAAA!\n");
-	test_build_ipv6();
+	check_build(AF_INET6, TYPE_AAAA);
 	fprintf(stderr, "test parsing DNS standard query packet for TYPE_A!\n");
 	test_parse_ipv4();
 	fprintf(stderr, "test parsing DNS standard query packet for TYPE_AAAA!\n");
