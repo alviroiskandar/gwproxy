@@ -126,6 +126,16 @@ static void write_file(const char *path, const char *data)
 	fclose(f);
 }
 
+/* A temporary file holding @data; its name goes to @path (a mkstemp template). */
+static void temp_file(char *path, const char *data)
+{
+	int fd = mkstemp(path);
+
+	assert(fd >= 0);
+	close(fd);
+	write_file(path, data);
+}
+
 /* Move all pending ciphertext from @from's send BIO into @to's recv BIO. */
 static void shuttle(struct gwp_ssl *from, struct gwp_ssl *to)
 {
@@ -136,19 +146,32 @@ static void shuttle(struct gwp_ssl *from, struct gwp_ssl *to)
 		assert(gwp_ssl_bio_write(to, buf, (size_t)n) == n);
 }
 
-static void do_handshake(struct gwp_ssl *cli, struct gwp_ssl *srv)
+/*
+ * Run a handshake that may fail. Returns GWP_SSL_OK once both sides are done,
+ * or GWP_SSL_ERROR as soon as either side fails.
+ */
+static int try_handshake(struct gwp_ssl *cli, struct gwp_ssl *srv)
 {
 	int cs, ss, rounds = 0;
 
 	do {
 		cs = gwp_ssl_handshake(cli);
-		assert(cs != GWP_SSL_ERROR);
 		shuttle(cli, srv);
+		if (cs == GWP_SSL_ERROR)
+			return cs;
 		ss = gwp_ssl_handshake(srv);
-		assert(ss != GWP_SSL_ERROR);
 		shuttle(srv, cli);
+		if (ss == GWP_SSL_ERROR)
+			return ss;
 		assert(++rounds < 32);
 	} while (cs != GWP_SSL_OK || ss != GWP_SSL_OK);
+
+	return GWP_SSL_OK;
+}
+
+static void do_handshake(struct gwp_ssl *cli, struct gwp_ssl *srv)
+{
+	assert(try_handshake(cli, srv) == GWP_SSL_OK);
 }
 
 /* Send @msg (@len bytes) as one plaintext write from @from and assert @to
@@ -538,39 +561,6 @@ static void test_bio_method_failure(void)
 	unlink(cert);
 	unlink(key);
 	PRTEST_OK();
-}
-
-/* A temporary file holding @data; its name goes to @path (a mkstemp template). */
-static void temp_file(char *path, const char *data)
-{
-	int fd = mkstemp(path);
-
-	assert(fd >= 0);
-	close(fd);
-	write_file(path, data);
-}
-
-/*
- * Run a handshake that may fail. Returns GWP_SSL_OK once both sides are done,
- * or GWP_SSL_ERROR as soon as either side fails.
- */
-static int try_handshake(struct gwp_ssl *cli, struct gwp_ssl *srv)
-{
-	int cs, ss, rounds = 0;
-
-	do {
-		cs = gwp_ssl_handshake(cli);
-		shuttle(cli, srv);
-		if (cs == GWP_SSL_ERROR)
-			return cs;
-		ss = gwp_ssl_handshake(srv);
-		shuttle(srv, cli);
-		if (ss == GWP_SSL_ERROR)
-			return ss;
-		assert(++rounds < 32);
-	} while (cs != GWP_SSL_OK || ss != GWP_SSL_OK);
-
-	return GWP_SSL_OK;
 }
 
 /*
