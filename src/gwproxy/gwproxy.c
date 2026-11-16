@@ -5375,6 +5375,21 @@ void gwp_setup_cli_sock_options(struct gwp_wrk *w, int fd)
 		setskopt_int(fd, IPPROTO_TCP, TCP_KEEPCNT, cfg->tcp_keepcnt);
 }
 
+/*
+ * 0 when --outgoing-family lets this proxy send a connection to @a, else
+ * -EAFNOSUPPORT, logged. For the TCP dial and the address an upstream is
+ * asked for; the startup and UDP relay checks say more in their own words.
+ */
+static inline int outgoing_family_check(struct gwp_ctx *ctx,
+					const struct gwp_sockaddr *a)
+{
+	if (gwp_ctx_outgoing_family_ok(ctx, a))
+		return 0;
+
+	pr_info(&ctx->lh, "--outgoing-family refuses target %s", ip_to_str(a));
+	return -EAFNOSUPPORT;
+}
+
 __hot
 int gwp_create_sock_target(struct gwp_wrk *w, struct gwp_sockaddr *addr,
 			   const struct gwp_conn_sockopt *so,
@@ -5390,11 +5405,9 @@ int gwp_create_sock_target(struct gwp_wrk *w, struct gwp_sockaddr *addr,
 	 * "-j DNAT" rewrite into the forbidden family is caught here too.
 	 * -EAFNOSUPPORT reaches the client as SOCKS5 REP 0x08 / HTTP 502.
 	 */
-	if (!gwp_ctx_outgoing_family_ok(w->ctx, addr)) {
-		pr_info(&w->ctx->lh,
-			"--outgoing-family refuses target %s", ip_to_str(addr));
-		return -EAFNOSUPPORT;
-	}
+	r = outgoing_family_check(w->ctx, addr);
+	if (r)
+		return r;
 
 	fd = __sys_socket(addr->sa.sa_family, t, 0);
 	if (unlikely(fd < 0))
@@ -6327,6 +6340,7 @@ int gwp_conn_dial_addr(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 		       struct gwp_sockaddr **addr)
 {
 	int fam = gcp->target_addr.sa.sa_family;
+	int r;
 
 	if (!gcp->upstream) {
 		*addr = &gcp->target_addr;
@@ -6341,11 +6355,10 @@ int gwp_conn_dial_addr(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 	 * replaced such a hostname has updated target_addr too.
 	 */
 	if (gcp->up_dst.ver != GWP_SOCKS5_ATYP_DOMAIN &&
-	    (fam == AF_INET || fam == AF_INET6) &&
-	    !gwp_ctx_outgoing_family_ok(ctx, &gcp->target_addr)) {
-		pr_info(&ctx->lh, "--outgoing-family refuses target %s",
-			ip_to_str(&gcp->target_addr));
-		return -EAFNOSUPPORT;
+	    (fam == AF_INET || fam == AF_INET6)) {
+		r = outgoing_family_check(ctx, &gcp->target_addr);
+		if (r)
+			return r;
 	}
 
 	*addr = &gcp->upstream->addr;
