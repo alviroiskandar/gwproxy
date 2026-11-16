@@ -1522,6 +1522,19 @@ static ssize_t do_recv_tls(struct gwp_conn *src)
 }
 
 /*
+ * The epoll mask of a socket whose TLS handshake runs: more ciphertext in,
+ * and out while some of the engine's is queued.
+ */
+static inline uint32_t tls_hs_mask(struct gwp_ssl *tls)
+{
+	uint32_t mask = EPOLLIN | EPOLLRDHUP;
+
+	if (gwp_ssl_bio_pending(tls) > 0)
+		mask |= EPOLLOUT;
+	return mask;
+}
+
+/*
  * Send the ciphertext queued in @c's engine, straight from the queue,
  * consuming only what the socket takes; a full socket stops it. Returns the
  * number of bytes sent, or <0 on error.
@@ -2106,7 +2119,6 @@ static int upstream_tls_io(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			   uint32_t events)
 {
 	struct gwp_conn *t = &gcp->target;
-	uint32_t mask = EPOLLIN | EPOLLRDHUP;
 	ssize_t n;
 	int hs, r;
 
@@ -2136,9 +2148,7 @@ static int upstream_tls_io(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		return upstream_start(w, gcp);
 	}
 
-	if (gwp_ssl_bio_pending(t->tls) > 0)
-		mask |= EPOLLOUT;
-	return upstream_arm(w, gcp, mask);
+	return upstream_arm(w, gcp, tls_hs_mask(t->tls));
 }
 #endif
 
@@ -3849,7 +3859,6 @@ static int tls_flush_hs(struct gwp_conn *c)
 static int handle_ev_tls_handshake(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_conn *c = &gcp->client;
-	uint32_t mask;
 	ssize_t n;
 	int hs, r;
 
@@ -3871,22 +3880,18 @@ static int handle_ev_tls_handshake(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	if (r)
 		return r;
 
-	if (hs != GWP_SSL_OK) {
-		/* Still handshaking: want more ciphertext, and to flush ours. */
-		mask = EPOLLIN | EPOLLRDHUP;
-		if (gwp_ssl_bio_pending(c->tls) > 0)
-			mask |= EPOLLOUT;
-		return tls_arm_client(w, gcp, mask);
+	if (hs == GWP_SSL_OK) {
+		pr_dbg(&w->ctx->lh, "TLS handshake complete (cfd=%d, alpn=%s)",
+		       c->fd, gwp_ssl_alpn(c->tls) ?: "none");
+		gcp->conn_state = CONN_STATE_PROT;
 	}
 
-	pr_dbg(&w->ctx->lh, "TLS handshake complete (cfd=%d, alpn=%s)", c->fd,
-	       gwp_ssl_alpn(c->tls) ?: "none");
-	gcp->conn_state = CONN_STATE_PROT;
-	mask = EPOLLIN | EPOLLRDHUP;
-	if (gwp_ssl_bio_pending(c->tls) > 0)
-		mask |= EPOLLOUT;
-	r = tls_arm_client(w, gcp, mask);
-	if (r)
+	/*
+	 * Still handshaking, want more ciphertext and to flush ours. Done,
+	 * the same: the application data starts, and ours may still be out.
+	 */
+	r = tls_arm_client(w, gcp, tls_hs_mask(c->tls));
+	if (r || hs != GWP_SSL_OK)
 		return r;
 
 	return client_prot_in(w, gcp);
