@@ -1495,8 +1495,9 @@ static noinline ssize_t rewrite_res_hdr(const char *hdr, size_t len, char *out,
 		lines[nr_lines].klen = (uint32_t)(colon - p);
 		nr_lines++;
 		if (NAME_IS(p, (size_t)(colon - p), "Connection")) {
-			nr_toks = conn_tokenise(colon + 1, n - 11, toks,
-						nr_toks);
+			nr_toks = conn_tokenise(colon + 1,
+						(size_t)(p + n - colon - 1),
+						toks, nr_toks);
 			if (nr_toks < 0)
 				return nr_toks;
 		}
@@ -1517,11 +1518,13 @@ static noinline ssize_t rewrite_res_hdr(const char *hdr, size_t len, char *out,
 		}
 		for (l = 0; !has_te && l < nr_lines; l++) {
 			const char *k = hdr + lines[l].off;
+			size_t klen = lines[l].klen;
 
-			if (!NAME_IS(k, lines[l].klen, "Content-Length"))
+			if (!NAME_IS(k, klen, "Content-Length"))
 				continue;
-			if (res_cl_value(k + 15, lines[l].len - 15, &have_cl,
-					 &cl, &nr_cl) < 0)
+			/* The value starts after the name and its colon. */
+			if (res_cl_value(k + klen + 1, lines[l].len - klen - 1,
+					 &have_cl, &cl, &nr_cl) < 0)
 				return -EBADMSG;
 		}
 
