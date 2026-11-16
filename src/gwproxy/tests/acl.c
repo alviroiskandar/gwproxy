@@ -371,184 +371,128 @@ static noinline void test_user(void)
 #endif
 }
 
+/*
+ * Load @rules, evaluate OUTPUT for a TCP connection to @ip:@port (an IPv6
+ * literal is told by its ':'), assert the verdict is @want and return the
+ * request with what the rules recorded in it. Its target pointer is dead by
+ * then; the DNAT, MARK and BIND results are values held in the copy.
+ */
+static noinline struct gwp_acl_req eval_rules(const char *rules,
+					      const char *ip, uint16_t port,
+					      enum gwp_acl_verdict want)
+{
+	struct gwp_sockaddr t = gwp_test_addr(ip, port);
+	struct gwp_acl_req req = { .target = &t, .dport = port,
+				   .proto = GWP_ACL_PROTO_TCP };
+	struct gwp_acl *a = NULL;
+
+	assert(!gwp_acl_parse_str(&a, rules));
+	assert(gwp_acl_eval_output(a, &req) == want);
+	gwp_acl_destroy(a);
+	return req;
+}
+
 static noinline void test_mark(void)
 {
-	struct gwp_sockaddr t = sa4("1.2.3.4", 80);
-	struct gwp_acl *a = NULL;
 	struct gwp_acl_req req;
 
 	/* MARK is a composable modifier: it records the fwmark (hex accepted)
 	 * and eval keeps matching to reach a terminal rule / the policy. */
-	assert(!gwp_acl_parse_str(&a,
-		"-A OUTPUT -d 1.2.3.4 -j MARK --set-mark 0x64\n"
-		"-P OUTPUT ACCEPT\n"));
-	memset(&req, 0, sizeof(req));
-	req.target = &t; req.dport = 80; req.proto = GWP_ACL_PROTO_TCP;
-	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_ACCEPT);
+	req = eval_rules("-A OUTPUT -d 1.2.3.4 -j MARK --set-mark 0x64\n"
+			 "-P OUTPUT ACCEPT\n",
+			 "1.2.3.4", 80, GWP_ACL_ACCEPT);
 	assert(req.mark_set && req.mark == 100);
-	gwp_acl_destroy(a);
 
 	/* A non-matching MARK rule leaves the request unmarked. */
-	a = NULL;
-	assert(!gwp_acl_parse_str(&a,
-		"-A OUTPUT -d 9.9.9.9 -j MARK --set-mark 7\n"
-		"-P OUTPUT ACCEPT\n"));
-	memset(&req, 0, sizeof(req));
-	req.target = &t; req.dport = 80; req.proto = GWP_ACL_PROTO_TCP;
-	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_ACCEPT);
+	req = eval_rules("-A OUTPUT -d 9.9.9.9 -j MARK --set-mark 7\n"
+			 "-P OUTPUT ACCEPT\n",
+			 "1.2.3.4", 80, GWP_ACL_ACCEPT);
 	assert(!req.mark_set);
-	gwp_acl_destroy(a);
 
 	/* Last MARK wins; a later terminal REJECT still decides the verdict. */
-	a = NULL;
-	assert(!gwp_acl_parse_str(&a,
-		"-A OUTPUT -d 1.2.3.4 -j MARK --set-mark 1\n"
-		"-A OUTPUT -d 1.2.3.4 -j MARK --set-mark 2\n"
-		"-A OUTPUT -d 1.2.3.4 -j REJECT\n"
-		"-P OUTPUT ACCEPT\n"));
-	memset(&req, 0, sizeof(req));
-	req.target = &t; req.dport = 80; req.proto = GWP_ACL_PROTO_TCP;
-	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_REJECT);
+	req = eval_rules("-A OUTPUT -d 1.2.3.4 -j MARK --set-mark 1\n"
+			 "-A OUTPUT -d 1.2.3.4 -j MARK --set-mark 2\n"
+			 "-A OUTPUT -d 1.2.3.4 -j REJECT\n"
+			 "-P OUTPUT ACCEPT\n",
+			 "1.2.3.4", 80, GWP_ACL_REJECT);
 	assert(req.mark_set && req.mark == 2);
-	gwp_acl_destroy(a);
 
 	/*
 	 * --accept makes MARK terminal: the mark is recorded and traversal
 	 * stops, so the REJECT below it -- which decides the verdict in the
 	 * case above -- is never reached.
 	 */
-	a = NULL;
-	assert(!gwp_acl_parse_str(&a,
-		"-A OUTPUT -d 1.2.3.4 -j MARK --set-mark 1 --accept\n"
-		"-A OUTPUT -d 1.2.3.4 -j MARK --set-mark 2\n"
-		"-A OUTPUT -d 1.2.3.4 -j REJECT\n"
-		"-P OUTPUT ACCEPT\n"));
-	memset(&req, 0, sizeof(req));
-	req.target = &t; req.dport = 80; req.proto = GWP_ACL_PROTO_TCP;
-	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_ACCEPT);
+	req = eval_rules("-A OUTPUT -d 1.2.3.4 -j MARK --set-mark 1 --accept\n"
+			 "-A OUTPUT -d 1.2.3.4 -j MARK --set-mark 2\n"
+			 "-A OUTPUT -d 1.2.3.4 -j REJECT\n"
+			 "-P OUTPUT ACCEPT\n",
+			 "1.2.3.4", 80, GWP_ACL_ACCEPT);
 	assert(req.mark_set && req.mark == 1);	/* not overridden by the 2 */
-	gwp_acl_destroy(a);
 
 	/* Token order is free: --accept may come before its -j. */
-	a = NULL;
-	assert(!gwp_acl_parse_str(&a,
-		"-A OUTPUT -d 1.2.3.4 --accept -j MARK --set-mark 9\n"
-		"-A OUTPUT -d 1.2.3.4 -j REJECT\n"
-		"-P OUTPUT ACCEPT\n"));
-	memset(&req, 0, sizeof(req));
-	req.target = &t; req.dport = 80; req.proto = GWP_ACL_PROTO_TCP;
-	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_ACCEPT);
+	req = eval_rules("-A OUTPUT -d 1.2.3.4 --accept -j MARK --set-mark 9\n"
+			 "-A OUTPUT -d 1.2.3.4 -j REJECT\n"
+			 "-P OUTPUT ACCEPT\n",
+			 "1.2.3.4", 80, GWP_ACL_ACCEPT);
 	assert(req.mark_set && req.mark == 9);
-	gwp_acl_destroy(a);
 
 	/* --accept only fires when the rule actually matches. */
-	a = NULL;
-	assert(!gwp_acl_parse_str(&a,
-		"-A OUTPUT -d 9.9.9.9 -j MARK --set-mark 5 --accept\n"
-		"-A OUTPUT -d 1.2.3.4 -j REJECT\n"
-		"-P OUTPUT ACCEPT\n"));
-	memset(&req, 0, sizeof(req));
-	req.target = &t; req.dport = 80; req.proto = GWP_ACL_PROTO_TCP;
-	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_REJECT);
+	req = eval_rules("-A OUTPUT -d 9.9.9.9 -j MARK --set-mark 5 --accept\n"
+			 "-A OUTPUT -d 1.2.3.4 -j REJECT\n"
+			 "-P OUTPUT ACCEPT\n",
+			 "1.2.3.4", 80, GWP_ACL_REJECT);
 	assert(!req.mark_set);
-	gwp_acl_destroy(a);
 }
 
 static noinline void test_bind(void)
 {
-	struct gwp_sockaddr t = sa4("1.2.3.4", 80);
-	struct gwp_acl *a = NULL;
 	struct gwp_acl_req req;
 	char ip[64];
 
 	/* BIND records a source address (with port) and interface, and keeps
 	 * matching (composable modifier). */
-	assert(!gwp_acl_parse_str(&a,
-		"-A OUTPUT -d 1.2.3.4 -j BIND --to-source 10.0.0.2:5000 --to-iface wg0\n"
-		"-P OUTPUT ACCEPT\n"));
-	memset(&req, 0, sizeof(req));
-	req.target = &t; req.dport = 80; req.proto = GWP_ACL_PROTO_TCP;
-	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_ACCEPT);
+	req = eval_rules("-A OUTPUT -d 1.2.3.4 -j BIND --to-source 10.0.0.2:5000 --to-iface wg0\n"
+			 "-P OUTPUT ACCEPT\n",
+			 "1.2.3.4", 80, GWP_ACL_ACCEPT);
 	assert(req.bind.set && req.bind.have_src);
 	assert(!strcmp(req.bind.iface, "wg0"));
 	assert(req.bind.src.i4.sin_family == AF_INET);
 	assert(inet_ntop(AF_INET, &req.bind.src.i4.sin_addr, ip, sizeof(ip)));
 	assert(!strcmp(ip, "10.0.0.2") && ntohs(req.bind.src.i4.sin_port) == 5000);
-	gwp_acl_destroy(a);
 
 	/* Interface-only bind. */
-	a = NULL;
-	assert(!gwp_acl_parse_str(&a,
-		"-A OUTPUT -j BIND --to-iface eth1\n-P OUTPUT ACCEPT\n"));
-	memset(&req, 0, sizeof(req));
-	req.target = &t; req.dport = 80; req.proto = GWP_ACL_PROTO_TCP;
-	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_ACCEPT);
+	req = eval_rules("-A OUTPUT -j BIND --to-iface eth1\n-P OUTPUT ACCEPT\n",
+			 "1.2.3.4", 80, GWP_ACL_ACCEPT);
 	assert(req.bind.set && !req.bind.have_src && !strcmp(req.bind.iface, "eth1"));
-	gwp_acl_destroy(a);
 
 	/* Bracketed IPv6 source with a port; source-only bind. */
-	a = NULL;
-	assert(!gwp_acl_parse_str(&a,
-		"-A OUTPUT -j BIND --to-source [2001:db8::1]:443\n"
-		"-P OUTPUT ACCEPT\n"));
-	memset(&req, 0, sizeof(req));
-	req.target = &t; req.dport = 80; req.proto = GWP_ACL_PROTO_TCP;
-	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_ACCEPT);
+	req = eval_rules("-A OUTPUT -j BIND --to-source [2001:db8::1]:443\n"
+			 "-P OUTPUT ACCEPT\n",
+			 "1.2.3.4", 80, GWP_ACL_ACCEPT);
 	assert(req.bind.set && req.bind.have_src && req.bind.iface[0] == '\0');
 	assert(req.bind.src.i6.sin6_family == AF_INET6);
 	assert(ntohs(req.bind.src.i6.sin6_port) == 443);
-	gwp_acl_destroy(a);
 
 	/* Composable: BIND then a terminal REJECT still records the bind. */
-	a = NULL;
-	assert(!gwp_acl_parse_str(&a,
-		"-A OUTPUT -d 1.2.3.4 -j BIND --to-iface eth0\n"
-		"-A OUTPUT -d 1.2.3.4 -j REJECT\n-P OUTPUT ACCEPT\n"));
-	memset(&req, 0, sizeof(req));
-	req.target = &t; req.dport = 80; req.proto = GWP_ACL_PROTO_TCP;
-	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_REJECT);
+	req = eval_rules("-A OUTPUT -d 1.2.3.4 -j BIND --to-iface eth0\n"
+			 "-A OUTPUT -d 1.2.3.4 -j REJECT\n-P OUTPUT ACCEPT\n",
+			 "1.2.3.4", 80, GWP_ACL_REJECT);
 	assert(req.bind.set && !strcmp(req.bind.iface, "eth0"));
-	gwp_acl_destroy(a);
 
 	/*
 	 * The same pair with --accept: identical rules, opposite verdict,
 	 * because BIND now terminates instead of falling through.
 	 */
-	a = NULL;
-	assert(!gwp_acl_parse_str(&a,
-		"-A OUTPUT -d 1.2.3.4 -j BIND --to-iface eth0 --accept\n"
-		"-A OUTPUT -d 1.2.3.4 -j REJECT\n-P OUTPUT ACCEPT\n"));
-	memset(&req, 0, sizeof(req));
-	req.target = &t; req.dport = 80; req.proto = GWP_ACL_PROTO_TCP;
-	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_ACCEPT);
+	req = eval_rules("-A OUTPUT -d 1.2.3.4 -j BIND --to-iface eth0 --accept\n"
+			 "-A OUTPUT -d 1.2.3.4 -j REJECT\n-P OUTPUT ACCEPT\n",
+			 "1.2.3.4", 80, GWP_ACL_ACCEPT);
 	assert(req.bind.set && !strcmp(req.bind.iface, "eth0"));
-	gwp_acl_destroy(a);
 
 	/* --accept alongside a source spec, and against a REJECT policy. */
-	a = NULL;
-	assert(!gwp_acl_parse_str(&a,
-		"-A OUTPUT -d 1.2.3.4 -j BIND --to-source 10.0.0.9 --accept\n"
-		"-P OUTPUT REJECT\n"));
-	memset(&req, 0, sizeof(req));
-	req.target = &t; req.dport = 80; req.proto = GWP_ACL_PROTO_TCP;
-	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_ACCEPT);
+	req = eval_rules("-A OUTPUT -d 1.2.3.4 -j BIND --to-source 10.0.0.9 --accept\n"
+			 "-P OUTPUT REJECT\n",
+			 "1.2.3.4", 80, GWP_ACL_ACCEPT);
 	assert(req.bind.set && req.bind.have_src);
-	gwp_acl_destroy(a);
-}
-
-/* Evaluate one OUTPUT DNAT rule against target @ip:@port; return the req. */
-static noinline struct gwp_acl_req dnat_eval(const char *rule, const char *ip,
-				    uint16_t port, bool v6)
-{
-	struct gwp_acl *a = NULL;
-	struct gwp_sockaddr t = v6 ? sa6(ip, port) : sa4(ip, port);
-	struct gwp_acl_req req = { .target = &t, .dport = port,
-				  .proto = GWP_ACL_PROTO_TCP };
-
-	assert(!gwp_acl_parse_str(&a, rule));
-	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_ACCEPT);
-	gwp_acl_destroy(a);
-	return req;
 }
 
 static noinline void test_dnat(void)
@@ -557,52 +501,52 @@ static noinline void test_dnat(void)
 	char ip[64];
 
 	/* Rewrite both address and port. */
-	req = dnat_eval("-A OUTPUT -d 1.2.3.4 -j DNAT --to 5.6.7.8:9999\n",
-			"1.2.3.4", 80, false);
+	req = eval_rules("-A OUTPUT -d 1.2.3.4 -j DNAT --to 5.6.7.8:9999\n",
+			 "1.2.3.4", 80, GWP_ACL_ACCEPT);
 	assert(req.dnat_applied && req.dnat.i4.sin_family == AF_INET);
 	assert(inet_ntop(AF_INET, &req.dnat.i4.sin_addr, ip, sizeof(ip)));
 	assert(!strcmp(ip, "5.6.7.8") && ntohs(req.dnat.i4.sin_port) == 9999);
 
 	/* Address only: port carried over from the target. */
-	req = dnat_eval("-A OUTPUT -d 1.2.3.4 -j DNAT --to 5.6.7.8\n",
-			"1.2.3.4", 80, false);
+	req = eval_rules("-A OUTPUT -d 1.2.3.4 -j DNAT --to 5.6.7.8\n",
+			 "1.2.3.4", 80, GWP_ACL_ACCEPT);
 	assert(req.dnat_applied);
 	assert(inet_ntop(AF_INET, &req.dnat.i4.sin_addr, ip, sizeof(ip)));
 	assert(!strcmp(ip, "5.6.7.8") && ntohs(req.dnat.i4.sin_port) == 80);
 
 	/* Port only: address carried over from the target. */
-	req = dnat_eval("-A OUTPUT -d 1.2.3.4 -j DNAT --to :4444\n",
-			"1.2.3.4", 80, false);
+	req = eval_rules("-A OUTPUT -d 1.2.3.4 -j DNAT --to :4444\n",
+			 "1.2.3.4", 80, GWP_ACL_ACCEPT);
 	assert(req.dnat_applied);
 	assert(inet_ntop(AF_INET, &req.dnat.i4.sin_addr, ip, sizeof(ip)));
 	assert(!strcmp(ip, "1.2.3.4") && ntohs(req.dnat.i4.sin_port) == 4444);
 
 	/* Port only on an IPv6 target: address preserved, family stays v6. */
-	req = dnat_eval("-A OUTPUT -d 2001:db8::1 -j DNAT --to :4444\n",
-			"2001:db8::1", 443, true);
+	req = eval_rules("-A OUTPUT -d 2001:db8::1 -j DNAT --to :4444\n",
+			 "2001:db8::1", 443, GWP_ACL_ACCEPT);
 	assert(req.dnat_applied && req.dnat.i6.sin6_family == AF_INET6);
 	assert(inet_ntop(AF_INET6, &req.dnat.i6.sin6_addr, ip, sizeof(ip)));
 	assert(!strcmp(ip, "2001:db8::1") && ntohs(req.dnat.i6.sin6_port) == 4444);
 
 	/* IPv6 address+port rewrite via bracket form. */
-	req = dnat_eval("-A OUTPUT -d 1.2.3.4 -j DNAT --to [2001:db8::2]:5555\n",
-			"1.2.3.4", 80, false);
+	req = eval_rules("-A OUTPUT -d 1.2.3.4 -j DNAT --to [2001:db8::2]:5555\n",
+			 "1.2.3.4", 80, GWP_ACL_ACCEPT);
 	assert(req.dnat_applied && req.dnat.i6.sin6_family == AF_INET6);
 	assert(inet_ntop(AF_INET6, &req.dnat.i6.sin6_addr, ip, sizeof(ip)));
 	assert(!strcmp(ip, "2001:db8::2") && ntohs(req.dnat.i6.sin6_port) == 5555);
 
 	/* A non-matching target is not rewritten. */
-	req = dnat_eval("-A OUTPUT -d 1.2.3.4 -j DNAT --to :4444\n"
-			"-P OUTPUT ACCEPT\n", "9.9.9.9", 80, false);
+	req = eval_rules("-A OUTPUT -d 1.2.3.4 -j DNAT --to :4444\n"
+			 "-P OUTPUT ACCEPT\n", "9.9.9.9", 80, GWP_ACL_ACCEPT);
 	assert(!req.dnat_applied);
 
 	/*
 	 * DNAT is terminal: a later matching REJECT must not be reached, so the
 	 * verdict is ACCEPT and the rewrite still applies.
 	 */
-	req = dnat_eval("-A OUTPUT -d 1.2.3.4 -j DNAT --to 5.6.7.8\n"
-			"-A OUTPUT -d 1.2.3.4 -j REJECT\n"
-			"-P OUTPUT REJECT\n", "1.2.3.4", 80, false);
+	req = eval_rules("-A OUTPUT -d 1.2.3.4 -j DNAT --to 5.6.7.8\n"
+			 "-A OUTPUT -d 1.2.3.4 -j REJECT\n"
+			 "-P OUTPUT REJECT\n", "1.2.3.4", 80, GWP_ACL_ACCEPT);
 	assert(req.dnat_applied);
 	assert(inet_ntop(AF_INET, &req.dnat.i4.sin_addr, ip, sizeof(ip)));
 	assert(!strcmp(ip, "5.6.7.8"));
@@ -1303,20 +1247,14 @@ static noinline void test_domain_only_target_criteria(void)
 /* Load "-j MARK --set-mark @v" and return the mark an evaluation sets. */
 static noinline uint32_t mark_of(const char *v)
 {
-	struct gwp_sockaddr t = sa4("1.2.3.4", 80);
-	struct gwp_acl *a = NULL;
 	struct gwp_acl_req req;
 	char *rules;
 
 	assert(asprintf(&rules, "-A OUTPUT -j MARK --set-mark %s\n"
 			"-P OUTPUT ACCEPT\n", v) > 0);
-	assert(!gwp_acl_parse_str(&a, rules));
+	req = eval_rules(rules, "1.2.3.4", 80, GWP_ACL_ACCEPT);
 	free(rules);
-	memset(&req, 0, sizeof(req));
-	req.target = &t; req.dport = 80; req.proto = GWP_ACL_PROTO_TCP;
-	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_ACCEPT);
 	assert(req.mark_set);
-	gwp_acl_destroy(a);
 	return req.mark;
 }
 
