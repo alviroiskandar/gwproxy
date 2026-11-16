@@ -673,6 +673,24 @@ einval:
 }
 
 #ifdef CONFIG_NEW_DNS_RESOLVER
+static void gwp_ctx_free_raw_dns(struct gwp_wrk *w)
+{
+	size_t i;
+
+	if (!w->dns)
+		return;
+
+	if (w->dns->resolvers) {
+		for (i = 0; i < w->dns->nr; i++)
+			gwp_dns_res_free(&w->dns->resolvers[i]);
+		free(w->dns->resolvers);
+		w->dns->resolvers = NULL;
+	}
+
+	free(w->dns);
+	w->dns = NULL;
+}
+
 static int gwp_ctx_init_raw_dns(struct gwp_wrk *w)
 {
 	struct gwp_ctx *ctx = w->ctx;
@@ -692,42 +710,21 @@ static int gwp_ctx_init_raw_dns(struct gwp_wrk *w)
 	w->dns->resolvers = calloc(w->dns->nr, sizeof(*w->dns->resolvers));
 	if (!w->dns->resolvers) {
 		r = -ENOMEM;
-		goto err_dns;
+		goto err;
 	}
 
 	r = gwp_dns_res_init(ctx, &w->dns->resolvers[0], ctx->cfg.dns_servers);
 	if (r < 0)
-		goto err_resolvers;
+		goto err;
 
 	pr_dbg(&ctx->lh, "Worker %u initialized raw DNS resolver: %s",
 		w->idx, ctx->cfg.dns_servers);
 	return 0;
 
-err_resolvers:
-	free(w->dns->resolvers);
-	w->dns->resolvers = NULL;
-err_dns:
-	free(w->dns);
-	w->dns = NULL;
+err:
+	/* A resolver whose init failed holds nothing: its free is a no-op. */
+	gwp_ctx_free_raw_dns(w);
 	return r;
-}
-
-static void gwp_ctx_free_raw_dns(struct gwp_wrk *w)
-{
-	size_t i;
-
-	if (!w->dns)
-		return;
-
-	if (w->dns->resolvers) {
-		for (i = 0; i < w->dns->nr; i++)
-			gwp_dns_res_free(&w->dns->resolvers[i]);
-		free(w->dns->resolvers);
-		w->dns->resolvers = NULL;
-	}
-
-	free(w->dns);
-	w->dns = NULL;
 }
 
 static int gwp_alloc_dns_packet(struct gwp_conn_pair *gcp)
