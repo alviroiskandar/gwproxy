@@ -623,17 +623,6 @@ static bool put_gcp(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	return true;
 }
 
-static bool has_inflight_attempt(const struct gwp_conn_pair *gcp)
-{
-	uint8_t i;
-
-	for (i = 0; i < GWP_MAX_CONN_CAND; i++) {
-		if (gcp->attempt_fd[i] >= 0)
-			return true;
-	}
-	return false;
-}
-
 /*
  * Start one connect attempt to gcp->target_addr, which the caller has already
  * selected and had the ACL approve. The socket goes into attempt slot @slot and
@@ -678,7 +667,7 @@ static int start_connect_attempt(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	s = get_sqe_nofail(w);
 	io_uring_prep_connect(s, fd, &ca->sa, gwp_sockaddr_len(ca));
 	io_uring_sqe_set_data(s, gcp);
-	s->user_data |= EV_BIT_TARGET_ATTEMPT + ((uint64_t)slot << 48ull);
+	s->user_data |= gwp_ev_bit_attempt(slot);
 	get_gcp(gcp);
 	pr_dbg(&ctx->lh,
 		"Prepared connect attempt %u (fd=%d, addr=%s, idx=%u, ref_cnt=%d)",
@@ -1008,20 +997,17 @@ static void __arm_attempt_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		gcp->idx, gcp->ats.tv_sec, gcp->ats.tv_nsec, gcp->ref_cnt);
 }
 
-static void arm_attempt_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+/* Arm the delay after which the next candidate joins the race, if any. */
+static int arm_attempt_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
-	struct gwp_ctx *ctx = w->ctx;
+	int ms;
 
 	if (gcp->attempt_timer_armed)
-		return;
-	if (gcp->next_cand >= gcp->nr_cand)
-		return;			/* nothing left to start */
-	if (ctx->cfg.connect_attempt_delay <= 0)
-		return;			/* racing disabled: fall back only */
-	if (gcp->upstream)
-		return;			/* one proxy, nothing to race */
-
-	__arm_attempt_timer(w, gcp, ctx->cfg.connect_attempt_delay);
+		return 0;
+	ms = gwp_conn_race_delay_ms(w->ctx, gcp);
+	if (ms)
+		__arm_attempt_timer(w, gcp, ms);
+	return 0;
 }
 
 /* How long a connect waits for a free descriptor before it tries again, in ms. */
@@ -1046,7 +1032,7 @@ static bool wait_for_fd(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int err)
 		return false;
 	if (gcp->prot_type != GWP_PROT_TYPE_NONE)
 		return false;
-	if (has_inflight_attempt(gcp) || gcp->attempt_timer_armed)
+	if (gwp_has_inflight_attempt(gcp) || gcp->attempt_timer_armed)
 		return false;
 
 	if (!(gcp->flags & GWP_CONN_FLAG_FD_WAIT)) {
@@ -1948,16 +1934,7 @@ static int __handle_ev_accept(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 		return fd;
 	}
 
-	if (!gwp_ctx_acl_client_allowed(ctx, &w->iou->accept_addr,
-					GWP_ACL_PROTO_TCP)) {
-		gwp_wrk_acl_denied(w, &w->iou->accept_addr);
-		prep_close(w, fd);
-		return 0;
-	}
-
-	/* --max-conns-per-ip: before anything is read or set up. */
-	if (unlikely(ctx->iplim) &&
-	    !gwp_ctx_iplim_get(w, &w->iou->accept_addr)) {
+	if (!gwp_wrk_admit_client(w, &w->iou->accept_addr)) {
 		prep_close(w, fd);
 		return 0;
 	}
@@ -2067,12 +2044,7 @@ static int handle_ev_accept(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 		 * handle_accept_error().
 		 */
 		if (r == -EMFILE || r == -ENFILE || r == -ENOMEM) {
-			if (!w->accept_is_stopped) {
-				w->accept_is_stopped = true;
-				pr_warn(&w->ctx->lh,
-					"Too many open files, pausing accept (tidx=%u)",
-					w->idx);
-			}
+			gwp_wrk_accept_paused(w, r, &w->accept_is_stopped);
 			arm_accept_retry(w);
 			return 0;
 		}
@@ -2088,12 +2060,7 @@ static int handle_ev_accept(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 		 */
 		if (cqe->res < 0 &&
 		    (r == -ENOBUFS || r == -EPERM || r == -EACCES)) {
-			if (!w->accept_is_stopped) {
-				w->accept_is_stopped = true;
-				pr_warn(&w->ctx->lh,
-					"Failed to accept new connection: %s, pausing accept (tidx=%u)",
-					strerror(-r), w->idx);
-			}
+			gwp_wrk_accept_paused(w, r, &w->accept_is_stopped);
 			arm_accept_retry(w);
 			return 0;
 		}
@@ -2124,11 +2091,8 @@ static int handle_ev_accept(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 		return 0;
 	}
 
-	if (unlikely(w->accept_is_stopped)) {
-		w->accept_is_stopped = false;
-		pr_info(&w->ctx->lh, "Resumed accepting new connections (tidx=%u)",
-			w->idx);
-	}
+	if (unlikely(w->accept_is_stopped))
+		gwp_wrk_accept_resumed(w, &w->accept_is_stopped);
 
 	arm_accept(w);
 	return 0;
@@ -2223,10 +2187,7 @@ static int udp_up_iou_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	prep_timer_del_target(w, gcp);
 	prep_client_watch_del(w, gcp);
-	gcp->up_tx = false;
-	gcp->is_target_alive = true;
-	gcp->conn_state = CONN_STATE_SOCKS5_UDP_ASSOCIATE;
-	gwp_conn_upstream_up(gcp);
+	gwp_conn_upstream_established(gcp, CONN_STATE_SOCKS5_UDP_ASSOCIATE);
 	gcp->client.len = 0;
 	prep_send_client(w, gcp);
 #ifdef CONFIG_HTTPS
@@ -2246,7 +2207,6 @@ static int udp_up_iou_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 /* The upstream tunnel is up (reply already spliced); start forwarding. */
 static int upstream_iou_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
-	struct gwp_ctx *ctx = w->ctx;
 	int r;
 
 	if (gcp->flags & GWP_CONN_FLAG_UDP_UP)
@@ -2255,18 +2215,13 @@ static int upstream_iou_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	prep_timer_del_target(w, gcp);
 	prep_client_watch_del(w, gcp);
 	arm_idle_timer(w, gcp);
-	gcp->up_tx = false;
-	gcp->is_target_alive = true;
-	gcp->conn_state = CONN_STATE_FORWARDING;
-	gwp_conn_upstream_up(gcp);
+	gwp_conn_upstream_established(gcp, CONN_STATE_FORWARDING);
 
 	r = gwp_http_fwd_begin(w, gcp);
 	if (r)
 		return r;
 
-	pr_info(&ctx->lh, "Upstream tunnel established (idx=%u, ca=%s, dst=%s)",
-		gcp->idx, ip_to_str(&gcp->client_addr),
-		gwp_upstream_dst_str(gcp));
+	gwp_log_upstream_established(w, gcp);
 
 	/* Start forwarding. */
 	if (gcp->target.len)
@@ -2477,18 +2432,6 @@ static bool client_send_busy(struct gwp_conn_pair *gcp)
 		return gcp->tls_io->tx_sent < gcp->tls_io->tx_len;
 #endif
 	return gcp->client_tx;
-}
-
-/*
- * Connected to the upstream proxy, but the handshake with it has not begun:
- * finish_target_connect() left that to the completion of a client send.
- */
-static bool upstream_start_held(struct gwp_conn_pair *gcp)
-{
-	int cs = gcp->conn_state;
-
-	return gcp->upstream && gcp->target.fd >= 0 &&
-	       (cs == CONN_STATE_SOCKS5_CONNECT || cs == CONN_STATE_HTTP_CONNECT);
 }
 
 /*
@@ -2716,11 +2659,7 @@ static int finish_target_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	prep_client_watch_del(w, gcp);
 	arm_idle_timer(w, gcp);
 	gcp->is_target_alive = true;
-	pr_info(&w->ctx->lh,
-		"Target socket connected (fd=%d, idx=%u, ca=%s, ta=%s)",
-		gcp->target.fd, gcp->idx,
-		ip_to_str(&gcp->client_addr),
-		ip_to_str(&gcp->target_addr));
+	gwp_log_target_connected(w, gcp);
 
 	http_fwd = (gcp->prot_type == GWP_PROT_TYPE_HTTP && gcp->http_conn &&
 		    gwp_http_conn_is_forward(gcp->http_conn));
@@ -2800,31 +2739,15 @@ static int finish_target_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 }
 
 /*
- * Whether the result @res of a connect says that the target accepted and then
- * reset the connection: a refused SYN gives ECONNREFUSED, one that is never
- * answered ETIMEDOUT. What it sent before the reset can still be read, so the
- * connect counts as a success. Not for an upstream proxy, whose reset fails
- * the handshake that is yet to run on the connection.
- */
-static bool target_was_up(const struct gwp_conn_pair *gcp, int res)
-{
-	return (res == -ECONNRESET || res == -EPIPE) && !gcp->upstream;
-}
-
-/*
- * A connect that target_was_up() took as a success. Its result has taken the
- * error off the socket, and nothing more can be sent to the target: its write
- * side counts as shut, and what the client sent for it is dropped. Forwarding
- * reads what the target sent, then the end of stream, and the pair ends once
- * that is delivered.
+ * A connect that gwp_conn_target_was_up() took as a success, by its result
+ * @res. What the client sent for the target is dropped too: nothing more can
+ * be sent to it. Forwarding reads what the target sent, then the end of
+ * stream, and the pair ends once that is delivered.
  */
 static void target_note_reset(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			      int res)
 {
-	pr_dbg(&w->ctx->lh, "Target connected, then ended: %s (idx=%u, fd=%d)",
-		strerror(-res), gcp->idx, gcp->target.fd);
-	gcp->target.rst = true;
-	gcp->target.wr_shut = true;
+	gwp_conn_target_note_reset(w, gcp, -res);
 	gwp_conn_buf_consume(&gcp->client, gcp->client.len);
 }
 
@@ -2847,8 +2770,8 @@ static int handle_ev_target_attempt(struct gwp_wrk *w, void *udata,
 	if (unlikely(fd < 0))
 		return 0;		/* already retired */
 
-	/* Connected, then reset; see target_was_up(). */
-	if (target_was_up(gcp, res)) {
+	/* Connected, then reset; see gwp_conn_target_was_up(). */
+	if (gwp_conn_target_was_up(gcp, -res)) {
 		up_res = res;
 		res = 0;
 	}
@@ -2884,7 +2807,7 @@ static int handle_ev_target_attempt(struct gwp_wrk *w, void *udata,
 		 * candidate once nothing is outstanding, so a slow-but-working
 		 * address is not abandoned because a faster one was refused.
 		 */
-		if (has_inflight_attempt(gcp))
+		if (gwp_has_inflight_attempt(gcp))
 			return 0;
 
 		return connect_next_candidate(w, gcp, res);
@@ -3038,22 +2961,10 @@ static int handle_ev_timer(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		/*
 		 * Tell the client the origin timed out (SOCKS5 REP 0x06, HTTP
 		 * 504) rather than hanging up silently. Only once the request
-		 * is complete -- the other user of this timer is the protocol
-		 * handshake, where nothing has been requested yet. That is
-		 * while a target socket exists, while the target's name is
-		 * being looked up, and during a race, where there is no target
-		 * fd yet, so the in-flight attempts count as one.
+		 * is complete (gwp_conn_timeout_owed()).
 		 */
-		if (gcp->target.fd >= 0 || has_inflight_attempt(gcp) ||
-		    gwp_in_dns_lookup(gcp)) {
-			/* Not while the name resolves: no upstream yet. */
-			if (!gwp_in_dns_lookup(gcp)) {
-				gwp_upstream_note_end(gcp,
-						      GWP_UPSTREAM_END_TIMEOUT,
-						      gwp_upstream_timeout_val(gcp));
-				/* No time left to retry in. */
-				gwp_conn_upstream_failed(w, gcp, r, false);
-			}
+		if (gwp_conn_timeout_owed(gcp)) {
+			gwp_conn_timeout_upstream(w, gcp, r);
 
 			/* The pair ends once the answer can be given. */
 			if (upstream_tmo(w, gcp))
@@ -3088,45 +2999,10 @@ static int handle_sock_ret(int r)
 }
 
 /*
- * A recv from @c (@rx) or a send to it failed with @err while the pair
- * forwards. A plaintext peer that reset the connection, or died otherwise,
- * ends only its own side, as on the epoll loop (conn_note_reset() there):
- * nothing more can be sent to it, so its write side counts as shut and what
- * is queued for it is dropped (see drop_for_reset()), but what it sent before
- * goes on to the other side, like any data before an EOF. A failed recv has
- * returned the last of it, and is taken as the end of @c's stream. After a
- * failed send it is still queued on the socket, and the recv ends with an EOF
- * then, as the send has taken the error off the socket. The reset is
- * recorded in gwp_conn::rst. Returns true when @err was taken so.
- *
- * TLS sides are left as they were: a failure on one ends the pair at once,
- * and gwp_conn_pair_abort_target() passes the abort on.
- */
-static bool conn_note_reset(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
-			    struct gwp_conn *c, int err, bool rx)
-{
-	if (!gcp->is_target_alive || c->tls)
-		return false;
-	if (err != -ECONNRESET && err != -EPIPE && err != -ETIMEDOUT)
-		return false;
-
-	if (rx)
-		c->rd_eof = true;
-	if (!c->rst) {
-		pr_dbg(&w->ctx->lh, "%s connection ended: %s (idx=%u, fd=%d)",
-			c == &gcp->client ? "Client" : "Target",
-			strerror(-err), gcp->idx, c->fd);
-		c->rst = true;
-	}
-	c->wr_shut = true;
-	return true;
-}
-
-/*
- * @dst was reset (conn_note_reset()): what @src holds for it can no longer be
- * delivered. Drop it instead of sending it, and do not read @src for @dst
- * any more: the pair ends once @dst's own stream has been delivered, which
- * does not wait for @src. Returns true when @dst was reset.
+ * @dst was reset (gwp_conn_note_reset()): what @src holds for it can no
+ * longer be delivered. Drop it instead of sending it, and do not read @src
+ * for @dst any more: the pair ends once @dst's own stream has been
+ * delivered, which does not wait for @src. Returns true when @dst was reset.
  */
 static bool drop_for_reset(struct gwp_conn *src, struct gwp_conn *dst)
 {
@@ -3176,7 +3052,7 @@ static bool tls_close_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 }
 
 /*
- * The plaintext target was reset (conn_note_reset()) and the TLS client has
+ * The plaintext target was reset (gwp_conn_note_reset()) and the TLS client has
  * been handed all it sent. A close_notify would turn the abort into a clean
  * end: once the ciphertext the client is owed has left, the pair goes down
  * as it did at the reset before, and gwp_conn_pair_abort_target() deals with
@@ -3208,7 +3084,7 @@ static int tls_target_cut(struct gwp_conn_pair *gcp)
 static int iou_forward_progress(struct gwp_wrk __unused *w,
 				struct gwp_conn_pair *gcp)
 {
-	bool shut_client = false, shut_target = false, done;
+	bool shut_client = false, shut_target = false;
 
 	if (target_rx_done(gcp) && gcp->target.len == 0 && !gcp->client.wr_shut) {
 #ifdef CONFIG_HTTPS
@@ -3221,11 +3097,7 @@ static int iou_forward_progress(struct gwp_wrk __unused *w,
 			return 0;
 #endif
 		shut_client = true;
-		gcp->client.wr_shut = true;
-#ifdef CONFIG_HTTPS
-		if (client_is_tls(gcp))
-			gwp_ssl_tx_close(gcp->client.tls);
-#endif
+		gwp_conn_mark_wr_shut(&gcp->client);
 	}
 
 	if (gcp->client.rd_eof && gcp->client.len == 0 && !gcp->target.wr_shut) {
@@ -3239,35 +3111,16 @@ static int iou_forward_progress(struct gwp_wrk __unused *w,
 			return 0;
 #endif
 		shut_target = true;
-		gcp->target.wr_shut = true;
-#ifdef CONFIG_HTTPS
-		if (target_is_tls(gcp))
-			gwp_ssl_tx_close(gcp->target.tls);
-#endif
+		gwp_conn_mark_wr_shut(&gcp->target);
 	}
 
 	/*
-	 * Once both directions are done the pair is torn down, and closing
-	 * its sockets sends the FINs. A shutdown() right before that close
-	 * only costs a syscall, provided nothing is left unread on the
-	 * socket: close() answers unread data with an RST instead of a FIN.
 	 * Here a write side is shut only after the other socket's read side
 	 * reached EOF, so when both are done both sockets have been read to
-	 * EOF; the test is kept explicit, as in the epoll loop. The survivor
-	 * of a reset gets no FIN at all: the teardown passes the reset on
-	 * (gwp_conn_reset_passes_to()).
+	 * EOF; gwp_conn_pair_shut_wr() keeps the test explicit all the same.
 	 */
-	done = gcp->client.wr_shut && gcp->target.wr_shut;
-	if (shut_client && !(done && (gcp->client.rd_eof ||
-		gwp_conn_reset_passes_to(gcp, &gcp->client))))
-		__sys_shutdown(gcp->client.fd, SHUT_WR);
-	if (shut_target && !(done && (gcp->target.rd_eof ||
-		gwp_conn_reset_passes_to(gcp, &gcp->target))))
-		__sys_shutdown(gcp->target.fd, SHUT_WR);
-	if (done)
-		return -ECONNRESET;
-
-	return 0;
+	return gwp_conn_pair_shut_wr(gcp, shut_client, shut_target) ?
+	       -ECONNRESET : 0;
 }
 
 static int handle_ev_client_recv(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
@@ -3279,7 +3132,7 @@ static int handle_ev_client_recv(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	if (r < 0) {
 		if (r == -EAGAIN || r == -EINTR)
 			return prep_recv_client(w, gcp);
-		if (!conn_note_reset(w, gcp, &gcp->client, r, true))
+		if (!gwp_conn_note_reset(w, gcp, &gcp->client, r, true))
 			return r;
 		/* A send to the client in flight finds the reset itself. */
 		if (!gcp->client_tx)
@@ -3357,7 +3210,7 @@ static int handle_ev_target_recv(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		 * that resets inside its response header, as for one that
 		 * closes there.
 		 */
-		if (!conn_note_reset(w, gcp, &gcp->target, r, true))
+		if (!gwp_conn_note_reset(w, gcp, &gcp->target, r, true))
 			return r;
 		r = 0;
 	}
@@ -3398,7 +3251,7 @@ static int handle_ev_client_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	int r = cqe->res;
 
 	gcp->client_tx = false;
-	if (r < 0 && conn_note_reset(w, gcp, &gcp->client, r, false)) {
+	if (r < 0 && gwp_conn_note_reset(w, gcp, &gcp->client, r, false)) {
 		gwp_conn_buf_consume(&gcp->target, gcp->target.len);
 		return iou_forward_progress(w, gcp);
 	}
@@ -3439,7 +3292,7 @@ static int handle_ev_client_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		if (gcp->target.len > 0 ||
 		    gwp_ssl_bio_pending(gcp->client.tls) > 0) {
 			send_client_tls(w, gcp);
-		} else if (upstream_start_held(gcp)) {
+		} else if (gwp_upstream_start_held(gcp)) {
 			return upstream_iou_start(w, gcp);
 		} else if (t->prot_resume) {
 			t->prot_resume = false;
@@ -3476,7 +3329,7 @@ static int handle_ev_client_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		return gcp->fail_err;
 
 	/* The reply is out; the upstream handshake may use target.buf now. */
-	if (upstream_start_held(gcp))
+	if (gwp_upstream_start_held(gcp))
 		return upstream_iou_start(w, gcp);
 
 	/*
@@ -3499,11 +3352,11 @@ static int handle_ev_target_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	/*
 	 * The target was reset: what the client sends can no longer reach it,
 	 * but what the target sent before the reset is still to be read, and
-	 * the target's recv goes on until it ends (conn_note_reset()). Over
+	 * the target's recv goes on until it ends (gwp_conn_note_reset()). Over
 	 * HTTP forwarding, a request whose send failed so while the response
 	 * header is awaited is answered 502 then, as a reset there is.
 	 */
-	if (r < 0 && conn_note_reset(w, gcp, &gcp->target, r, false)) {
+	if (r < 0 && gwp_conn_note_reset(w, gcp, &gcp->target, r, false)) {
 		gwp_conn_buf_consume(&gcp->client, gcp->client.len);
 		return iou_forward_progress(w, gcp);
 	}
@@ -3551,119 +3404,25 @@ static int acl_reject_target(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	return -EACCES;
 }
 
-/*
- * Start the next candidate address, having already tried (or not yet started)
- * the others. @err is why the previous attempt failed, reported to the client
- * if no candidate is left. Returns 0 once an attempt is in flight, or a
- * negative errno once they are exhausted.
- *
- * A candidate the ACL rejects is skipped rather than being fatal: the rule
- * denied that address, not the name, and another address of the same host may
- * well be permitted. Only when every candidate is denied does the client get
- * the ACL rejection.
- */
+/* Queue the client's failure reply, as acl_reject_target() does. */
+static int send_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	prep_send_client(w, gcp);
+	return 0;
+}
+
+static const struct gwp_connect_ops connect_ops = {
+	.start		= start_connect_attempt,
+	.arm_race	= arm_attempt_timer,
+	.wait_fd	= wait_for_fd,
+	.acl_reject	= acl_reject_target,
+	.send_reply	= send_fail_reply,
+};
+
 static int connect_next_candidate(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				  int err)
 {
-	bool acl_denied = false;
-
-	/*
-	 * No candidate list at all: socks5h:// hands the hostname to the
-	 * upstream proxy and never resolves it here, so target_addr stays
-	 * unset and there is exactly one connect to make -- to the upstream.
-	 * Attempt it once, leaving target_addr untouched so the ACL keeps
-	 * seeing "no resolved IP" and matches on -m domain as before.
-	 */
-	if (!gcp->nr_cand) {
-		if (gcp->next_cand)
-			goto exhausted;
-
-		gcp->next_cand = 1;
-		if (!gwp_ctx_acl_target_allowed(w->ctx, gcp))
-			return acl_reject_target(w, gcp);
-
-		err = start_connect_attempt(w, gcp, 0);
-		if (!err)
-			return 0;
-		goto exhausted;
-	}
-
-	while (gcp->next_cand < gcp->nr_cand) {
-		uint8_t slot = gcp->next_cand;
-
-		gcp->target_addr = gcp->cand[gcp->next_cand++];
-
-		if (!gwp_ctx_acl_target_allowed(w->ctx, gcp)) {
-			acl_denied = true;
-			continue;
-		}
-
-		gcp->flags |= GWP_CONN_FLAG_ACL_CAND_OK;
-		err = start_connect_attempt(w, gcp, slot);
-		if (!err) {
-			/*
-			 * Racing: do not wait for this attempt to resolve
-			 * before queueing the next one.
-			 */
-			arm_attempt_timer(w, gcp);
-			return 0;
-		}
-
-		pr_dbg(&w->ctx->lh, "Target %s did not start: %s (idx=%u)",
-			ip_to_str(&gcp->target_addr), strerror(-err), gcp->idx);
-
-		if (wait_for_fd(w, gcp, err))
-			return 0;
-
-		/*
-		 * Chaining: every attempt dials the same upstream proxy, so
-		 * walking the target's addresses would just repeat the same
-		 * failure. The candidates still matter for the ACL above and
-		 * for the destination named to the upstream. Not so for a
-		 * -j MARK or -j BIND, which is this candidate's alone: the
-		 * next one may well carry another, or none.
-		 */
-		if (gcp->upstream && !gcp->acl_sockopt.mark_set &&
-		    !gcp->acl_sockopt.bind.set)
-			break;
-	}
-
-	/*
-	 * Nothing new could be started. If earlier attempts are still racing,
-	 * one of them may yet succeed -- wait for it rather than failing now.
-	 */
-	if (has_inflight_attempt(gcp))
-		return 0;
-
-	/*
-	 * The ACL is the reason this request failed only if it denied every
-	 * candidate. Once any address was allowed -- possibly on an earlier
-	 * walk, whose attempt has since failed -- the honest answer is that
-	 * attempt's error, not a rejection that applies to the addresses we
-	 * merely skipped.
-	 */
-	if (acl_denied && !(gcp->flags & GWP_CONN_FLAG_ACL_CAND_OK))
-		return acl_reject_target(w, gcp);
-
-exhausted:
-	pr_dbg(&w->ctx->lh, "No target address left to try (idx=%u): %s",
-		gcp->idx, strerror(-err));
-	/* No socket left to close: the retry walks the candidates again. */
-	if (gwp_conn_upstream_failed(w, gcp, err, true)) {
-		gcp->next_cand = 0;
-		return connect_next_candidate(w, gcp, err);
-	}
-
-	/*
-	 * Report the failure instead of just hanging up, so the client learns
-	 * the target refused rather than guessing: a SOCKS5 REP (RFC 1928 s6)
-	 * or an HTTP 502. Queued before the error return tears the pair down,
-	 * as acl_reject_target() does.
-	 */
-	if (!gwp_conn_fail_reply(w, gcp, err) && gcp->target.len)
-		prep_send_client(w, gcp);
-
-	return err;
+	return gwp_conn_next_candidate(w, gcp, err, &connect_ops);
 }
 
 /*
@@ -3762,17 +3521,9 @@ static void prep_udp_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	struct gwp_iou_udp *u = gcp->udp_iou;
 	struct io_uring_sqe *s = get_sqe_nofail(w);
 
+	/* The send reads the destination after this returns: keep a copy. */
 	u->dst = out->dst;
-	u->iov.iov_base = out->buf;
-	u->iov.iov_len = out->len;
-	memset(&u->mh, 0, sizeof(u->mh));
-	u->mh.msg_name = &u->dst;
-	u->mh.msg_namelen = out->dstlen;
-	u->mh.msg_iov = &u->iov;
-	u->mh.msg_iovlen = 1;
-	u->mh.msg_controllen = gwp_udp_src_cmsg(out, &u->cb);
-	if (u->mh.msg_controllen)
-		u->mh.msg_control = u->cb.b;
+	gwp_udp_out_msg(&u->mh, &u->iov, &u->cb, &u->dst, out);
 	io_uring_prep_sendmsg(s, gcp->udp_fd, &u->mh, MSG_NOSIGNAL);
 	io_uring_sqe_set_data(s, gcp);
 	s->user_data |= EV_BIT_IOU_UDP_TX;
@@ -3882,8 +3633,7 @@ static int chk_prot_result(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int r)
 {
 	int ct = gcp->conn_state;
 
-	if (r == -EINPROGRESS &&
-	    (ct == CONN_STATE_SOCKS5_DNS_QUERY || ct == CONN_STATE_HTTP_DNS_QUERY))
+	if (r == -EINPROGRESS && gwp_in_dns_lookup(gcp))
 		return prep_domain_resolution(w, gcp);
 
 	if (r == 0 &&
@@ -4016,8 +3766,9 @@ static int handle_ev_dns_query(struct gwp_wrk *w, void *udata)
 	 * named an address does from the start, and says so, as on epoll
 	 * (handle_connect()). What asks whether a connect is under way goes
 	 * by the state: the handshake held for the client's reply
-	 * (upstream_start_held()) would never start, and a connect timeout
-	 * would be taken for the lookup's and not charged to an upstream.
+	 * (gwp_upstream_start_held()) would never start, and a connect
+	 * timeout would be taken for the lookup's and not charged to an
+	 * upstream.
 	 */
 	if (gcp->conn_state == CONN_STATE_SOCKS5_DNS_QUERY)
 		gcp->conn_state = CONN_STATE_SOCKS5_CONNECT;
@@ -4202,10 +3953,8 @@ static int handle_event(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 	 * the common teardown below expects it. A block of selectors rather
 	 * than one value, hence the range test ahead of the switch.
 	 */
-	if (ev_bit >= EV_BIT_TARGET_ATTEMPT &&
-	    ev_bit < EV_BIT_TARGET_ATTEMPT +
-		     ((uint64_t)GWP_MAX_CONN_CAND << 48ull)) {
-		uint8_t slot = (uint8_t)((ev_bit - EV_BIT_TARGET_ATTEMPT) >> 48ull);
+	if (gwp_ev_bit_is_attempt(ev_bit)) {
+		uint8_t slot = gwp_ev_bit_attempt_slot(ev_bit);
 
 		pr_dbg(&ctx->lh, "Handling target attempt %u event: %d", slot,
 			cqe->res);

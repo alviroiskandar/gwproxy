@@ -123,11 +123,6 @@ struct gwp_cfg {
 
 struct gwp_ctx;
 
-enum {
-	GWP_UPSTREAM_SOCKS5	= 0,
-	GWP_UPSTREAM_HTTP	= 1,
-};
-
 /*
  * One upstream proxy server, parsed from a URL such as --upstream-proxy's. A
  * connection that chains through it holds a reference (gwp_conn_pair::upstream)
@@ -365,6 +360,28 @@ enum {
 
 static_assert((EV_BIT_CLIENT_PROT & ~EV_BIT_ALL) == 0,
 	      "the largest event selector must fit inside EV_BIT_ALL");
+
+/*
+ * The selector of connect attempt slot @slot (EV_BIT_TARGET_ATTEMPT), its
+ * range test and the slot it carries. Both loops tag a racing attempt this
+ * way; the caller ORs in the pair pointer.
+ */
+static inline uint64_t gwp_ev_bit_attempt(uint8_t slot)
+{
+	return EV_BIT_TARGET_ATTEMPT + ((uint64_t)slot << 48ull);
+}
+
+static inline bool gwp_ev_bit_is_attempt(uint64_t ev_bit)
+{
+	return ev_bit >= EV_BIT_TARGET_ATTEMPT &&
+	       ev_bit < EV_BIT_TARGET_ATTEMPT +
+			((uint64_t)GWP_MAX_CONN_CAND << 48ull);
+}
+
+static inline uint8_t gwp_ev_bit_attempt_slot(uint64_t ev_bit)
+{
+	return (uint8_t)((ev_bit - EV_BIT_TARGET_ATTEMPT) >> 48ull);
+}
 
 enum {
 	CONN_STATE_INIT			= 0,
@@ -1245,6 +1262,8 @@ bool gwp_ctx_iplim_get(struct gwp_wrk *w, const struct gwp_sockaddr *addr);
 bool gwp_wrk_log_limit(struct gwp_wrk *w, struct gwp_log_limit *l,
 		       uint32_t *quiet);
 void gwp_wrk_acl_denied(struct gwp_wrk *w, const struct gwp_sockaddr *addr);
+void gwp_wrk_accept_paused(struct gwp_wrk *w, int e, bool *logged);
+void gwp_wrk_accept_resumed(struct gwp_wrk *w, bool *logged);
 void gwp_wrk_no_orig_dst(struct gwp_wrk *w, const struct gwp_sockaddr *addr,
 			 int err);
 void gwp_ctx_iplim_put(struct gwp_ctx *ctx, const struct gwp_sockaddr *addr);
@@ -1305,6 +1324,21 @@ bool gwp_conn_upstream_failed(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
  * (the pool reference) goes.
  */
 void gwp_conn_upstream_up(struct gwp_conn_pair *gcp);
+
+/*
+ * The upstream granted the tunnel (or the UDP ASSOCIATE): no request of ours
+ * is in flight any more, the target counts as up, and the pair goes to
+ * @state, CONN_STATE_FORWARDING or CONN_STATE_SOCKS5_UDP_ASSOCIATE. What each
+ * loop does around it (timers, watches, the client's reply) stays there.
+ */
+static inline void gwp_conn_upstream_established(struct gwp_conn_pair *gcp,
+						 int state)
+{
+	gcp->up_tx = false;
+	gcp->is_target_alive = true;
+	gcp->conn_state = state;
+	gwp_conn_upstream_up(gcp);
+}
 int gwp_create_sock_target(struct gwp_wrk *w, struct gwp_sockaddr *addr,
 			   const struct gwp_conn_sockopt *so,
 			   bool *is_target_alive, bool non_block);
@@ -1407,6 +1441,29 @@ union gwp_udp_cmsg {
 size_t gwp_udp_src_cmsg(const struct gwp_udp_out *out, union gwp_udp_cmsg *cb);
 
 /*
+ * Fill @mh, @iov and @cb for the sendmsg of @out's datagram to @dst, from the
+ * source it must come from, if it has one. @dst is @out->dst or a copy of it
+ * that must stay valid until the send is done; the other three are the
+ * caller's too, for the same reason.
+ */
+static inline void gwp_udp_out_msg(struct msghdr *mh, struct iovec *iov,
+				   union gwp_udp_cmsg *cb,
+				   struct gwp_sockaddr *dst,
+				   const struct gwp_udp_out *out)
+{
+	iov->iov_base = out->buf;
+	iov->iov_len = out->len;
+	memset(mh, 0, sizeof(*mh));
+	mh->msg_name = dst;
+	mh->msg_namelen = out->dstlen;
+	mh->msg_iov = iov;
+	mh->msg_iovlen = 1;
+	mh->msg_controllen = gwp_udp_src_cmsg(out, cb);
+	if (mh->msg_controllen)
+		mh->msg_control = cb->b;
+}
+
+/*
  * SOCKS5 UDP relay per-datagram classifier, shared by both event loops. @base
  * points at a received datagram of @n bytes, with GWP_SOCKS5_UDP_HDR_MAX bytes
  * of slack before it; @src is its source. Maintain the client pin
@@ -1452,6 +1509,68 @@ void gwp_conn_set_single_candidate(struct gwp_conn_pair *gcp,
 				   const struct gwp_sockaddr *addr);
 
 /*
+ * What gwp_conn_next_candidate() needs from the event loop that runs it.
+ * Each returns 0 or a negative errno unless it says otherwise.
+ */
+struct gwp_connect_ops {
+	/*
+	 * Start one connect attempt to gcp->target_addr, which the ACL has
+	 * approved, in attempt slot @slot.
+	 */
+	int (*start)(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+		     uint8_t slot);
+	/* An attempt is running: arm the delay before the next one joins. */
+	int (*arm_race)(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
+	/*
+	 * An attempt could not start with @err: true when the loop takes
+	 * that as a wait for a free descriptor instead, to try again later.
+	 * NULL for a loop that does not wait.
+	 */
+	bool (*wait_fd)(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int err);
+	/*
+	 * Every candidate was denied: answer the client with the ACL's
+	 * rejection; returns the error that ends the pair.
+	 */
+	int (*acl_reject)(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
+	/* Send the failure reply gwp_conn_fail_reply() put in target.buf. */
+	int (*send_reply)(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
+};
+
+/*
+ * Start the next candidate address, having already tried (or not yet started)
+ * the others. @err is why the previous attempt failed, reported to the client
+ * if no candidate is left. Returns 0 once an attempt is in flight, or a
+ * negative errno once they are exhausted.
+ *
+ * A candidate the ACL rejects is skipped rather than being fatal: the rule
+ * denied that address, not the name, and another address of the same host may
+ * well be permitted. Only when every candidate is denied does the client get
+ * the ACL rejection.
+ *
+ * Both event loops walk the candidates here, with their own I/O in @ops.
+ */
+int gwp_conn_next_candidate(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			    int err, const struct gwp_connect_ops *ops);
+
+/*
+ * The delay, in ms, after which the next candidate of @gcp joins the race,
+ * or 0 when no attempt timer is to be armed. Racing is what makes a
+ * black-holed address cheap: without it a target that silently drops SYNs
+ * costs the whole connect timeout before anything else is tried.
+ */
+static inline int gwp_conn_race_delay_ms(const struct gwp_ctx *ctx,
+					 const struct gwp_conn_pair *gcp)
+{
+	if (gcp->next_cand >= gcp->nr_cand)
+		return 0;		/* nothing left to start */
+	if (ctx->cfg.connect_attempt_delay <= 0)
+		return 0;		/* racing disabled: fall back only */
+	if (gcp->upstream)
+		return 0;		/* one proxy, nothing to race */
+	return ctx->cfg.connect_attempt_delay;
+}
+
+/*
  * Close every connect attempt still in flight, e.g. once one attempt has won
  * the race or the pair is being torn down. Returns how many descriptors were
  * closed, which the epoll loop credits to its accept-rearm accounting.
@@ -1469,6 +1588,58 @@ bool gwp_conn_reset_passed(const struct gwp_conn_pair *gcp,
 			   const struct gwp_conn *c);
 
 /*
+ * A recv from @c (@rx) or a send to it failed with @err while the pair
+ * forwards, on either event loop. A plaintext peer that reset the
+ * connection, or died otherwise, ends only its own side: nothing more can be
+ * sent to it, so its write side counts as shut and the loop drops what is
+ * queued for it (epoll's fwd_send(), io_uring's drop_for_reset()), but what
+ * it sent before is still queued on its socket ahead of the error and goes
+ * on to the other side, like any data before an EOF. A failed recv has
+ * returned the last of it, and is taken as the end of @c's stream. After a
+ * failed send it is still to be read, and the recv ends with an EOF then, as
+ * the send has taken the error off the socket: the error is reported once.
+ * The reset is recorded in gwp_conn::rst (see gwp_conn_reset_passed()).
+ * Returns true when @err was taken so.
+ *
+ * TLS sides are left as they were: a failure on one ends the pair at once,
+ * with gwp_conn_pair_abort_target() passing the abort on, and epoll's
+ * do_recv_tls() has its own way of ending at a failed recv.
+ */
+bool gwp_conn_note_reset(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			 struct gwp_conn *c, int err, bool rx);
+
+/*
+ * Whether the error @err (a positive errno: SO_ERROR on epoll, the negated
+ * result on io_uring) of a connect says that the target accepted and then
+ * reset the connection: a refused SYN gives ECONNREFUSED, one that is never
+ * answered ETIMEDOUT. What it sent before the reset can still be read, so the
+ * connect counts as a success. Not for an upstream proxy, whose reset fails
+ * the handshake that is yet to run on the connection.
+ */
+static inline bool gwp_conn_target_was_up(const struct gwp_conn_pair *gcp,
+					  int err)
+{
+	return (err == ECONNRESET || err == EPIPE) && !gcp->upstream;
+}
+
+/*
+ * A connect that gwp_conn_target_was_up() took as a success, by @err (a
+ * positive errno). Reading the connect's result has taken the error off the
+ * socket, so it is recorded here, as gwp_conn_note_reset() would: nothing
+ * more can be sent to the target, so its write side counts as shut, and
+ * forwarding reads what the target sent, and ends there.
+ */
+static inline void gwp_conn_target_note_reset(struct gwp_wrk *w,
+					      struct gwp_conn_pair *gcp,
+					      int err)
+{
+	pr_dbg(&w->ctx->lh, "Target connected, then ended: %s (idx=%u, fd=%d)",
+		strerror(err), gcp->idx, gcp->target.fd);
+	gcp->target.rst = true;
+	gcp->target.wr_shut = true;
+}
+
+/*
  * The other side of @c was reset (gwp_conn_reset_passed()), and @c, the
  * plaintext survivor, is to be reset in turn once it has taken what it is
  * owed, so that the cut shows: the end of the pair gives it no FIN, and
@@ -1477,6 +1648,41 @@ bool gwp_conn_reset_passed(const struct gwp_conn_pair *gcp,
  */
 bool gwp_conn_reset_passes_to(const struct gwp_conn_pair *gcp,
 			      const struct gwp_conn *c);
+
+/*
+ * The other side's stream has ended and been flushed to @c while the pair
+ * forwards: mark @c's write side shut, and for a TLS @c queue its
+ * close_notify. The shutdown() itself is left to gwp_conn_pair_shut_wr(),
+ * which skips it if the pair is torn down anyway.
+ */
+void gwp_conn_mark_wr_shut(struct gwp_conn *c);
+
+/*
+ * After a forwarding step that marked the client's (@shut_client) or the
+ * target's (@shut_target) write side shut, issue their shutdown()s, and
+ * return whether the pair is done: both write sides are shut, and the pair
+ * is torn down without dropping any data.
+ *
+ * Closing a done pair's sockets sends the FINs. A shutdown() right before
+ * that close() only costs a syscall, provided nothing is left unread on the
+ * socket: close() answers unread data with an RST instead of a FIN, so a
+ * socket whose read side has not reached EOF still gets the explicit
+ * shutdown(). The survivor of a reset gets no FIN at all: the teardown passes
+ * the reset on (gwp_conn_reset_passes_to()).
+ */
+static inline bool gwp_conn_pair_shut_wr(struct gwp_conn_pair *gcp,
+					 bool shut_client, bool shut_target)
+{
+	bool done = gcp->client.wr_shut && gcp->target.wr_shut;
+
+	if (shut_client && !(done && (gcp->client.rd_eof ||
+		gwp_conn_reset_passes_to(gcp, &gcp->client))))
+		__sys_shutdown(gcp->client.fd, SHUT_WR);
+	if (shut_target && !(done && (gcp->target.rd_eof ||
+		gwp_conn_reset_passes_to(gcp, &gcp->target))))
+		__sys_shutdown(gcp->target.fd, SHUT_WR);
+	return done;
+}
 
 /*
  * @gcp is done and about to be freed, with no I/O left in flight on its
@@ -1495,6 +1701,33 @@ int gwp_conn_pair_linger(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 bool gwp_ctx_acl_client_allowed(struct gwp_ctx *ctx,
 				const struct gwp_sockaddr *client,
 				enum gwp_acl_proto proto);
+
+/*
+ * The admission gate for a TCP client just accepted from @addr: the ACL
+ * INPUT chain (a refusal is logged), then --max-conns-per-ip. Both run
+ * before anything is allocated, so a flood of unwanted clients costs no
+ * more than an accept and a close. False means the caller closes the
+ * socket; true with ctx->iplim set means an iplimit slot is now held for
+ * @addr.
+ */
+static inline bool gwp_wrk_admit_client(struct gwp_wrk *w,
+					const struct gwp_sockaddr *addr)
+{
+	struct gwp_ctx *ctx = w->ctx;
+
+	if (!gwp_ctx_acl_client_allowed(ctx, addr, GWP_ACL_PROTO_TCP)) {
+		gwp_wrk_acl_denied(w, addr);
+		return false;
+	}
+	/*
+	 * unlikely(), spelled out: this header does not include common.h,
+	 * whose __unused would clash with musl's struct stat in files that
+	 * include <sys/stat.h> after it.
+	 */
+	if (__builtin_expect(!!ctx->iplim, 0) && !gwp_ctx_iplim_get(w, addr))
+		return false;
+	return true;
+}
 /*
  * True when @a may be dialled under --outgoing-family. v4-mapped aware, so a
  * ::ffff:a.b.c.d target from the UDP relay counts as IPv4.
@@ -1568,6 +1801,20 @@ static inline bool gwp_in_upstream_hs(const struct gwp_conn_pair *gcp)
 }
 
 /*
+ * Connected to the upstream proxy, but the handshake with it has not begun:
+ * the loop left that until the client has its reply (upstream_hold() on
+ * epoll; on io_uring, finish_target_connect() left it to the completion of
+ * a client send).
+ */
+static inline bool gwp_upstream_start_held(const struct gwp_conn_pair *gcp)
+{
+	int cs = gcp->conn_state;
+
+	return gcp->upstream && gcp->target.fd >= 0 &&
+	       (cs == CONN_STATE_SOCKS5_CONNECT || cs == CONN_STATE_HTTP_CONNECT);
+}
+
+/*
  * The value of a GWP_UPSTREAM_END_TIMEOUT for @gcp's attempt (see enum
  * gwp_upstream_end): 0 while the upstream owes us its part, the connect or
  * the handshake up to our CONNECT request; 1 once that request is out and
@@ -1583,9 +1830,8 @@ static inline int gwp_upstream_timeout_val(const struct gwp_conn_pair *gcp)
 		return !gcp->up_tx;
 	if (gwp_in_upstream_hs(gcp))
 		return 0;
-	/* Connected, but held for the client (upstream_start_held()). */
-	return gcp->upstream && gcp->target.fd >= 0 &&
-	       (cs == CONN_STATE_SOCKS5_CONNECT || cs == CONN_STATE_HTTP_CONNECT);
+	/* Connected, but held for the client. */
+	return gwp_upstream_start_held(gcp);
 }
 
 /*
@@ -1598,6 +1844,47 @@ static inline bool gwp_in_dns_lookup(const struct gwp_conn_pair *gcp)
 
 	return cs == CONN_STATE_SOCKS5_DNS_QUERY ||
 	       cs == CONN_STATE_HTTP_DNS_QUERY;
+}
+
+/* Are any connect attempts of this pair still waiting for a result? */
+static inline bool gwp_has_inflight_attempt(const struct gwp_conn_pair *gcp)
+{
+	uint8_t i;
+
+	for (i = 0; i < GWP_MAX_CONN_CAND; i++) {
+		if (gcp->attempt_fd[i] >= 0)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * Whether a connect timeout finds the client's request complete, so that the
+ * client is owed an answer: while a target socket exists, while the target's
+ * name is being looked up, and during a race, where there is no target fd
+ * yet, so the in-flight attempts count as one. The other user of the timer
+ * is the protocol handshake, where nothing has been requested yet.
+ */
+static inline bool gwp_conn_timeout_owed(const struct gwp_conn_pair *gcp)
+{
+	return gcp->target.fd >= 0 || gwp_has_inflight_attempt(gcp) ||
+	       gwp_in_dns_lookup(gcp);
+}
+
+/*
+ * Charge the connect timeout @err of a pair gwp_conn_timeout_owed() an
+ * answer to its upstream, which has no time left to retry in. Not while the
+ * name resolves: no upstream is involved yet.
+ */
+static inline void gwp_conn_timeout_upstream(struct gwp_wrk *w,
+					     struct gwp_conn_pair *gcp,
+					     int err)
+{
+	if (gwp_in_dns_lookup(gcp))
+		return;
+	gwp_upstream_note_end(gcp, GWP_UPSTREAM_END_TIMEOUT,
+			      gwp_upstream_timeout_val(gcp));
+	gwp_conn_upstream_failed(w, gcp, err, false);
 }
 
 /* Move the data back to the start of the buffer, regaining the room in front. */
@@ -1660,6 +1947,21 @@ void log_conn_pair_created(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		ip_to_str(&gcp->client_addr), ip_to_str(&gcp->target_addr));
 }
 
+/*
+ * Every connection to a target is logged once it is up, the same way on both
+ * event loops: once the connect completes, or, on epoll, in
+ * handle_new_client() for a plain forwarding connect that completed at once.
+ * A connection through an upstream proxy is logged when the tunnel is up
+ * instead.
+ */
+static inline
+void gwp_log_target_connected(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	pr_info(&w->ctx->lh, "Target socket connected (fd=%d, idx=%u, ca=%s, ta=%s)",
+		gcp->target.fd, gcp->idx, ip_to_str(&gcp->client_addr),
+		ip_to_str(&gcp->target_addr));
+}
+
 int gwp_socks5_prep_connect_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				  int err);
 
@@ -1701,6 +2003,14 @@ int gwp_upstream_authority(const struct gwp_socks5_addr *dst, char *buf,
 			   size_t cap);
 
 /*
+ * Format @a as text after the prefix @pfx: "host:port", "1.2.3.4:port" or
+ * "[ipv6]:port". Returns 0, or -EINVAL for an address type it does not know
+ * or a result that does not fit @cap bytes.
+ */
+int gwp_socks5_addr_str(const struct gwp_socks5_addr *a, const char *pfx,
+			char *buf, size_t cap);
+
+/*
  * The upstream proxy handshake succeeded: build our downstream CONNECT reply
  * (SOCKS5 or HTTP), drop the proxy's @consumed reply bytes from the target
  * buffer while keeping any early destination data, and splice our reply ahead
@@ -1712,6 +2022,15 @@ int gwp_upstream_splice_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 /* "host:port" for a domain upstream target, else its resolved IP. Returns a
  * thread-local buffer valid until the next call on the same thread. */
 const char *gwp_upstream_dst_str(struct gwp_conn_pair *gcp);
+
+/* Both loops log every TCP tunnel through an upstream once it is up. */
+static inline
+void gwp_log_upstream_established(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	pr_info(&w->ctx->lh, "Upstream tunnel established (idx=%u, ca=%s, dst=%s)",
+		gcp->idx, ip_to_str(&gcp->client_addr),
+		gwp_upstream_dst_str(gcp));
+}
 
 /*
  * The next I/O step in the transport-agnostic upstream-proxy handshake state

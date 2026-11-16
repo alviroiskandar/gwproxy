@@ -126,6 +126,16 @@ static void write_file(const char *path, const char *data)
 	fclose(f);
 }
 
+/* A temporary file holding @data; its name goes to @path (a mkstemp template). */
+static void temp_file(char *path, const char *data)
+{
+	int fd = mkstemp(path);
+
+	assert(fd >= 0);
+	close(fd);
+	write_file(path, data);
+}
+
 /* Move all pending ciphertext from @from's send BIO into @to's recv BIO. */
 static void shuttle(struct gwp_ssl *from, struct gwp_ssl *to)
 {
@@ -136,19 +146,84 @@ static void shuttle(struct gwp_ssl *from, struct gwp_ssl *to)
 		assert(gwp_ssl_bio_write(to, buf, (size_t)n) == n);
 }
 
-static void do_handshake(struct gwp_ssl *cli, struct gwp_ssl *srv)
+/*
+ * Run a handshake that may fail. Returns GWP_SSL_OK once both sides are done,
+ * or GWP_SSL_ERROR as soon as either side fails.
+ */
+static int try_handshake(struct gwp_ssl *cli, struct gwp_ssl *srv)
 {
 	int cs, ss, rounds = 0;
 
 	do {
 		cs = gwp_ssl_handshake(cli);
-		assert(cs != GWP_SSL_ERROR);
 		shuttle(cli, srv);
+		if (cs == GWP_SSL_ERROR)
+			return cs;
 		ss = gwp_ssl_handshake(srv);
-		assert(ss != GWP_SSL_ERROR);
 		shuttle(srv, cli);
+		if (ss == GWP_SSL_ERROR)
+			return ss;
 		assert(++rounds < 32);
 	} while (cs != GWP_SSL_OK || ss != GWP_SSL_OK);
+
+	return GWP_SSL_OK;
+}
+
+static void do_handshake(struct gwp_ssl *cli, struct gwp_ssl *srv)
+{
+	assert(try_handshake(cli, srv) == GWP_SSL_OK);
+}
+
+static const char CERT_TEMPLATE[] = "/tmp/gwp_ssl_cert.XXXXXX";
+static const char KEY_TEMPLATE[] = "/tmp/gwp_ssl_key.XXXXXX";
+
+/* The server's certificate and key files, and a server and a client context. */
+struct ssl_env {
+	char cert[sizeof(CERT_TEMPLATE)];
+	char key[sizeof(KEY_TEMPLATE)];
+	struct gwp_ssl_ctx *sctx, *cctx;
+};
+
+/* Write the certificate and key files only; both contexts stay NULL. */
+static void ssl_env_files(struct ssl_env *e)
+{
+	memcpy(e->cert, CERT_TEMPLATE, sizeof(CERT_TEMPLATE));
+	memcpy(e->key, KEY_TEMPLATE, sizeof(KEY_TEMPLATE));
+	temp_file(e->cert, TEST_CERT);
+	temp_file(e->key, TEST_KEY);
+	e->sctx = e->cctx = NULL;
+}
+
+static void ssl_env_init(struct ssl_env *e)
+{
+	ssl_env_files(e);
+	assert(!gwp_ssl_ctx_server_create(&e->sctx, e->cert, e->key));
+	assert(e->sctx);
+	assert(!gwp_ssl_ctx_client_create(&e->cctx));
+	assert(e->cctx);
+}
+
+static void ssl_env_fini(struct ssl_env *e)
+{
+	gwp_ssl_ctx_free(e->sctx);
+	gwp_ssl_ctx_free(e->cctx);
+	unlink(e->cert);
+	unlink(e->key);
+}
+
+/* A server and a client connection of @e, not handshaken yet. */
+static void ssl_pair_new(struct ssl_env *e, struct gwp_ssl **srv,
+			 struct gwp_ssl **cli)
+{
+	*srv = gwp_ssl_server_new(e->sctx);
+	*cli = gwp_ssl_client_new(e->cctx);
+	assert(*srv && *cli);
+}
+
+static void ssl_pair_free(struct gwp_ssl *srv, struct gwp_ssl *cli)
+{
+	gwp_ssl_free(srv);
+	gwp_ssl_free(cli);
 }
 
 /* Send @msg (@len bytes) as one plaintext write from @from and assert @to
@@ -176,29 +251,13 @@ static void round_trip(struct gwp_ssl *from, struct gwp_ssl *to,
 
 static void test_handshake_and_roundtrip(void)
 {
-	char cert[] = "/tmp/gwp_ssl_cert.XXXXXX";
-	char key[] = "/tmp/gwp_ssl_key.XXXXXX";
-	struct gwp_ssl_ctx *sctx = NULL, *cctx = NULL;
+	struct ssl_env e;
 	struct gwp_ssl *srv, *cli;
 	char *big;
 	size_t i;
-	int fd, r;
 
-	/* mkstemp to get unique names, then overwrite with the PEMs. */
-	fd = mkstemp(cert); assert(fd >= 0); close(fd);
-	fd = mkstemp(key); assert(fd >= 0); close(fd);
-	write_file(cert, TEST_CERT);
-	write_file(key, TEST_KEY);
-
-	r = gwp_ssl_ctx_server_create(&sctx, cert, key);
-	assert(!r && sctx);
-	r = gwp_ssl_ctx_client_create(&cctx);
-	assert(!r && cctx);
-
-	srv = gwp_ssl_server_new(sctx);
-	cli = gwp_ssl_client_new(cctx);
-	assert(srv && cli);
-
+	ssl_env_init(&e);
+	ssl_pair_new(&e, &srv, &cli);
 	do_handshake(cli, srv);
 
 	/* Small messages, both directions. */
@@ -213,12 +272,8 @@ static void test_handshake_and_roundtrip(void)
 	round_trip(cli, srv, big, 40000);
 	free(big);
 
-	gwp_ssl_free(srv);
-	gwp_ssl_free(cli);
-	gwp_ssl_ctx_free(sctx);
-	gwp_ssl_ctx_free(cctx);
-	unlink(cert);
-	unlink(key);
+	ssl_pair_free(srv, cli);
+	ssl_env_fini(&e);
 	PRTEST_OK();
 }
 
@@ -229,22 +284,12 @@ static void test_handshake_and_roundtrip(void)
  */
 static void test_tx_starved(void)
 {
-	char cert[] = "/tmp/gwp_ssl_cert.XXXXXX";
-	char key[] = "/tmp/gwp_ssl_key.XXXXXX";
-	struct gwp_ssl_ctx *sctx = NULL, *cctx = NULL;
+	struct ssl_env e;
 	struct gwp_ssl *srv, *cli;
 	size_t consumed;
-	int fd;
 
-	fd = mkstemp(cert); assert(fd >= 0); close(fd);
-	fd = mkstemp(key); assert(fd >= 0); close(fd);
-	write_file(cert, TEST_CERT);
-	write_file(key, TEST_KEY);
-	assert(!gwp_ssl_ctx_server_create(&sctx, cert, key));
-	assert(!gwp_ssl_ctx_client_create(&cctx));
-	srv = gwp_ssl_server_new(sctx);
-	cli = gwp_ssl_client_new(cctx);
-	assert(srv && cli);
+	ssl_env_init(&e);
+	ssl_pair_new(&e, &srv, &cli);
 
 	assert(!gwp_ssl_tx_starved(cli));
 	assert(gwp_ssl_write(cli, "x", 1, &consumed) == GWP_SSL_WANT_READ);
@@ -266,12 +311,8 @@ static void test_tx_starved(void)
 	round_trip(cli, srv, "after", 5);
 	assert(!gwp_ssl_tx_starved(cli));
 
-	gwp_ssl_free(srv);
-	gwp_ssl_free(cli);
-	gwp_ssl_ctx_free(sctx);
-	gwp_ssl_ctx_free(cctx);
-	unlink(cert);
-	unlink(key);
+	ssl_pair_free(srv, cli);
+	ssl_env_fini(&e);
 	PRTEST_OK();
 }
 
@@ -284,26 +325,17 @@ static void test_tx_starved(void)
  */
 static void test_zero_copy_queues(void)
 {
-	char cert[] = "/tmp/gwp_ssl_cert.XXXXXX";
-	char key[] = "/tmp/gwp_ssl_key.XXXXXX";
-	struct gwp_ssl_ctx *sctx = NULL, *cctx = NULL;
+	struct ssl_env e;
 	static unsigned char out[50000];
 	size_t i, plen, len, consumed, got, total, chunk;
 	struct gwp_ssl *srv, *cli;
 	const unsigned char *p;
 	unsigned char *dst;
 	char *big;
-	int fd, r;
+	int r;
 
-	fd = mkstemp(cert); assert(fd >= 0); close(fd);
-	fd = mkstemp(key); assert(fd >= 0); close(fd);
-	write_file(cert, TEST_CERT);
-	write_file(key, TEST_KEY);
-	assert(!gwp_ssl_ctx_server_create(&sctx, cert, key));
-	assert(!gwp_ssl_ctx_client_create(&cctx));
-	srv = gwp_ssl_server_new(sctx);
-	cli = gwp_ssl_client_new(cctx);
-	assert(srv && cli);
+	ssl_env_init(&e);
+	ssl_pair_new(&e, &srv, &cli);
 	do_handshake(cli, srv);
 	assert(!gwp_ssl_rx_more(srv));
 
@@ -342,12 +374,8 @@ static void test_zero_copy_queues(void)
 	assert(!memcmp(out, big, sizeof(out)));
 	free(big);
 
-	gwp_ssl_free(srv);
-	gwp_ssl_free(cli);
-	gwp_ssl_ctx_free(sctx);
-	gwp_ssl_ctx_free(cctx);
-	unlink(cert);
-	unlink(key);
+	ssl_pair_free(srv, cli);
+	ssl_env_fini(&e);
 	PRTEST_OK();
 }
 
@@ -364,9 +392,7 @@ static void test_bad_cert_rejected(void)
 
 static void test_alpn_negotiation(void)
 {
-	char cert[] = "/tmp/gwp_ssl_cert.XXXXXX";
-	char key[] = "/tmp/gwp_ssl_key.XXXXXX";
-	struct gwp_ssl_ctx *sctx = NULL, *cctx = NULL;
+	struct ssl_env e;
 	/* h2 (preferred by the client) then http/1.1, in ALPN wire form. */
 	static const unsigned char offer_both[] = {
 		2, 'h', '2', 8, 'h', 't', 't', 'p', '/', '1', '.', '1'
@@ -375,67 +401,42 @@ static void test_alpn_negotiation(void)
 	static const unsigned char offer_h2[] = { 2, 'h', '2' };
 	struct gwp_ssl *srv, *cli;
 	const char *sel;
-	int fd, r;
 
-	fd = mkstemp(cert); assert(fd >= 0); close(fd);
-	fd = mkstemp(key); assert(fd >= 0); close(fd);
-	write_file(cert, TEST_CERT);
-	write_file(key, TEST_KEY);
-
-	r = gwp_ssl_ctx_server_create(&sctx, cert, key); assert(!r && sctx);
-	r = gwp_ssl_ctx_client_create(&cctx); assert(!r && cctx);
+	ssl_env_init(&e);
 
 	/* Overlap: the server prefers and selects http/1.1 on both ends. */
-	srv = gwp_ssl_server_new(sctx);
-	cli = gwp_ssl_client_new(cctx);
-	assert(srv && cli);
+	ssl_pair_new(&e, &srv, &cli);
 	assert(gwp_ssl_set_alpn(cli, offer_both, sizeof(offer_both)) == 0);
 	do_handshake(cli, srv);
 	sel = gwp_ssl_alpn(srv);
 	assert(sel && !strcmp(sel, "http/1.1"));
 	sel = gwp_ssl_alpn(cli);
 	assert(sel && !strcmp(sel, "http/1.1"));
-	gwp_ssl_free(srv);
-	gwp_ssl_free(cli);
+	ssl_pair_free(srv, cli);
 
 	/* No overlap: nothing is selected, but the handshake still succeeds. */
-	srv = gwp_ssl_server_new(sctx);
-	cli = gwp_ssl_client_new(cctx);
-	assert(srv && cli);
+	ssl_pair_new(&e, &srv, &cli);
 	assert(gwp_ssl_set_alpn(cli, offer_h2, sizeof(offer_h2)) == 0);
 	do_handshake(cli, srv);
 	assert(gwp_ssl_alpn(srv) == NULL);
-	gwp_ssl_free(srv);
-	gwp_ssl_free(cli);
+	ssl_pair_free(srv, cli);
 
-	gwp_ssl_ctx_free(sctx);
-	gwp_ssl_ctx_free(cctx);
-	unlink(cert);
-	unlink(key);
+	ssl_env_fini(&e);
 	PRTEST_OK();
 }
 
 /* How the end of a peer's stream looks, for all that the engine has read. */
 static void test_rx_cut(void)
 {
-	char cert[] = "/tmp/gwp_ssl_cert.XXXXXX";
-	char key[] = "/tmp/gwp_ssl_key.XXXXXX";
-	struct gwp_ssl_ctx *sctx = NULL, *cctx = NULL;
+	struct ssl_env e;
 	static unsigned char wire[4096];
 	struct gwp_ssl *srv, *cli;
 	char out[64];
 	size_t got;
-	int fd, n;
+	int n;
 
-	fd = mkstemp(cert); assert(fd >= 0); close(fd);
-	fd = mkstemp(key); assert(fd >= 0); close(fd);
-	write_file(cert, TEST_CERT);
-	write_file(key, TEST_KEY);
-	assert(!gwp_ssl_ctx_server_create(&sctx, cert, key));
-	assert(!gwp_ssl_ctx_client_create(&cctx));
-	srv = gwp_ssl_server_new(sctx);
-	cli = gwp_ssl_client_new(cctx);
-	assert(srv && cli);
+	ssl_env_init(&e);
+	ssl_pair_new(&e, &srv, &cli);
 	do_handshake(cli, srv);
 
 	/* Nothing but whole records so far. */
@@ -469,13 +470,10 @@ static void test_rx_cut(void)
 	assert(gwp_ssl_read(srv, out, sizeof(out), &got) == GWP_SSL_OK && !got);
 	assert(!gwp_ssl_rx_cut(srv));
 
-	gwp_ssl_free(srv);
-	gwp_ssl_free(cli);
+	ssl_pair_free(srv, cli);
 
 	/* A record that fails to verify, which goes for all later reads too. */
-	srv = gwp_ssl_server_new(sctx);
-	cli = gwp_ssl_client_new(cctx);
-	assert(srv && cli);
+	ssl_pair_new(&e, &srv, &cli);
 	do_handshake(cli, srv);
 	assert(gwp_ssl_write(cli, "abc", 3, &got) == GWP_SSL_OK && got == 3);
 	n = gwp_ssl_bio_read(cli, wire, sizeof(wire));
@@ -487,24 +485,17 @@ static void test_rx_cut(void)
 	assert(!gwp_ssl_rx_more(srv));
 	assert(gwp_ssl_rx_cut(srv));
 	assert(gwp_ssl_read(srv, out, sizeof(out), &got) == GWP_SSL_ERROR);
-	gwp_ssl_free(srv);
-	gwp_ssl_free(cli);
+	ssl_pair_free(srv, cli);
 
 	/* The socket failing under a stream that looked fine. */
-	srv = gwp_ssl_server_new(sctx);
-	cli = gwp_ssl_client_new(cctx);
-	assert(srv && cli);
+	ssl_pair_new(&e, &srv, &cli);
 	do_handshake(cli, srv);
 	assert(!gwp_ssl_rx_cut(srv));
 	gwp_ssl_rx_fail(srv);
 	assert(gwp_ssl_rx_cut(srv));
-	gwp_ssl_free(srv);
-	gwp_ssl_free(cli);
+	ssl_pair_free(srv, cli);
 
-	gwp_ssl_ctx_free(sctx);
-	gwp_ssl_ctx_free(cctx);
-	unlink(cert);
-	unlink(key);
+	ssl_env_fini(&e);
 	PRTEST_OK();
 }
 
@@ -515,62 +506,19 @@ static void test_rx_cut(void)
  */
 static void test_bio_method_failure(void)
 {
-	char cert[] = "/tmp/gwp_ssl_cert.XXXXXX";
-	char key[] = "/tmp/gwp_ssl_key.XXXXXX";
-	struct gwp_ssl_ctx *sctx = NULL, *cctx = NULL;
-	int fd;
+	struct ssl_env e;
 
-	fd = mkstemp(cert); assert(fd >= 0); close(fd);
-	fd = mkstemp(key); assert(fd >= 0); close(fd);
-	write_file(cert, TEST_CERT);
-	write_file(key, TEST_KEY);
+	ssl_env_files(&e);
 
 	bio_meth_new_fails = true;
-	assert(gwp_ssl_ctx_server_create(&sctx, cert, key) < 0);
-	assert(gwp_ssl_ctx_client_create(&cctx) < 0);
+	assert(gwp_ssl_ctx_server_create(&e.sctx, e.cert, e.key) < 0);
+	assert(gwp_ssl_ctx_client_create(&e.cctx) < 0);
 
 	bio_meth_new_fails = false;
-	assert(!gwp_ssl_ctx_server_create(&sctx, cert, key));
-	assert(!gwp_ssl_ctx_client_create(&cctx));
-	gwp_ssl_ctx_free(sctx);
-	gwp_ssl_ctx_free(cctx);
-
-	unlink(cert);
-	unlink(key);
+	assert(!gwp_ssl_ctx_server_create(&e.sctx, e.cert, e.key));
+	assert(!gwp_ssl_ctx_client_create(&e.cctx));
+	ssl_env_fini(&e);
 	PRTEST_OK();
-}
-
-/* A temporary file holding @data; its name goes to @path (a mkstemp template). */
-static void temp_file(char *path, const char *data)
-{
-	int fd = mkstemp(path);
-
-	assert(fd >= 0);
-	close(fd);
-	write_file(path, data);
-}
-
-/*
- * Run a handshake that may fail. Returns GWP_SSL_OK once both sides are done,
- * or GWP_SSL_ERROR as soon as either side fails.
- */
-static int try_handshake(struct gwp_ssl *cli, struct gwp_ssl *srv)
-{
-	int cs, ss, rounds = 0;
-
-	do {
-		cs = gwp_ssl_handshake(cli);
-		shuttle(cli, srv);
-		if (cs == GWP_SSL_ERROR)
-			return cs;
-		ss = gwp_ssl_handshake(srv);
-		shuttle(srv, cli);
-		if (ss == GWP_SSL_ERROR)
-			return ss;
-		assert(++rounds < 32);
-	} while (cs != GWP_SSL_OK || ss != GWP_SSL_OK);
-
-	return GWP_SSL_OK;
 }
 
 /*

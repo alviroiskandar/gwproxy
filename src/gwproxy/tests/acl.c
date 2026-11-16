@@ -10,6 +10,7 @@
 /* Before common.h: musl's struct stat has a field named __unused. */
 #include <sys/stat.h>
 #include <gwproxy/acl.h>
+#include <gwproxy/upstream_lb.h>
 #include <gwproxy/common.h>
 #include <arpa/inet.h>
 #include <assert.h>
@@ -63,6 +64,31 @@ static struct gwp_sockaddr sa4mapped(const char *ip, uint16_t port)
 	return s;
 }
 
+/*
+ * @s, read as an address of @family, is @ip, with the port @port unless @port
+ * is negative. Checking the family field itself is left to the caller.
+ */
+static void assert_addr(const struct gwp_sockaddr *s, int family,
+			const char *ip, int port)
+{
+	char got[INET6_ADDRSTRLEN];
+	uint16_t p;
+
+	if (family == AF_INET6) {
+		assert(inet_ntop(AF_INET6, &s->i6.sin6_addr, got, sizeof(got)));
+		p = ntohs(s->i6.sin6_port);
+	} else {
+		assert(family == AF_INET);
+		assert(inet_ntop(AF_INET, &s->i4.sin_addr, got, sizeof(got)));
+		p = ntohs(s->i4.sin_port);
+	}
+	if (strcmp(got, ip) || (port >= 0 && p != port)) {
+		fprintf(stderr, "got %s:%u, want %s:%d\n", got,
+			(unsigned int)p, ip, port);
+		assert(0);
+	}
+}
+
 static enum gwp_acl_verdict out(struct gwp_acl *a, struct gwp_sockaddr *t,
 				const char *dom, uint16_t dport,
 				enum gwp_acl_proto p)
@@ -72,6 +98,24 @@ static enum gwp_acl_verdict out(struct gwp_acl *a, struct gwp_sockaddr *t,
 	};
 
 	return gwp_acl_eval_output(a, &req);
+}
+
+/* out() for a TCP connection to @ip:@port, an IPv4 or IPv6 literal. */
+static enum gwp_acl_verdict out_ip(struct gwp_acl *a, const char *ip,
+				   uint16_t port)
+{
+	struct gwp_sockaddr t = gwp_test_addr(ip, port);
+
+	return out(a, &t, NULL, port, GWP_ACL_PROTO_TCP);
+}
+
+/* out_ip() for the IPv4 @ip as the v4-mapped address sa4mapped() makes. */
+static enum gwp_acl_verdict out_mapped(struct gwp_acl *a, const char *ip,
+				       uint16_t port)
+{
+	struct gwp_sockaddr t = sa4mapped(ip, port);
+
+	return out(a, &t, NULL, port, GWP_ACL_PROTO_TCP);
 }
 
 static enum gwp_acl_verdict out_user(struct gwp_acl *a, struct gwp_sockaddr *t,
@@ -109,51 +153,36 @@ static const char DEFAULT_RULES[] =
 static noinline void test_default_ruleset(void)
 {
 	struct gwp_acl *a = NULL;
-	struct gwp_sockaddr s;
 	int r;
 
 	r = gwp_acl_parse_str(&a, DEFAULT_RULES);
 	assert(!r && a);
 
 	/* Public IP on an allowed port is accepted. */
-	s = sa4("8.8.8.8", 80);
-	assert(out(a, &s, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
-	s = sa4("8.8.8.8", 443);
-	assert(out(a, &s, NULL, 443, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
+	assert(out_ip(a, "8.8.8.8", 80) == GWP_ACL_ACCEPT);
+	assert(out_ip(a, "8.8.8.8", 443) == GWP_ACL_ACCEPT);
 
 	/* Public IP on a disallowed port is rejected (! --dports). */
-	s = sa4("8.8.8.8", 22);
-	assert(out(a, &s, NULL, 22, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+	assert(out_ip(a, "8.8.8.8", 22) == GWP_ACL_REJECT);
 
 	/* Private / loopback ranges rejected even on an allowed port. */
-	s = sa4("127.0.0.1", 80);
-	assert(out(a, &s, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
-	s = sa4("10.1.2.3", 443);
-	assert(out(a, &s, NULL, 443, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
-	s = sa4("192.168.5.5", 80);
-	assert(out(a, &s, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
-	s = sa4("172.16.0.1", 80);
-	assert(out(a, &s, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
-	s = sa4("172.31.255.255", 80);
-	assert(out(a, &s, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+	assert(out_ip(a, "127.0.0.1", 80) == GWP_ACL_REJECT);
+	assert(out_ip(a, "10.1.2.3", 443) == GWP_ACL_REJECT);
+	assert(out_ip(a, "192.168.5.5", 80) == GWP_ACL_REJECT);
+	assert(out_ip(a, "172.16.0.1", 80) == GWP_ACL_REJECT);
+	assert(out_ip(a, "172.31.255.255", 80) == GWP_ACL_REJECT);
 
 	/* 172.15/16 is just outside 172.16.0.0/12 -> allowed. */
-	s = sa4("172.15.0.1", 80);
-	assert(out(a, &s, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
+	assert(out_ip(a, "172.15.0.1", 80) == GWP_ACL_ACCEPT);
 
 	/* v4-mapped loopback must also hit the 127.0.0.0/8 rule. */
-	s = sa4mapped("127.0.0.1", 80);
-	assert(out(a, &s, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+	assert(out_mapped(a, "127.0.0.1", 80) == GWP_ACL_REJECT);
 
 	/* IPv6 link-local / ULA rejected; public v6 allowed. */
-	s = sa6("fe80::1", 80);
-	assert(out(a, &s, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
-	s = sa6("fc00::1", 80);
-	assert(out(a, &s, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
-	s = sa6("2606:4700::1", 80);
-	assert(out(a, &s, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
-	s = sa6("2606:4700::1", 22);
-	assert(out(a, &s, NULL, 22, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+	assert(out_ip(a, "fe80::1", 80) == GWP_ACL_REJECT);
+	assert(out_ip(a, "fc00::1", 80) == GWP_ACL_REJECT);
+	assert(out_ip(a, "2606:4700::1", 80) == GWP_ACL_ACCEPT);
+	assert(out_ip(a, "2606:4700::1", 22) == GWP_ACL_REJECT);
 
 	gwp_acl_destroy(a);
 }
@@ -172,19 +201,13 @@ static noinline void test_v4mapped_cidr(void)
 		"-A OUTPUT -d ::ffff:10.0.0.0/104 -j REJECT\n"
 		"-A OUTPUT -d ::ffff:192.0.2.7 -j REJECT\n"
 		"-A INPUT -s ::ffff:198.51.100.0/120 -j REJECT\n"));
-	s = sa4("10.1.2.3", 80);
-	assert(out(a, &s, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
-	s = sa4mapped("10.1.2.3", 80);
-	assert(out(a, &s, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
-	s = sa4("11.1.2.3", 80);
-	assert(out(a, &s, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
-	s = sa4("192.0.2.7", 80);
-	assert(out(a, &s, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
-	s = sa4("192.0.2.8", 80);
-	assert(out(a, &s, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
+	assert(out_ip(a, "10.1.2.3", 80) == GWP_ACL_REJECT);
+	assert(out_mapped(a, "10.1.2.3", 80) == GWP_ACL_REJECT);
+	assert(out_ip(a, "11.1.2.3", 80) == GWP_ACL_ACCEPT);
+	assert(out_ip(a, "192.0.2.7", 80) == GWP_ACL_REJECT);
+	assert(out_ip(a, "192.0.2.8", 80) == GWP_ACL_ACCEPT);
 	/* The rule is IPv4 now: a non-mapped IPv6 target is not caught. */
-	s = sa6("::10.1.2.3", 80);
-	assert(out(a, &s, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
+	assert(out_ip(a, "::10.1.2.3", 80) == GWP_ACL_ACCEPT);
 	s = sa4mapped("198.51.100.9", 1234);
 	assert(in(a, &s, 1234, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
 	s = sa4("198.51.101.9", 1234);
@@ -193,10 +216,8 @@ static noinline void test_v4mapped_cidr(void)
 
 	/* All of ::ffff:0:0/96 is all of IPv4. */
 	assert(!gwp_acl_parse_str(&a, "-A OUTPUT -d ::ffff:0:0/96 -j REJECT\n"));
-	s = sa4("93.184.216.34", 443);
-	assert(out(a, &s, NULL, 443, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
-	s = sa6("2606:4700::1", 443);
-	assert(out(a, &s, NULL, 443, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
+	assert(out_ip(a, "93.184.216.34", 443) == GWP_ACL_REJECT);
+	assert(out_ip(a, "2606:4700::1", 443) == GWP_ACL_ACCEPT);
 	gwp_acl_destroy(a);
 }
 
@@ -208,12 +229,9 @@ static noinline void test_ports_and_negation(void)
 	/* Port ranges and lists. */
 	assert(!gwp_acl_parse_str(&a,
 		"-A OUTPUT -d 1.2.3.4 --dports 1000-2000,8080 -j REJECT\n"));
-	s = sa4("1.2.3.4", 1500);
-	assert(out(a, &s, NULL, 1500, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
-	s = sa4("1.2.3.4", 8080);
-	assert(out(a, &s, NULL, 8080, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
-	s = sa4("1.2.3.4", 3000);
-	assert(out(a, &s, NULL, 3000, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
+	assert(out_ip(a, "1.2.3.4", 1500) == GWP_ACL_REJECT);
+	assert(out_ip(a, "1.2.3.4", 8080) == GWP_ACL_REJECT);
+	assert(out_ip(a, "1.2.3.4", 3000) == GWP_ACL_ACCEPT);
 	gwp_acl_destroy(a);
 
 	/* Negated source: reject everything except 10.0.0.0/8. */
@@ -371,241 +389,176 @@ static noinline void test_user(void)
 #endif
 }
 
+/*
+ * Load @rules, evaluate OUTPUT for a TCP connection to @ip:@port (an IPv6
+ * literal is told by its ':'), assert the verdict is @want and return the
+ * request with what the rules recorded in it. Its target pointer is dead by
+ * then; the DNAT, MARK and BIND results are values held in the copy.
+ */
+static noinline struct gwp_acl_req eval_rules(const char *rules,
+					      const char *ip, uint16_t port,
+					      enum gwp_acl_verdict want)
+{
+	struct gwp_sockaddr t = gwp_test_addr(ip, port);
+	struct gwp_acl_req req = { .target = &t, .dport = port,
+				   .proto = GWP_ACL_PROTO_TCP };
+	struct gwp_acl *a = NULL;
+
+	assert(!gwp_acl_parse_str(&a, rules));
+	assert(gwp_acl_eval_output(a, &req) == want);
+	gwp_acl_destroy(a);
+	return req;
+}
+
 static noinline void test_mark(void)
 {
-	struct gwp_sockaddr t = sa4("1.2.3.4", 80);
-	struct gwp_acl *a = NULL;
 	struct gwp_acl_req req;
 
 	/* MARK is a composable modifier: it records the fwmark (hex accepted)
 	 * and eval keeps matching to reach a terminal rule / the policy. */
-	assert(!gwp_acl_parse_str(&a,
-		"-A OUTPUT -d 1.2.3.4 -j MARK --set-mark 0x64\n"
-		"-P OUTPUT ACCEPT\n"));
-	memset(&req, 0, sizeof(req));
-	req.target = &t; req.dport = 80; req.proto = GWP_ACL_PROTO_TCP;
-	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_ACCEPT);
+	req = eval_rules("-A OUTPUT -d 1.2.3.4 -j MARK --set-mark 0x64\n"
+			 "-P OUTPUT ACCEPT\n",
+			 "1.2.3.4", 80, GWP_ACL_ACCEPT);
 	assert(req.mark_set && req.mark == 100);
-	gwp_acl_destroy(a);
 
 	/* A non-matching MARK rule leaves the request unmarked. */
-	a = NULL;
-	assert(!gwp_acl_parse_str(&a,
-		"-A OUTPUT -d 9.9.9.9 -j MARK --set-mark 7\n"
-		"-P OUTPUT ACCEPT\n"));
-	memset(&req, 0, sizeof(req));
-	req.target = &t; req.dport = 80; req.proto = GWP_ACL_PROTO_TCP;
-	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_ACCEPT);
+	req = eval_rules("-A OUTPUT -d 9.9.9.9 -j MARK --set-mark 7\n"
+			 "-P OUTPUT ACCEPT\n",
+			 "1.2.3.4", 80, GWP_ACL_ACCEPT);
 	assert(!req.mark_set);
-	gwp_acl_destroy(a);
 
 	/* Last MARK wins; a later terminal REJECT still decides the verdict. */
-	a = NULL;
-	assert(!gwp_acl_parse_str(&a,
-		"-A OUTPUT -d 1.2.3.4 -j MARK --set-mark 1\n"
-		"-A OUTPUT -d 1.2.3.4 -j MARK --set-mark 2\n"
-		"-A OUTPUT -d 1.2.3.4 -j REJECT\n"
-		"-P OUTPUT ACCEPT\n"));
-	memset(&req, 0, sizeof(req));
-	req.target = &t; req.dport = 80; req.proto = GWP_ACL_PROTO_TCP;
-	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_REJECT);
+	req = eval_rules("-A OUTPUT -d 1.2.3.4 -j MARK --set-mark 1\n"
+			 "-A OUTPUT -d 1.2.3.4 -j MARK --set-mark 2\n"
+			 "-A OUTPUT -d 1.2.3.4 -j REJECT\n"
+			 "-P OUTPUT ACCEPT\n",
+			 "1.2.3.4", 80, GWP_ACL_REJECT);
 	assert(req.mark_set && req.mark == 2);
-	gwp_acl_destroy(a);
 
 	/*
 	 * --accept makes MARK terminal: the mark is recorded and traversal
 	 * stops, so the REJECT below it -- which decides the verdict in the
 	 * case above -- is never reached.
 	 */
-	a = NULL;
-	assert(!gwp_acl_parse_str(&a,
-		"-A OUTPUT -d 1.2.3.4 -j MARK --set-mark 1 --accept\n"
-		"-A OUTPUT -d 1.2.3.4 -j MARK --set-mark 2\n"
-		"-A OUTPUT -d 1.2.3.4 -j REJECT\n"
-		"-P OUTPUT ACCEPT\n"));
-	memset(&req, 0, sizeof(req));
-	req.target = &t; req.dport = 80; req.proto = GWP_ACL_PROTO_TCP;
-	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_ACCEPT);
+	req = eval_rules("-A OUTPUT -d 1.2.3.4 -j MARK --set-mark 1 --accept\n"
+			 "-A OUTPUT -d 1.2.3.4 -j MARK --set-mark 2\n"
+			 "-A OUTPUT -d 1.2.3.4 -j REJECT\n"
+			 "-P OUTPUT ACCEPT\n",
+			 "1.2.3.4", 80, GWP_ACL_ACCEPT);
 	assert(req.mark_set && req.mark == 1);	/* not overridden by the 2 */
-	gwp_acl_destroy(a);
 
 	/* Token order is free: --accept may come before its -j. */
-	a = NULL;
-	assert(!gwp_acl_parse_str(&a,
-		"-A OUTPUT -d 1.2.3.4 --accept -j MARK --set-mark 9\n"
-		"-A OUTPUT -d 1.2.3.4 -j REJECT\n"
-		"-P OUTPUT ACCEPT\n"));
-	memset(&req, 0, sizeof(req));
-	req.target = &t; req.dport = 80; req.proto = GWP_ACL_PROTO_TCP;
-	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_ACCEPT);
+	req = eval_rules("-A OUTPUT -d 1.2.3.4 --accept -j MARK --set-mark 9\n"
+			 "-A OUTPUT -d 1.2.3.4 -j REJECT\n"
+			 "-P OUTPUT ACCEPT\n",
+			 "1.2.3.4", 80, GWP_ACL_ACCEPT);
 	assert(req.mark_set && req.mark == 9);
-	gwp_acl_destroy(a);
 
 	/* --accept only fires when the rule actually matches. */
-	a = NULL;
-	assert(!gwp_acl_parse_str(&a,
-		"-A OUTPUT -d 9.9.9.9 -j MARK --set-mark 5 --accept\n"
-		"-A OUTPUT -d 1.2.3.4 -j REJECT\n"
-		"-P OUTPUT ACCEPT\n"));
-	memset(&req, 0, sizeof(req));
-	req.target = &t; req.dport = 80; req.proto = GWP_ACL_PROTO_TCP;
-	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_REJECT);
+	req = eval_rules("-A OUTPUT -d 9.9.9.9 -j MARK --set-mark 5 --accept\n"
+			 "-A OUTPUT -d 1.2.3.4 -j REJECT\n"
+			 "-P OUTPUT ACCEPT\n",
+			 "1.2.3.4", 80, GWP_ACL_REJECT);
 	assert(!req.mark_set);
-	gwp_acl_destroy(a);
 }
 
 static noinline void test_bind(void)
 {
-	struct gwp_sockaddr t = sa4("1.2.3.4", 80);
-	struct gwp_acl *a = NULL;
 	struct gwp_acl_req req;
-	char ip[64];
 
 	/* BIND records a source address (with port) and interface, and keeps
 	 * matching (composable modifier). */
-	assert(!gwp_acl_parse_str(&a,
-		"-A OUTPUT -d 1.2.3.4 -j BIND --to-source 10.0.0.2:5000 --to-iface wg0\n"
-		"-P OUTPUT ACCEPT\n"));
-	memset(&req, 0, sizeof(req));
-	req.target = &t; req.dport = 80; req.proto = GWP_ACL_PROTO_TCP;
-	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_ACCEPT);
+	req = eval_rules("-A OUTPUT -d 1.2.3.4 -j BIND --to-source 10.0.0.2:5000 --to-iface wg0\n"
+			 "-P OUTPUT ACCEPT\n",
+			 "1.2.3.4", 80, GWP_ACL_ACCEPT);
 	assert(req.bind.set && req.bind.have_src);
 	assert(!strcmp(req.bind.iface, "wg0"));
 	assert(req.bind.src.i4.sin_family == AF_INET);
-	assert(inet_ntop(AF_INET, &req.bind.src.i4.sin_addr, ip, sizeof(ip)));
-	assert(!strcmp(ip, "10.0.0.2") && ntohs(req.bind.src.i4.sin_port) == 5000);
-	gwp_acl_destroy(a);
+	assert_addr(&req.bind.src, AF_INET, "10.0.0.2", 5000);
 
 	/* Interface-only bind. */
-	a = NULL;
-	assert(!gwp_acl_parse_str(&a,
-		"-A OUTPUT -j BIND --to-iface eth1\n-P OUTPUT ACCEPT\n"));
-	memset(&req, 0, sizeof(req));
-	req.target = &t; req.dport = 80; req.proto = GWP_ACL_PROTO_TCP;
-	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_ACCEPT);
+	req = eval_rules("-A OUTPUT -j BIND --to-iface eth1\n-P OUTPUT ACCEPT\n",
+			 "1.2.3.4", 80, GWP_ACL_ACCEPT);
 	assert(req.bind.set && !req.bind.have_src && !strcmp(req.bind.iface, "eth1"));
-	gwp_acl_destroy(a);
 
 	/* Bracketed IPv6 source with a port; source-only bind. */
-	a = NULL;
-	assert(!gwp_acl_parse_str(&a,
-		"-A OUTPUT -j BIND --to-source [2001:db8::1]:443\n"
-		"-P OUTPUT ACCEPT\n"));
-	memset(&req, 0, sizeof(req));
-	req.target = &t; req.dport = 80; req.proto = GWP_ACL_PROTO_TCP;
-	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_ACCEPT);
+	req = eval_rules("-A OUTPUT -j BIND --to-source [2001:db8::1]:443\n"
+			 "-P OUTPUT ACCEPT\n",
+			 "1.2.3.4", 80, GWP_ACL_ACCEPT);
 	assert(req.bind.set && req.bind.have_src && req.bind.iface[0] == '\0');
 	assert(req.bind.src.i6.sin6_family == AF_INET6);
 	assert(ntohs(req.bind.src.i6.sin6_port) == 443);
-	gwp_acl_destroy(a);
 
 	/* Composable: BIND then a terminal REJECT still records the bind. */
-	a = NULL;
-	assert(!gwp_acl_parse_str(&a,
-		"-A OUTPUT -d 1.2.3.4 -j BIND --to-iface eth0\n"
-		"-A OUTPUT -d 1.2.3.4 -j REJECT\n-P OUTPUT ACCEPT\n"));
-	memset(&req, 0, sizeof(req));
-	req.target = &t; req.dport = 80; req.proto = GWP_ACL_PROTO_TCP;
-	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_REJECT);
+	req = eval_rules("-A OUTPUT -d 1.2.3.4 -j BIND --to-iface eth0\n"
+			 "-A OUTPUT -d 1.2.3.4 -j REJECT\n-P OUTPUT ACCEPT\n",
+			 "1.2.3.4", 80, GWP_ACL_REJECT);
 	assert(req.bind.set && !strcmp(req.bind.iface, "eth0"));
-	gwp_acl_destroy(a);
 
 	/*
 	 * The same pair with --accept: identical rules, opposite verdict,
 	 * because BIND now terminates instead of falling through.
 	 */
-	a = NULL;
-	assert(!gwp_acl_parse_str(&a,
-		"-A OUTPUT -d 1.2.3.4 -j BIND --to-iface eth0 --accept\n"
-		"-A OUTPUT -d 1.2.3.4 -j REJECT\n-P OUTPUT ACCEPT\n"));
-	memset(&req, 0, sizeof(req));
-	req.target = &t; req.dport = 80; req.proto = GWP_ACL_PROTO_TCP;
-	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_ACCEPT);
+	req = eval_rules("-A OUTPUT -d 1.2.3.4 -j BIND --to-iface eth0 --accept\n"
+			 "-A OUTPUT -d 1.2.3.4 -j REJECT\n-P OUTPUT ACCEPT\n",
+			 "1.2.3.4", 80, GWP_ACL_ACCEPT);
 	assert(req.bind.set && !strcmp(req.bind.iface, "eth0"));
-	gwp_acl_destroy(a);
 
 	/* --accept alongside a source spec, and against a REJECT policy. */
-	a = NULL;
-	assert(!gwp_acl_parse_str(&a,
-		"-A OUTPUT -d 1.2.3.4 -j BIND --to-source 10.0.0.9 --accept\n"
-		"-P OUTPUT REJECT\n"));
-	memset(&req, 0, sizeof(req));
-	req.target = &t; req.dport = 80; req.proto = GWP_ACL_PROTO_TCP;
-	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_ACCEPT);
+	req = eval_rules("-A OUTPUT -d 1.2.3.4 -j BIND --to-source 10.0.0.9 --accept\n"
+			 "-P OUTPUT REJECT\n",
+			 "1.2.3.4", 80, GWP_ACL_ACCEPT);
 	assert(req.bind.set && req.bind.have_src);
-	gwp_acl_destroy(a);
-}
-
-/* Evaluate one OUTPUT DNAT rule against target @ip:@port; return the req. */
-static noinline struct gwp_acl_req dnat_eval(const char *rule, const char *ip,
-				    uint16_t port, bool v6)
-{
-	struct gwp_acl *a = NULL;
-	struct gwp_sockaddr t = v6 ? sa6(ip, port) : sa4(ip, port);
-	struct gwp_acl_req req = { .target = &t, .dport = port,
-				  .proto = GWP_ACL_PROTO_TCP };
-
-	assert(!gwp_acl_parse_str(&a, rule));
-	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_ACCEPT);
-	gwp_acl_destroy(a);
-	return req;
 }
 
 static noinline void test_dnat(void)
 {
 	struct gwp_acl_req req;
-	char ip[64];
 
 	/* Rewrite both address and port. */
-	req = dnat_eval("-A OUTPUT -d 1.2.3.4 -j DNAT --to 5.6.7.8:9999\n",
-			"1.2.3.4", 80, false);
+	req = eval_rules("-A OUTPUT -d 1.2.3.4 -j DNAT --to 5.6.7.8:9999\n",
+			 "1.2.3.4", 80, GWP_ACL_ACCEPT);
 	assert(req.dnat_applied && req.dnat.i4.sin_family == AF_INET);
-	assert(inet_ntop(AF_INET, &req.dnat.i4.sin_addr, ip, sizeof(ip)));
-	assert(!strcmp(ip, "5.6.7.8") && ntohs(req.dnat.i4.sin_port) == 9999);
+	assert_addr(&req.dnat, AF_INET, "5.6.7.8", 9999);
 
 	/* Address only: port carried over from the target. */
-	req = dnat_eval("-A OUTPUT -d 1.2.3.4 -j DNAT --to 5.6.7.8\n",
-			"1.2.3.4", 80, false);
+	req = eval_rules("-A OUTPUT -d 1.2.3.4 -j DNAT --to 5.6.7.8\n",
+			 "1.2.3.4", 80, GWP_ACL_ACCEPT);
 	assert(req.dnat_applied);
-	assert(inet_ntop(AF_INET, &req.dnat.i4.sin_addr, ip, sizeof(ip)));
-	assert(!strcmp(ip, "5.6.7.8") && ntohs(req.dnat.i4.sin_port) == 80);
+	assert_addr(&req.dnat, AF_INET, "5.6.7.8", 80);
 
 	/* Port only: address carried over from the target. */
-	req = dnat_eval("-A OUTPUT -d 1.2.3.4 -j DNAT --to :4444\n",
-			"1.2.3.4", 80, false);
+	req = eval_rules("-A OUTPUT -d 1.2.3.4 -j DNAT --to :4444\n",
+			 "1.2.3.4", 80, GWP_ACL_ACCEPT);
 	assert(req.dnat_applied);
-	assert(inet_ntop(AF_INET, &req.dnat.i4.sin_addr, ip, sizeof(ip)));
-	assert(!strcmp(ip, "1.2.3.4") && ntohs(req.dnat.i4.sin_port) == 4444);
+	assert_addr(&req.dnat, AF_INET, "1.2.3.4", 4444);
 
 	/* Port only on an IPv6 target: address preserved, family stays v6. */
-	req = dnat_eval("-A OUTPUT -d 2001:db8::1 -j DNAT --to :4444\n",
-			"2001:db8::1", 443, true);
+	req = eval_rules("-A OUTPUT -d 2001:db8::1 -j DNAT --to :4444\n",
+			 "2001:db8::1", 443, GWP_ACL_ACCEPT);
 	assert(req.dnat_applied && req.dnat.i6.sin6_family == AF_INET6);
-	assert(inet_ntop(AF_INET6, &req.dnat.i6.sin6_addr, ip, sizeof(ip)));
-	assert(!strcmp(ip, "2001:db8::1") && ntohs(req.dnat.i6.sin6_port) == 4444);
+	assert_addr(&req.dnat, AF_INET6, "2001:db8::1", 4444);
 
 	/* IPv6 address+port rewrite via bracket form. */
-	req = dnat_eval("-A OUTPUT -d 1.2.3.4 -j DNAT --to [2001:db8::2]:5555\n",
-			"1.2.3.4", 80, false);
+	req = eval_rules("-A OUTPUT -d 1.2.3.4 -j DNAT --to [2001:db8::2]:5555\n",
+			 "1.2.3.4", 80, GWP_ACL_ACCEPT);
 	assert(req.dnat_applied && req.dnat.i6.sin6_family == AF_INET6);
-	assert(inet_ntop(AF_INET6, &req.dnat.i6.sin6_addr, ip, sizeof(ip)));
-	assert(!strcmp(ip, "2001:db8::2") && ntohs(req.dnat.i6.sin6_port) == 5555);
+	assert_addr(&req.dnat, AF_INET6, "2001:db8::2", 5555);
 
 	/* A non-matching target is not rewritten. */
-	req = dnat_eval("-A OUTPUT -d 1.2.3.4 -j DNAT --to :4444\n"
-			"-P OUTPUT ACCEPT\n", "9.9.9.9", 80, false);
+	req = eval_rules("-A OUTPUT -d 1.2.3.4 -j DNAT --to :4444\n"
+			 "-P OUTPUT ACCEPT\n", "9.9.9.9", 80, GWP_ACL_ACCEPT);
 	assert(!req.dnat_applied);
 
 	/*
 	 * DNAT is terminal: a later matching REJECT must not be reached, so the
 	 * verdict is ACCEPT and the rewrite still applies.
 	 */
-	req = dnat_eval("-A OUTPUT -d 1.2.3.4 -j DNAT --to 5.6.7.8\n"
-			"-A OUTPUT -d 1.2.3.4 -j REJECT\n"
-			"-P OUTPUT REJECT\n", "1.2.3.4", 80, false);
+	req = eval_rules("-A OUTPUT -d 1.2.3.4 -j DNAT --to 5.6.7.8\n"
+			 "-A OUTPUT -d 1.2.3.4 -j REJECT\n"
+			 "-P OUTPUT REJECT\n", "1.2.3.4", 80, GWP_ACL_ACCEPT);
 	assert(req.dnat_applied);
-	assert(inet_ntop(AF_INET, &req.dnat.i4.sin_addr, ip, sizeof(ip)));
-	assert(!strcmp(ip, "5.6.7.8"));
+	assert_addr(&req.dnat, AF_INET, "5.6.7.8", -1);
 
 	/*
 	 * A domain-only request (no resolved IP, as with a socks5h upstream) can
@@ -624,8 +577,7 @@ static noinline void test_dnat(void)
 		q.proto = GWP_ACL_PROTO_TCP;
 		assert(gwp_acl_eval_output(a, &q) == GWP_ACL_ACCEPT);
 		assert(q.dnat_applied && q.dnat.i4.sin_family == AF_INET);
-		assert(inet_ntop(AF_INET, &q.dnat.i4.sin_addr, ip, sizeof(ip)));
-		assert(!strcmp(ip, "10.1.2.3") && ntohs(q.dnat.i4.sin_port) == 8443);
+		assert_addr(&q.dnat, AF_INET, "10.1.2.3", 8443);
 		gwp_acl_destroy(a);
 	}
 }
@@ -672,6 +624,29 @@ static noinline void test_comments_and_default_policy(void)
 	s = sa4("1.2.3.4", 1);
 	assert(out(NULL, &s, NULL, 1, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
 	assert(in(NULL, &s, 1, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
+}
+
+/*
+ * gwp_acl_parse_str() with what it writes to stderr dropped: a text meant to
+ * fail logs its bad line, and a random -j UPSTREAM rule with a -d draws a
+ * warning each time. Expected diagnostics in "make test" output would only
+ * look like test failures.
+ */
+static int parse_quiet(struct gwp_acl **a, const char *text)
+{
+	int saved, null, r;
+
+	fflush(stderr);
+	saved = dup(STDERR_FILENO);
+	null = open("/dev/null", O_WRONLY);
+	assert(saved >= 0 && null >= 0);
+	assert(dup2(null, STDERR_FILENO) == STDERR_FILENO);
+	close(null);
+	r = gwp_acl_parse_str(a, text);
+	fflush(stderr);
+	assert(dup2(saved, STDERR_FILENO) == STDERR_FILENO);
+	close(saved);
+	return r;
 }
 
 static noinline void test_parse_errors(void)
@@ -804,68 +779,28 @@ static noinline void test_parse_errors(void)
 		"-A OUTPUT -d 1.2.3.4 -j DNAT --to 5.6.7.8:0x50\n", /* hex DNAT port */
 		"-A WEIRD -d 1.2.3.4 -j REJECT\n",	    /* bad chain */
 		"garbage line\n",			    /* not -P/-A */
+		/* --domain-regexp still needs the -m domain module first. */
+		"-A OUTPUT --domain-regexp x -j REJECT\n",
+		/* -m user is OUTPUT-only; --user needs it and takes no dupes. */
+		"-A OUTPUT --user alice -j REJECT\n",	    /* no -m user */
+		"-A INPUT -m user --user alice -j REJECT\n",	    /* INPUT */
+		"-A OUTPUT -m user --user a --user b -j REJECT\n", /* dup */
+#ifdef CONFIG_PCRE
+		/* A malformed pattern; exact + regexp for one field. */
+		"-A OUTPUT -m domain --domain-regexp ( -j REJECT\n",
+		"-A OUTPUT -m domain --domain a --domain-regexp b -j REJECT\n",
+#else
+		/* Without --use-pcre the regexp options are rejected outright. */
+		"-A OUTPUT -m user --user-regexp x -j REJECT\n",
+		"-A OUTPUT -m domain --domain-regexp x -j REJECT\n",
+#endif
 	};
 	size_t i;
-	int saved, devnull;
-
-	/*
-	 * These cases are meant to fail parsing, and the parser logs each bad
-	 * line to stderr. Silence stderr for the loop so the expected
-	 * diagnostics do not look like test failures in "make test" output.
-	 */
-	fflush(stderr);
-	saved = dup(STDERR_FILENO);
-	devnull = open("/dev/null", O_WRONLY);
-	if (saved >= 0 && devnull >= 0)
-		dup2(devnull, STDERR_FILENO);
 
 	for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
 		a = (void *)0x1;
-		assert(gwp_acl_parse_str(&a, bad[i]) < 0);
+		assert(parse_quiet(&a, bad[i]) < 0);
 	}
-
-	/* --domain-regexp still needs the -m domain module loaded first. */
-	a = (void *)0x1;
-	assert(gwp_acl_parse_str(&a,
-		"-A OUTPUT --domain-regexp x -j REJECT\n") < 0);
-
-	/* -m user is OUTPUT-only; --user needs the module and rejects dupes. */
-	a = (void *)0x1;
-	assert(gwp_acl_parse_str(&a,
-		"-A OUTPUT --user alice -j REJECT\n") < 0);		/* no -m user */
-	a = (void *)0x1;
-	assert(gwp_acl_parse_str(&a,
-		"-A INPUT -m user --user alice -j REJECT\n") < 0);	/* INPUT */
-	a = (void *)0x1;
-	assert(gwp_acl_parse_str(&a,
-		"-A OUTPUT -m user --user a --user b -j REJECT\n") < 0);	/* dup */
-#ifndef CONFIG_PCRE
-	a = (void *)0x1;
-	assert(gwp_acl_parse_str(&a,
-		"-A OUTPUT -m user --user-regexp x -j REJECT\n") < 0);	/* no pcre */
-#endif
-#ifdef CONFIG_PCRE
-	/* A malformed pattern, and mixing exact + regexp for one field, fail. */
-	a = (void *)0x1;
-	assert(gwp_acl_parse_str(&a,
-		"-A OUTPUT -m domain --domain-regexp ( -j REJECT\n") < 0);
-	a = (void *)0x1;
-	assert(gwp_acl_parse_str(&a,
-		"-A OUTPUT -m domain --domain a --domain-regexp b -j REJECT\n") < 0);
-#else
-	/* Without --use-pcre the regexp option is rejected outright. */
-	a = (void *)0x1;
-	assert(gwp_acl_parse_str(&a,
-		"-A OUTPUT -m domain --domain-regexp x -j REJECT\n") < 0);
-#endif
-
-	fflush(stderr);
-	if (saved >= 0)
-		dup2(saved, STDERR_FILENO);
-	if (devnull >= 0)
-		close(devnull);
-	if (saved >= 0)
-		close(saved);
 }
 
 /*
@@ -916,18 +851,12 @@ static noinline void test_index_first_match(void)
 	/* 12 + 8 OUTPUT rules in two runs, 8 INPUT rules in one. */
 	assert(gwp_acl_nr_indexed(a) == 12 + 8 + 8);
 
-	t = sa4("10.1.2.3", 80);
-	assert(out(a, &t, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
-	t = sa4("192.0.2.9", 80);
-	assert(out(a, &t, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
-	t = sa6("2001:db8::1", 80);
-	assert(out(a, &t, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
-	t = sa4mapped("198.51.100.20", 80);
-	assert(out(a, &t, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
-	t = sa4("198.51.100.20", 80);
-	assert(out(a, &t, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
-	t = sa4("198.51.101.20", 80);
-	assert(out(a, &t, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
+	assert(out_ip(a, "10.1.2.3", 80) == GWP_ACL_ACCEPT);
+	assert(out_ip(a, "192.0.2.9", 80) == GWP_ACL_REJECT);
+	assert(out_ip(a, "2001:db8::1", 80) == GWP_ACL_REJECT);
+	assert(out_mapped(a, "198.51.100.20", 80) == GWP_ACL_REJECT);
+	assert(out_ip(a, "198.51.100.20", 80) == GWP_ACL_REJECT);
+	assert(out_ip(a, "198.51.101.20", 80) == GWP_ACL_ACCEPT);
 
 	/* Domains: case-insensitive, first rule wins, none without a name. */
 	t = sa4("93.184.216.34", 80);
@@ -999,10 +928,7 @@ static uint32_t rnd_state;
 
 static uint32_t rnd(uint32_t n)
 {
-	rnd_state ^= rnd_state << 13;
-	rnd_state ^= rnd_state >> 17;
-	rnd_state ^= rnd_state << 5;
-	return rnd_state % n;
+	return gwp_up_rand(&rnd_state) % n;
 }
 
 static const char *const rnd_v4_nets[] = {
@@ -1159,27 +1085,6 @@ static bool same_result(const struct gwp_acl_req *x, enum gwp_acl_verdict vx,
 }
 
 /*
- * gwp_acl_parse_str() with its warnings dropped: a random -j UPSTREAM rule
- * with a -d draws one each time.
- */
-static int parse_quiet(struct gwp_acl **a, const char *text)
-{
-	int saved, null, r;
-
-	fflush(stderr);
-	saved = dup(STDERR_FILENO);
-	null = open("/dev/null", O_WRONLY);
-	assert(saved >= 0 && null >= 0);
-	assert(dup2(null, STDERR_FILENO) == STDERR_FILENO);
-	close(null);
-	r = gwp_acl_parse_str(a, text);
-	fflush(stderr);
-	assert(dup2(saved, STDERR_FILENO) == STDERR_FILENO);
-	close(saved);
-	return r;
-}
-
-/*
  * Random rule files, each evaluated twice: as written, where long runs
  * are indexed, and with a never-matching two-criterion rule after every
  * rule, which leaves no run to index. Every request must get the same
@@ -1303,20 +1208,14 @@ static noinline void test_domain_only_target_criteria(void)
 /* Load "-j MARK --set-mark @v" and return the mark an evaluation sets. */
 static noinline uint32_t mark_of(const char *v)
 {
-	struct gwp_sockaddr t = sa4("1.2.3.4", 80);
-	struct gwp_acl *a = NULL;
 	struct gwp_acl_req req;
 	char *rules;
 
 	assert(asprintf(&rules, "-A OUTPUT -j MARK --set-mark %s\n"
 			"-P OUTPUT ACCEPT\n", v) > 0);
-	assert(!gwp_acl_parse_str(&a, rules));
+	req = eval_rules(rules, "1.2.3.4", 80, GWP_ACL_ACCEPT);
 	free(rules);
-	memset(&req, 0, sizeof(req));
-	req.target = &t; req.dport = 80; req.proto = GWP_ACL_PROTO_TCP;
-	assert(gwp_acl_eval_output(a, &req) == GWP_ACL_ACCEPT);
 	assert(req.mark_set);
-	gwp_acl_destroy(a);
 	return req.mark;
 }
 
@@ -1393,8 +1292,7 @@ static noinline void test_number_bases(void)
 	assert(out(a, &t, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
 	assert(out(a, &t, NULL, 444, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
 	assert(out(a, &t, NULL, 64, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
-	t = sa4("11.1.2.3", 80);
-	assert(out(a, &t, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
+	assert(out_ip(a, "11.1.2.3", 80) == GWP_ACL_ACCEPT);
 	gwp_acl_destroy(a);
 }
 
@@ -2021,29 +1919,45 @@ static void inc_rmdir(char *dir)
 	free(dir);
 }
 
-/* @acl's watched files are @dir/<each of @names>, in that order. */
-static void inc_files(struct gwp_acl *acl, const char *dir,
-		      const char *const *names, size_t nr)
+/*
+ * The entries @get (gwp_acl_file or gwp_acl_dir) lists for @acl are
+ * @dir/<each of @names> ("" for @dir itself), in that order, and no more.
+ * @what names an entry in the message on a mismatch.
+ */
+static void inc_list(struct gwp_acl *acl,
+		     const char *(*get)(const struct gwp_acl *, size_t),
+		     const char *what, const char *dir,
+		     const char *const *names, size_t nr)
 {
 	char path[PATH_MAX];
 	size_t i;
 
 	for (i = 0; i < nr; i++) {
-		snprintf(path, sizeof(path), "%s/%s", dir, names[i]);
-		assert(gwp_acl_file(acl, i));
-		if (strcmp(gwp_acl_file(acl, i), path))
-			fprintf(stderr, "file %zu is %s, not %s\n", i,
-				gwp_acl_file(acl, i), path);
-		assert(!strcmp(gwp_acl_file(acl, i), path));
+		if (*names[i])
+			snprintf(path, sizeof(path), "%s/%s", dir, names[i]);
+		else
+			snprintf(path, sizeof(path), "%s", dir);
+		assert(get(acl, i));
+		if (strcmp(get(acl, i), path))
+			fprintf(stderr, "%s %zu is %s, not %s\n", what, i,
+				get(acl, i), path);
+		assert(!strcmp(get(acl, i), path));
 	}
-	assert(!gwp_acl_file(acl, nr));
+	if (get(acl, nr))
+		fprintf(stderr, "extra %s %s\n", what, get(acl, nr));
+	assert(!get(acl, nr));
+}
+
+/* @acl's watched files are @dir/<each of @names>, in that order. */
+static void inc_files(struct gwp_acl *acl, const char *dir,
+		      const char *const *names, size_t nr)
+{
+	inc_list(acl, gwp_acl_file, "file", dir, names, nr);
 }
 
 static enum gwp_acl_verdict inc_out(struct gwp_acl *a, const char *ip)
 {
-	struct gwp_sockaddr t = sa4(ip, 80);
-
-	return out(a, &t, NULL, 80, GWP_ACL_PROTO_TCP);
+	return out_ip(a, ip, 80);
 }
 
 /*
@@ -2114,15 +2028,45 @@ static noinline void test_include_order(void)
 	inc_rmdir(dir);
 }
 
+static void up_capture(void);
+static char *up_captured(void);
+
+/*
+ * @text as main.acl in @dir must fail to load with @err and, unless @msg is
+ * NULL, say @msg (with "%s" standing for main.acl's path). What the load says
+ * is shown only on a mismatch.
+ */
+static void inc_refused_msg(const char *dir, const char *text, int err,
+			    const char *msg)
+{
+	struct gwp_acl *a = NULL;
+	char *path = inc_write(dir, "main.acl", text), *said, *want = NULL;
+	int r;
+
+	if (msg)
+		assert(asprintf(&want, msg, path) > 0);
+	up_capture();
+	r = gwp_acl_create(&a, path);
+	said = up_captured();
+	if (r != err || (want && !strstr(said, want))) {
+		if (want)
+			fprintf(stderr, "returned %d, not %d; want \"%s\", it said:\n%s",
+				r, err, want, said);
+		else
+			fprintf(stderr, "returned %d, not %d; it said:\n%s",
+				r, err, said);
+		assert(0);
+	}
+	assert(!a);
+	free(said);
+	free(want);
+	free(path);
+}
+
 /* @text as main.acl in @dir must fail to load with @err. */
 static void inc_refused(const char *dir, const char *text, int err)
 {
-	struct gwp_acl *a = NULL;
-	char *path = inc_write(dir, "main.acl", text);
-
-	assert(gwp_acl_create(&a, path) == err);
-	assert(!a);
-	free(path);
+	inc_refused_msg(dir, text, err, NULL);
 }
 
 /*
@@ -2328,8 +2272,7 @@ static noinline void test_include_reload(void)
  * ------------------------------------------------------------------------
  */
 
-static void up_capture(void);
-static char *up_captured(void);
+static char *up_create_said(struct gwp_acl **a, const char *path, int want);
 
 /* mkdir @dir/@name; returns the malloc'd path. */
 static char *inc_mkdir(const char *dir, const char *name)
@@ -2344,32 +2287,6 @@ static char *inc_mkdir(const char *dir, const char *name)
 static void inc_mkdir_put(const char *dir, const char *name)
 {
 	free(inc_mkdir(dir, name));
-}
-
-/*
- * @text as main.acl in @dir must fail to load with @err, and say @msg (with
- * "%s" standing for main.acl's path).
- */
-static void inc_refused_msg(const char *dir, const char *text, int err,
-			    const char *msg)
-{
-	struct gwp_acl *a = NULL;
-	char *path = inc_write(dir, "main.acl", text), *said, *want;
-	int r;
-
-	assert(asprintf(&want, msg, path) > 0);
-	up_capture();
-	r = gwp_acl_create(&a, path);
-	said = up_captured();
-	if (r != err || !strstr(said, want)) {
-		fprintf(stderr, "returned %d, not %d; want \"%s\", it said:\n%s",
-			r, err, want, said);
-		assert(0);
-	}
-	assert(!a);
-	free(said);
-	free(want);
-	free(path);
 }
 
 /* @text as main.acl in @dir loads, and its files are @names in order. */
@@ -2685,9 +2602,7 @@ static noinline void test_include_optional(void)
 	path = inc_write(dir, "main.acl", "-P OUTPUT ACCEPT\n"
 			 "include_optional opt.acl;\n"
 			 "-A OUTPUT -d 192.0.2.2 -j REJECT\n");
-	up_capture();
-	assert(!gwp_acl_create(&a, path));
-	said = up_captured();
+	said = up_create_said(&a, path, 0);
 	assert(asprintf(&want, "acl: %s: line 2: warning: include_optional %s/opt.acl: No such file or directory; nothing included",
 			path, dir) > 0);
 	if (!strstr(said, want)) {
@@ -2785,23 +2700,7 @@ static noinline void test_include_optional(void)
 static void inc_dirs(struct gwp_acl *acl, const char *dir,
 		     const char *const *names, size_t nr)
 {
-	char path[PATH_MAX];
-	size_t i;
-
-	for (i = 0; i < nr; i++) {
-		if (*names[i])
-			snprintf(path, sizeof(path), "%s/%s", dir, names[i]);
-		else
-			snprintf(path, sizeof(path), "%s", dir);
-		assert(gwp_acl_dir(acl, i));
-		if (strcmp(gwp_acl_dir(acl, i), path))
-			fprintf(stderr, "dir %zu is %s, not %s\n", i,
-				gwp_acl_dir(acl, i), path);
-		assert(!strcmp(gwp_acl_dir(acl, i), path));
-	}
-	if (gwp_acl_dir(acl, nr))
-		fprintf(stderr, "extra dir %s\n", gwp_acl_dir(acl, nr));
-	assert(!gwp_acl_dir(acl, nr));
+	inc_list(acl, gwp_acl_dir, "dir", dir, names, nr);
 }
 
 /*
@@ -2987,6 +2886,35 @@ static void up_check(int r, int want, const char *said)
 }
 
 /*
+ * gwp_acl_create() of @path into *@a, or gwp_acl_reload() of @a, with what it
+ * says captured: it must return @want. Returns what it said (malloc'd), for
+ * the caller to check and free.
+ */
+static char *up_create_said(struct gwp_acl **a, const char *path, int want)
+{
+	char *said;
+	int r;
+
+	up_capture();
+	r = gwp_acl_create(a, path);
+	said = up_captured();
+	up_check(r, want, said);
+	return said;
+}
+
+static char *up_reload_said(struct gwp_acl *a, int want)
+{
+	char *said;
+	int r;
+
+	up_capture();
+	r = gwp_acl_reload(a);
+	said = up_captured();
+	up_check(r, want, said);
+	return said;
+}
+
+/*
  * @text must fail to parse with @err, and the message must contain @msg (and
  * never the password "s3cret" a URL in the text may carry).
  */
@@ -3023,6 +2951,30 @@ static enum gwp_acl_verdict up_eval(struct gwp_acl *a, const char *user,
 	return gwp_acl_eval_output(a, req);
 }
 
+/*
+ * The name of the upstream choice @u in @req: the pool's name, "DIRECT",
+ * "UNSURE", or "" for none. Only a pool choice may hold a pool. It does not
+ * release @req, so a pool's name stays valid for the caller to copy.
+ */
+static const char *up_name(const struct gwp_acl_req *req,
+			   enum gwp_acl_upstream u)
+{
+	if (u == GWP_ACL_UPSTREAM_POOL) {
+		assert(req->upstream_pool);
+		return gwp_acl_pool_name(req->upstream_pool);
+	}
+	assert(!req->upstream_pool);
+	switch (u) {
+	case GWP_ACL_UPSTREAM_DIRECT:
+		return "DIRECT";
+	case GWP_ACL_UPSTREAM_UNSURE:
+		return "UNSURE";
+	default:
+		assert(u == GWP_ACL_UPSTREAM_NONE);
+		return "";
+	}
+}
+
 /* The pool name OUTPUT chose for @user, "DIRECT", or "" for none. */
 static const char *up_choice(struct gwp_acl *a, const char *user)
 {
@@ -3030,22 +2982,8 @@ static const char *up_choice(struct gwp_acl *a, const char *user)
 	struct gwp_acl_req req;
 
 	assert(up_eval(a, user, &req) == GWP_ACL_ACCEPT);
-	switch (req.upstream) {
-	case GWP_ACL_UPSTREAM_NONE:
-		assert(!req.upstream_pool);
-		strcpy(name, "");
-		break;
-	case GWP_ACL_UPSTREAM_DIRECT:
-		assert(!req.upstream_pool);
-		strcpy(name, "DIRECT");
-		break;
-	default:
-		assert(req.upstream == GWP_ACL_UPSTREAM_POOL);
-		assert(req.upstream_pool);
-		snprintf(name, sizeof(name), "%s",
-			 gwp_acl_pool_name(req.upstream_pool));
-		break;
-	}
+	assert(req.upstream != GWP_ACL_UPSTREAM_UNSURE);
+	snprintf(name, sizeof(name), "%s", up_name(&req, req.upstream));
 	gwp_acl_req_release(&req);
 	assert(!req.upstream_pool && req.upstream == GWP_ACL_UPSTREAM_NONE);
 	gwp_acl_req_release(&req);
@@ -3269,7 +3207,6 @@ static noinline void test_upstream_include(void)
 {
 	char *dir = inc_dir(), *path, *said;
 	struct gwp_acl *a = NULL;
-	int r;
 
 	inc_put(dir, "pools.acl",
 		"upstream inc {\n server socks5h://10.0.0.1:1080;\n}\n"
@@ -3290,20 +3227,14 @@ static noinline void test_upstream_include(void)
 	inc_put(dir, "main.acl",
 		"upstream inc {\n server http://10.0.0.2:1;\n}\n"
 		"include pools.acl;\n");
-	up_capture();
-	r = gwp_acl_create(&a, path);
-	said = up_captured();
-	up_check(r, -EINVAL, said);
+	said = up_create_said(&a, path, -EINVAL);
 	assert(strstr(said, "pools.acl: line 1: upstream pool inc is defined twice"));
 	assert(strstr(said, "main.acl: line 4: failed to include a file"));
 	free(said);
 
 	/* An undefined pool is named with the file and line that use it. */
 	inc_put(dir, "main.acl", "include pools.acl;\n");
-	up_capture();
-	r = gwp_acl_create(&a, path);
-	said = up_captured();
-	up_check(r, -EINVAL, said);
+	said = up_create_said(&a, path, -EINVAL);
 	assert(strstr(said, "pools.acl: line 4: upstream pool top is not defined"));
 	free(said);
 
@@ -3311,19 +3242,13 @@ static noinline void test_upstream_include(void)
 	inc_put(dir, "open.acl", "upstream o {\n server http://10.0.0.2:1;\n");
 	inc_put(dir, "main.acl",
 		"include open.acl;\n}\n-A OUTPUT -j UPSTREAM --to o\n");
-	up_capture();
-	r = gwp_acl_create(&a, path);
-	said = up_captured();
-	up_check(r, -EINVAL, said);
+	said = up_create_said(&a, path, -EINVAL);
 	assert(strstr(said, "open.acl: line 1: upstream pool o is not closed"));
 	free(said);
 	inc_put(dir, "main.acl",
 		"upstream o {\n server http://10.0.0.2:1;\n"
 		"include pools.acl;\n}\n");
-	up_capture();
-	r = gwp_acl_create(&a, path);
-	said = up_captured();
-	up_check(r, -EINVAL, said);
+	said = up_create_said(&a, path, -EINVAL);
 	assert(strstr(said, "main.acl: line 3: include is not allowed inside an upstream block"));
 	free(said);
 	assert(!a);
@@ -3341,7 +3266,6 @@ static noinline void test_upstream_creds_warning(void)
 	static const char warn[] = "readable by group or others";
 	char *dir = inc_dir(), *path, *inc_path, *said, *p;
 	struct gwp_acl *a;
-	int r;
 
 	inc_path = inc_write(dir, "creds.acl",
 			     "upstream c {\n server http://u:s3cret@10.0.0.1:1;\n}\n");
@@ -3351,20 +3275,14 @@ static noinline void test_upstream_creds_warning(void)
 	inc_put(dir, "none.acl", "upstream n {\n server http://10.0.0.1:1;\n}\n");
 
 	/* 0600 everywhere: nothing to say. */
-	up_capture();
-	r = gwp_acl_create(&a, path);
-	said = up_captured();
-	up_check(r, 0, said);
+	said = up_create_said(&a, path, 0);
 	assert(!strstr(said, warn));
 	free(said);
 
 	/* Readable by others: warned once per load, reload included. */
 	assert(!chmod(inc_path, 0644));
 	assert(!chmod(path, 0640));
-	up_capture();
-	r = gwp_acl_reload(a);
-	said = up_captured();
-	up_check(r, 0, said);
+	said = up_reload_said(a, 0);
 	p = strstr(said, warn);
 	assert(p && !strstr(p + 1, warn));
 	assert(strstr(said, "creds.acl: warning: holds upstream credentials"));
@@ -3378,19 +3296,13 @@ static noinline void test_upstream_creds_warning(void)
 	 */
 	assert(!chmod(path, 0644));
 	assert(!chmod(dir, 0755));
-	up_capture();
-	r = gwp_acl_reload(a);
-	said = up_captured();
-	up_check(r, 0, said);
+	said = up_reload_said(a, 0);
 	assert(!strstr(said, "none.acl"));
 	free(said);
 
 	/* Group-readable alone counts too. */
 	assert(!chmod(inc_path, 0640));
-	up_capture();
-	r = gwp_acl_reload(a);
-	said = up_captured();
-	up_check(r, 0, said);
+	said = up_reload_said(a, 0);
 	assert(strstr(said, warn));
 	free(said);
 
@@ -3663,7 +3575,6 @@ static noinline void test_upstream_server_ops(void)
 	struct gwp_acl_req req;
 	struct up_srv *held;
 	struct gwp_acl *a;
-	int r;
 
 	g_up_made = 0;
 	path = inc_write(dir, "main.acl",
@@ -3703,10 +3614,7 @@ static noinline void test_upstream_server_ops(void)
 		" server http://10.0.0.5:3128;\n"
 		" server http://u:s3cret@unresolvable.invalid:3128;\n"
 		"}\n");
-	up_capture();
-	r = gwp_acl_reload(a);
-	said = up_captured();
-	up_check(r, -EINVAL, said);
+	said = up_reload_said(a, -EINVAL);
 	assert(strstr(said, "main.acl: line 3: upstream pool p server 2 (http://unresolvable.invalid:3128): the host does not resolve"));
 	assert(!strstr(said, "s3cret"));
 	free(said);
@@ -3718,10 +3626,7 @@ static noinline void test_upstream_server_ops(void)
 
 	/* With no reason given, the errno says why. */
 	inc_put(dir, "main.acl", "upstream p {\n server http://nowhy:1;\n}\n");
-	up_capture();
-	r = gwp_acl_reload(a);
-	said = up_captured();
-	up_check(r, -EINVAL, said);
+	said = up_reload_said(a, -EINVAL);
 	assert(strstr(said, "main.acl: line 2: upstream pool p server 1 (http://nowhy:1): "));
 	assert(strstr(said, strerror(EAFNOSUPPORT)));
 	free(said);
@@ -3773,15 +3678,7 @@ static const char *up_pick(struct gwp_acl *a, const char *user,
 	req.proto = GWP_ACL_PROTO_TCP;
 	u = gwp_acl_eval_upstream(a, &req);
 	assert(u == req.upstream && !req.upstream_only);
-	if (u == GWP_ACL_UPSTREAM_POOL)
-		snprintf(name, sizeof(name), "%s",
-			 gwp_acl_pool_name(req.upstream_pool));
-	else
-		snprintf(name, sizeof(name), "%s",
-			 u == GWP_ACL_UPSTREAM_DIRECT ? "DIRECT" :
-			 u == GWP_ACL_UPSTREAM_UNSURE ? "UNSURE" : "");
-	if (u != GWP_ACL_UPSTREAM_POOL)
-		assert(!req.upstream_pool);
+	snprintf(name, sizeof(name), "%s", up_name(&req, u));
 	gwp_acl_req_release(&req);
 	return name;
 }
@@ -3887,13 +3784,7 @@ static const char *up_pick_nt(struct gwp_acl *a, const char *user)
 	req.no_target = true;
 	req.proto = GWP_ACL_PROTO_TCP;
 	u = gwp_acl_eval_upstream(a, &req);
-	if (u == GWP_ACL_UPSTREAM_POOL)
-		name = gwp_acl_pool_name(req.upstream_pool);
-	else
-		name = u == GWP_ACL_UPSTREAM_DIRECT ? "DIRECT" :
-		       u == GWP_ACL_UPSTREAM_UNSURE ? "UNSURE" : "";
-	if (u != GWP_ACL_UPSTREAM_POOL)
-		assert(!req.upstream_pool);
+	name = up_name(&req, u);
 	gwp_acl_req_release(&req);
 	return name;
 }
@@ -4497,6 +4388,51 @@ static noinline void test_upstream_errors(void)
 	gwp_acl_destroy(a);
 }
 
+/*
+ * A pool server's URL takes what --upstream-proxy takes, up to its limits: a
+ * user name and a password of 255 bytes each, and 511 bytes after the scheme.
+ */
+static noinline void test_upstream_url_limits(void)
+{
+	char cred[257], *text, *p;
+	struct gwp_acl *a = NULL;
+
+	/* Both at 255 bytes would not fit in the 511: one at a time. */
+	memset(cred, 'u', 255);
+	cred[255] = '\0';
+	assert(asprintf(&text, "upstream p {\n server http://%s:p@h:1;\n}\n",
+			cred) > 0);
+	assert(!gwp_acl_parse_str(&a, text));
+	gwp_acl_destroy(a);
+	a = NULL;
+	free(text);
+	assert(asprintf(&text, "upstream p {\n server http://u:%s@h:1;\n}\n",
+			cred) > 0);
+	assert(!gwp_acl_parse_str(&a, text));
+	gwp_acl_destroy(a);
+	a = NULL;
+	free(text);
+
+	strcpy(cred + 255, "u");
+	assert(asprintf(&text, "upstream p {\n server http://%s@h:1;\n}\n",
+			cred) > 0);
+	up_refused(text, -EINVAL, "longer than 255 bytes");
+	free(text);
+
+	/* 511 bytes after "http://", then 512. */
+	text = malloc(700);
+	assert(text);
+	p = text + sprintf(text, "upstream p {\n server http://");
+	memset(p, 'h', 509);
+	strcpy(p + 509, ":1;\n}\n");
+	assert(!gwp_acl_parse_str(&a, text));
+	gwp_acl_destroy(a);
+	memset(p, 'h', 510);
+	strcpy(p + 510, ":1;\n}\n");
+	up_refused(text, -EINVAL, "the URL is too long");
+	free(text);
+}
+
 #ifdef CONFIG_PCRE
 /* Linked with --wrap, so a test can fail the context's allocation. */
 void *__real_pcre2_match_context_create_8(void *gcontext);
@@ -4562,6 +4498,7 @@ static void run_tests(void)
 	test_include_optional();
 	test_include_dirs();
 	test_upstream_errors();
+	test_upstream_url_limits();
 	test_upstream_server_opts();
 	test_upstream_methods();
 	test_upstream_pool_https();

@@ -50,24 +50,21 @@ static uint32_t client_reply_room(const struct gwp_conn_pair *gcp)
 
 const char *gwp_upstream_dst_str(struct gwp_conn_pair *gcp)
 {
+	/* A 255-byte domain and ":65535" fit, and so does any address. */
 	static __thread char buf[300];
 
+	/*
+	 * A failed format falls back to the target address, so the line
+	 * never shows what an earlier call left in the buffer.
+	 */
 	if (gcp->up_dst.ver == GWP_SOCKS5_ATYP_DOMAIN) {
-		snprintf(buf, sizeof(buf), "%s:%u", gcp->up_dst.domain.str,
-			 ntohs(gcp->up_dst.port));
-		return buf;
-	}
-
-	/* What a UDP ASSOCIATE names: where its datagrams come from. */
-	if ((gcp->flags & GWP_CONN_FLAG_UDP_UP) && gcp->up_dst.ver) {
-		char ip[INET6_ADDRSTRLEN];
-		bool v4 = gcp->up_dst.ver == GWP_SOCKS5_ATYP_IPV4;
-
-		inet_ntop(v4 ? AF_INET : AF_INET6, gcp->up_dst.ip6, ip,
-			  sizeof(ip));
-		snprintf(buf, sizeof(buf), v4 ? "udp from %s:%u" :
-			 "udp from [%s]:%u", ip, ntohs(gcp->up_dst.port));
-		return buf;
+		if (!gwp_socks5_addr_str(&gcp->up_dst, "", buf, sizeof(buf)))
+			return buf;
+	} else if ((gcp->flags & GWP_CONN_FLAG_UDP_UP) && gcp->up_dst.ver) {
+		/* What a UDP ASSOCIATE names: where its datagrams come from. */
+		if (!gwp_socks5_addr_str(&gcp->up_dst, "udp from ", buf,
+					 sizeof(buf)))
+			return buf;
 	}
 
 	return ip_to_str(&gcp->target_addr);

@@ -14,53 +14,157 @@
 #include <unistd.h>
 #include "test_util.h"
 
-#define test_socks5_init_ctx_no_auth(CTX)		\
-do {							\
-	struct gwp_socks5_ctx **__ctx = (CTX);		\
-	int __r;					\
-							\
-	__r = gwp_socks5_ctx_init(__ctx, NULL);		\
-	assert(!__r);					\
-	assert(*__ctx);					\
-	assert((*__ctx)->auth == NULL);			\
-} while (0)
+static void test_socks5_init_ctx_no_auth(struct gwp_socks5_ctx **ctx)
+{
+	int r;
 
-#define test_socks5_alloc_conn(CTX) ({			\
-	struct gwp_socks5_ctx *__ctx = (CTX);		\
-	struct gwp_socks5_conn *__conn;			\
-							\
-	__conn = gwp_socks5_conn_alloc(__ctx);		\
-	assert(__conn);					\
-	assert(__conn->state == GWP_SOCKS5_ST_INIT);	\
-	assert(__conn->ctx == __ctx);			\
-	(__conn);					\
-})
+	r = gwp_socks5_ctx_init(ctx, NULL);
+	assert(!r);
+	assert(*ctx);
+	assert((*ctx)->auth == NULL);
+}
 
-#define test_socks5_do_handshake_no_auth(CTX, CONN)		\
-do {								\
-	static const uint8_t in[] = {				\
-		0x05, 0x01, 0x00 /* VER, NMETHODS, METHOD */	\
-	};							\
-	struct gwp_socks5_conn *__conn = (CONN);		\
-	size_t in_len, out_len;					\
-	uint8_t out[10];					\
-	int r;							\
-								\
-	in_len = sizeof(in);					\
-	out_len = sizeof(out);					\
-	r = gwp_socks5_conn_handle_data(__conn, in,		\
-					&in_len, out,		\
-					&out_len);		\
-	assert(!r);						\
-								\
-	assert(in_len == 3);					\
-	assert(out_len == 2);					\
-	/* VER */						\
-	assert(out[0] == 0x05);					\
-	/* METHOD: NO AUTHENTICATION REQUIRED */		\
-	assert(out[1] == 0x00);					\
-	assert(conn->state == GWP_SOCKS5_ST_CMD);		\
-} while (0)
+/* A context that asks for @auth's credentials and allows UDP ASSOCIATE. */
+static void test_socks5_init_ctx_auth(struct gwp_socks5_ctx **ctx,
+				      struct gwp_auth *auth)
+{
+	const struct gwp_socks5_cfg cfg = {
+		.auth = auth,
+		.udp_associate = true,
+	};
+	int r;
+
+	r = gwp_socks5_ctx_init(ctx, &cfg);
+	assert(!r);
+	assert(*ctx);
+	assert((*ctx)->auth == auth);
+}
+
+static struct gwp_socks5_conn *
+test_socks5_alloc_conn(struct gwp_socks5_ctx *ctx)
+{
+	struct gwp_socks5_conn *conn;
+
+	conn = gwp_socks5_conn_alloc(ctx);
+	assert(conn);
+	assert(conn->state == GWP_SOCKS5_ST_INIT);
+	assert(conn->ctx == ctx);
+	return conn;
+}
+
+/* Abort, naming the caller's @line, when the check @what (@ok) failed. */
+static void check_at(int line, bool ok, const char *what)
+{
+	if (ok)
+		return;
+	fprintf(stderr, "%s:%d: %s does not match\n", __FILE__, line, what);
+	abort();
+}
+
+/*
+ * Feed the @in_len bytes at @in to @conn with room for @out_cap bytes of
+ * reply, and check that gwp_socks5_conn_handle_data() returns @want_r, takes
+ * @want_in bytes, writes exactly the @want_out_len bytes at @want_out and
+ * leaves @conn in @want_state.
+ */
+static void feed_at(int line, struct gwp_socks5_conn *conn, const void *in,
+		    size_t in_len, size_t out_cap, int want_r, size_t want_in,
+		    const void *want_out, size_t want_out_len, int want_state)
+{
+	size_t out_len = out_cap;
+	uint8_t out[4096];
+	int r;
+
+	assert(out_cap <= sizeof(out));
+	r = gwp_socks5_conn_handle_data(conn, in, &in_len, out, &out_len);
+	check_at(line, r == want_r, "return value");
+	check_at(line, in_len == want_in, "in_len");
+	check_at(line, out_len == want_out_len, "out_len");
+	if (want_out_len)
+		check_at(line, !memcmp(out, want_out, want_out_len), "reply");
+	check_at(line, conn->state == want_state, "state");
+}
+
+/*
+ * The expected reply @lit is a string literal, its length taken without the
+ * terminating NUL, so it may hold NUL bytes; the "" makes anything but a
+ * literal fail to build. A macro for that and for the caller's __LINE__.
+ */
+#define FEED(conn, in, in_len, cap, r, used, lit, st)			\
+	feed_at(__LINE__, (conn), (in), (in_len), (cap), (r), (used),	\
+		"" lit, sizeof("" lit) - 1, (st))
+
+typedef int (*test_socks5_res_t)(struct gwp_socks5_conn *conn,
+				 const struct gwp_socks5_addr *bind_addr,
+				 uint8_t rep, void *out_buf, size_t *out_len);
+
+/*
+ * Make @conn's success reply with @res (the CONNECT or the UDP ASSOCIATE
+ * one) and @bind_addr, and check that it is exactly the @want_len bytes at
+ * @want and leaves @conn in @want_state.
+ */
+static void reply_at(int line, struct gwp_socks5_conn *conn,
+		     test_socks5_res_t res,
+		     const struct gwp_socks5_addr *bind_addr, const void *want,
+		     size_t want_len, int want_state)
+{
+	uint8_t out[64];
+	size_t out_len = sizeof(out);
+	int r;
+
+	r = res(conn, bind_addr, GWP_SOCKS5_REP_SUCCESS, out, &out_len);
+	check_at(line, !r, "return value");
+	check_at(line, out_len == want_len, "out_len");
+	check_at(line, !memcmp(out, want, want_len), "reply");
+	check_at(line, conn->state == want_state, "state");
+}
+
+/* A macro for the same reasons as FEED(). */
+#define REPLY(conn, res, bind_addr, lit, st)				\
+	reply_at(__LINE__, (conn), (res), (bind_addr), "" lit,		\
+		 sizeof("" lit) - 1, (st))
+
+/* ATYP, BND.ADDR and BND.PORT of the reply when no address is given. */
+#define BND_IP4_ZERO							\
+	"\x01"			/* ATYP: IPv4 address */		\
+	"\x00\x00\x00\x00"	/* BND.ADDR: 0.0.0.0 */			\
+	"\x00\x00"		/* BND.PORT: 0 */
+
+#define REP_OK_IP4_ZERO							\
+	"\x05\x00\x00"		/* VER, REP: succeeded, RSV */		\
+	BND_IP4_ZERO
+
+#define REP_OK_IP4_LO							\
+	"\x05\x00\x00"		/* VER, REP: succeeded, RSV */		\
+	"\x01"			/* ATYP: IPv4 address */		\
+	"\x7f\x00\x00\x01"	/* BND.ADDR: 127.0.0.1 */		\
+	"\xaa\xaa"		/* BND.PORT */
+
+#define REP_OK_IP6_LO							\
+	"\x05\x00\x00"		/* VER, REP: succeeded, RSV */		\
+	"\x04"			/* ATYP: IPv6 address */		\
+	"\x00\x00\x00\x00\x00\x00\x00\x00"				\
+	"\x00\x00\x00\x00\x00\x00\x00\x01" /* BND.ADDR: ::1 */		\
+	"\xaa\xaa"		/* BND.PORT */
+
+/* The request's DST is 127.0.0.1:80. */
+static void test_socks5_assert_dst_ipv4_lo80(const struct gwp_socks5_conn *conn)
+{
+	assert(conn->dst_addr.ver == GWP_SOCKS5_ATYP_IPV4);
+	assert(!memcmp(conn->dst_addr.ip4, "\x7f\x00\x00\x01", 4));
+	assert(!memcmp(&conn->dst_addr.port, "\x00\x50", 2));
+}
+
+static void test_socks5_do_handshake_no_auth(struct gwp_socks5_conn *conn)
+{
+	static const uint8_t in[] = {
+		0x05, 0x01, 0x00 /* VER, NMETHODS, METHOD */
+	};
+
+	FEED(conn, in, sizeof(in), 10, 0, 3,
+	     "\x05\x00" /* VER, METHOD: NO AUTHENTICATION REQUIRED */,
+	     GWP_SOCKS5_ST_CMD);
+}
 
 static void test_connect_ipv4(void)
 {
@@ -77,45 +181,18 @@ static void test_connect_ipv4(void)
 	};
 	struct gwp_socks5_conn *conn;
 	struct gwp_socks5_ctx *ctx;
-	size_t in_len, out_len;
-	uint8_t out[4096];
-	int r;
 
 	test_socks5_init_ctx_no_auth(&ctx);
 	conn = test_socks5_alloc_conn(ctx);
-	test_socks5_do_handshake_no_auth(ctx, conn);
+	test_socks5_do_handshake_no_auth(conn);
 
-	in_len = sizeof(in);
-	out_len = sizeof(out);
-	r = gwp_socks5_conn_handle_data(conn, in, &in_len, out, &out_len);
-	assert(!r);
-	assert(in_len == sizeof(in));
-	assert(out_len == 0);
-	assert(conn->state == GWP_SOCKS5_ST_CMD_CONNECT);
-	assert(conn->dst_addr.ver == GWP_SOCKS5_ATYP_IPV4);
-	assert(!memcmp(conn->dst_addr.ip4, "\x7f\x00\x00\x01", 4));
-	assert(!memcmp(&conn->dst_addr.port, "\x00\x50", 2));
+	FEED(conn, in, sizeof(in), 4096, 0, sizeof(in), "",
+	     GWP_SOCKS5_ST_CMD_CONNECT);
+	test_socks5_assert_dst_ipv4_lo80(conn);
 
 	/* Reply with connect success. */
-	out_len = sizeof(out);
-	r = gwp_socks5_conn_cmd_connect_res(conn, &bind_addr,
-					    GWP_SOCKS5_REP_SUCCESS, out,
-					    &out_len);
-	assert(!r);
-	assert(out_len == 10);
-	/* VER */
-	assert(out[0] == 0x05);
-	/* REP: succeeded */
-	assert(out[1] == 0x00);
-	/* RSV */
-	assert(out[2] == 0x00);
-	/* ATYP: IPv4 address */
-	assert(out[3] == GWP_SOCKS5_ATYP_IPV4);
-	/* BND.ADDR */
-	assert(!memcmp(&out[4], "\x7f\x00\x00\x01", 4));
-	/* BND.PORT */
-	assert(!memcmp(&out[8], "\xaa\xaa", 2));
-	assert(conn->state == GWP_SOCKS5_ST_FORWARDING);
+	REPLY(conn, gwp_socks5_conn_cmd_connect_res, &bind_addr, REP_OK_IP4_LO,
+	      GWP_SOCKS5_ST_FORWARDING);
 
 	/*
 	 * All good!
@@ -146,45 +223,20 @@ static void test_connect_ipv6(void)
 	};
 	struct gwp_socks5_conn *conn;
 	struct gwp_socks5_ctx *ctx;
-	size_t in_len, out_len;
-	uint8_t out[4096];
-	int r;
 
 	test_socks5_init_ctx_no_auth(&ctx);
 	conn = test_socks5_alloc_conn(ctx);
-	test_socks5_do_handshake_no_auth(ctx, conn);
+	test_socks5_do_handshake_no_auth(conn);
 
-	in_len = sizeof(in);
-	out_len = sizeof(out);
-	r = gwp_socks5_conn_handle_data(conn, in, &in_len, out, &out_len);
-	assert(!r);
-	assert(in_len == sizeof(in));
-	assert(out_len == 0);
-	assert(conn->state == GWP_SOCKS5_ST_CMD_CONNECT);
+	FEED(conn, in, sizeof(in), 4096, 0, sizeof(in), "",
+	     GWP_SOCKS5_ST_CMD_CONNECT);
 	assert(conn->dst_addr.ver == GWP_SOCKS5_ATYP_IPV6);
 	assert(!memcmp(conn->dst_addr.ip6, "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01", 16));
 	assert(!memcmp(&conn->dst_addr.port, "\x00\x50", 2));
 
 	/* Reply with connect success. */
-	out_len = sizeof(out);
-	r = gwp_socks5_conn_cmd_connect_res(conn, &bind_addr,
-					    GWP_SOCKS5_REP_SUCCESS, out,
-					    &out_len);
-	assert(!r);
-	assert(out_len == 22);
-	/* VER */
-	assert(out[0] == 0x05);
-	/* REP: succeeded */
-	assert(out[1] == 0x00);
-	/* RSV */
-	assert(out[2] == 0x00);
-	/* ATYP: IPv6 address */
-	assert(out[3] == GWP_SOCKS5_ATYP_IPV6);
-	/* BND.ADDR */
-	assert(!memcmp(&out[4], "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01", 16));
-	/* BND.PORT */
-	assert(!memcmp(&out[20], "\xaa\xaa", 2));
-	assert(conn->state == GWP_SOCKS5_ST_FORWARDING);
+	REPLY(conn, gwp_socks5_conn_cmd_connect_res, &bind_addr, REP_OK_IP6_LO,
+	      GWP_SOCKS5_ST_FORWARDING);
 
 	/*
 	 * All good!
@@ -211,45 +263,20 @@ static int test_connect_domain(void)
 	};
 	struct gwp_socks5_conn *conn;
 	struct gwp_socks5_ctx *ctx;
-	size_t in_len, out_len;
-	uint8_t out[4096];
-	int r;
 
 	test_socks5_init_ctx_no_auth(&ctx);
 	conn = test_socks5_alloc_conn(ctx);
-	test_socks5_do_handshake_no_auth(ctx, conn);
-	in_len = sizeof(in);
-	out_len = sizeof(out);
-	r = gwp_socks5_conn_handle_data(conn, in, &in_len, out, &out_len);
-	assert(!r);
-	assert(in_len == sizeof(in));
-	assert(out_len == 0);
-	assert(conn->state == GWP_SOCKS5_ST_CMD_CONNECT);
+	test_socks5_do_handshake_no_auth(conn);
+	FEED(conn, in, sizeof(in), 4096, 0, sizeof(in), "",
+	     GWP_SOCKS5_ST_CMD_CONNECT);
 	assert(conn->dst_addr.ver == GWP_SOCKS5_ATYP_DOMAIN);
 	assert(conn->dst_addr.domain.len == 11);
 	assert(!memcmp(conn->dst_addr.domain.str, "example.com", 11));
 	assert(!memcmp(&conn->dst_addr.port, "\x00\x50", 2));
 
 	/* Reply with connect success. */
-	out_len = sizeof(out);
-	r = gwp_socks5_conn_cmd_connect_res(conn, &bind_addr,
-					    GWP_SOCKS5_REP_SUCCESS, out,
-					    &out_len);
-	assert(!r);
-	assert(out_len == 10);
-	/* VER */
-	assert(out[0] == 0x05);
-	/* REP: succeeded */
-	assert(out[1] == 0x00);
-	/* RSV */
-	assert(out[2] == 0x00);
-	/* ATYP */
-	assert(out[3] == GWP_SOCKS5_ATYP_IPV4);
-	/* BND.ADDR */
-	assert(!memcmp(&out[4], "\x7f\x00\x00\x01", 4));
-	/* BND.PORT */
-	assert(!memcmp(&out[8], "\xaa\xaa", 2));
-	assert(conn->state == GWP_SOCKS5_ST_FORWARDING);
+	REPLY(conn, gwp_socks5_conn_cmd_connect_res, &bind_addr, REP_OK_IP4_LO,
+	      GWP_SOCKS5_ST_FORWARDING);
 
 	/*
 	 * All good!
@@ -278,88 +305,29 @@ static void test_short_recv(void)
 	};
 	struct gwp_socks5_conn *conn;
 	struct gwp_socks5_ctx *ctx;
-	size_t in_len, out_len;
 	const uint8_t *inb;
-	uint8_t out[4096];
 	size_t i;
-	int r;
 
-	ctx = NULL;
-	r = gwp_socks5_ctx_init(&ctx, NULL);
-	assert(!r);
-	assert(ctx);
-	assert(ctx->auth == NULL);
-
-	conn = gwp_socks5_conn_alloc(ctx);
-	assert(conn);
-	assert(conn->state == GWP_SOCKS5_ST_INIT);
-	assert(conn->ctx == ctx);
+	test_socks5_init_ctx_no_auth(&ctx);
+	conn = test_socks5_alloc_conn(ctx);
 
 	inb = in;
-	for (i = 0; i < 3; i++) {
-		in_len = i;
-		out_len = sizeof(out);
-		r = gwp_socks5_conn_handle_data(conn, inb, &in_len, out,
-						&out_len);
-		assert(r == -EAGAIN);
-		assert(in_len == 0);
-		assert(out_len == 0);
-		assert(conn->state == GWP_SOCKS5_ST_INIT);
-	}
-	in_len = 3;
-	out_len = sizeof(out);
-	r = gwp_socks5_conn_handle_data(conn, inb, &in_len, out, &out_len);
-	assert(!r);
-	assert(in_len == 3);
-	assert(out_len == 2);
-	/* VER */
-	assert(out[0] == 0x05);
-	/* METHOD: NO AUTHENTICATION REQUIRED */
-	assert(out[1] == 0x00);
-	assert(conn->state == GWP_SOCKS5_ST_CMD);
-	inb += in_len;
+	for (i = 0; i < 3; i++)
+		FEED(conn, inb, i, 4096, -EAGAIN, 0, "", GWP_SOCKS5_ST_INIT);
+	FEED(conn, inb, 3, 4096, 0, 3,
+	     "\x05\x00" /* VER, METHOD: NO AUTHENTICATION REQUIRED */,
+	     GWP_SOCKS5_ST_CMD);
+	inb += 3;
 
-	for (i = 0; i < (sizeof(in) - 3); i++) {
-		in_len = i;
-		out_len = sizeof(out);
-		r = gwp_socks5_conn_handle_data(conn, inb, &in_len, out,
-						&out_len);
-		assert(r == -EAGAIN);
-		assert(in_len == 0);
-		assert(out_len == 0);
-		assert(conn->state == GWP_SOCKS5_ST_CMD);
-	}
-	out_len = sizeof(out);
-	in_len = sizeof(in) - 3;
-	r = gwp_socks5_conn_handle_data(conn, inb, &in_len, out, &out_len);
-	assert(!r);
-	assert(in_len == (sizeof(in) - 3));
-	assert(out_len == 0);
-	assert(conn->state == GWP_SOCKS5_ST_CMD_CONNECT);
-	assert(conn->dst_addr.ver == GWP_SOCKS5_ATYP_IPV4);
-	assert(!memcmp(conn->dst_addr.ip4, "\x7f\x00\x00\x01", 4));
-	assert(!memcmp(&conn->dst_addr.port, "\x00\x50", 2));
+	for (i = 0; i < (sizeof(in) - 3); i++)
+		FEED(conn, inb, i, 4096, -EAGAIN, 0, "", GWP_SOCKS5_ST_CMD);
+	FEED(conn, inb, sizeof(in) - 3, 4096, 0, sizeof(in) - 3, "",
+	     GWP_SOCKS5_ST_CMD_CONNECT);
+	test_socks5_assert_dst_ipv4_lo80(conn);
 
 	/* Reply with connect success. */
-	out_len = sizeof(out);
-	r = gwp_socks5_conn_cmd_connect_res(conn, &bind_addr,
-					    GWP_SOCKS5_REP_SUCCESS, out,
-					    &out_len);
-	assert(!r);
-	assert(out_len == 10);
-	/* VER */
-	assert(out[0] == 0x05);
-	/* REP: succeeded */
-	assert(out[1] == 0x00);
-	/* RSV */
-	assert(out[2] == 0x00);
-	/* ATYP: IPv4 address */
-	assert(out[3] == GWP_SOCKS5_ATYP_IPV4);
-	/* BND.ADDR */
-	assert(!memcmp(&out[4], "\x7f\x00\x00\x01", 4));
-	/* BND.PORT */
-	assert(!memcmp(&out[8], "\xaa\xaa", 2));
-	assert(conn->state == GWP_SOCKS5_ST_FORWARDING);
+	REPLY(conn, gwp_socks5_conn_cmd_connect_res, &bind_addr, REP_OK_IP4_LO,
+	      GWP_SOCKS5_ST_FORWARDING);
 	gwp_socks5_conn_free(conn);
 	gwp_socks5_ctx_free(ctx);
 }
@@ -383,84 +351,33 @@ static void test_auth_userpass(void)
 	char *cred_file;
 	struct gwp_socks5_conn *conn;
 	struct gwp_socks5_ctx *ctx;
-	struct gwp_socks5_cfg cfg;
 	struct gwp_auth *auth;
-	size_t in_len, out_len;
 	const uint8_t *inb;
-	uint8_t out[4096];
-	ssize_t r;
 
 	auth = gwp_test_auth_from_buf("gwp_socks5_auth", cred_data,
 				      sizeof(cred_data) - 1, &cred_file);
-	cfg.auth = auth;
-	cfg.udp_associate = true;
-	r = gwp_socks5_ctx_init(&ctx, &cfg);
-	assert(!r);
-	assert(ctx);
-	assert(ctx->auth == auth);
-
-	conn = gwp_socks5_conn_alloc(ctx);
-	assert(conn);
-	assert(conn->state == GWP_SOCKS5_ST_INIT);
-	assert(conn->ctx == ctx);
+	test_socks5_init_ctx_auth(&ctx, auth);
+	conn = test_socks5_alloc_conn(ctx);
 
 	inb = in;
-	in_len = 4; /* VER, NMETHODS, {USER/PASS} */
-	out_len = sizeof(out);
-	r = gwp_socks5_conn_handle_data(conn, inb, &in_len, out, &out_len);
-	assert(!r);
-	assert(in_len == 4);
-	assert(out_len == 2);
+	/* VER, NMETHODS, {USER/PASS} */
+	FEED(conn, inb, 4, 4096, 0, 4, "\x05\x02" /* VER, METHOD: USER/PASS */,
+	     GWP_SOCKS5_ST_AUTH_USERPASS);
+	inb += 4;
 
-	/* VER, METHOD: USER/PASS */
-	assert(out[0] == 0x05);
-	assert(out[1] == 0x02);
-	assert(conn->state == GWP_SOCKS5_ST_AUTH_USERPASS);
+	/* VER, ULEN, UNAME, PLEN, PASSWD */
+	FEED(conn, inb, 11, 4096, 0, 11, "\x01\x00" /* VER, REP: succeeded */,
+	     GWP_SOCKS5_ST_CMD);
+	inb += 11;
 
-	inb += in_len;
-	in_len = 11; /* VER, ULEN, UNAME, PLEN, PASSWD */
-	out_len = sizeof(out);
-	r = gwp_socks5_conn_handle_data(conn, inb, &in_len, out, &out_len);
-	assert(!r);
-	assert(in_len == 11);
-	assert(out_len == 2);
-
-	/* VER, REP: succeeded */
-	assert(out[0] == 0x01);
-	assert(out[1] == 0x00);
-	assert(conn->state == GWP_SOCKS5_ST_CMD);
-	inb += in_len;
-	in_len = sizeof(in) - 15; /* Remaining data */
-	out_len = sizeof(out);
-	r = gwp_socks5_conn_handle_data(conn, inb, &in_len, out, &out_len);
-	assert(!r);
-	assert(in_len == (sizeof(in) - 15));
-	assert(out_len == 0);
-	assert(conn->state == GWP_SOCKS5_ST_CMD_CONNECT);
-	assert(conn->dst_addr.ver == GWP_SOCKS5_ATYP_IPV4);
-	assert(!memcmp(conn->dst_addr.ip4, "\x7f\x00\x00\x01", 4));
-	assert(!memcmp(&conn->dst_addr.port, "\x00\x50", 2));
+	/* Remaining data */
+	FEED(conn, inb, sizeof(in) - 15, 4096, 0, sizeof(in) - 15, "",
+	     GWP_SOCKS5_ST_CMD_CONNECT);
+	test_socks5_assert_dst_ipv4_lo80(conn);
 
 	/* Reply with connect success. */
-	out_len = sizeof(out);
-	r = gwp_socks5_conn_cmd_connect_res(conn, NULL,
-					    GWP_SOCKS5_REP_SUCCESS, out,
-					    &out_len);
-	assert(!r);
-	assert(out_len == 10);
-	/* VER */
-	assert(out[0] == 0x05);
-	/* REP: succeeded */
-	assert(out[1] == 0x00);
-	/* RSV */
-	assert(out[2] == 0x00);
-	/* ATYP: IPv4 address */
-	assert(out[3] == GWP_SOCKS5_ATYP_IPV4);
-	/* BND.ADDR */
-	assert(!memcmp(&out[4], "\x00\x00\x00", 4));
-	/* BND.PORT */
-	assert(!memcmp(&out[8], "\x00\x00", 2));
-	assert(conn->state == GWP_SOCKS5_ST_FORWARDING);
+	REPLY(conn, gwp_socks5_conn_cmd_connect_res, NULL, REP_OK_IP4_ZERO,
+	      GWP_SOCKS5_ST_FORWARDING);
 	gwp_socks5_conn_free(conn);
 	gwp_socks5_ctx_free(ctx);
 	gwp_test_auth_put(auth, cred_file);
@@ -606,45 +523,20 @@ static void test_auth_userpass_empty_password(void)
 	char *cred_file;
 	struct gwp_socks5_conn *conn;
 	struct gwp_socks5_ctx *ctx;
-	struct gwp_socks5_cfg cfg;
 	struct gwp_auth *auth;
-	size_t in_len, out_len;
-	const uint8_t *inb;
-	uint8_t out[64];
-	ssize_t r;
 
 	auth = gwp_test_auth_from_buf("gwp_socks5_auth", cred_data,
 				      sizeof(cred_data) - 1, &cred_file);
-	cfg.auth = auth;
-	cfg.udp_associate = true;
-	r = gwp_socks5_ctx_init(&ctx, &cfg);
-	assert(!r);
-	assert(ctx);
+	test_socks5_init_ctx_auth(&ctx, auth);
+	conn = test_socks5_alloc_conn(ctx);
 
-	conn = gwp_socks5_conn_alloc(ctx);
-	assert(conn);
+	/* greeting */
+	FEED(conn, in, 3, 64, 0, 3, "\x05\x02" /* VER, METHOD: USER/PASS */,
+	     GWP_SOCKS5_ST_AUTH_USERPASS);
 
-	inb = in;
-	in_len = 3; /* greeting */
-	out_len = sizeof(out);
-	r = gwp_socks5_conn_handle_data(conn, inb, &in_len, out, &out_len);
-	assert(!r);
-	assert(in_len == 3);
-	assert(out_len == 2);
-	assert(out[0] == 0x05);
-	assert(out[1] == 0x02); /* METHOD: USER/PASS */
-	assert(conn->state == GWP_SOCKS5_ST_AUTH_USERPASS);
-
-	inb += in_len;
-	in_len = 7; /* VER, ULEN, UNAME(4), PLEN */
-	out_len = sizeof(out);
-	r = gwp_socks5_conn_handle_data(conn, inb, &in_len, out, &out_len);
-	assert(!r);
-	assert(in_len == 7);
-	assert(out_len == 2);
-	assert(out[0] == 0x01);
-	assert(out[1] == 0x01); /* STATUS: failure */
-	assert(conn->state == GWP_SOCKS5_ST_ERR);
+	/* VER, ULEN, UNAME(4), PLEN */
+	FEED(conn, in + 3, 7, 64, 0, 7, "\x01\x01" /* VER, STATUS: failure */,
+	     GWP_SOCKS5_ST_ERR);
 	/* The rejected name is kept for the log, not as the user. */
 	assert(!gwp_socks5_conn_username(conn));
 	{
@@ -668,23 +560,12 @@ static void test_offered_methods_no_match(void)
 	};
 	struct gwp_socks5_conn *conn;
 	struct gwp_socks5_ctx *ctx;
-	size_t in_len, out_len;
-	uint8_t out[10];
-	int r;
 
 	test_socks5_init_ctx_no_auth(&ctx);
 	conn = test_socks5_alloc_conn(ctx);
-	in_len = sizeof(in);
-	out_len = sizeof(out);
-	r = gwp_socks5_conn_handle_data(conn, in, &in_len, out, &out_len);
-	assert(!r);
-	assert(in_len == sizeof(in));
-	assert(out_len == 2);
-	/* VER */
-	assert(out[0] == 0x05);
-	/* REP: no acceptable methods */
-	assert(out[1] == 0xff);
-	assert(conn->state == GWP_SOCKS5_ST_ERR);
+	FEED(conn, in, sizeof(in), 10, 0, sizeof(in),
+	     "\x05\xff" /* VER, REP: no acceptable methods */,
+	     GWP_SOCKS5_ST_ERR);
 	gwp_socks5_conn_free(conn);
 	gwp_socks5_ctx_free(ctx);
 }
@@ -706,25 +587,16 @@ static void test_err_state_pipelined_byte(void)
 	};
 	struct gwp_socks5_conn *conn;
 	struct gwp_socks5_ctx *ctx;
-	size_t in_len, out_len;
-	uint8_t out[64];
-	int r;
 
 	test_socks5_init_ctx_no_auth(&ctx);
 	conn = test_socks5_alloc_conn(ctx);
-	in_len = sizeof(in);
-	out_len = sizeof(out);
-	r = gwp_socks5_conn_handle_data(conn, in, &in_len, out, &out_len);
-	assert(r == -EINVAL);
-	/* Only the 3 greeting bytes were consumed. */
-	assert(in_len == 3);
-	/* Only the 2-byte method reply was produced -- NOT sizeof(out). */
-	assert(out_len == 2);
-	/* VER */
-	assert(out[0] == 0x05);
-	/* METHOD: no acceptable methods */
-	assert(out[1] == 0xff);
-	assert(conn->state == GWP_SOCKS5_ST_ERR);
+	/*
+	 * Only the 3 greeting bytes are consumed, and only the 2-byte method
+	 * reply is produced -- NOT the 64 bytes of room.
+	 */
+	FEED(conn, in, sizeof(in), 64, -EINVAL, 3,
+	     "\x05\xff" /* VER, METHOD: no acceptable methods */,
+	     GWP_SOCKS5_ST_ERR);
 	gwp_socks5_conn_free(conn);
 	gwp_socks5_ctx_free(ctx);
 }
@@ -737,19 +609,10 @@ static void test_invalid_version(void)
 	};
 	struct gwp_socks5_conn *conn;
 	struct gwp_socks5_ctx *ctx;
-	size_t in_len, out_len;
-	uint8_t out[10];
-	int r;
 
 	test_socks5_init_ctx_no_auth(&ctx);
 	conn = test_socks5_alloc_conn(ctx);
-	in_len = sizeof(in);
-	out_len = sizeof(out);
-	r = gwp_socks5_conn_handle_data(conn, in, &in_len, out, &out_len);
-	assert(r == -EINVAL);
-	assert(in_len == 0);
-	assert(out_len == 0);
-	assert(conn->state == GWP_SOCKS5_ST_ERR);
+	FEED(conn, in, sizeof(in), 10, -EINVAL, 0, "", GWP_SOCKS5_ST_ERR);
 	gwp_socks5_conn_free(conn);
 	gwp_socks5_ctx_free(ctx);
 }
@@ -761,32 +624,13 @@ static void test_invalid_connect_addr_type(void)
 	};
 	struct gwp_socks5_conn *conn;
 	struct gwp_socks5_ctx *ctx;
-	size_t in_len, out_len;
-	uint8_t out[10];
-	int r;
 
 	test_socks5_init_ctx_no_auth(&ctx);
 	conn = test_socks5_alloc_conn(ctx);
-	test_socks5_do_handshake_no_auth(ctx, conn);
-	in_len = sizeof(in);
-	out_len = sizeof(out);
-	r = gwp_socks5_conn_handle_data(conn, in, &in_len, out, &out_len);
-	assert(r == -EINVAL);
-	assert(in_len == 0);
-	assert(out_len == 10);
-	/* VER */
-	assert(out[0] == 0x05);
-	/* REP: address type not supported */
-	assert(out[1] == GWP_SOCKS5_REP_ATYP_NOT_SUPPORTED);
-	/* RSV */
-	assert(out[2] == 0x00);
-	/* ATYP: IPv4 address */
-	assert(out[3] == GWP_SOCKS5_ATYP_IPV4);
-	/* BND.ADDR */
-	assert(!memcmp(&out[4], "\x00\x00\x00\x00", 4));
-	/* BND.PORT */
-	assert(!memcmp(&out[8], "\x00\x00", 2));
-	assert(conn->state == GWP_SOCKS5_ST_ERR);
+	test_socks5_do_handshake_no_auth(conn);
+	FEED(conn, in, sizeof(in), 10, -EINVAL, 0,
+	     "\x05\x08\x00" /* VER, REP: address type not supported, RSV */
+	     BND_IP4_ZERO, GWP_SOCKS5_ST_ERR);
 	gwp_socks5_conn_free(conn);
 	gwp_socks5_ctx_free(ctx);
 }
@@ -800,32 +644,13 @@ static void test_invalid_command(void)
 	};
 	struct gwp_socks5_conn *conn;
 	struct gwp_socks5_ctx *ctx;
-	size_t in_len, out_len;
-	uint8_t out[10];
-	int r;
 
 	test_socks5_init_ctx_no_auth(&ctx);
 	conn = test_socks5_alloc_conn(ctx);
-	test_socks5_do_handshake_no_auth(ctx, conn);
-	in_len = sizeof(in);
-	out_len = sizeof(out);
-	r = gwp_socks5_conn_handle_data(conn, in, &in_len, out, &out_len);
-	assert(r == -EINVAL);
-	assert(in_len == 0);
-	assert(out_len == 10);
-	/* VER */
-	assert(out[0] == 0x05);
-	/* REP: command not supported */
-	assert(out[1] == GWP_SOCKS5_REP_COMMAND_NOT_SUPPORTED);
-	/* RSV */
-	assert(out[2] == 0x00);
-	/* ATYP: IPv4 address */
-	assert(out[3] == GWP_SOCKS5_ATYP_IPV4);
-	/* BND.ADDR */
-	assert(!memcmp(&out[4], "\x00\x00\x00\x00", 4));
-	/* BND.PORT */
-	assert(!memcmp(&out[8], "\x00\x00", 2));
-	assert(conn->state == GWP_SOCKS5_ST_ERR);
+	test_socks5_do_handshake_no_auth(conn);
+	FEED(conn, in, sizeof(in), 10, -EINVAL, 0,
+	     "\x05\x07\x00" /* VER, REP: command not supported, RSV */
+	     BND_IP4_ZERO, GWP_SOCKS5_ST_ERR);
 	gwp_socks5_conn_free(conn);
 	gwp_socks5_ctx_free(ctx);
 }
@@ -841,46 +666,16 @@ static void test_multi_state_at_once(void)
 	};
 	struct gwp_socks5_conn *conn;
 	struct gwp_socks5_ctx *ctx;
-	size_t in_len, out_len;
-	uint8_t out[4096];
-	int r;
 
 	test_socks5_init_ctx_no_auth(&ctx);
 	conn = test_socks5_alloc_conn(ctx);
-	in_len = sizeof(in);
-	out_len = sizeof(out);
-	r = gwp_socks5_conn_handle_data(conn, in, &in_len, out, &out_len);
-	assert(!r);
-	assert(in_len == sizeof(in));
-	assert(out_len == 2);
-	/* VER */
-	assert(out[0] == 0x05);
-	/* METHOD: NO AUTHENTICATION REQUIRED */
-	assert(out[1] == 0x00);
-	assert(conn->state == GWP_SOCKS5_ST_CMD_CONNECT);
-	assert(conn->dst_addr.ver == GWP_SOCKS5_ATYP_IPV4);
-	assert(!memcmp(conn->dst_addr.ip4, "\x7f\x00\x00\x01", 4));
-	assert(!memcmp(&conn->dst_addr.port, "\x00\x50", 2));
+	FEED(conn, in, sizeof(in), 4096, 0, sizeof(in),
+	     "\x05\x00" /* VER, METHOD: NO AUTHENTICATION REQUIRED */,
+	     GWP_SOCKS5_ST_CMD_CONNECT);
+	test_socks5_assert_dst_ipv4_lo80(conn);
 
-	out_len = sizeof(out);
-	r = gwp_socks5_conn_cmd_connect_res(conn, NULL,
-					    GWP_SOCKS5_REP_SUCCESS, out,
-					    &out_len);
-	assert(!r);
-	assert(out_len == 10);
-	/* VER */
-	assert(out[0] == 0x05);
-	/* REP: succeeded */
-	assert(out[1] == 0x00);
-	/* RSV */
-	assert(out[2] == 0x00);
-	/* ATYP: IPv4 address */
-	assert(out[3] == GWP_SOCKS5_ATYP_IPV4);
-	/* BND.ADDR */
-	assert(!memcmp(&out[4], "\x00\x00\x00\x00", 4));
-	/* BND.PORT */
-	assert(!memcmp(&out[8], "\x00\x00", 2));
-	assert(conn->state == GWP_SOCKS5_ST_FORWARDING);
+	REPLY(conn, gwp_socks5_conn_cmd_connect_res, NULL, REP_OK_IP4_ZERO,
+	      GWP_SOCKS5_ST_FORWARDING);
 	gwp_socks5_conn_free(conn);
 	gwp_socks5_ctx_free(ctx);
 }
@@ -896,8 +691,7 @@ static void test_enobufs(void)
 	};
 	struct gwp_socks5_conn *conn;
 	struct gwp_socks5_ctx *ctx;
-	size_t in_len, out_len;
-	const uint8_t *inb = in;
+	size_t out_len;
 	uint8_t out[4096];
 	size_t i;
 	int r;
@@ -908,37 +702,16 @@ static void test_enobufs(void)
 	/*
 	 * Prepare authentication data.
 	 */
-	in_len = 3;
-	out_len = 1;
-	r = gwp_socks5_conn_handle_data(conn, inb, &in_len, out, &out_len);
-	assert(r == -ENOBUFS);
-	assert(in_len == 0);
-	assert(out_len == 0);
-
-	in_len = 3;
-	out_len = 2;
-	r = gwp_socks5_conn_handle_data(conn, inb, &in_len, out, &out_len);
-	assert(!r);
-	assert(in_len == 3);
-	assert(out_len == 2);
-	assert(out[0] == 0x05); /* VER */
-	assert(out[1] == 0x00); /* METHOD: NO AUTHENTICATION REQUIRED */
-	assert(conn->state == GWP_SOCKS5_ST_CMD);
-	inb += in_len;
+	FEED(conn, in, 3, 1, -ENOBUFS, 0, "", GWP_SOCKS5_ST_INIT);
+	FEED(conn, in, 3, 2, 0, 3,
+	     "\x05\x00" /* VER, METHOD: NO AUTHENTICATION REQUIRED */,
+	     GWP_SOCKS5_ST_CMD);
 
 	/*
 	 * Prepare connect data.
 	 */
-	in_len = 10;
-	out_len = 0;
-	r = gwp_socks5_conn_handle_data(conn, inb, &in_len, out, &out_len);
-	assert(!r);
-	assert(in_len == 10);
-	assert(out_len == 0);
-	assert(conn->state == GWP_SOCKS5_ST_CMD_CONNECT);
-	assert(conn->dst_addr.ver == GWP_SOCKS5_ATYP_IPV4);
-	assert(!memcmp(conn->dst_addr.ip4, "\x7f\x00\x00\x01", 4));
-	assert(!memcmp(&conn->dst_addr.port, "\x00\x50", 2));
+	FEED(conn, in + 3, 10, 0, 0, 10, "", GWP_SOCKS5_ST_CMD_CONNECT);
+	test_socks5_assert_dst_ipv4_lo80(conn);
 
 	for (i = 0; i < 10; i++) {
 		out_len = i;
@@ -973,52 +746,29 @@ static void test_enobufs_combined_with_multi_state_at_once(void)
 	char *cred_file;
 	struct gwp_socks5_conn *conn;
 	struct gwp_socks5_ctx *ctx;
-	struct gwp_socks5_cfg cfg;
 	struct gwp_auth *auth;
-	size_t in_len, out_len;
+	size_t blen, out_len;
 	uint8_t out[4096];
 	ssize_t r;
 	size_t i;
 
 	auth = gwp_test_auth_from_buf("gwp_socks5_auth", cred_data,
 				      sizeof(cred_data) - 1, &cred_file);
-	cfg.auth = auth;
-	cfg.udp_associate = true;
-	r = gwp_socks5_ctx_init(&ctx, &cfg);
-	assert(!r);
-	assert(ctx);
-	assert(ctx->auth == auth);
+	test_socks5_init_ctx_auth(&ctx, auth);
+	conn = test_socks5_alloc_conn(ctx);
 
-	conn = gwp_socks5_conn_alloc(ctx);
-	assert(conn);
-	assert(conn->state == GWP_SOCKS5_ST_INIT);
-	assert(conn->ctx == ctx);
+	/* Nothing is consumed, so nothing is reported written. */
+	for (i = 0; i < 4; i++)
+		FEED(conn, in, sizeof(in), i, -ENOBUFS, 0, "",
+		     GWP_SOCKS5_ST_INIT);
 
-	for (i = 0; i < 4; i++) {
-		in_len = sizeof(in);
-		out_len = i;
-		r = gwp_socks5_conn_handle_data(conn, in, &in_len, out, &out_len);
-		assert(r == -ENOBUFS);
-		assert(in_len == 0);
-		/* Nothing is consumed, so nothing is reported written. */
-		assert(out_len == 0);
-		assert(conn->state == GWP_SOCKS5_ST_INIT);
-	}
-
-	in_len = sizeof(in);
-	out_len = 4;
-	r = gwp_socks5_conn_handle_data(conn, in, &in_len, out, &out_len);
-	assert(!r);
-	assert(in_len == sizeof(in));
-	assert(out_len == 4);
-	assert(out[0] == 0x05); /* VER */
-	assert(out[1] == 0x02); /* METHOD: USER/PASS */
-	assert(conn->state == GWP_SOCKS5_ST_CMD_CONNECT);
+	FEED(conn, in, sizeof(in), 4, 0, sizeof(in),
+	     "\x05\x02" /* VER, METHOD: USER/PASS */
+	     "\x01\x00" /* VER, STATUS: succeeded */,
+	     GWP_SOCKS5_ST_CMD_CONNECT);
 	assert(!strcmp(gwp_socks5_conn_username(conn), "user"));
-	assert(!gwp_socks5_conn_rejected_user(conn, &in_len));
-	assert(conn->dst_addr.ver == GWP_SOCKS5_ATYP_IPV4);
-	assert(!memcmp(conn->dst_addr.ip4, "\x7f\x00\x00\x01", 4));
-	assert(!memcmp(&conn->dst_addr.port, "\x00\x50", 2));
+	assert(!gwp_socks5_conn_rejected_user(conn, &blen));
+	test_socks5_assert_dst_ipv4_lo80(conn);
 
 	/* Reply with connect success. */
 	for (i = 0; i < 10; i++) {
@@ -1031,25 +781,8 @@ static void test_enobufs_combined_with_multi_state_at_once(void)
 		assert(conn->state == GWP_SOCKS5_ST_CMD_CONNECT);
 	}
 
-	out_len = sizeof(out);
-	r = gwp_socks5_conn_cmd_connect_res(conn, NULL,
-					    GWP_SOCKS5_REP_SUCCESS, out,
-					    &out_len);
-	assert(!r);
-	assert(out_len == 10);
-	/* VER */
-	assert(out[0] == 0x05);
-	/* REP: succeeded */
-	assert(out[1] == 0x00);
-	/* RSV */
-	assert(out[2] == 0x00);
-	/* ATYP: IPv4 address */
-	assert(out[3] == GWP_SOCKS5_ATYP_IPV4);
-	/* BND.ADDR */
-	assert(!memcmp(&out[4], "\x00\x00\x00\x00", 4));
-	/* BND.PORT */
-	assert(!memcmp(&out[8], "\x00\x00", 2));
-	assert(conn->state == GWP_SOCKS5_ST_FORWARDING);
+	REPLY(conn, gwp_socks5_conn_cmd_connect_res, NULL, REP_OK_IP4_ZERO,
+	      GWP_SOCKS5_ST_FORWARDING);
 	gwp_socks5_conn_free(conn);
 	gwp_socks5_ctx_free(ctx);
 	gwp_test_auth_put(auth, cred_file);
@@ -1070,36 +803,17 @@ static void test_udp_associate(void)
 	};
 	struct gwp_socks5_conn *conn;
 	struct gwp_socks5_ctx *ctx;
-	size_t in_len, out_len;
-	uint8_t out[64];
-	int r;
 
 	test_socks5_init_ctx_no_auth(&ctx);
 	conn = test_socks5_alloc_conn(ctx);
-	test_socks5_do_handshake_no_auth(ctx, conn);
+	test_socks5_do_handshake_no_auth(conn);
 
-	in_len = sizeof(in);
-	out_len = sizeof(out);
-	r = gwp_socks5_conn_handle_data(conn, in, &in_len, out, &out_len);
-	assert(!r);
-	assert(in_len == sizeof(in));
-	assert(out_len == 0);
-	assert(conn->state == GWP_SOCKS5_ST_CMD_UDP_ASSOCIATE);
+	FEED(conn, in, sizeof(in), 64, 0, sizeof(in), "",
+	     GWP_SOCKS5_ST_CMD_UDP_ASSOCIATE);
 
 	/* Reply with the relay endpoint. */
-	out_len = sizeof(out);
-	r = gwp_socks5_conn_cmd_udp_associate_res(conn, &bind_addr,
-						  GWP_SOCKS5_REP_SUCCESS, out,
-						  &out_len);
-	assert(!r);
-	assert(out_len == 10);
-	assert(out[0] == 0x05);			/* VER */
-	assert(out[1] == 0x00);			/* REP: success */
-	assert(out[2] == 0x00);			/* RSV */
-	assert(out[3] == GWP_SOCKS5_ATYP_IPV4);	/* ATYP */
-	assert(!memcmp(&out[4], "\x7f\x00\x00\x01", 4));	/* BND.ADDR */
-	assert(!memcmp(&out[8], "\xaa\xaa", 2));		/* BND.PORT */
-	assert(conn->state == GWP_SOCKS5_ST_UDP_ASSOCIATED);
+	REPLY(conn, gwp_socks5_conn_cmd_udp_associate_res, &bind_addr,
+	      REP_OK_IP4_LO, GWP_SOCKS5_ST_UDP_ASSOCIATED);
 
 	gwp_socks5_conn_free(conn);
 	gwp_socks5_ctx_free(ctx);

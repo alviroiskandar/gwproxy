@@ -193,6 +193,90 @@ static void test_url_host(void)
 	BAD_HOST("abcdefghijklmnop:1");
 }
 
+static void check_scheme(const char *url, const char *prefix, int type,
+			 bool remote_dns, bool use_tls, uint16_t def_port)
+{
+	const struct gwp_upstream_scheme *sc;
+	const char *rest = NULL;
+
+	sc = gwp_upstream_scheme(url, &rest);
+	if (!prefix) {
+		assert(!sc);
+		nr_checks++;
+		return;
+	}
+	assert(sc && !strcmp(sc->prefix, prefix));
+	assert(sc->len == strlen(prefix) && rest == url + sc->len);
+	assert(sc->type == type && sc->remote_dns == remote_dns);
+	assert(sc->use_tls == use_tls && sc->def_port == def_port);
+	nr_checks++;
+}
+
+/* The four schemes, each with its properties, and nothing else. */
+static void test_scheme(void)
+{
+	check_scheme("socks5://h", "socks5://", GWP_UPSTREAM_SOCKS5, false,
+		     false, 1080);
+	check_scheme("socks5h://h", "socks5h://", GWP_UPSTREAM_SOCKS5, true,
+		     false, 1080);
+	check_scheme("http://h:1", "http://", GWP_UPSTREAM_HTTP, true, false,
+		     8080);
+	check_scheme("https://", "https://", GWP_UPSTREAM_HTTP, true, true,
+		     8080);
+	check_scheme("", NULL, 0, false, false, 0);
+	check_scheme("socks5", NULL, 0, false, false, 0);
+	check_scheme("socks5:/h", NULL, 0, false, false, 0);
+	check_scheme("socks4://h", NULL, 0, false, false, 0);
+	check_scheme("SOCKS5://h", NULL, 0, false, false, 0);
+	check_scheme("httpx://h", NULL, 0, false, false, 0);
+	check_scheme("ftp://h", NULL, 0, false, false, 0);
+}
+
+static void check_creds(const char *rest, bool want, size_t want_ul,
+			size_t want_pl, size_t want_at)
+{
+	size_t ul = 1234, pl = 1234;
+	const char *at = NULL;
+
+	assert(gwp_upstream_split_creds(rest, &at, &ul, &pl) == want);
+	if (want) {
+		assert(at == rest + want_at && *at == '@');
+		assert(ul == want_ul && pl == want_pl);
+	}
+	nr_checks++;
+}
+
+/*
+ * The credentials end at the last '@', the user name at the first ':' before
+ * it; the lengths are only measured, so the callers' limits apply to them.
+ */
+static void test_split_creds(void)
+{
+	char big[600];
+
+	check_creds("h:1", false, 0, 0, 0);
+	check_creds("", false, 0, 0, 0);
+	check_creds("u@h", true, 1, 0, 1);
+	check_creds("u:p@h", true, 1, 1, 3);
+	check_creds("u:@h", true, 1, 0, 2);
+	check_creds(":p@h", true, 0, 1, 2);
+	check_creds("@h", true, 0, 0, 0);
+	check_creds("u:p:q@h", true, 1, 3, 5);
+	check_creds("u:p@q@h:1", true, 1, 3, 5);
+	check_creds("u@p:q@h", true, 3, 1, 5);
+
+	/* Long ones are only measured: the callers refuse what is too long. */
+	memset(big, 'u', 256);
+	strcpy(big + 256, ":p@h");
+	check_creds(big, true, 256, 1, 258);
+	memset(big, 'p', 255);
+	big[0] = 'u';
+	big[1] = ':';
+	strcpy(big + 255, "@h");
+	check_creds(big, true, 1, 253, 255);
+	assert(GWP_UPSTREAM_CRED_MAX == 255 && GWP_UPSTREAM_REST_MAX == 512);
+}
+
 int main(void)
 {
 	test_connect();
@@ -203,6 +287,8 @@ int main(void)
 	test_http();
 	test_str();
 	test_url_host();
+	test_scheme();
+	test_split_creds();
 	printf("upstream: %u checks passed\n", nr_checks);
 	return 0;
 }

@@ -78,9 +78,14 @@ struct gwp_dns_cache {
  */
 #define GWP_DNS_RECLAIM_BUCKETS	64
 
-static uint64_t hash_key(const uint64_t key[2], const char *name, size_t len)
+/*
+ * The bucket of the folded name @lkey (@len bytes, without the NUL). Insert and
+ * lookup both go through here, so they always agree on where a name lives.
+ */
+static inline size_t dns_map_idx(const struct dns_hash_map *map,
+				 const char *lkey, size_t len)
 {
-	return gwp_siphash13(key, name, len);
+	return gwp_siphash13(map->key, lkey, len) % map->nr_buckets;
 }
 
 static int dns_map_init(struct dns_hash_map *map, size_t nr_buckets,
@@ -264,9 +269,8 @@ static bool dns_map_has_room(struct dns_hash_map *map, time_t now)
 static int dns_map_insert(struct dns_hash_map *map, const char *key,
 			  const struct addrinfo *ai, time_t expired_at)
 {
-	struct dns_cache_entry *de, *cur, *prev = NULL, *next;
+	struct dns_cache_entry *de, *cur, **pp;
 	time_t now = time(NULL);
-	uint64_t hash, idx;
 	char lkey[256];
 	int r;
 
@@ -278,129 +282,45 @@ static int dns_map_insert(struct dns_hash_map *map, const char *key,
 		return r;
 
 	/*
-	 * There are three cases:
-	 *   1) No collision, insert the entry directly (best case).
-	 *   2) Collision with the same key, replace the entry.
-	 *   3) Collision with a different key, chain the entry.
+	 * Walk the bucket through the link that points at each entry, so the
+	 * head of the chain needs no case of its own. On the way, unlink the
+	 * expired entries, and replace an entry with the same name in place.
 	 */
-	hash = hash_key(map->key, lkey, de->e.name_len - 1);
-	idx = hash % map->nr_buckets;
-	cur = map->table[idx];
-	if (!cur) {
-		/*
-		 * Case 1. Best case, no collision!
-		 */
-		if (!dns_map_has_room(map, now)) {
-			free(de);	/* fresh, not linked anywhere yet */
-			return -ENOSPC;
-		}
-		map->table[idx] = de;
-		de->next = NULL;
-		map->nr_entries++;
-		return 0;
-	}
-
-	/*
-	 * Handle the collision cases. This is a slow path.
-	 *
-	 * We are killing two birds with one stone here:
-	 *    1) Try finding an entry with the same key and replace it.
-	 *    2) Remove expired entries during the traversal.
-	 *
-	 * [ No animals were harmed in writing this code. ]
-	 *
-	 * TODO(ammarafizi2): Review the traversal logic again.
-	 */
-	prev = NULL;
-	cur = map->table[idx];
-
-	while (cur) {
-		/*
-		 *	1) Expired `cur` when `prev` is NULL:
-		 *		A -> B -> C -> D
-		 *		prev = NULL; cur = A; next = cur->next = B;
-		 *		cur is expired; free(cur);
-		 *		cur = next = B;
-		 *		prev is NULL; map->table[idx] = cur;
-		 *		next = cur->next = C;
-		 *		B -> C -> D
-		 *		prev = NULL; cur = B; next = cur->next = C;
-		 *
-		 *	2) Expired `cur` when `prev` is not NULL:
-		 *		A -> B -> C -> D
-		 *		prev = A; cur = B; next = cur->next = C;
-		 *		cur is expired; free(cur);
-		 *		cur = next = C;
-		 *		prev is A; prev->next = cur = C;
-		 *		next = cur->next = D;
-		 *		A -> C -> D
-		 *		prev = A; cur = C; next = cur->next = D;
-		 *
-		 *	Conclusions:
-		 *		- If @cur is expired and @prev is NULL, set
-		 *		@map->table[idx] to @cur->next. Then free @cur.
-		 *		- If @cur is expired and prev is not NULL, set
-		 *		@prev->next to @cur->next. Then free @cur.
-		 */
-		while (cur && cur->expired_at <= now) {
-			/*
-			 * Remove expired entries.
-			 */
+	pp = &map->table[dns_map_idx(map, lkey, de->e.name_len - 1)];
+	while ((cur = *pp)) {
+		if (cur->expired_at <= now) {
+			*pp = cur->next;
 			map->nr_entries--;
-			next = cur->next;
 			put_dns_entry(cur);
-			if (prev)
-				prev->next = next;
-			else
-				map->table[idx] = next;
-
-			cur = next;
+			continue;
 		}
-
-		if (!cur)
-			break;
 
 		if (cur->e.name_len == de->e.name_len &&
 		    !memcmp(cur->e.block, de->e.block, de->e.name_len)) {
-			/*
-			 * Case 2. Collision with the same key
-			 * Replace the entry.
-			 */
-			if (prev)
-				prev->next = de;
-			else
-				map->table[idx] = de;
-
 			de->next = cur->next;
+			*pp = de;
 			put_dns_entry(cur);
 			return 0;
 		}
 
-		prev = cur;
-		cur = cur->next;
+		pp = &cur->next;
 	}
 
 	/*
-	 * Case 3. The worst case.
-	 * Collision with a different key or an expired entry.
-	 *
-	 * The collision walk above already reclaimed any expired entries in this
-	 * bucket, so the count reflects live + not-yet-swept entries, and @prev
-	 * is live: a sweep leaves it alone. Bound the cache: once at capacity
-	 * with nothing to reclaim, refuse new keys (resolution still works, it is
-	 * just not cached) rather than growing without limit.
+	 * A new name. The walk above reclaimed the expired entries of this
+	 * bucket, so @pp is the bucket head or the link of a live entry, and
+	 * the sweep in dns_map_has_room(), which frees only what has expired
+	 * by the same @now, leaves it valid. Bound the cache: once at capacity
+	 * with nothing to reclaim, refuse new names (resolution still works,
+	 * it is just not cached) rather than growing without limit.
 	 */
 	if (!dns_map_has_room(map, now)) {
 		free(de);	/* fresh, not linked anywhere yet */
 		return -ENOSPC;
 	}
-	map->nr_entries++;
 	de->next = NULL;
-	if (prev)
-		prev->next = de;
-	else
-		map->table[idx] = de;
-
+	*pp = de;
+	map->nr_entries++;
 	return 0;
 }
 
@@ -421,7 +341,7 @@ static int dns_map_lookup(struct dns_hash_map *map, const char *key,
 {
 	struct dns_cache_entry *cur;
 	time_t now = time(NULL);
-	uint64_t hash, idx;
+	size_t idx;
 	char lkey[256];
 	size_t nl;
 
@@ -429,8 +349,7 @@ static int dns_map_lookup(struct dns_hash_map *map, const char *key,
 	if (nl <= 1 || nl > 255)
 		return -EINVAL;
 
-	hash = hash_key(map->key, lkey, nl - 1);
-	idx = hash % map->nr_buckets;
+	idx = dns_map_idx(map, lkey, nl - 1);
 	cur = map->table[idx];
 
 	while (cur) {

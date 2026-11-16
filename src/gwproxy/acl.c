@@ -24,6 +24,7 @@
 #include <dirent.h>
 #include <fnmatch.h>
 #include <gwproxy/rand.h>
+#include <gwproxy/upstream.h>
 
 #ifdef CONFIG_PCRE
 #include <pcre2.h>
@@ -81,8 +82,6 @@ struct gwp_acl_dnat {
 /* Limits of the upstream pools of one rule set. */
 #define ACL_POOL_NAME_MAX	64
 #define ACL_MAX_POOLS		1024
-/* What gwp_parse_upstream() takes after the scheme, NUL included. */
-#define ACL_URL_REST_MAX	512
 
 /*
  * An "upstream NAME { ... }" block. Built while its file is parsed, then
@@ -131,6 +130,14 @@ struct gwp_acl_up {
 	struct gwp_acl_pool	*pool;
 };
 
+/* A -m domain or -m user value: an exact .str, or a compiled .re (PCRE). */
+union acl_name {
+	char		*str;
+#ifdef CONFIG_PCRE
+	pcre2_code	*re;
+#endif
+};
+
 /*
  * The rules of a chain are kept in one array, in file order.
  *
@@ -148,19 +155,9 @@ struct gwp_acl_up {
  */
 struct gwp_acl_rule {
 	/* -m domain: exact .str, or compiled .re when @domain_is_re (PCRE). */
-	union {
-		char		*str;
-#ifdef CONFIG_PCRE
-		pcre2_code	*re;
-#endif
-	} domain;
+	union acl_name		domain;
 	/* -m user: exact .str, or compiled .re when @user_is_re (PCRE). */
-	union {
-		char		*str;
-#ifdef CONFIG_PCRE
-		pcre2_code	*re;
-#endif
-	} user;
+	union acl_name		user;
 	struct gwp_acl_ports	sports, dports;
 	struct gwp_acl_cidr	src, dst;
 	/*
@@ -719,6 +716,7 @@ static int parse_ports(const char *s, struct gwp_acl_ports *p)
 	char buf[256];
 	char *save = NULL, *tok;
 	size_t cap = 0;
+	int err = -EINVAL;
 
 	if (strlen(s) >= sizeof(buf))
 		return -EINVAL;
@@ -736,10 +734,10 @@ static int parse_ports(const char *s, struct gwp_acl_ports *p)
 			*dash = '\0';
 
 		if (parse_num(tok, false, 65535, &lo))
-			goto einval;
+			goto fail;
 		if (dash) {
 			if (parse_num(dash + 1, false, 65535, &hi) || hi < lo)
-				goto einval;
+				goto fail;
 		} else {
 			hi = lo;
 		}
@@ -749,8 +747,10 @@ static int parse_ports(const char *s, struct gwp_acl_ports *p)
 
 			cap = cap ? cap * 2 : 4;
 			nv = realloc(p->v, cap * sizeof(*nv));
-			if (!nv)
-				goto enomem;
+			if (!nv) {
+				err = -ENOMEM;
+				goto fail;
+			}
 			p->v = nv;
 		}
 		p->v[p->nr].lo = (uint16_t)lo;
@@ -759,19 +759,14 @@ static int parse_ports(const char *s, struct gwp_acl_ports *p)
 	}
 
 	if (!p->nr)
-		goto einval;
+		goto fail;
 	return 0;
 
-einval:
+fail:
 	free(p->v);
 	p->v = NULL;
 	p->nr = 0;
-	return -EINVAL;
-enomem:
-	free(p->v);
-	p->v = NULL;
-	p->nr = 0;
-	return -ENOMEM;
+	return err;
 }
 
 static bool ports_match(const struct gwp_acl_ports *p, uint16_t port)
@@ -857,22 +852,42 @@ static int parse_dnat(const char *s, struct gwp_acl_dnat *d)
  * ------------------------------------------------------------------------
  */
 
+/*
+ * Compile the regexp @v into @n. Returns 0, -EINVAL for a bad pattern, or
+ * -ENOSYS on a build without PCRE.
+ */
+static int acl_name_compile(union acl_name *n, const char *v, bool caseless)
+{
+#ifdef CONFIG_PCRE
+	n->re = regex_compile(v, caseless);
+	return n->re ? 0 : -EINVAL;
+#else
+	(void)n;
+	(void)v;
+	(void)caseless;
+	return -ENOSYS;
+#endif
+}
+
+/* Free the value of @n, a compiled regexp if @is_re. */
+static inline void acl_name_free(union acl_name *n, bool is_re)
+{
+#ifdef CONFIG_PCRE
+	if (is_re) {
+		pcre2_code_free(n->re);
+		return;
+	}
+#else
+	(void)is_re;
+#endif
+	free(n->str);
+}
+
 /* Free what @r points to; @r itself lives in its chain's array. */
 static void free_rule(struct gwp_acl_rule *r)
 {
-#ifdef CONFIG_PCRE
-	if (r->domain_is_re)
-		pcre2_code_free(r->domain.re);
-	else
-		free(r->domain.str);
-	if (r->user_is_re)
-		pcre2_code_free(r->user.re);
-	else
-		free(r->user.str);
-#else
-	free(r->domain.str);
-	free(r->user.str);
-#endif
+	acl_name_free(&r->domain, r->domain_is_re);
+	acl_name_free(&r->user, r->user_is_re);
 	free(r->sports.v);
 	free(r->dports.v);
 	/* The pool belongs to the ruleset; only a name not resolved yet is ours. */
@@ -1041,17 +1056,34 @@ static int tokenise(char *line, char **tok)
 }
 
 /*
- * Report a problem at the line being parsed: "acl: FILE: line N: ...", or
- * "acl: line N: ..." for text.
+ * Report a problem at line @line of @path: "acl: FILE: line N: ...", or
+ * "acl: line N: ..." for text (@path NULL).
  */
-static void load_vmsg(const struct acl_load *ld, const char *fmt, va_list ap)
+static void acl_vmsg(const char *path, unsigned line, const char *fmt,
+		     va_list ap)
 {
-	if (ld->path)
-		fprintf(stderr, "acl: %s: line %u: ", ld->path, ld->lineno);
+	if (path)
+		fprintf(stderr, "acl: %s: line %u: ", path, line);
 	else
-		fprintf(stderr, "acl: line %u: ", ld->lineno);
+		fprintf(stderr, "acl: line %u: ", line);
 	vfprintf(stderr, fmt, ap);
 	fputc('\n', stderr);
+}
+
+static void __attribute__((__format__(printf, 3, 4)))
+acl_msg(const char *path, unsigned line, const char *fmt, ...)
+{
+	va_list ap;
+
+	va_start(ap, fmt);
+	acl_vmsg(path, line, fmt, ap);
+	va_end(ap);
+}
+
+/* The same at the line being parsed. */
+static void load_vmsg(const struct acl_load *ld, const char *fmt, va_list ap)
+{
+	acl_vmsg(ld->path, ld->lineno, fmt, ap);
 }
 
 static void __attribute__((__format__(printf, 2, 3)))
@@ -1064,9 +1096,9 @@ load_warn(const struct acl_load *ld, const char *fmt, ...)
 	va_end(ap);
 }
 
-/* Report the error that fails this line; returns -EINVAL. */
-static int __attribute__((__format__(printf, 2, 3)))
-load_err(struct acl_load *ld, const char *fmt, ...)
+/* Report the error that fails this line; returns @err. */
+static int __attribute__((__format__(printf, 3, 4)))
+load_fail(struct acl_load *ld, int err, const char *fmt, ...)
 {
 	va_list ap;
 
@@ -1074,8 +1106,14 @@ load_err(struct acl_load *ld, const char *fmt, ...)
 	load_vmsg(ld, fmt, ap);
 	va_end(ap);
 	ld->reported = true;
-	return -EINVAL;
+	return err;
 }
+
+/*
+ * The same, returning -EINVAL. A macro, as a varargs function cannot pass
+ * its arguments on to load_fail(); this keeps the format checked.
+ */
+#define load_err(ld, ...) load_fail(ld, -EINVAL, __VA_ARGS__)
 
 /*
  * ------------------------------------------------------------------------
@@ -1182,28 +1220,22 @@ int gwp_acl_url_redact(const char *url, char *buf, size_t size)
 	return (n < 0 || (size_t)n >= size) ? -ENAMETOOLONG : 0;
 }
 
+static bool host_char(char c)
+{
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+	       (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_';
+}
+
 /* A pool name: 1 to 64 of letters, digits, '_', '-' and '.'. */
 static bool pool_name_ok(const char *s)
 {
 	size_t i;
 
 	for (i = 0; s[i]; i++) {
-		char c = s[i];
-
-		if (i == ACL_POOL_NAME_MAX)
-			return false;
-		if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-		      (c >= '0' && c <= '9') || c == '_' || c == '-' ||
-		      c == '.'))
+		if (i == ACL_POOL_NAME_MAX || !host_char(s[i]))
 			return false;
 	}
 	return i > 0;
-}
-
-static bool host_char(char c)
-{
-	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-	       (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_';
 }
 
 /*
@@ -1222,48 +1254,28 @@ static bool host_char(char c)
 static int check_server_url(const char *url, bool *remote_dns, bool *creds,
 			    const char **why)
 {
-	static const struct {
-		const char	*scheme;
-		bool		remote_dns;
-	} schemes[] = {
-		{ "socks5://",	false },
-		{ "socks5h://",	true },
-		{ "http://",	true },
-		{ "https://",	true },
-	};
-	const char *rest = NULL, *host, *at, *p;
-	size_t i;
+	const struct gwp_upstream_scheme *sc;
+	const char *rest, *host, *at, *p;
+	size_t ul, pl;
 
-	for (i = 0; i < sizeof(schemes) / sizeof(schemes[0]); i++) {
-		size_t len = strlen(schemes[i].scheme);
-
-		if (!strncmp(url, schemes[i].scheme, len)) {
-			rest = url + len;
-			*remote_dns = schemes[i].remote_dns;
-			break;
-		}
-	}
-	if (!rest) {
+	sc = gwp_upstream_scheme(url, &rest);
+	if (!sc) {
 		*why = "the scheme must be socks5://, socks5h://, http:// or https://";
 		return -EINVAL;
 	}
-	if (strlen(rest) >= ACL_URL_REST_MAX) {
+	*remote_dns = sc->remote_dns;
+	if (strlen(rest) >= GWP_UPSTREAM_REST_MAX) {
 		*why = "the URL is too long";
 		return -EINVAL;
 	}
 
-	at = strrchr(rest, '@');
-	*creds = at != NULL;
-	if (at) {
-		const char *colon = memchr(rest, ':', (size_t)(at - rest));
-		size_t ul = colon ? (size_t)(colon - rest) : (size_t)(at - rest);
-		size_t pl = colon ? (size_t)(at - colon - 1) : 0;
-
+	*creds = gwp_upstream_split_creds(rest, &at, &ul, &pl);
+	if (*creds) {
 		if (!ul) {
 			*why = "the user name is empty";
 			return -EINVAL;
 		}
-		if (ul > 255 || pl > 255) {
+		if (ul > GWP_UPSTREAM_CRED_MAX || pl > GWP_UPSTREAM_CRED_MAX) {
 			*why = "the user name or password is longer than 255 bytes";
 			return -EINVAL;
 		}
@@ -1460,9 +1472,9 @@ static int pool_add_server(struct acl_load *ld, const char *url,
 }
 
 /*
- * The arguments of a directive in a pool block, which ends in ';': the ';'
- * may stand alone as the last word or end it. Strips it and returns the
- * number of words left, or -1 when it is missing.
+ * The arguments of a directive that ends in ';' (in a pool block, or an
+ * include line): the ';' may stand alone as the last word or end it.
+ * Strips it and returns the number of words left, or -1 when it is missing.
  */
 static int directive_words(char **tok, int n)
 {
@@ -1757,13 +1769,9 @@ static int resolve_pools(struct acl_load *ld)
 			p = bsearch(r->act.up.name, rs->pools, rs->nr_pools,
 				    sizeof(*rs->pools), pool_key_cmp);
 		if (!p) {
-			if (ld->refs[i].path)
-				fprintf(stderr, "acl: %s: line %u: upstream pool %s is not defined\n",
-					ld->refs[i].path, ld->refs[i].line,
-					r->act.up.name);
-			else
-				fprintf(stderr, "acl: line %u: upstream pool %s is not defined\n",
-					ld->refs[i].line, r->act.up.name);
+			acl_msg(ld->refs[i].path, ld->refs[i].line,
+				"upstream pool %s is not defined",
+				r->act.up.name);
 			return -EINVAL;
 		}
 		free(r->act.up.name);
@@ -1844,7 +1852,7 @@ static int parse_rule(struct acl_load *ld, char **tok, int n)
 	char *up_name = NULL;		/* -j UPSTREAM --to NAME */
 	const char *v;
 	size_t l;
-	int i, ret = -EINVAL;
+	int i, e, ret = -EINVAL;
 
 	if (n < 2)
 		return -EINVAL;
@@ -1923,18 +1931,15 @@ static int parse_rule(struct acl_load *ld, char **tok, int n)
 			if (chain != GWP_ACL_OUTPUT || !m_domain || !v ||
 			    r->has_domain || r->has_dst)
 				goto out;
-#ifdef CONFIG_PCRE
-			r->domain.re = regex_compile(v, /*caseless=*/true);
-			if (!r->domain.re)
+			/* -ENOSYS without a --use-pcre build. */
+			e = acl_name_compile(&r->domain, v, /*caseless=*/true);
+			if (e) {
+				ret = e;
 				goto out;
+			}
 			r->domain_is_re = true;
 			r->has_domain = true;
 			r->neg_domain = neg;
-#else
-			/* --domain-regexp requires a --use-pcre build. */
-			ret = -ENOSYS;
-			goto out;
-#endif
 		} else if (!strcmp(o, "--user")) {
 			v = next_val(tok, n, &i);
 			if (chain != GWP_ACL_OUTPUT || !m_user || !v ||
@@ -1952,19 +1957,15 @@ static int parse_rule(struct acl_load *ld, char **tok, int n)
 			if (chain != GWP_ACL_OUTPUT || !m_user || !v ||
 			    r->has_user)
 				goto out;
-#ifdef CONFIG_PCRE
 			/* Usernames are case-sensitive, unlike hostnames. */
-			r->user.re = regex_compile(v, /*caseless=*/false);
-			if (!r->user.re)
+			e = acl_name_compile(&r->user, v, /*caseless=*/false);
+			if (e) {
+				ret = e;
 				goto out;
+			}
 			r->user_is_re = true;
 			r->has_user = true;
 			r->neg_user = neg;
-#else
-			/* --user-regexp requires a --use-pcre build. */
-			ret = -ENOSYS;
-			goto out;
-#endif
 		} else if (!strcmp(o, "--mode")) {
 			v = next_val(tok, n, &i);
 			/*
@@ -2594,9 +2595,7 @@ static int note_missing(struct acl_load *ld, const char *path,
 /* Fail the include line over @path, which the pattern walk met. */
 static int glob_fail(struct acl_load *ld, const char *path, int err)
 {
-	load_warn(ld, "%s: %s", path, strerror(-err));
-	ld->reported = true;
-	return err;
+	return load_fail(ld, err, "%s: %s", path, strerror(-err));
 }
 
 /*
@@ -2612,12 +2611,10 @@ static int glob_read_dir(struct acl_load *ld, const char *dir, const char *pat,
 	DIR *d;
 	int fd, r = 0;
 
-	if (++ld->nr_glob_dirs > ACL_MAX_GLOB_DIRS) {
-		load_warn(ld, "the include patterns read more than %d directories",
-			  ACL_MAX_GLOB_DIRS);
-		ld->reported = true;
-		return -E2BIG;
-	}
+	if (++ld->nr_glob_dirs > ACL_MAX_GLOB_DIRS)
+		return load_fail(ld, -E2BIG,
+				 "the include patterns read more than %d directories",
+				 ACL_MAX_GLOB_DIRS);
 
 	fd = open(open_path, O_RDONLY | O_DIRECTORY | O_NONBLOCK | O_CLOEXEC);
 	if (fd < 0) {
@@ -2683,10 +2680,9 @@ static int glob_read_dir(struct acl_load *ld, const char *dir, const char *pat,
 		if (r)
 			break;
 		if (last && out->nr > ACL_MAX_FILES) {
-			load_warn(ld, "the include pattern matches more than %d files",
-				  ACL_MAX_FILES);
-			ld->reported = true;
-			r = -E2BIG;
+			r = load_fail(ld, -E2BIG,
+				      "the include pattern matches more than %d files",
+				      ACL_MAX_FILES);
 			break;
 		}
 	}
@@ -2857,18 +2853,12 @@ static int parse_include(struct acl_load *ld, char **tok, int n,
 	struct inc_list res = { 0 };
 	char *inc, *pat, *path;
 	const char *why;
-	size_t len, i;
+	size_t i;
 	int r;
 
-	if (n == 3 && !strcmp(tok[2], ";")) {
-		inc = tok[1];
-	} else if (n == 2 && (len = strlen(tok[1])) > 1 &&
-		   tok[1][len - 1] == ';') {
-		tok[1][len - 1] = '\0';
-		inc = tok[1];
-	} else {
+	if (directive_words(tok, n) != 2)
 		return -EINVAL;
-	}
+	inc = tok[1];
 	if (strchr(inc, ';'))
 		return -EINVAL;
 
@@ -2906,9 +2896,8 @@ static int parse_include(struct acl_load *ld, char **tok, int n,
 				  tok[0], inc);
 			return 0;
 		}
-		load_warn(ld, "%s %s: no file matches", tok[0], inc);
-		ld->reported = true;
-		return -ENOENT;
+		return load_fail(ld, -ENOENT, "%s %s: no file matches",
+				 tok[0], inc);
 	}
 	for (i = 0; i < res.nr && !r; i++)
 		r = load_file(ld, res.v[i], optional);
@@ -3054,6 +3043,27 @@ static int cidr_tab_init(struct acl_cidr_tab *t, uint32_t nr)
 	return 0;
 }
 
+/*
+ * The slot of @t that holds the prefix @key/@bits, or else the free slot
+ * where it would go. Adding and finding share this probe, so that they
+ * cannot disagree on where a prefix lives.
+ */
+static inline uint32_t cidr_tab_slot(const struct acl_cidr_tab *t,
+				     uint64_t seed, const uint8_t key[16],
+				     uint8_t bits, bool is_v4)
+{
+	uint32_t i = (uint32_t)cidr_hash(seed, key, bits, is_v4) & t->mask;
+
+	for (; t->v[i].pos != ACL_NO_POS; i = (i + 1) & t->mask) {
+		const struct acl_cidr_ent *e = &t->v[i];
+
+		if (e->bits == bits && e->is_v4 == is_v4 &&
+		    !memcmp(e->addr, key, 16))
+			break;
+	}
+	return i;
+}
+
 static void cidr_tab_add(struct acl_cidr_tab *t, uint64_t seed,
 			 const struct gwp_acl_cidr *c, uint32_t pos)
 {
@@ -3069,15 +3079,10 @@ static void cidr_tab_add(struct acl_cidr_tab *t, uint64_t seed,
 		lens[(*nr_len)++] = c->bits;
 
 	/* c->addr is already masked by parse_cidr(). */
-	i = (uint32_t)cidr_hash(seed, c->addr, c->bits, c->is_v4) & t->mask;
-	for (; t->v[i].pos != ACL_NO_POS; i = (i + 1) & t->mask) {
-		struct acl_cidr_ent *e = &t->v[i];
-
-		/* An earlier rule with the same prefix shadows this one. */
-		if (e->bits == c->bits && e->is_v4 == c->is_v4 &&
-		    !memcmp(e->addr, c->addr, 16))
-			return;
-	}
+	i = cidr_tab_slot(t, seed, c->addr, c->bits, c->is_v4);
+	/* An earlier rule with the same prefix shadows this one. */
+	if (t->v[i].pos != ACL_NO_POS)
+		return;
 	memcpy(t->v[i].addr, c->addr, 16);
 	t->v[i].bits = c->bits;
 	t->v[i].is_v4 = c->is_v4;
@@ -3098,20 +3103,13 @@ static uint32_t cidr_tab_find(const struct acl_cidr_tab *t, uint64_t seed,
 	nr_len = is_v4 ? t->nr_len4 : t->nr_len6;
 	for (k = 0; k < nr_len; k++) {
 		uint8_t key[16];
-		uint32_t i;
+		uint32_t pos;
 
 		cidr_key(key, ip, is_v4, lens[k]);
-		i = (uint32_t)cidr_hash(seed, key, lens[k], is_v4) & t->mask;
-		for (; t->v[i].pos != ACL_NO_POS; i = (i + 1) & t->mask) {
-			const struct acl_cidr_ent *e = &t->v[i];
-
-			if (e->bits == lens[k] && e->is_v4 == is_v4 &&
-			    !memcmp(e->addr, key, 16)) {
-				if (e->pos < best)
-					best = e->pos;
-				break;
-			}
-		}
+		/* A free slot holds ACL_NO_POS, which never lowers @best. */
+		pos = t->v[cidr_tab_slot(t, seed, key, lens[k], is_v4)].pos;
+		if (pos < best)
+			best = pos;
 	}
 	return best;
 }
@@ -3132,17 +3130,28 @@ static int dom_tab_init(struct acl_dom_tab *t, uint32_t nr)
 	return 0;
 }
 
+/* The same as cidr_tab_slot() for the domain @str of hash @h. */
+static inline uint32_t dom_tab_slot(const struct acl_dom_tab *t, uint64_t h,
+				    const char *str)
+{
+	uint32_t i = (uint32_t)h & t->mask;
+
+	for (; t->v[i].pos != ACL_NO_POS; i = (i + 1) & t->mask) {
+		if (t->v[i].hash == h && !ascii_casecmp(t->v[i].str, str))
+			break;
+	}
+	return i;
+}
+
 static void dom_tab_add(struct acl_dom_tab *t, uint64_t seed, const char *str,
 			uint32_t pos)
 {
 	uint64_t h = dom_hash(seed, str);
-	uint32_t i = (uint32_t)h & t->mask;
+	uint32_t i = dom_tab_slot(t, h, str);
 
-	for (; t->v[i].pos != ACL_NO_POS; i = (i + 1) & t->mask) {
-		/* An earlier rule with the same domain shadows this one. */
-		if (t->v[i].hash == h && !ascii_casecmp(t->v[i].str, str))
-			return;
-	}
+	/* An earlier rule with the same domain shadows this one. */
+	if (t->v[i].pos != ACL_NO_POS)
+		return;
 	t->v[i].str = str;
 	t->v[i].hash = h;
 	t->v[i].pos = pos;
@@ -3151,14 +3160,8 @@ static void dom_tab_add(struct acl_dom_tab *t, uint64_t seed, const char *str,
 static uint32_t dom_tab_find(const struct acl_dom_tab *t, uint64_t seed,
 			     const char *str)
 {
-	uint64_t h = dom_hash(seed, str);
-	uint32_t i = (uint32_t)h & t->mask;
-
-	for (; t->v[i].pos != ACL_NO_POS; i = (i + 1) & t->mask) {
-		if (t->v[i].hash == h && !ascii_casecmp(t->v[i].str, str))
-			return t->v[i].pos;
-	}
-	return ACL_NO_POS;
+	/* A free slot holds ACL_NO_POS: not found. */
+	return t->v[dom_tab_slot(t, dom_hash(seed, str), str)].pos;
 }
 
 /*
@@ -3418,8 +3421,7 @@ static int parse_lines(struct acl_load *ld, char *text)
 		if (ld->reported)
 			;	/* the line's own message said it all */
 		else if (ld->include_failed)
-			fprintf(stderr, "acl: %s: line %u: failed to include a file\n",
-				ld->path, lineno);
+			acl_msg(ld->path, lineno, "failed to include a file");
 		else if (ld->path)
 			fprintf(stderr, "acl: %s: parse error on line %u: %s\n",
 				ld->path, lineno, strerror(-r));
@@ -4119,19 +4121,34 @@ void gwp_acl_destroy(struct gwp_acl *acl)
 #define CRIT_FAILS(r, has, neg, matched) ((r)->has && ((matched) == (r)->neg))
 
 /*
+ * True if @s matches @n: the regexp if @is_re, else the string, compared
+ * ignoring ASCII case if @caseless. A NULL @s never matches.
+ */
+static inline bool acl_name_match(const union acl_name *n, bool is_re,
+				  bool caseless, const char *s)
+{
+	if (!s)
+		return false;
+#ifdef CONFIG_PCRE
+	if (is_re)
+		return n->re && regex_match(n->re, s);
+#else
+	(void)is_re;
+#endif
+	if (!n->str)
+		return false;
+	return caseless ? !ascii_casecmp(s, n->str) : !strcmp(s, n->str);
+}
+
+/*
  * True if rule @r's -m domain criterion matches the requested hostname @dom
  * (exact, case-insensitive; or PCRE when --domain-regexp was used). Returns
  * false for a NULL @dom so a literal-IP request never matches a domain rule.
  */
 static bool domain_match(const struct gwp_acl_rule *r, const char *dom)
 {
-	if (!dom)
-		return false;
-#ifdef CONFIG_PCRE
-	if (r->domain_is_re)
-		return r->domain.re && regex_match(r->domain.re, dom);
-#endif
-	return r->domain.str && !ascii_casecmp(dom, r->domain.str);
+	return acl_name_match(&r->domain, r->domain_is_re, /*caseless=*/true,
+			      dom);
 }
 
 /*
@@ -4142,13 +4159,8 @@ static bool domain_match(const struct gwp_acl_rule *r, const char *dom)
  */
 static bool user_match(const struct gwp_acl_rule *r, const char *user)
 {
-	if (!user)
-		return false;
-#ifdef CONFIG_PCRE
-	if (r->user_is_re)
-		return r->user.re && regex_match(r->user.re, user);
-#endif
-	return r->user.str && !strcmp(user, r->user.str);
+	return acl_name_match(&r->user, r->user_is_re, /*caseless=*/false,
+			      user);
 }
 
 /*
@@ -4435,6 +4447,20 @@ static enum gwp_acl_verdict __eval_chain(const struct acl_chain *c,
 }
 
 /*
+ * Drop what the rules decided for @req: a fresh OUTPUT evaluation starts
+ * from this, and a fail-closed REJECT must not leave any of it behind. One
+ * list for both, so a new result field cannot be missed in one of them.
+ */
+static inline void req_clear_result(struct gwp_acl_req *req)
+{
+	req->dnat_applied = false;
+	req->mark_set = false;
+	req->bind.set = false;
+	req->upstream = GWP_ACL_UPSTREAM_NONE;
+	req->upstream_pool = NULL;
+}
+
+/*
  * __eval_chain(), failing closed: if any regexp along the way could not be
  * decided (regex_match()), the rules this request met are not known, so it
  * is refused, whatever they would have said, and the verdict is not cached.
@@ -4454,11 +4480,7 @@ static enum gwp_acl_verdict eval_chain(const struct gwp_acl_ruleset *rs,
 	if (req->upstream_only)
 		req->upstream_unsure = true;
 
-	req->dnat_applied = false;
-	req->mark_set = false;
-	req->bind.set = false;
-	req->upstream = GWP_ACL_UPSTREAM_NONE;
-	req->upstream_pool = NULL;
+	req_clear_result(req);
 	req->cacheable = false;
 	return GWP_ACL_REJECT;
 }
@@ -4472,11 +4494,7 @@ static enum gwp_acl_verdict eval_output(struct gwp_acl *acl,
 	uint32_t gen;
 	uint8_t sum;
 
-	req->dnat_applied = false;
-	req->mark_set = false;
-	req->bind.set = false;
-	req->upstream = GWP_ACL_UPSTREAM_NONE;
-	req->upstream_pool = NULL;
+	req_clear_result(req);
 	req->upstream_unsure = false;
 	req->gen = 0;
 	req->cacheable = true;

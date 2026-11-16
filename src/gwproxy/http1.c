@@ -25,44 +25,6 @@ static inline size_t min_st(size_t a, size_t b)
 	return (a < b) ? a : b;
 }
 
-/**
- * Checks if a character is a valid 'tchar' as defined in RFC 7230,
- * Section 3.2.6.
- *
- * Reference: https://datatracker.ietf.org/doc/html/rfc7230#section-3.2.6
- *
- * A 'tchar' is any visible (VCHAR) character except delimiters,
- * specifically: "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-"
- * / "." / "^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA.
- *
- * @param  c The character to check, represented as an int.
- * @return 1 if the character is a valid 'tchar', 0 otherwise.
- */
-static inline int is_tchar(int c)
-{
-	/* Digits. */
-	if (c >= '0' && c <= '9')
-		return 1;
-
-	/* Uppercase */
-	if (c >= 'A' && c <= 'Z')
-		return 1;
-
-	/* Lowercase */
-	if (c >= 'a' && c <= 'z')
-		return 1;
-
-	/* The 15 extra symbols from the spec */
-	switch (c) {
-	case '!': case '#': case '$': case '%': case '&':
-	case '\'': case '*': case '+': case '-': case '.':
-	case '^': case '_': case '`': case '|': case '~':
-		return 1;
-	default:
-		return 0;
-	}
-}
-
 static inline int is_space(int c)
 {
 	return (c == ' ' || c == '\t');
@@ -81,20 +43,40 @@ static inline int is_vchar(int c)
 	return 0;
 }
 
-/*
- * A byte of a field value: HTAB, SP, VCHAR and obs-text (RFC 9110 Section
- * 5.5). A value is never read as text, only compared with the few names and
- * tokens the proxy knows, so obs-text simply fails to match those. A bare CR,
- * NUL or any other control byte is refused: it could end the line for a peer.
- */
-static inline bool is_field_char(unsigned char c)
-{
-	return c == '\t' || (c >= 0x20 && c != 0x7f);
-}
-
 static inline int is_alpha(int c)
 {
 	return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+}
+
+/*
+ * Step *@off of @buf (@len bytes) past the line end there: LF or CRLF.
+ * Returns 0, -EAGAIN if the buffer ends within it, -EINVAL if there is
+ * none, or -E2BIG if the header grows to its limit.
+ */
+static inline int eat_eol(const struct gwnet_http_hdr_pctx *ctx,
+			  const char *buf, size_t len, size_t *off)
+{
+	if (buf[*off] == '\r') {
+		if (++*off >= len)
+			return -EAGAIN;
+		if (ctx->tot_len + *off >= ctx->max_len)
+			return -E2BIG;
+	}
+
+	if (buf[*off] != '\n')
+		return -EINVAL;
+	++*off;
+	if (ctx->tot_len + *off >= ctx->max_len)
+		return -E2BIG;
+	return 0;
+}
+
+/* The length of @s (@len bytes) without its trailing white space. */
+static inline uint32_t rtrim_len(const char *s, uint32_t len)
+{
+	while (len && is_space(s[len - 1]))
+		len--;
+	return len;
 }
 
 /**
@@ -111,11 +93,8 @@ static inline int is_alpha(int c)
  */
 static bool is_field_merged_list(const char *key, size_t n)
 {
-#define LH(s)	{ s, sizeof(s) - 1 }
-	static const struct {
-		const char	*name;
-		size_t		len;
-	} comma_separated_list_headers[] = {
+#define LH(s)	GWNET_HTTP_NAME(s)
+	static const struct gwnet_http_name comma_separated_list_headers[] = {
 		/* RFC 7231, Section 5.3.2 */
 		LH("Accept"),
 		/* RFC 7231, Section 5.3.3 */
@@ -160,16 +139,10 @@ static bool is_field_merged_list(const char *key, size_t n)
 		LH("WWW-Authenticate"),
 	};
 #undef LH
-	size_t i;
 
-	for (i = 0; i < sizeof(comma_separated_list_headers) /
-			 sizeof(comma_separated_list_headers[0]); i++) {
-		if (n == comma_separated_list_headers[i].len &&
-		    !strncasecmp(key, comma_separated_list_headers[i].name, n))
-			return true;
-	}
-
-	return false;
+	return gwnet_http_name_in(comma_separated_list_headers,
+				  ARRAY_SIZE(comma_separated_list_headers),
+				  key, n);
 }
 
 /**
@@ -187,11 +160,8 @@ static bool is_field_merged_list(const char *key, size_t n)
  */
 static bool is_field_singular(const char *key, size_t n)
 {
-#define LH(s)	{ s, sizeof(s) - 1 }
-	static const struct {
-		const char	*name;
-		size_t		len;
-	} singular_headers[] = {
+#define LH(s)	GWNET_HTTP_NAME(s)
+	static const struct gwnet_http_name singular_headers[] = {
 		LH("Authorization"),
 		LH("Content-Length"),
 		LH("Content-Location"),
@@ -212,16 +182,9 @@ static bool is_field_singular(const char *key, size_t n)
 		LH("User-Agent"),
 	};
 #undef LH
-	size_t i;
 
-	for (i = 0; i < sizeof(singular_headers) /
-			 sizeof(singular_headers[0]); i++) {
-		if (n == singular_headers[i].len &&
-		    !strncasecmp(key, singular_headers[i].name, n))
-			return true;
-	}
-
-	return false;
+	return gwnet_http_name_in(singular_headers,
+				  ARRAY_SIZE(singular_headers), key, n);
 }
 
 static int add_field(struct gwnet_http_hdr_fields *ff, uint32_t koff,
@@ -309,7 +272,7 @@ static int parse_hdr_req_first_line(struct gwnet_http_hdr_pctx *ctx,
 	 * Any token is taken: the ones not in the table are extension
 	 * methods (WebDAV's PROPFIND, say), GWNET_HTTP_METHOD_OTHER.
 	 */
-	while (is_tchar(buf[off])) {
+	while (gwnet_http_is_tchar((unsigned char)buf[off])) {
 		if (++off >= len)
 			return -EAGAIN;
 		if (ctx->tot_len + off >= ctx->max_len)
@@ -550,11 +513,12 @@ static int parse_hdr_res_first_line(struct gwnet_http_hdr_pctx *ctx,
 				    struct gwnet_http_res_hdr *hdr)
 {
 	size_t off = 0, len = ctx->len - ctx->off, cmpl, reml, i;
-	const char *reason, *buf = &ctx->buf[ctx->off], *p;
+	const char *reason, *buf = &ctx->buf[ctx->off];
 	uint8_t version_code;
 	uint32_t reason_len;
 	char rcode[3];
 	uint16_t code;
+	int r;
 
 	if (!len)
 		return -EAGAIN;
@@ -669,30 +633,12 @@ static int parse_hdr_res_first_line(struct gwnet_http_hdr_pctx *ctx,
 		reason_len++;
 	}
 
-	if (buf[off] == '\r') {
-		if (++off >= len)
-			return -EAGAIN;
-		if (ctx->tot_len + off >= ctx->max_len)
-			return -E2BIG;
-	}
+	r = eat_eol(ctx, buf, len, &off);
+	if (r)
+		return r;
 
-	if (buf[off] != '\n')
-		return -EINVAL;
-	++off;
-	if (ctx->tot_len + off >= ctx->max_len)
-		return -E2BIG;
-
-	if (reason_len) {
-		/*
-		 * Trim the trailing whitespaces from
-		 * the reason phrase.
-		 */
-		p = &reason[reason_len - 1];
-		while (p >= reason && is_space(*p)) {
-			--reason_len;
-			--p;
-		}
-	}
+	/* Trim the trailing whitespaces from the reason phrase. */
+	reason_len = rtrim_len(reason, reason_len);
 
 	hdr->reason = malloc(reason_len + 1);
 	if (!hdr->reason)
@@ -739,7 +685,7 @@ static int parse_hdr_fields(struct gwnet_http_hdr_pctx *ctx,
 		return -EAGAIN;
 
 	while (1) {
-		const char *k, *v, *p;
+		const char *k, *v;
 		uint32_t kl, vl;
 
 		/*
@@ -771,7 +717,7 @@ static int parse_hdr_fields(struct gwnet_http_hdr_pctx *ctx,
 		 *
 		 * After the colon, there may be a space, but it is
 		 * optional. If it exists, it must be followed by
-		 * field value bytes, see is_field_char().
+		 * field value bytes, see gwnet_http_is_field_char().
 		 *
 		 * The value may contain trailing space characters,
 		 * they must be trimmed.
@@ -790,7 +736,7 @@ static int parse_hdr_fields(struct gwnet_http_hdr_pctx *ctx,
 			if (buf[off] == ':')
 				break;
 
-			if (!is_tchar(buf[off]))
+			if (!gwnet_http_is_tchar((unsigned char)buf[off]))
 				return -EINVAL;
 
 			kl++;
@@ -822,7 +768,7 @@ static int parse_hdr_fields(struct gwnet_http_hdr_pctx *ctx,
 			if (c == '\r' || c == '\n')
 				break;
 
-			if (!is_field_char((unsigned char)c))
+			if (!gwnet_http_is_field_char((unsigned char)c))
 				return -EINVAL;
 
 			vl++;
@@ -834,29 +780,14 @@ static int parse_hdr_fields(struct gwnet_http_hdr_pctx *ctx,
 				return -E2BIG;
 		}
 
-		if (buf[off] == '\r') {
-			if (++off >= len)
-				return -EAGAIN;
-			if (ctx->tot_len + off >= ctx->max_len)
-				return -E2BIG;
-		}
+		r = eat_eol(ctx, buf, len, &off);
+		if (r)
+			return r;
 
-		if (buf[off] != '\n')
-			return -EINVAL;
-		++off;
-		if (ctx->tot_len + off >= ctx->max_len)
-			return -E2BIG;
-
-		if (vl) {
-			/*
-			 * Trim trailing whitespaces from the value.
-			 */
-			p = &v[vl - 1];
-			while (p >= v && is_space(*p)) {
-				--vl;
-				--p;
-			}
-		}
+		/*
+		 * Trim trailing whitespaces from the value.
+		 */
+		vl = rtrim_len(v, vl);
 
 		if (ctx->nr_fields >= ctx->max_fields)
 			return -E2BIG;

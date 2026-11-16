@@ -42,6 +42,22 @@ static struct gwp_up_health *def_health(struct gwp_up_state *s)
 	return h;
 }
 
+/* A new reference to @k's state in @t and its default ejection state. */
+static struct gwp_up_health *srv_get(struct gwp_up_table *t,
+				     const struct gwp_up_key *k)
+{
+	return def_health(gwp_up_state_get(t, k));
+}
+
+/* Drop the references srv_get() took, the ejection state's first. */
+static void srv_put(struct gwp_up_health *h)
+{
+	struct gwp_up_state *s = h->st;
+
+	gwp_up_health_put(h);
+	gwp_up_state_put(s);
+}
+
 /* A failure of @h's server, deciding for @h only (and any others silently). */
 static bool fail(struct gwp_up_health *h, uint32_t now)
 {
@@ -247,6 +263,14 @@ static uint32_t tp_random(void *arg)
 	return gwp_up_rand(&p->xs);
 }
 
+/* Draw @vals[0..@nr) in turn from now on, starting at the first. */
+static void tp_fake(struct tpool *p, const uint32_t *vals, uint32_t nr)
+{
+	p->fake = vals;
+	p->nr_fake = nr;
+	p->ifake = 0;
+}
+
 /* The random value whose probe lands on server @j of @nr. */
 static uint32_t tp_at(uint32_t nr, uint32_t j)
 {
@@ -447,16 +471,13 @@ static void test_eject_window(uint32_t t0)
 	struct gwp_up_table *t = gwp_up_table_create();
 	const uint32_t w = GWP_UP_EJECT_WINDOW_MS;
 	struct gwp_up_health *h;
-	struct gwp_up_state *s;
 	uint32_t end;
 	bool back;
 
 	assert(GWP_UP_EJECT_FAILS == 3 && w == 30000 &&
 	       GWP_UP_EJECT_MS == 300000);
 	assert(t);
-	s = gwp_up_state_get(t, &k);
-	h = def_health(s);
-	assert(s);
+	h = srv_get(t, &k);
 	assert(gwp_up_health_ejected(h, t0, &back) == 0 && !back);
 
 	/* Two are not enough; the third, right at the window's edge, is. */
@@ -477,13 +498,11 @@ static void test_eject_window(uint32_t t0)
 	assert(gwp_up_health_ejected(h, end, &back) == 0 && back);
 	assert(gwp_up_health_ejected(h, end, &back) == 0 && !back);
 	assert(gwp_up_health_ejected(h, end + 5, &back) == 0 && !back);
-	gwp_up_health_put(h);
-	gwp_up_state_put(s);
+	srv_put(h);
 
 	/* One millisecond too wide: no ejection, until a later one fits. */
-	s = gwp_up_state_get(t, &k);
-	h = def_health(s);
-	assert(s && gwp_up_health_ejected(h, t0, NULL) == 0);
+	h = srv_get(t, &k);
+	assert(gwp_up_health_ejected(h, t0, NULL) == 0);
 	assert(!fail(h, t0));
 	assert(!fail(h, t0 + 2000));
 	assert(!fail(h, t0 + w + 1));
@@ -508,16 +527,13 @@ static void test_eject_window(uint32_t t0)
 	assert(!fail(h, end + w));
 	assert(!fail(h, end + w + 1));
 	assert(fail(h, end + w + 2));
-	gwp_up_health_put(h);
-	gwp_up_state_put(s);
+	srv_put(h);
 
 	/* A server whose identity was gone in between starts fresh. */
-	s = gwp_up_state_get(t, &k);
-	h = def_health(s);
-	assert(s && gwp_up_health_ejected(h, 0, NULL) == 0);
+	h = srv_get(t, &k);
+	assert(gwp_up_health_ejected(h, 0, NULL) == 0);
 	assert(!fail(h, end + w + 3));
-	gwp_up_health_put(h);
-	gwp_up_state_put(s);
+	srv_put(h);
 	assert(gwp_up_table_destroy(t) == 0);
 }
 
@@ -531,13 +547,10 @@ static void test_eject_zero(void)
 	struct gwp_up_table *t = gwp_up_table_create();
 	const uint32_t now = 0u - GWP_UP_EJECT_MS;	/* ends at 0 */
 	struct gwp_up_health *h;
-	struct gwp_up_state *s;
 	bool back;
 
 	assert(t);
-	s = gwp_up_state_get(t, &k);
-	h = def_health(s);
-	assert(s);
+	h = srv_get(t, &k);
 	/* A failure at 0 is recorded, as 1. */
 	assert(!fail(h, now - 2));
 	assert(!fail(h, now - 1));
@@ -546,18 +559,14 @@ static void test_eject_zero(void)
 	       !back);
 	assert(gwp_up_health_ejected(h, 0, &back) == 1 && !back);
 	assert(gwp_up_health_ejected(h, 1, &back) == 0 && back);
-	gwp_up_health_put(h);
-	gwp_up_state_put(s);
+	srv_put(h);
 
-	s = gwp_up_state_get(t, &k);
-	h = def_health(s);
-	assert(s);
+	h = srv_get(t, &k);
 	assert(!fail(h, UINT32_MAX));
 	assert(!fail(h, 0));
 	assert(fail(h, 5));
 	assert(gwp_up_health_ejected(h, 5, NULL) == GWP_UP_EJECT_MS);
-	gwp_up_health_put(h);
-	gwp_up_state_put(s);
+	srv_put(h);
 	assert(gwp_up_table_destroy(t) == 0);
 }
 
@@ -570,21 +579,17 @@ static void test_eject_rebuild(void)
 	struct gwp_up_key k = key_of(GWP_UP_SCHEME_SOCKS5H, "::1", 9, "u");
 	struct gwp_up_table *t = gwp_up_table_create();
 	struct gwp_up_health *ho, *hn;
-	struct gwp_up_state *old, *new;
 
 	assert(t);
-	old = gwp_up_state_get(t, &k);
-	ho = def_health(old);
+	ho = srv_get(t, &k);
 	assert(!fail(ho, 10) && !fail(ho, 20));
 	assert(fail(ho, 30));
-	new = gwp_up_state_get(t, &k);
-	hn = def_health(new);
-	gwp_up_health_put(ho);
-	gwp_up_state_put(old);
-	assert(new == old && hn == ho);
+	hn = srv_get(t, &k);
+	srv_put(ho);
+	/* hn's references keep what ho pointed at. */
+	assert(hn == ho && hn->st == ho->st);
 	assert(gwp_up_health_ejected(hn, 40, NULL) == GWP_UP_EJECT_MS - 10);
-	gwp_up_health_put(hn);
-	gwp_up_state_put(new);
+	srv_put(hn);
 	assert(gwp_up_table_destroy(t) == 0);
 }
 
@@ -909,9 +914,7 @@ static void test_pick_probe(void)
 	assert(GWP_UP_PICK_PROBES == 4);
 	tp_init(&p, 8);
 	vals[0] = tp_at(8, 6);
-	p.fake = vals;
-	p.nr_fake = 1;
-	p.ifake = 0;
+	tp_fake(&p, vals, 1);
 	assert(tp_pick(&p, false, 2, NONE) == 2);
 	assert(!p.nr_random);
 
@@ -925,16 +928,14 @@ static void test_pick_probe(void)
 	vals[0] = tp_at(8, 5);
 	vals[1] = tp_at(8, 2);
 	vals[2] = tp_at(8, 7);
-	p.nr_fake = 3;
-	p.ifake = 0;
+	tp_fake(&p, vals, 3);
 	n = p.nr_random;
 	assert(tp_pick(&p, false, 10, NONE) == 7);
 	assert(p.nr_random - n == 3);
 
 	/* Every probe misses: the next in service after the cursor. */
 	vals[0] = vals[1] = vals[2] = vals[3] = tp_at(8, 5);
-	p.nr_fake = 4;
-	p.ifake = 0;
+	tp_fake(&p, vals, 4);
 	n = p.nr_random;
 	assert(tp_pick(&p, false, 2, NONE) == 3);
 	assert(p.nr_random - n == GWP_UP_PICK_PROBES);
@@ -942,8 +943,7 @@ static void test_pick_probe(void)
 	/* A retry: the one after the failed server, else probes, never it. */
 	vals[0] = tp_at(8, 1);
 	vals[1] = tp_at(8, 4);
-	p.nr_fake = 2;
-	p.ifake = 0;
+	tp_fake(&p, vals, 2);
 	n = p.nr_random;
 	assert(tp_pick(&p, false, 99, 0) == 1);
 	assert(p.nr_random == n);
@@ -969,8 +969,7 @@ static void test_pick_probe(void)
 	 */
 	vals[0] = tp_at(8, 5);
 	vals[1] = tp_at(8, 6);
-	p.nr_fake = 2;
-	p.ifake = 0;
+	tp_fake(&p, vals, 2);
 	n = p.nr_random;
 	assert(tp_pick(&p, true, 2, NONE) == 6);
 	assert(p.nr_random - n == 2);
@@ -1005,9 +1004,7 @@ static void test_pick_probe(void)
 	tp_free(&p);
 	tp_init(&p, 3);
 	vals[0] = tp_at(3, 1);
-	p.fake = vals;
-	p.nr_fake = 1;
-	p.ifake = 0;
+	tp_fake(&p, vals, 1);
 	tp_eject(&p, 0, 300);
 	tp_eject(&p, 1, 100);
 	tp_eject(&p, 2, 200);
@@ -1019,6 +1016,18 @@ static void test_pick_probe(void)
 #define NR_DIST		10u
 #define NR_DIST_PICKS	200000u
 
+/* Fail unless server @i's @hits are @want within @tol; @what labels it. */
+static void check_share(const char *what, uint32_t i, uint64_t hits,
+			uint64_t want, uint64_t tol)
+{
+	if (hits + tol < want || hits > want + tol) {
+		fprintf(stderr, "%sserver %u: %llu picks, want %llu +- %llu\n",
+			what, i, (unsigned long long)hits,
+			(unsigned long long)want, (unsigned long long)tol);
+		assert(0);
+	}
+}
+
 /*
  * With a real generator, the turns of ejected servers are spread evenly:
  * every server in service gets its equal share of the picks within 3%,
@@ -1027,8 +1036,14 @@ static void test_pick_probe(void)
  * run of 3 at the cursor's path. The share of a server in service is
  * NR_DIST_PICKS / in-service; the ejected turns (a tenth or three tenths)
  * are binomial over it, so 3% is several standard deviations wide.
+ *
+ * With @least_conn, every count tied (connections short enough to have
+ * ended before the next pick): the ties' start moves off an ejected
+ * server by the same probes, so each server in service gets its equal
+ * share within 3%, the one after the run too.
  */
-static void test_pick_spread(uint32_t first, uint32_t run, uint32_t seed)
+static void test_pick_spread(bool least_conn, uint32_t first, uint32_t run,
+			     uint32_t seed)
 {
 	uint32_t hits[NR_DIST] = { 0 }, rr, i, want, tol;
 	struct tpool p;
@@ -1038,7 +1053,7 @@ static void test_pick_spread(uint32_t first, uint32_t run, uint32_t seed)
 	for (i = first; i < first + run; i++)
 		tp_eject(&p, i, 1000);
 	for (rr = 0; rr < NR_DIST_PICKS; rr++)
-		hits[tp_pick(&p, false, rr, NONE)]++;
+		hits[tp_pick(&p, least_conn, rr, NONE)]++;
 	want = NR_DIST_PICKS / (NR_DIST - run);
 	tol = want * 3 / 100;
 	for (i = 0; i < NR_DIST; i++) {
@@ -1046,48 +1061,17 @@ static void test_pick_spread(uint32_t first, uint32_t run, uint32_t seed)
 			assert(!hits[i]);
 			continue;
 		}
-		if (hits[i] + tol < want || hits[i] > want + tol) {
-			fprintf(stderr, "server %u: %u picks, want %u +- %u\n",
-				i, hits[i], want, tol);
-			assert(0);
-		}
+		check_share(least_conn ? "least_conn " : "", i, hits[i], want,
+			    tol);
 	}
-	/* Each ejected turn took one or a few draws, never more than 4. */
-	assert(p.nr_random >= run * (NR_DIST_PICKS / NR_DIST));
-	assert(p.nr_random <= GWP_UP_PICK_PROBES * run *
-			      (NR_DIST_PICKS / NR_DIST));
-	tp_free(&p);
-}
-
-/*
- * test_pick_spread() for least_conn with every count tied (connections
- * short enough to have ended before the next pick): the ties' start
- * moves off an ejected server by the same probes, so each server in
- * service gets its equal share within 3%, the one after the run too.
- */
-static void test_pick_spread_lc(uint32_t first, uint32_t run, uint32_t seed)
-{
-	uint32_t hits[NR_DIST] = { 0 }, rr, i, want, tol;
-	struct tpool p;
-
-	tp_init(&p, NR_DIST);
-	p.xs = seed;
-	for (i = first; i < first + run; i++)
-		tp_eject(&p, i, 1000);
-	for (rr = 0; rr < NR_DIST_PICKS; rr++)
-		hits[tp_pick(&p, true, rr, NONE)]++;
-	want = NR_DIST_PICKS / (NR_DIST - run);
-	tol = want * 3 / 100;
-	for (i = 0; i < NR_DIST; i++) {
-		if (i >= first && i < first + run) {
-			assert(!hits[i]);
-			continue;
-		}
-		if (hits[i] + tol < want || hits[i] > want + tol) {
-			fprintf(stderr, "least_conn server %u: %u picks, want %u +- %u\n",
-				i, hits[i], want, tol);
-			assert(0);
-		}
+	if (!least_conn) {
+		/*
+		 * Each ejected turn took one or a few draws, never more
+		 * than 4.
+		 */
+		assert(p.nr_random >= run * (NR_DIST_PICKS / NR_DIST));
+		assert(p.nr_random <= GWP_UP_PICK_PROBES * run *
+				      (NR_DIST_PICKS / NR_DIST));
 	}
 	tp_free(&p);
 }
@@ -1278,11 +1262,7 @@ static void test_weights_spread(void)
 			continue;
 		want = NR_DIST_PICKS / 8 * w[i];
 		tol = want * 3 / 100;
-		if (hits[i] + tol < want || hits[i] > want + tol) {
-			fprintf(stderr, "weighted server %u: %u picks, want %u +- %u\n",
-				i, hits[i], want, tol);
-			assert(0);
-		}
+		check_share("weighted ", i, hits[i], want, tol);
 	}
 	tp_free(&p);
 }
@@ -1347,8 +1327,7 @@ static void test_max_conns(void)
 	assert(tp_pick(&p, false, 0, 0) == 2);
 	/* A probe that lands on it misses. */
 	vals[0] = tp_at(4, 1);
-	p.fake = vals;
-	p.nr_fake = 1;
+	tp_fake(&p, vals, 1);
 	assert(tp_pick(&p, false, 1, NONE) == 2);
 	assert(p.nr_random == GWP_UP_PICK_PROBES);
 	vals[0] = tp_at(4, 3);
@@ -1689,12 +1668,7 @@ static void test_slow_rr(const uint32_t *w, const uint32_t *num, uint32_t nr,
 		uint64_t want = NR_DIST_PICKS * sw[i] / sum;
 		uint64_t tol = NR_DIST_PICKS * 3 / 100;
 
-		if (hits[i] + tol < want || hits[i] > want + tol) {
-			fprintf(stderr, "slow rr server %u: %u picks, want %llu +- %llu\n",
-				i, hits[i], (unsigned long long)want,
-				(unsigned long long)tol);
-			assert(0);
-		}
+		check_share("slow rr ", i, hits[i], want, tol);
 		if (num[i] < 8)
 			tp_unramp(&p, i);
 	}
@@ -1720,19 +1694,16 @@ static void test_slow_pick(void)
 	tp_ramp(&p, 1, 40000, 1, 4);
 	/* No random source: its turns as usual. */
 	assert(tp_pick(&p, false, 1, NONE) == 1);
-	p.fake = vals;
 	/* A number under a quarter takes the turn, over it lets it pass. */
 	vals[0] = 0x3fff0000u;
-	p.nr_fake = 1;
-	p.ifake = 0;
+	tp_fake(&p, vals, 1);
 	n = p.nr_random;
 	assert(tp_pick(&p, false, 1, NONE) == 1);
 	assert(p.nr_random - n == 1);
 	/* Passed, then a probe on 3, in service. */
 	vals[0] = 0x40000000u;
 	vals[1] = tp_at(4, 3);
-	p.nr_fake = 2;
-	p.ifake = 0;
+	tp_fake(&p, vals, 2);
 	assert(tp_pick(&p, false, 1, NONE) == 3);
 	/* The others' turns draw nothing. */
 	n = p.nr_random;
@@ -1744,8 +1715,7 @@ static void test_slow_pick(void)
 		vals[1 + 2 * i] = tp_at(4, 1);
 		vals[2 + 2 * i] = 0xffffffffu;
 	}
-	p.nr_fake = 2 * GWP_UP_PICK_PROBES + 1;
-	p.ifake = 0;
+	tp_fake(&p, vals, 2 * GWP_UP_PICK_PROBES + 1);
 	n = p.nr_random;
 	assert(tp_pick(&p, false, 1, NONE) == 2);
 	assert(p.nr_random - n == 2 * GWP_UP_PICK_PROBES + 1);
@@ -1866,12 +1836,7 @@ static void test_random_spread(const uint32_t *w, uint32_t nr, uint32_t seed,
 			assert(!hits[i]);
 			continue;
 		}
-		if (hits[i] + tol < want || hits[i] > want + tol) {
-			fprintf(stderr, "random server %u: %u picks, want %llu +- %llu\n",
-				i, hits[i], (unsigned long long)want,
-				(unsigned long long)tol);
-			assert(0);
-		}
+		check_share("random ", i, hits[i], want, tol);
 	}
 	if (ramp < nr)
 		tp_unramp(&p, ramp);
@@ -1895,11 +1860,10 @@ static void test_random_pick(void)
 	uint32_t i, n;
 
 	tp_init(&p, 4);
-	p.fake = vals;
 
 	/* random: the one drawn, whatever the counts and the cursor. */
 	vals[0] = tp_at(4, 2);
-	p.nr_fake = 1;
+	tp_fake(&p, vals, 1);
 	tp_open(&p, 2, 9);
 	for (i = 0; i < 3; i++) {
 		p.ifake = 0;
@@ -1910,8 +1874,7 @@ static void test_random_pick(void)
 	/* random two: the fewer open of the two drawn; ties to the first. */
 	vals[0] = tp_at(4, 2);
 	vals[1] = tp_at(4, 1);
-	p.nr_fake = 2;
-	p.ifake = 0;
+	tp_fake(&p, vals, 2);
 	assert(tp_pick(&p, RND2, 0, NONE) == 1);
 	assert(p.nr_random == 5);
 	tp_open(&p, 1, 9);
@@ -1923,8 +1886,7 @@ static void test_random_pick(void)
 	/* The same one twice: drawn again. */
 	vals[0] = vals[1] = tp_at(4, 1);
 	vals[2] = tp_at(4, 3);
-	p.nr_fake = 3;
-	p.ifake = 0;
+	tp_fake(&p, vals, 3);
 	n = p.nr_random;
 	assert(tp_pick(&p, RND2, 0, NONE) == 3);
 	assert(p.nr_random - n == 3);
@@ -1938,8 +1900,7 @@ static void test_random_pick(void)
 	p.ifake = 0;
 	assert(tp_pick(&p, RND, 0, NONE) == 2);
 	vals[3] = tp_at(4, 1);
-	p.nr_fake = 4;
-	p.ifake = 0;
+	tp_fake(&p, vals, 4);
 	assert(tp_pick(&p, RND2, 0, NONE) == 2);
 	/*
 	 * With weights: 10 open on weight 3 are fewer per weight than 9 on
@@ -1949,8 +1910,7 @@ static void test_random_pick(void)
 	tp_weights(&p, w);
 	vals[0] = tp_at(6, 0);		/* by weight: 0 1 2 3 3 3 */
 	vals[1] = tp_at(6, 1);
-	p.nr_fake = 2;
-	p.ifake = 0;
+	tp_fake(&p, vals, 2);
 	assert(tp_pick(&p, RND2, 0, NONE) == 0);
 	p.ifake = 0;
 	tp_open(&p, 0, 0);
@@ -1974,14 +1934,12 @@ static void test_random_pick(void)
 	 * good one for random two: that one.
 	 */
 	tp_init(&p, 6);
-	p.fake = vals;
 	tp_eject(&p, 1, 100);
 	tp_eject(&p, 2, 100);
 	tp_eject(&p, 4, 100);
 	for (i = 0; i < 2 + GWP_UP_PICK_PROBES; i++)
 		vals[i] = tp_at(6, i % 2 ? 2 : 1);
-	p.nr_fake = 2 + GWP_UP_PICK_PROBES;
-	p.ifake = 0;
+	tp_fake(&p, vals, 2 + GWP_UP_PICK_PROBES);
 	n = p.nr_random;
 	assert(tp_pick(&p, RND2, 0, NONE) == 3);
 	assert(p.nr_random - n == 2 + GWP_UP_PICK_PROBES);
@@ -2008,8 +1966,7 @@ static void test_random_pick(void)
 	vals[1] = 0x40000000u;		/* over a quarter: passed */
 	vals[2] = tp_at(6, 0);
 	vals[3] = 0x3fff0000u;		/* under it: taken */
-	p.nr_fake = 4;
-	p.ifake = 0;
+	tp_fake(&p, vals, 4);
 	n = p.nr_random;
 	assert(tp_pick(&p, RND, 0, NONE) == 0);
 	assert(p.nr_random - n == 4);
@@ -2019,8 +1976,7 @@ static void test_random_pick(void)
 	vals[0] = tp_at(6, 3);
 	vals[1] = tp_at(6, 0);
 	vals[2] = 0;
-	p.nr_fake = 3;
-	p.ifake = 0;
+	tp_fake(&p, vals, 3);
 	assert(tp_pick(&p, RND2, 0, NONE) == 3);
 	tp_open(&p, 3, 4);
 	p.ifake = 0;
@@ -2035,14 +1991,12 @@ static void test_random_pick(void)
 	/* A retry: never the failed one, though drawn. */
 	vals[0] = tp_at(6, 3);
 	vals[1] = tp_at(6, 5);
-	p.nr_fake = 2;
-	p.ifake = 0;
+	tp_fake(&p, vals, 2);
 	assert(tp_pick(&p, RND, 0, 3) == 5);
 	p.ifake = 0;
 	assert(tp_pick(&p, RND2, 0, 3) == 5);
 	/* Drawn every time: the next in service after it. */
-	p.nr_fake = 1;
-	p.ifake = 0;
+	tp_fake(&p, vals, 1);
 	assert(tp_pick(&p, RND, 0, 3) == 5);
 	/* One other drawn, every time: that one. */
 	p.ifake = 0;
@@ -2214,7 +2168,6 @@ static void test_threads(void)
 
 struct race {
 	pthread_barrier_t	go;
-	struct gwp_up_state	*s;
 	struct gwp_up_health	*h;
 	uint32_t		now;
 	_Atomic(uint32_t)	ejected;
@@ -2235,6 +2188,35 @@ static void *race_fn(void *arg)
 }
 
 /*
+ * @nr_threads workers fail @k's server @per_thread times each, all at
+ * @now: it is ejected exactly once.
+ */
+static void race_round(struct gwp_up_table *t, const struct gwp_up_key *k,
+		       uint32_t now, uint32_t per_thread,
+		       unsigned int nr_threads)
+{
+	pthread_t th[NR_THREADS];
+	struct race r;
+	unsigned int i;
+
+	assert(nr_threads <= NR_THREADS);
+	r.h = srv_get(t, k);
+	r.now = now;
+	r.per_thread = per_thread;
+	atomic_init(&r.ejected, 0);
+	assert(!pthread_barrier_init(&r.go, NULL, nr_threads));
+	for (i = 0; i < nr_threads; i++)
+		assert(!pthread_create(&th[i], NULL, race_fn, &r));
+	for (i = 0; i < nr_threads; i++)
+		assert(!pthread_join(th[i], NULL));
+	pthread_barrier_destroy(&r.go);
+	assert(atomic_load(&r.ejected) == 1);
+	assert(gwp_up_health_ejected(r.h, r.now, NULL) == GWP_UP_EJECT_MS);
+	/* Its last reference: the next round starts fresh. */
+	srv_put(r.h);
+}
+
+/*
  * Workers fail at once. Exactly as many failures as it takes, one per
  * thread: none of them may be lost, so the server is ejected, exactly
  * once. Many per thread: still one ejection.
@@ -2243,45 +2225,12 @@ static void test_eject_threads(void)
 {
 	struct gwp_up_key k = key_of(GWP_UP_SCHEME_HTTP, "10.0.0.7", 80, NULL);
 	struct gwp_up_table *t = gwp_up_table_create();
-	pthread_t th[NR_THREADS];
-	struct race r;
-	int n, i;
+	uint32_t n;
 
 	assert(t);
-	for (n = 0; n < NR_RACES; n++) {
-		r.s = gwp_up_state_get(t, &k);
-		r.h = def_health(r.s);
-		r.now = 1000 + (uint32_t)n;
-		r.per_thread = 1;
-		atomic_init(&r.ejected, 0);
-		assert(!pthread_barrier_init(&r.go, NULL, GWP_UP_EJECT_FAILS));
-		for (i = 0; i < (int)GWP_UP_EJECT_FAILS; i++)
-			assert(!pthread_create(&th[i], NULL, race_fn, &r));
-		for (i = 0; i < (int)GWP_UP_EJECT_FAILS; i++)
-			assert(!pthread_join(th[i], NULL));
-		pthread_barrier_destroy(&r.go);
-		assert(atomic_load(&r.ejected) == 1);
-		assert(gwp_up_health_ejected(r.h, r.now, NULL) ==
-		       GWP_UP_EJECT_MS);
-		/* Its last reference: the next round starts fresh. */
-		gwp_up_health_put(r.h);
-		gwp_up_state_put(r.s);
-	}
-
-	r.s = gwp_up_state_get(t, &k);
-	r.h = def_health(r.s);
-	r.now = 77;
-	r.per_thread = 1000;
-	atomic_init(&r.ejected, 0);
-	assert(!pthread_barrier_init(&r.go, NULL, NR_THREADS));
-	for (i = 0; i < NR_THREADS; i++)
-		assert(!pthread_create(&th[i], NULL, race_fn, &r));
-	for (i = 0; i < NR_THREADS; i++)
-		assert(!pthread_join(th[i], NULL));
-	pthread_barrier_destroy(&r.go);
-	assert(atomic_load(&r.ejected) == 1);
-	gwp_up_health_put(r.h);
-	gwp_up_state_put(r.s);
+	for (n = 0; n < NR_RACES; n++)
+		race_round(t, &k, 1000 + n, 1, GWP_UP_EJECT_FAILS);
+	race_round(t, &k, 77, 1000, NR_THREADS);
 	assert(gwp_up_table_destroy(t) == 0);
 }
 
@@ -2309,12 +2258,12 @@ int main(void)
 	test_pick_missing();
 	test_pick_big();
 	test_pick_probe();
-	test_pick_spread(3, 1, 12345);
-	test_pick_spread(3, 3, 777);
-	test_pick_spread(7, 3, 0x9e3779b9);
-	test_pick_spread_lc(3, 1, 4242);
-	test_pick_spread_lc(3, 3, 99);
-	test_pick_spread_lc(7, 3, 0x2545f491);
+	test_pick_spread(false, 3, 1, 12345);
+	test_pick_spread(false, 3, 3, 777);
+	test_pick_spread(false, 7, 3, 0x9e3779b9);
+	test_pick_spread(true, 3, 1, 4242);
+	test_pick_spread(true, 3, 3, 99);
+	test_pick_spread(true, 7, 3, 0x2545f491);
 	test_weights();
 	test_weights_least_conn();
 	test_weights_spread();

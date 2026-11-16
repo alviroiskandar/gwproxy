@@ -68,6 +68,50 @@ static int run(struct gwp_http_conn *hc, struct gwp_auth *auth, const char *buf,
 	return r;
 }
 
+/*
+ * Check that @buf, on a fresh connection, comes out as @want. With @whole it
+ * goes through run(), which also checks that all of it was read; without, a
+ * request refused before it is all read goes through proc().
+ */
+static void expect_code(const char *buf, bool whole, int want)
+{
+	struct gwp_http_conn *hc = gwp_http_conn_alloc();
+	char *host, *port;
+	const char *req;
+	size_t req_len;
+	int r;
+
+	assert(hc);
+	if (whole)
+		r = run(hc, NULL, buf, &host, &port, &req, &req_len);
+	else
+		r = proc(hc, NULL, buf, &host, &port, &req, &req_len, NULL);
+	assert(r == want);
+	gwp_http_conn_free(hc);
+}
+
+/*
+ * Check that @in, on a fresh connection, is forwarded as exactly @want, and
+ * say what came out instead when it is not.
+ */
+static void expect_forward(const char *in, const char *want)
+{
+	struct gwp_http_conn *hc = gwp_http_conn_alloc();
+	char *host, *port;
+	const char *req;
+	size_t req_len;
+	bool same;
+
+	assert(hc);
+	assert(run(hc, NULL, in, &host, &port, &req, &req_len) ==
+	       GWP_HTTP_FORWARD);
+	same = req_len == strlen(want) && !memcmp(req, want, req_len);
+	if (!same)
+		fprintf(stderr, "%s: got %.*s\n", in, (int)req_len, req);
+	assert(same);
+	gwp_http_conn_free(hc);
+}
+
 static void test_connect_ipv4(void)
 {
 	static const char buf[] =
@@ -185,17 +229,8 @@ static void test_forward_drops_proxy(void)
 		"X-Before: 1\r\nProxys: s\r\nProxy-Foo: f\r\n"
 		"Proxy_: u\r\nX-After: 2\r\n"
 		"Via: 1.1 gwproxy\r\nConnection: close\r\n\r\n";
-	struct gwp_http_conn *hc = gwp_http_conn_alloc();
-	char *host, *port;
-	const char *req = NULL;
-	size_t req_len = 0;
 
-	assert(hc);
-	assert(run(hc, NULL, buf, &host, &port, &req, &req_len) ==
-	       GWP_HTTP_FORWARD);
-	assert(req_len == sizeof(want) - 1);
-	assert(!memcmp(req, want, req_len));
-	gwp_http_conn_free(hc);
+	expect_forward(buf, want);
 	PRTEST_OK();
 }
 
@@ -374,20 +409,12 @@ static void test_forward_conn_lists_framing(void)
 		("GET http://example.com/a HTTP/1.1\r\n"
 		 "Connection: Host\r\n\r\n"),
 	};
-	struct gwp_http_conn *hc;
-	char *host, *port;
-	const char *req = NULL;
-	size_t req_len = 0, i;
+	size_t i;
 	uint8_t out[128];
 	int r;
 
-	for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
-		hc = gwp_http_conn_alloc();
-		assert(hc);
-		r = run(hc, NULL, bad[i], &host, &port, &req, &req_len);
-		assert(r == GWP_HTTP_BAD_REQUEST);
-		gwp_http_conn_free(hc);
-	}
+	for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++)
+		expect_code(bad[i], true, GWP_HTTP_BAD_REQUEST);
 
 	r = gwp_http_build_bad_request_reply(out, sizeof(out));
 	assert(r > 0 && !strncmp((char *)out, "HTTP/1.1 400 ", 13));
@@ -435,11 +462,12 @@ static int req_body(const char *hdr, const char *body, size_t step,
  */
 static void test_forward_conn_limit(void)
 {
+	static const char want[] =
+		"GET / HTTP/1.1\r\nHost: example.com\r\n"
+		"X-32: c\r\nVia: 1.1 gwproxy\r\n"
+		"Connection: close\r\n\r\n";
 	static char buf[4096];
-	struct gwp_http_conn *hc;
-	char *host, *port;
-	const char *req = NULL;
-	size_t req_len = 0, n;
+	size_t n;
 	int i;
 
 	n = (size_t)sprintf(buf, "GET http://example.com/ HTTP/1.1\r\n"
@@ -447,26 +475,10 @@ static void test_forward_conn_limit(void)
 	for (i = 0; i < 32; i++)
 		n += (size_t)sprintf(buf + n, "x-%d, X-%d,", i, i);
 	n += (size_t)sprintf(buf + n, "\r\nX-31: b\r\nX-32: c\r\n\r\n");
-	hc = gwp_http_conn_alloc();
-	assert(hc);
-	assert(run(hc, NULL, buf, &host, &port, &req, &req_len) ==
-	       GWP_HTTP_FORWARD);
-	{
-		static const char want[] =
-			"GET / HTTP/1.1\r\nHost: example.com\r\n"
-			"X-32: c\r\nVia: 1.1 gwproxy\r\n"
-			"Connection: close\r\n\r\n";
-
-		assert(req_len == strlen(want) && !memcmp(req, want, req_len));
-	}
-	gwp_http_conn_free(hc);
+	expect_forward(buf, want);
 
 	sprintf(buf + n - 2, "Connection: X-32\r\n\r\n");
-	hc = gwp_http_conn_alloc();
-	assert(hc);
-	assert(run(hc, NULL, buf, &host, &port, &req, &req_len) ==
-	       GWP_HTTP_BAD_REQUEST);
-	gwp_http_conn_free(hc);
+	expect_code(buf, true, GWP_HTTP_BAD_REQUEST);
 	PRTEST_OK();
 }
 
@@ -549,10 +561,6 @@ static void test_req_framing(void)
 	};
 	char body[256];
 	size_t fwd, step, i;
-	struct gwp_http_conn *hc;
-	char *host, *port;
-	const char *req;
-	size_t req_len;
 
 	for (step = 1; step <= 64; step *= 4) {
 		/* Content-Length: exactly that many bytes, the rest dropped. */
@@ -590,21 +598,19 @@ static void test_req_framing(void)
 					bad_chunked[i], step, &fwd) == -EBADMSG);
 	}
 
-	for (i = 0; i < sizeof(bad_hdr) / sizeof(bad_hdr[0]); i++) {
-		hc = gwp_http_conn_alloc();
-		assert(hc);
-		assert(run(hc, NULL, bad_hdr[i], &host, &port, &req,
-			   &req_len) == GWP_HTTP_BAD_REQUEST);
-		gwp_http_conn_free(hc);
-	}
+	for (i = 0; i < sizeof(bad_hdr) / sizeof(bad_hdr[0]); i++)
+		expect_code(bad_hdr[i], true, GWP_HTTP_BAD_REQUEST);
 	PRTEST_OK();
 }
 
-/* Feed @in to a fresh response filter in one go; returns its result. */
-static int res_feed(struct gwp_http_conn *hc, const char *in, bool eof,
-		    char *out, size_t out_cap, size_t *out_len)
+/*
+ * Feed @in in one go to a fresh response filter that may hold back @hold
+ * bytes; returns its result.
+ */
+static int res_feed(struct gwp_http_conn *hc, size_t hold, const char *in,
+		    bool eof, char *out, size_t out_cap, size_t *out_len)
 {
-	assert(!gwp_http_fwd_res_init(hc, 1024));
+	assert(!gwp_http_fwd_res_init(hc, hold));
 	return gwp_http_fwd_res_input(hc, in, strlen(in), eof, out, out_cap,
 				      out_len);
 }
@@ -675,7 +681,7 @@ static void test_res_framing(void)
 	for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
 		hc = gwp_http_conn_alloc();
 		assert(hc);
-		r = res_feed(hc, cases[i].in, false, out, sizeof(out),
+		r = res_feed(hc, 1024, cases[i].in, false, out, sizeof(out),
 			     &out_len);
 		assert(r == cases[i].ret);
 		if (!r)
@@ -723,7 +729,8 @@ static void test_res_rewrite(void)
 	size_t out_len, i;
 
 	assert(hc);
-	assert(res_feed(hc, in, false, out, sizeof(out), &out_len) == 0);
+	assert(res_feed(hc, 1024, in, false, out, sizeof(out),
+			&out_len) == 0);
 	assert(gwp_http_fwd_res_state(hc) == GWP_HTTP_RES_BODY);
 	assert(out_len == strlen(want) && !memcmp(out, want, out_len));
 
@@ -767,7 +774,8 @@ static void test_res_interim(void)
 	size_t out_len;
 
 	assert(hc);
-	assert(res_feed(hc, in, false, out, sizeof(out), &out_len) == 0);
+	assert(res_feed(hc, 1024, in, false, out, sizeof(out),
+			&out_len) == 0);
 	assert(gwp_http_fwd_res_state(hc) == GWP_HTTP_RES_HDR);
 	assert(out_len == 25 && !memcmp(out, "HTTP/1.1 100 Continue\r\n\r\n", 25));
 	assert(gwp_http_fwd_res_pending(hc) == 11);
@@ -803,14 +811,12 @@ static void test_res_limits(void)
 	for (i = 0; i < 256; i++)
 		n += (size_t)sprintf(in + n, "X-%d: v\r\n", i);
 	sprintf(in + n, "\r\n");
-	assert(!gwp_http_fwd_res_init(hc, sizeof(in)));
-	assert(gwp_http_fwd_res_input(hc, in, strlen(in), false, out,
-				      sizeof(out), &out_len) == 0);
+	assert(res_feed(hc, sizeof(in), in, false, out, sizeof(out),
+			&out_len) == 0);
 	assert(gwp_http_fwd_res_state(hc) == GWP_HTTP_RES_BODY);
 	sprintf(in + n, "X-x: v\r\n\r\n");
-	assert(!gwp_http_fwd_res_init(hc, sizeof(in)));
-	assert(gwp_http_fwd_res_input(hc, in, strlen(in), false, out,
-				      sizeof(out), &out_len) == -E2BIG);
+	assert(res_feed(hc, sizeof(in), in, false, out, sizeof(out),
+			&out_len) == -E2BIG);
 
 	/* 32 distinct options over two lines, each repeated: fine. */
 	n = (size_t)sprintf(in, "HTTP/1.1 200 OK\r\nX-0: drop\r\n"
@@ -822,9 +828,8 @@ static void test_res_limits(void)
 		n += (size_t)sprintf(in + n, ",, X-%d,x-%d", i, i);
 	n += (size_t)sprintf(in + n, "\r\nX-31: drop\r\n");
 	sprintf(in + n, "\r\n");
-	assert(!gwp_http_fwd_res_init(hc, sizeof(in)));
-	assert(gwp_http_fwd_res_input(hc, in, strlen(in), false, out,
-				      sizeof(out), &out_len) == 0);
+	assert(res_feed(hc, sizeof(in), in, false, out, sizeof(out),
+			&out_len) == 0);
 	{
 		static const char want[] =
 			"HTTP/1.1 200 OK\r\nKeep: me\r\n"
@@ -837,18 +842,16 @@ static void test_res_limits(void)
 
 	/* A 33rd distinct option: refused. */
 	sprintf(in + n, "Connection: X-32\r\n\r\n");
-	assert(!gwp_http_fwd_res_init(hc, sizeof(in)));
-	assert(gwp_http_fwd_res_input(hc, in, strlen(in), false, out,
-				      sizeof(out), &out_len) == -E2BIG);
+	assert(res_feed(hc, sizeof(in), in, false, out, sizeof(out),
+			&out_len) == -E2BIG);
 
 	/* A long list of one repeated option is one option. */
 	n = (size_t)sprintf(in, "HTTP/1.1 200 OK\r\nConnection: a");
 	for (i = 0; i < 5000; i++)
 		n += (size_t)sprintf(in + n, ",a");
 	sprintf(in + n, "\r\nA: x\r\nB: y\r\n\r\n");
-	assert(!gwp_http_fwd_res_init(hc, sizeof(in)));
-	assert(gwp_http_fwd_res_input(hc, in, strlen(in), false, out,
-				      sizeof(out), &out_len) == 0);
+	assert(res_feed(hc, sizeof(in), in, false, out, sizeof(out),
+			&out_len) == 0);
 	assert(out_len == strlen("HTTP/1.1 200 OK\r\nB: y\r\n"
 				 "Via: 1.1 gwproxy\r\n"
 				 "Connection: close\r\n"
@@ -908,26 +911,17 @@ static void test_via(void)
 		  "HTTP/1.1 100 Continue\r\nVia: 1.1 a\r\n\r\n" },
 	};
 	struct gwp_http_conn *hc;
-	const char *req;
-	char *host, *port, out[1024];
-	size_t i, req_len, out_len;
+	char out[1024];
+	size_t i, out_len;
 
-	for (i = 0; i < sizeof(req_cases) / sizeof(req_cases[0]); i++) {
-		hc = gwp_http_conn_alloc();
-		assert(hc);
-		assert(run(hc, NULL, req_cases[i].in, &host, &port, &req,
-			   &req_len) == GWP_HTTP_FORWARD);
-		if (strcmp(req, req_cases[i].out))
-			fprintf(stderr, "request %zu: %s\n", i, req);
-		assert(!strcmp(req, req_cases[i].out));
-		gwp_http_conn_free(hc);
-	}
+	for (i = 0; i < sizeof(req_cases) / sizeof(req_cases[0]); i++)
+		expect_forward(req_cases[i].in, req_cases[i].out);
 
 	for (i = 0; i < sizeof(res_cases) / sizeof(res_cases[0]); i++) {
 		hc = gwp_http_conn_alloc();
 		assert(hc);
-		assert(!res_feed(hc, res_cases[i].in, false, out, sizeof(out),
-				 &out_len));
+		assert(!res_feed(hc, 1024, res_cases[i].in, false, out,
+				 sizeof(out), &out_len));
 		if (out_len != strlen(res_cases[i].out) ||
 		    memcmp(out, res_cases[i].out, out_len))
 			fprintf(stderr, "response %zu: %.*s\n", i,
@@ -989,16 +983,14 @@ static void test_res_direct(void)
 		assert(out_len == want_len && !memcmp(buf, want, want_len));
 
 		/* In one read, separate buffers. */
-		assert(!gwp_http_fwd_res_init(hc, 16384));
-		assert(!gwp_http_fwd_res_input(hc, cases[i], len, false, out,
-					       sizeof(out), &out_len));
+		assert(!res_feed(hc, 16384, cases[i], false, out, sizeof(out),
+				 &out_len));
 		assert(out_len == want_len && !memcmp(out, want, want_len));
 	}
 
 	/* Too little room for header and body: refused either way. */
-	assert(!gwp_http_fwd_res_init(hc, 16384));
-	assert(gwp_http_fwd_res_input(hc, cases[0], strlen(cases[0]), false,
-				      out, 40, &out_len) == -E2BIG);
+	assert(res_feed(hc, 16384, cases[0], false, out, 40, &out_len) ==
+	       -E2BIG);
 	gwp_http_conn_free(hc);
 	PRTEST_OK();
 }
@@ -1014,6 +1006,7 @@ static void test_res_reject(void)
 		"HTTP/1.1 200 OK\r\nX: a\r\n b\r\n\r\n",	/* obs-fold */
 		"HTTP/1.1 200 OK\r\nX : a\r\n\r\n",
 		"HTTP/1.1 600 OK\r\n\r\n",
+		"HTTP/1.1 099 OK\r\n\r\n",
 	};
 	struct gwp_http_conn *hc = gwp_http_conn_alloc();
 	char out[1024], big[1100];
@@ -1021,23 +1014,24 @@ static void test_res_reject(void)
 
 	assert(hc);
 	for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
-		assert(res_feed(hc, bad[i], false, out, sizeof(out),
+		assert(res_feed(hc, 1024, bad[i], false, out, sizeof(out),
 				&out_len) < 0);
 		assert(gwp_http_fwd_res_state(hc) == GWP_HTTP_RES_FAILED);
 		assert(!out_len);
 	}
-	assert(res_feed(hc, bad[0], false, out, sizeof(out), &out_len) ==
-	       -EACCES);
+	assert(res_feed(hc, 1024, bad[0], false, out, sizeof(out),
+			&out_len) == -EACCES);
 
 	/* The origin closing before the header is complete. */
-	assert(res_feed(hc, "HTTP/1.1 200 OK\r\n", true, out, sizeof(out),
-			&out_len) == -EBADMSG);
+	assert(res_feed(hc, 1024, "HTTP/1.1 200 OK\r\n", true, out,
+			sizeof(out), &out_len) == -EBADMSG);
 
 	/* A header that cannot fit in what the filter may hold back. */
 	memset(big, 'a', sizeof(big) - 1);
 	big[sizeof(big) - 1] = '\0';
 	memcpy(big, "HTTP/1.1 200 OK\r\nX: ", 20);
-	assert(res_feed(hc, big, false, out, sizeof(out), &out_len) == -E2BIG);
+	assert(res_feed(hc, 1024, big, false, out, sizeof(out),
+			&out_len) == -E2BIG);
 
 	gwp_http_conn_free(hc);
 	PRTEST_OK();
@@ -1194,40 +1188,16 @@ static void test_errors(void)
 		"PROPFIND http://example.com/dav/ HTTP/1.1\r\nDepth: 1\r\n\r\n";
 	static const char lcmethod[] =
 		"get http://example.com/ HTTP/1.1\r\n\r\n";
-	struct gwp_http_conn *hc;
-	char *host, *port;
-	const char *req = NULL;
-	size_t req_len = 0;
 
-	hc = gwp_http_conn_alloc();
-	assert(hc);
-	assert(run(hc, NULL, https, &host, &port, &req, &req_len) ==
-	       GWP_HTTP_NOT_IMPLEMENTED);
-	gwp_http_conn_free(hc);
-
-	hc = gwp_http_conn_alloc();
-	assert(hc);
-	assert(proc(hc, NULL, bare, &host, &port, &req, &req_len, NULL) ==
-	       GWP_HTTP_BAD_REQUEST);
-	gwp_http_conn_free(hc);
+	expect_code(https, true, GWP_HTTP_NOT_IMPLEMENTED);
+	expect_code(bare, false, GWP_HTTP_BAD_REQUEST);
 
 	/* Any method token is forwarded, spelt as the client sent it. */
-	hc = gwp_http_conn_alloc();
-	assert(hc);
-	assert(run(hc, NULL, extmethod, &host, &port, &req, &req_len) ==
-	       GWP_HTTP_FORWARD);
-	assert(!strcmp(req, "PROPFIND /dav/ HTTP/1.1\r\n"
-			    "Host: example.com\r\nDepth: 1\r\n"
-			    "Via: 1.1 gwproxy\r\nConnection: close\r\n\r\n"));
-	gwp_http_conn_free(hc);
-
-	hc = gwp_http_conn_alloc();
-	assert(hc);
-	assert(run(hc, NULL, lcmethod, &host, &port, &req, &req_len) ==
-	       GWP_HTTP_FORWARD);
-	assert(!strcmp(req, "get / HTTP/1.1\r\nHost: example.com\r\n"
-			    "Via: 1.1 gwproxy\r\nConnection: close\r\n\r\n"));
-	gwp_http_conn_free(hc);
+	expect_forward(extmethod, "PROPFIND /dav/ HTTP/1.1\r\n"
+		       "Host: example.com\r\nDepth: 1\r\n"
+		       "Via: 1.1 gwproxy\r\nConnection: close\r\n\r\n");
+	expect_forward(lcmethod, "get / HTTP/1.1\r\nHost: example.com\r\n"
+		       "Via: 1.1 gwproxy\r\nConnection: close\r\n\r\n");
 
 	PRTEST_OK();
 }
@@ -1379,20 +1349,16 @@ static void test_max_forwards(void)
 		  "GET / HTTP/1.1\r\nHost: h\r\n"
 		  "Via: 1.1 gwproxy\r\nConnection: close\r\n\r\n" },
 	};
-	struct gwp_http_conn *hc;
-	char *host, *port;
-	const char *req;
-	size_t i, req_len;
-	int r;
+	size_t i;
 
 	for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-		hc = gwp_http_conn_alloc();
-		assert(hc);
-		r = run(hc, NULL, cases[i].in, &host, &port, &req, &req_len);
-		assert(r == cases[i].want);
-		if (cases[i].out)
-			assert(!strcmp(req, cases[i].out));
-		gwp_http_conn_free(hc);
+		/* Only a forwarded request has an output to compare. */
+		if (cases[i].out) {
+			assert(cases[i].want == GWP_HTTP_FORWARD);
+			expect_forward(cases[i].in, cases[i].out);
+		} else {
+			expect_code(cases[i].in, true, cases[i].want);
+		}
 	}
 	PRTEST_OK();
 }
@@ -1544,25 +1510,11 @@ static void test_field_obs_text(void)
 	static const char want[] =
 		"GET / HTTP/1.1\r\nHost: e\r\nX-N: caf\xc3\xa9 \xff\r\n"
 		"Via: 1.1 gwproxy\r\nConnection: close\r\n\r\n";
-	struct gwp_http_conn *hc;
-	char *host, *port;
-	const char *req = NULL;
-	size_t req_len = 0, i;
+	size_t i;
 
-	for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
-		hc = gwp_http_conn_alloc();
-		assert(hc);
-		assert(proc(hc, NULL, bad[i], &host, &port, &req, &req_len,
-			    NULL) == GWP_HTTP_BAD_REQUEST);
-		gwp_http_conn_free(hc);
-	}
-
-	hc = gwp_http_conn_alloc();
-	assert(hc);
-	assert(run(hc, NULL, good, &host, &port, &req, &req_len) ==
-	       GWP_HTTP_FORWARD);
-	assert(req_len == strlen(want) && !memcmp(req, want, req_len));
-	gwp_http_conn_free(hc);
+	for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++)
+		expect_code(bad[i], false, GWP_HTTP_BAD_REQUEST);
+	expect_forward(good, want);
 	PRTEST_OK();
 }
 
@@ -1695,37 +1647,21 @@ static void test_underscore_alias(void)
 		"Content_Lengthx: 1\r\nXContent_Length: 1\r\n"
 		"Host_: h\r\nTE_: x\r\nContent-Length: 4\r\n"
 		"Via: 1.1 gwproxy\r\nConnection: close\r\n\r\n";
-	struct gwp_http_conn *hc;
-	char *host, *port, buf[256];
-	const char *req;
-	size_t req_len, i;
+	char buf[256];
+	size_t i;
 
 	for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
 		snprintf(buf, sizeof(buf), "POST http://e/ HTTP/1.1\r\n"
 			 "X-A: 1\r\n%s\r\nContent-Length: 4\r\n\r\n",
 			 bad[i]);
-		hc = gwp_http_conn_alloc();
-		assert(hc);
-		assert(run(hc, NULL, buf, &host, &port, &req, &req_len) ==
-		       GWP_HTTP_BAD_REQUEST);
-		gwp_http_conn_free(hc);
+		expect_code(buf, true, GWP_HTTP_BAD_REQUEST);
 	}
 
-	hc = gwp_http_conn_alloc();
-	assert(hc);
-	assert(run(hc, NULL, good, &host, &port, &req, &req_len) ==
-	       GWP_HTTP_FORWARD);
-	assert(req_len == sizeof(good_want) - 1);
-	assert(!memcmp(req, good_want, req_len));
-	gwp_http_conn_free(hc);
+	expect_forward(good, good_want);
 
 	/* A CONNECT's fields go nowhere: nothing to refuse there. */
-	hc = gwp_http_conn_alloc();
-	assert(hc);
-	assert(run(hc, NULL, "CONNECT e:443 HTTP/1.1\r\n"
-		   "Content_Length: 4\r\n\r\n", &host, &port, &req,
-		   &req_len) == GWP_HTTP_CONNECT);
-	gwp_http_conn_free(hc);
+	expect_code("CONNECT e:443 HTTP/1.1\r\nContent_Length: 4\r\n\r\n",
+		    true, GWP_HTTP_CONNECT);
 	PRTEST_OK();
 }
 
@@ -1782,14 +1718,9 @@ static void test_duplicate_field(void)
 	const char *req = NULL;
 	size_t req_len = 0, i;
 
-	for (i = 0; i < sizeof(dups) / sizeof(dups[0]); i++) {
-		/* Not run(): the request is refused before it is all read. */
-		hc = gwp_http_conn_alloc();
-		assert(hc);
-		assert(proc(hc, NULL, dups[i], &host, &port, &req, &req_len,
-			    NULL) == GWP_HTTP_BAD_REQUEST);
-		gwp_http_conn_free(hc);
-	}
+	/* Not whole: the request is refused before it is all read. */
+	for (i = 0; i < sizeof(dups) / sizeof(dups[0]); i++)
+		expect_code(dups[i], false, GWP_HTTP_BAD_REQUEST);
 
 	hc = gwp_http_conn_alloc();
 	assert(hc);
@@ -1798,19 +1729,8 @@ static void test_duplicate_field(void)
 	assert(memmem(req, req_len, "\r\nAccept: a, b\r\n", 16));
 	gwp_http_conn_free(hc);
 
-	hc = gwp_http_conn_alloc();
-	assert(hc);
-	assert(run(hc, NULL, other, &host, &port, &req, &req_len) ==
-	       GWP_HTTP_FORWARD);
-	assert(req_len == strlen(other_want) &&
-	       !memcmp(req, other_want, req_len));
-	gwp_http_conn_free(hc);
-
-	hc = gwp_http_conn_alloc();
-	assert(hc);
-	assert(run(hc, NULL, tunnel, &host, &port, &req, &req_len) ==
-	       GWP_HTTP_CONNECT);
-	gwp_http_conn_free(hc);
+	expect_forward(other, other_want);
+	expect_code(tunnel, true, GWP_HTTP_CONNECT);
 	PRTEST_OK();
 }
 
@@ -1893,19 +1813,11 @@ static void test_header_limits(void)
 	for (i = 0; i < 128; i++)
 		n += (size_t)sprintf(buf + n, "X-%d: v\r\n", i);
 	n += (size_t)sprintf(buf + n, "\r\n");
-	hc = gwp_http_conn_alloc();
-	assert(hc);
-	assert(run(hc, NULL, buf, &host, &port, &req, &req_len) ==
-	       GWP_HTTP_FORWARD);
-	gwp_http_conn_free(hc);
+	expect_code(buf, true, GWP_HTTP_FORWARD);
 
 	/* One more field line, even a merged list field: refused. */
 	sprintf(buf + n - 2, "Accept: a\r\n\r\n");
-	hc = gwp_http_conn_alloc();
-	assert(hc);
-	r = proc(hc, NULL, buf, &host, &port, &req, &req_len, NULL);
-	assert(r == GWP_HTTP_TOO_LARGE);
-	gwp_http_conn_free(hc);
+	expect_code(buf, false, GWP_HTTP_TOO_LARGE);
 
 	/*
 	 * A request-target past the limit is a URI too long (RFC 9112
@@ -1914,19 +1826,11 @@ static void test_header_limits(void)
 	n = (size_t)sprintf(buf, "GET http://example.com/");
 	memset(buf + n, 'a', 17000);
 	sprintf(buf + n + 17000, " HTTP/1.1\r\n\r\n");
-	hc = gwp_http_conn_alloc();
-	assert(hc);
-	r = proc(hc, NULL, buf, &host, &port, &req, &req_len, NULL);
-	assert(r == GWP_HTTP_URI_TOO_LONG);
-	gwp_http_conn_free(hc);
+	expect_code(buf, false, GWP_HTTP_URI_TOO_LONG);
 	n = (size_t)sprintf(buf, "CONNECT ");
 	memset(buf + n, 'a', 17000);
 	sprintf(buf + n + 17000, ":443 HTTP/1.1\r\n\r\n");
-	hc = gwp_http_conn_alloc();
-	assert(hc);
-	r = proc(hc, NULL, buf, &host, &port, &req, &req_len, NULL);
-	assert(r == GWP_HTTP_URI_TOO_LONG);
-	gwp_http_conn_free(hc);
+	expect_code(buf, false, GWP_HTTP_URI_TOO_LONG);
 
 	/* A request line that fills a buffer: the same, as for a field. */
 	hc = gwp_http_conn_alloc();
@@ -1952,11 +1856,7 @@ static void test_header_limits(void)
 	memset(buf + n, 'a', 17000);
 	n += 17000;
 	sprintf(buf + n, "\r\n\r\n");
-	hc = gwp_http_conn_alloc();
-	assert(hc);
-	r = proc(hc, NULL, buf, &host, &port, &req, &req_len, NULL);
-	assert(r == GWP_HTTP_TOO_LARGE);
-	gwp_http_conn_free(hc);
+	expect_code(buf, false, GWP_HTTP_TOO_LARGE);
 	PRTEST_OK();
 }
 
@@ -1977,6 +1877,9 @@ static void test_upstream_reply(void)
 		{ "HTTP/1.0 200 OK\r\nVia: x\r\n\r\ntunnel", 0, 200, 27 },
 		{ "HTTP/1.1 200\n\n", 0, 200, 14 },
 		{ "HTTP/1.1 407 Auth\nX: y\r\n\r\n", 0, 407, 26 },
+		/* Unlike an origin's response, any first digit is taken. */
+		{ "HTTP/1.1 600 X\r\n\r\n", 0, 600, 18 },
+		{ "HTTP/1.1 099\n\n", 0, 99, 14 },
 		{ "HTTP/1.1 200 OK\r\n", -EAGAIN, 0, 0 },
 		{ "HTTP/1.1 200 OK\r\n\r", -EAGAIN, 0, 0 },
 		{ "HTTP/1.x 200 OK\r\n\r\n", -EINVAL, 0, 0 },

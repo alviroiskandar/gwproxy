@@ -207,11 +207,101 @@ static void test_full_table_reclaims_expired(void)
 	gwp_dns_cache_free(cache);
 }
 
+/* The names in the one chain of a one-bucket table, head first. */
+static void chain_names(const struct gwp_dns_cache *cache, char *out,
+			size_t len)
+{
+	const struct dns_cache_entry *e;
+	size_t n = 0;
+
+	out[0] = '\0';
+	for (e = cache->map.table[0]; e; e = e->next)
+		n += (size_t)snprintf(&out[n], len - n, "%s%s", n ? " " : "",
+				      (const char *)e->e.block);
+	assert(n < len);
+}
+
+static void expire(struct gwp_dns_cache *cache, const char *name)
+{
+	struct dns_cache_entry *e;
+
+	for (e = cache->map.table[0]; e; e = e->next) {
+		if (!strcmp((const char *)e->e.block, name)) {
+			e->expired_at = time(NULL) - 1;
+			return;
+		}
+	}
+	assert(0);
+}
+
+/*
+ * An insert walks the chain of its bucket: it unlinks the expired entries it
+ * passes, at the head and further in, replaces a live entry of the same name
+ * where it stands and stops there, and appends a new name at the end.
+ */
+static void test_chain_walk(void)
+{
+	struct gwp_dns_cache *cache = NULL;
+	struct gwp_dns_cache_addrs ca;
+	struct sockaddr_in sa;
+	struct addrinfo ai;
+	char names[64];
+	int r;
+
+	fill_ai_v4(&ai, &sa);
+
+	r = gwp_dns_cache_init(&cache, 1, 0);
+	assert(!r && cache);
+
+	assert(!gwp_dns_cache_insert(cache, "a.test", &ai, time(NULL) + 100));
+	assert(!gwp_dns_cache_insert(cache, "b.test", &ai, time(NULL) + 100));
+	assert(!gwp_dns_cache_insert(cache, "c.test", &ai, time(NULL) + 100));
+	assert(!gwp_dns_cache_insert(cache, "d.test", &ai, time(NULL) + 100));
+	chain_names(cache, names, sizeof(names));
+	assert(!strcmp(names, "a.test b.test c.test d.test"));
+	assert(cache->map.nr_entries == 4);
+
+	/* The expired head goes; the walk stops at b, so c stays. */
+	expire(cache, "a.test");
+	expire(cache, "c.test");
+	sa.sin_addr.s_addr = htonl(0x7f000002);
+	assert(!gwp_dns_cache_insert(cache, "B.TEST", &ai, time(NULL) + 100));
+	chain_names(cache, names, sizeof(names));
+	assert(!strcmp(names, "b.test c.test d.test"));
+	assert(cache->map.nr_entries == 3);
+	assert(!gwp_dns_cache_lookup_addrs(cache, "b.test", &ca));
+	assert(ca.nr_i4 == 1 && !memcmp(&ca.i4[0], &sa.sin_addr, 4));
+
+	/* A new name walks the whole chain and drops c on the way. */
+	assert(!gwp_dns_cache_insert(cache, "e.test", &ai, time(NULL) + 100));
+	chain_names(cache, names, sizeof(names));
+	assert(!strcmp(names, "b.test d.test e.test"));
+	assert(cache->map.nr_entries == 3);
+
+	/* A replaced tail keeps its place, and nothing follows it. */
+	assert(!gwp_dns_cache_insert(cache, "e.test", &ai, time(NULL) + 100));
+	chain_names(cache, names, sizeof(names));
+	assert(!strcmp(names, "b.test d.test e.test"));
+	assert(cache->map.nr_entries == 3);
+
+	/* Everything expired: the chain empties and takes the new name. */
+	expire(cache, "b.test");
+	expire(cache, "d.test");
+	expire(cache, "e.test");
+	assert(!gwp_dns_cache_insert(cache, "f.test", &ai, time(NULL) + 100));
+	chain_names(cache, names, sizeof(names));
+	assert(!strcmp(names, "f.test"));
+	assert(cache->map.nr_entries == 1);
+
+	gwp_dns_cache_free(cache);
+}
+
 int main(void)
 {
 	test_hash_flood();
 	test_lookup_does_not_sweep();
 	test_full_table_reclaims_expired();
+	test_chain_walk();
 	printf("All tests passed.\n");
 	return 0;
 }
