@@ -3189,6 +3189,16 @@ static int handle_ev_target_recv(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			return 0;
 		}
 		/*
+		 * A connect that reported the reset (target_note_reset()) may
+		 * have left the socket disconnected: the kernel retries the
+		 * connect once its poll sees the socket writable, and a retry
+		 * that finds it reset by then takes the error and disconnects
+		 * it, dropping what the target had sent. The recv then fails
+		 * with -ENOTCONN, which is the same end.
+		 */
+		if (r == -ENOTCONN && gcp->target.rst)
+			r = -ECONNRESET;
+		/*
 		 * A reset ends the target's stream as an EOF would, after all
 		 * it sent: the HTTP forwarding filter answers 502 for an origin
 		 * that resets inside its response header, as for one that
