@@ -2693,11 +2693,7 @@ static int finish_target_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	prep_client_watch_del(w, gcp);
 	arm_idle_timer(w, gcp);
 	gcp->is_target_alive = true;
-	pr_info(&w->ctx->lh,
-		"Target socket connected (fd=%d, idx=%u, ca=%s, ta=%s)",
-		gcp->target.fd, gcp->idx,
-		ip_to_str(&gcp->client_addr),
-		ip_to_str(&gcp->target_addr));
+	gwp_log_target_connected(w, gcp);
 
 	http_fwd = (gcp->prot_type == GWP_PROT_TYPE_HTTP && gcp->http_conn &&
 		    gwp_http_conn_is_forward(gcp->http_conn));

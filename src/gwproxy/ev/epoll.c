@@ -752,20 +752,6 @@ static int new_client_timeout(const struct gwp_cfg *cfg)
 }
 
 /*
- * Every connection to a target is logged once it is up, the same way on both
- * event loops: in handle_ev_target_conn_result() once the connect completes,
- * or in handle_new_client() for a plain forwarding connect that completed at
- * once. A connection through an upstream proxy is logged when the tunnel is
- * up instead.
- */
-static void log_target_connected(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
-{
-	pr_info(&w->ctx->lh, "Target socket connected (fd=%d, idx=%u, ca=%s, ta=%s)",
-		gcp->target.fd, gcp->idx, ip_to_str(&gcp->client_addr),
-		ip_to_str(&gcp->target_addr));
-}
-
-/*
  * Register a new client's descriptors: its target socket, if it has one by
  * now, and the client socket under @cl_ev_bit. With @cl_watched, the client
  * socket is in the epoll set already, under EV_BIT_CLIENT, as wait_for_target()
@@ -810,7 +796,7 @@ static int register_new_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		log_conn_pair_created(w, gcp);
 		/* Otherwise it is logged when EPOLLOUT reports the connect. */
 		if (gcp->is_target_alive)
-			log_target_connected(w, gcp);
+			gwp_log_target_connected(w, gcp);
 	}
 
 	return 0;
@@ -2407,7 +2393,7 @@ static int handle_ev_target_conn_result(struct gwp_wrk *w,
 		return upstream_start(w, gcp);
 	}
 
-	log_target_connected(w, gcp);
+	gwp_log_target_connected(w, gcp);
 	r = arm_idle_timer(w, gcp);
 	if (unlikely(r))
 		return r;

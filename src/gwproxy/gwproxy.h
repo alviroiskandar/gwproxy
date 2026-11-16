@@ -1707,6 +1707,21 @@ void log_conn_pair_created(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		ip_to_str(&gcp->client_addr), ip_to_str(&gcp->target_addr));
 }
 
+/*
+ * Every connection to a target is logged once it is up, the same way on both
+ * event loops: once the connect completes, or, on epoll, in
+ * handle_new_client() for a plain forwarding connect that completed at once.
+ * A connection through an upstream proxy is logged when the tunnel is up
+ * instead.
+ */
+static inline
+void gwp_log_target_connected(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	pr_info(&w->ctx->lh, "Target socket connected (fd=%d, idx=%u, ca=%s, ta=%s)",
+		gcp->target.fd, gcp->idx, ip_to_str(&gcp->client_addr),
+		ip_to_str(&gcp->target_addr));
+}
+
 int gwp_socks5_prep_connect_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				  int err);
 
