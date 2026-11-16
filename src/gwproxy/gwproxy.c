@@ -3883,6 +3883,24 @@ out:
 }
 
 /*
+ * Append to the control buffer @buf, at offset @off, a control message of
+ * @level and @type carrying the @len bytes at @data, and return the offset
+ * past it. The caller has zeroed @buf, so the padding stays zero, and made
+ * it big enough.
+ */
+static inline size_t gwp_cmsg_put(unsigned char *buf, size_t off, int level,
+				  int type, const void *data, size_t len)
+{
+	struct cmsghdr *cm = (struct cmsghdr *)(void *)(buf + off);
+
+	cm->cmsg_level = level;
+	cm->cmsg_type = type;
+	cm->cmsg_len = CMSG_LEN(len);
+	memcpy(CMSG_DATA(cm), data, len);
+	return off + CMSG_SPACE(len);
+}
+
+/*
  * Whether the kernel takes SO_MARK per datagram, as the UDP relay gives
  * --mark to the datagrams to the targets only (see udp_egress()). A kernel
  * older than 5.0 does not, nor, on some, a process with CAP_NET_RAW but not
@@ -3899,9 +3917,9 @@ static void gwp_ctx_init_udp_mark(struct gwp_ctx *ctx)
 	union gwp_udp_cmsg cb;
 	struct gwp_sockaddr dst;
 	struct in_pktinfo pi;
-	struct cmsghdr *cm;
 	struct msghdr mh;
 	struct iovec iov;
+	size_t clen;
 	ssize_t r;
 	int fd;
 
@@ -3911,18 +3929,12 @@ static void gwp_ctx_init_udp_mark(struct gwp_ctx *ctx)
 		return;
 
 	memset(&cb, 0, sizeof(cb));
-	cm = (struct cmsghdr *)(void *)cb.b;
-	cm->cmsg_level = SOL_SOCKET;
-	cm->cmsg_type = SO_MARK;
-	cm->cmsg_len = CMSG_LEN(sizeof(ctx->cfg.mark));
-	memcpy(CMSG_DATA(cm), &ctx->cfg.mark, sizeof(ctx->cfg.mark));
-	cm = (struct cmsghdr *)(void *)(cb.b + CMSG_SPACE(sizeof(ctx->cfg.mark)));
+	clen = gwp_cmsg_put(cb.b, 0, SOL_SOCKET, SO_MARK, &ctx->cfg.mark,
+			    sizeof(ctx->cfg.mark));
 	memset(&pi, 0, sizeof(pi));
 	pi.ipi_ifindex = INT_MAX;
-	cm->cmsg_level = IPPROTO_IP;
-	cm->cmsg_type = IP_PKTINFO;
-	cm->cmsg_len = CMSG_LEN(sizeof(pi));
-	memcpy(CMSG_DATA(cm), &pi, sizeof(pi));
+	clen = gwp_cmsg_put(cb.b, clen, IPPROTO_IP, IP_PKTINFO, &pi,
+			    sizeof(pi));
 
 	memset(&dst, 0, sizeof(dst));
 	dst.i4.sin_family = AF_INET;
@@ -3936,8 +3948,7 @@ static void gwp_ctx_init_udp_mark(struct gwp_ctx *ctx)
 	mh.msg_iov = &iov;
 	mh.msg_iovlen = 1;
 	mh.msg_control = cb.b;
-	mh.msg_controllen = CMSG_SPACE(sizeof(ctx->cfg.mark)) +
-			    CMSG_SPACE(sizeof(pi));
+	mh.msg_controllen = clen;
 	r = __sys_sendmsg(fd, &mh, MSG_NOSIGNAL);
 	__sys_close(fd);
 	if (r >= 0 || r == -ENODEV)
@@ -7205,7 +7216,6 @@ out_close:
 size_t gwp_udp_src_cmsg(const struct gwp_udp_out *out, union gwp_udp_cmsg *cb)
 {
 	const struct gwp_sockaddr *f = out->from;
-	struct cmsghdr *cm = (struct cmsghdr *)(void *)cb->b;
 	struct in_addr a4 = { 0 };
 	size_t len = 0;
 	bool f4, d4;
@@ -7239,9 +7249,7 @@ size_t gwp_udp_src_cmsg(const struct gwp_udp_out *out, union gwp_udp_cmsg *cb)
 		/* With no source, the unspecified one: routing picks it. */
 		memset(&pi, 0, sizeof(pi));
 		if (d4) {
-			pi.ipi6_addr.s6_addr[10] = 0xff;
-			pi.ipi6_addr.s6_addr[11] = 0xff;
-			memcpy(&pi.ipi6_addr.s6_addr[12], &a4, sizeof(a4));
+			set_v4mapped(&pi.ipi6_addr, &a4);
 		} else if (f) {
 			pi.ipi6_addr = f->i6.sin6_addr;
 			/* A link-local source is of its own link. */
@@ -7249,31 +7257,20 @@ size_t gwp_udp_src_cmsg(const struct gwp_udp_out *out, union gwp_udp_cmsg *cb)
 		}
 		if (out->from_ifindex)
 			pi.ipi6_ifindex = out->from_ifindex;
-		cm->cmsg_level = IPPROTO_IPV6;
-		cm->cmsg_type = IPV6_PKTINFO;
-		cm->cmsg_len = CMSG_LEN(sizeof(pi));
-		memcpy(CMSG_DATA(cm), &pi, sizeof(pi));
-		len = CMSG_SPACE(sizeof(pi));
+		len = gwp_cmsg_put(cb->b, 0, IPPROTO_IPV6, IPV6_PKTINFO, &pi,
+				   sizeof(pi));
 	} else {
 		struct in_pktinfo pi;
 
 		memset(&pi, 0, sizeof(pi));
 		pi.ipi_spec_dst = a4;
 		pi.ipi_ifindex = (int)out->from_ifindex;
-		cm->cmsg_level = IPPROTO_IP;
-		cm->cmsg_type = IP_PKTINFO;
-		cm->cmsg_len = CMSG_LEN(sizeof(pi));
-		memcpy(CMSG_DATA(cm), &pi, sizeof(pi));
-		len = CMSG_SPACE(sizeof(pi));
+		len = gwp_cmsg_put(cb->b, 0, IPPROTO_IP, IP_PKTINFO, &pi,
+				   sizeof(pi));
 	}
-	if (out->mark_set) {
-		cm = (struct cmsghdr *)(void *)(cb->b + len);
-		cm->cmsg_level = SOL_SOCKET;
-		cm->cmsg_type = SO_MARK;
-		cm->cmsg_len = CMSG_LEN(sizeof(out->mark));
-		memcpy(CMSG_DATA(cm), &out->mark, sizeof(out->mark));
-		len += CMSG_SPACE(sizeof(out->mark));
-	}
+	if (out->mark_set)
+		len = gwp_cmsg_put(cb->b, len, SOL_SOCKET, SO_MARK, &out->mark,
+				   sizeof(out->mark));
 	return len;
 }
 
