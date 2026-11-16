@@ -434,7 +434,7 @@ static int parse_options(int argc, char *argv[], struct gwp_cfg *cfg)
 		if (opt_bool(c, optarg, &cfg->fld))			\
 			goto einval;					\
 		break
-	#define NR_OPTS ((sizeof(long_opts) / sizeof(long_opts[0])) - 1)
+	#define NR_OPTS (ARRAY_SIZE(long_opts) - 1)
 	char short_opts[(NR_OPTS * 2) + 1], *p;
 	size_t i;
 	long long v;

@@ -1551,7 +1551,7 @@ static bool srv_opt_time(const char *s, uint64_t *ms)
 
 	if (!srv_opt_number(s, len, &v))
 		return false;
-	for (i = 0; i < sizeof(units) / sizeof(units[0]); i++) {
+	for (i = 0; i < ARRAY_SIZE(units); i++) {
 		if (!strcmp(s + len, units[i].unit)) {
 			*ms = v * units[i].ms;
 			return true;
@@ -1579,14 +1579,14 @@ static int parse_server_opts(struct acl_load *ld, char **tok, int n,
 	int i;
 
 	for (i = 0; i < n; i++) {
-		for (k = 0; k < sizeof(srv_opts) / sizeof(srv_opts[0]); k++) {
+		for (k = 0; k < ARRAY_SIZE(srv_opts); k++) {
 			len = strlen(srv_opts[k].name);
 			if (srv_opts[k].kind == SRV_OPT_FLAG ?
 			    !strcmp(tok[i], srv_opts[k].name) :
 			    !strncmp(tok[i], srv_opts[k].name, len))
 				break;
 		}
-		if (k == sizeof(srv_opts) / sizeof(srv_opts[0]))
+		if (k == ARRAY_SIZE(srv_opts))
 			return load_err(ld, "upstream pool %s server %u: word %d after the URL is not an option (expected " SRV_OPTS_LIST ")",
 					p->name, idx, i + 1);
 		so = &srv_opts[k];

@@ -236,7 +236,7 @@ static int parse_hdr_req_first_line(struct gwnet_http_hdr_pctx *ctx,
 		{ "TRACE",	5, GWNET_HTTP_METHOD_TRACE },
 		{ "CONNECT",	7, GWNET_HTTP_METHOD_CONNECT }
 	};
-	static const size_t nr_methods = sizeof(methods) / sizeof(methods[0]);
+	static const size_t nr_methods = ARRAY_SIZE(methods);
 	size_t i, cmpl, reml, off = 0, len = ctx->len - ctx->off;
 	const char *uri, *qs, *path, *buf = &ctx->buf[ctx->off];
 	uint32_t uri_len, qs_len, path_len;
@@ -1634,7 +1634,7 @@ static void test_req_hdr_query_string_multi_qmark(void)
 		{ "GET /a?b?c HTTP/1.1\r\nHost: e\r\n\r\n",	"/a?b?c", "/a",	"b?c" },
 		{ "OPTIONS ?? HTTP/1.1\r\nHost: e\r\n\r\n",	"??",	"",	"?" },
 	};
-	static const size_t nr = sizeof(cases) / sizeof(cases[0]);
+	static const size_t nr = ARRAY_SIZE(cases);
 	struct gwnet_http_hdr_pctx ctx;
 	struct gwnet_http_req_hdr hdr;
 	size_t i;
@@ -1740,7 +1740,7 @@ static void test_req_hdr_invalid_method(void)
 	size_t i;
 	int r;
 
-	for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
 		r = req_parse_buf(&ctx, &hdr, cases[i].line,
 				  strlen(cases[i].line), 0);
 		assert(r == cases[i].ret);
@@ -1892,7 +1892,7 @@ static void test_req_hdr_field_value_bytes(void)
 	gwnet_http_req_hdr_free(&hdr);
 	gwnet_http_hdr_pctx_free(&ctx);
 
-	for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++)
+	for (i = 0; i < ARRAY_SIZE(bad); i++)
 		REQ_EXPECT_FAIL(bad[i], strlen(bad[i]), -EINVAL, -1);
 
 	/* A NUL does not end a value either; strlen() would not reach it. */
@@ -2020,7 +2020,7 @@ static void test_req_hdr_invalid_lone_cr(void)
 	};
 	size_t i;
 
-	for (i = 0; i < sizeof(bufs) / sizeof(bufs[0]); i++)
+	for (i = 0; i < ARRAY_SIZE(bufs); i++)
 		REQ_EXPECT_FAIL(bufs[i], strlen(bufs[i]), -EINVAL,
 				GWNET_HTTP_HDR_ERR_MALFORMED);
 	PRTEST_OK();
