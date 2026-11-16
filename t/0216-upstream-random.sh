@@ -177,8 +177,15 @@ for loop in epoll io_uring; do
 	wait "$held" 2>/dev/null
 
 	# Ejected at its first draw, retried elsewhere, never drawn again.
-	for i in $(seq 1 20); do
+	# A third of the draws land on it until then: the first 60 miss it
+	# with a chance of (2/3)^60, about 3e-11 (20 draws: 3e-4, too
+	# often). Once drawn, 20 more must not draw it again.
+	for i in $(seq 1 60); do
 		get "$loop e $i" e
+		[ "$(npicks p_e 1)" -ge 1 ] && break
+	done
+	for i in $(seq 1 20); do
+		get "$loop e +$i" e
 	done
 	want "$loop e" "picks of the dead server" "$(npicks p_e 1)" 1
 	want "$loop e" "retries on it" \
