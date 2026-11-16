@@ -1522,6 +1522,36 @@ static ssize_t do_recv_tls(struct gwp_conn *src)
 }
 
 /*
+ * Send the ciphertext queued in @c's engine, straight from the queue,
+ * consuming only what the socket takes; a full socket stops it. Returns the
+ * number of bytes sent, or <0 on error.
+ */
+static inline ssize_t tls_flush(struct gwp_conn *c)
+{
+	size_t sent = 0, plen;
+	const void *p;
+	ssize_t n;
+
+	while ((p = gwp_ssl_bio_peek(c->tls, &plen)) != NULL) {
+		n = __sys_send(c->fd, p, plen, MSG_NOSIGNAL);
+		if (n > 0) {
+			gwp_ssl_bio_consume(c->tls, (size_t)n);
+			sent += (size_t)n;
+			if ((size_t)n < plen)
+				break;		/* socket full */
+		} else if (n == -EAGAIN || n == -EINTR) {
+			break;
+		} else if (n == 0) {
+			return -ECONNRESET;
+		} else {
+			return n;
+		}
+	}
+
+	return (ssize_t)sent;
+}
+
+/*
  * TLS send: encrypt src->buf into the send queue and flush the ciphertext to
  * dst->fd straight from the queue, consuming only what the socket accepts.
  * Unflushed ciphertext stays queued; adj_epl_out() keeps EPOLLOUT armed on a
@@ -1536,8 +1566,7 @@ static ssize_t do_recv_tls(struct gwp_conn *src)
  */
 static ssize_t do_send_tls(struct gwp_conn *src, struct gwp_conn *dst)
 {
-	size_t sent = 0, plen;
-	const void *p;
+	size_t sent = 0;
 	bool capped;
 	ssize_t n;
 	int sr;
@@ -1576,24 +1605,17 @@ again:
 	if (unlikely(dst->last_reply) && !src->len)
 		gwp_ssl_shutdown(dst->tls);
 
-	while ((p = gwp_ssl_bio_peek(dst->tls, &plen)) != NULL) {
-		n = __sys_send(dst->fd, p, plen, MSG_NOSIGNAL);
-		if (n > 0) {
-			gwp_ssl_bio_consume(dst->tls, (size_t)n);
-			sent += (size_t)n;
-			if ((size_t)n < plen)
-				return (ssize_t)sent;	/* socket full */
-		} else if (n == -EAGAIN || n == -EINTR) {
-			return (ssize_t)sent;
-		} else if (n == 0) {
-			return -ECONNRESET;
-		} else {
-			return n;
-		}
-	}
+	n = tls_flush(dst);
+	if (n < 0)
+		return n;
+	sent += (size_t)n;
 
-	/* The queue drained with plaintext held back by the cap: go on. */
-	if (capped)
+	/*
+	 * The queue drained with plaintext held back by the cap: go on. A
+	 * full socket leaves ciphertext queued, and the rest waits for
+	 * EPOLLOUT.
+	 */
+	if (capped && !gwp_ssl_bio_pending(dst->tls))
 		goto again;
 
 	return (ssize_t)sent;
@@ -3813,24 +3835,9 @@ static int tls_arm_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 /* Flush queued handshake/alert ciphertext to the client, best effort. */
 static int tls_flush_hs(struct gwp_conn *c)
 {
-	const void *p;
-	size_t plen;
-	ssize_t n;
+	ssize_t n = tls_flush(c);
 
-	while ((p = gwp_ssl_bio_peek(c->tls, &plen)) != NULL) {
-		n = __sys_send(c->fd, p, plen, MSG_NOSIGNAL);
-		if (n > 0) {
-			gwp_ssl_bio_consume(c->tls, (size_t)n);
-			if ((size_t)n < plen)
-				break;
-		} else if (n == -EAGAIN || n == -EINTR) {
-			break;
-		} else {
-			return (n == 0) ? -ECONNRESET : (int)n;
-		}
-	}
-
-	return 0;
+	return n < 0 ? (int)n : 0;
 }
 
 /*
