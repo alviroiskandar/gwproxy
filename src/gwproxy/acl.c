@@ -4427,6 +4427,20 @@ static enum gwp_acl_verdict __eval_chain(const struct acl_chain *c,
 }
 
 /*
+ * Drop what the rules decided for @req: a fresh OUTPUT evaluation starts
+ * from this, and a fail-closed REJECT must not leave any of it behind. One
+ * list for both, so a new result field cannot be missed in one of them.
+ */
+static inline void req_clear_result(struct gwp_acl_req *req)
+{
+	req->dnat_applied = false;
+	req->mark_set = false;
+	req->bind.set = false;
+	req->upstream = GWP_ACL_UPSTREAM_NONE;
+	req->upstream_pool = NULL;
+}
+
+/*
  * __eval_chain(), failing closed: if any regexp along the way could not be
  * decided (regex_match()), the rules this request met are not known, so it
  * is refused, whatever they would have said, and the verdict is not cached.
@@ -4446,11 +4460,7 @@ static enum gwp_acl_verdict eval_chain(const struct gwp_acl_ruleset *rs,
 	if (req->upstream_only)
 		req->upstream_unsure = true;
 
-	req->dnat_applied = false;
-	req->mark_set = false;
-	req->bind.set = false;
-	req->upstream = GWP_ACL_UPSTREAM_NONE;
-	req->upstream_pool = NULL;
+	req_clear_result(req);
 	req->cacheable = false;
 	return GWP_ACL_REJECT;
 }
@@ -4464,11 +4474,7 @@ static enum gwp_acl_verdict eval_output(struct gwp_acl *acl,
 	uint32_t gen;
 	uint8_t sum;
 
-	req->dnat_applied = false;
-	req->mark_set = false;
-	req->bind.set = false;
-	req->upstream = GWP_ACL_UPSTREAM_NONE;
-	req->upstream_pool = NULL;
+	req_clear_result(req);
 	req->upstream_unsure = false;
 	req->gen = 0;
 	req->cacheable = true;
