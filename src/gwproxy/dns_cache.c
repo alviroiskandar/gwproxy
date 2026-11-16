@@ -78,9 +78,14 @@ struct gwp_dns_cache {
  */
 #define GWP_DNS_RECLAIM_BUCKETS	64
 
-static uint64_t hash_key(const uint64_t key[2], const char *name, size_t len)
+/*
+ * The bucket of the folded name @lkey (@len bytes, without the NUL). Insert and
+ * lookup both go through here, so they always agree on where a name lives.
+ */
+static inline size_t dns_map_idx(const struct dns_hash_map *map,
+				 const char *lkey, size_t len)
 {
-	return gwp_siphash13(key, name, len);
+	return gwp_siphash13(map->key, lkey, len) % map->nr_buckets;
 }
 
 static int dns_map_init(struct dns_hash_map *map, size_t nr_buckets,
@@ -266,7 +271,7 @@ static int dns_map_insert(struct dns_hash_map *map, const char *key,
 {
 	struct dns_cache_entry *de, *cur, *prev = NULL, *next;
 	time_t now = time(NULL);
-	uint64_t hash, idx;
+	size_t idx;
 	char lkey[256];
 	int r;
 
@@ -283,8 +288,7 @@ static int dns_map_insert(struct dns_hash_map *map, const char *key,
 	 *   2) Collision with the same key, replace the entry.
 	 *   3) Collision with a different key, chain the entry.
 	 */
-	hash = hash_key(map->key, lkey, de->e.name_len - 1);
-	idx = hash % map->nr_buckets;
+	idx = dns_map_idx(map, lkey, de->e.name_len - 1);
 	cur = map->table[idx];
 	if (!cur) {
 		/*
@@ -421,7 +425,7 @@ static int dns_map_lookup(struct dns_hash_map *map, const char *key,
 {
 	struct dns_cache_entry *cur;
 	time_t now = time(NULL);
-	uint64_t hash, idx;
+	size_t idx;
 	char lkey[256];
 	size_t nl;
 
@@ -429,8 +433,7 @@ static int dns_map_lookup(struct dns_hash_map *map, const char *key,
 	if (nl <= 1 || nl > 255)
 		return -EINVAL;
 
-	hash = hash_key(map->key, lkey, nl - 1);
-	idx = hash % map->nr_buckets;
+	idx = dns_map_idx(map, lkey, nl - 1);
 	cur = map->table[idx];
 
 	while (cur) {
