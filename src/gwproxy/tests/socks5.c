@@ -963,6 +963,29 @@ static void test_cli_udp_associate(void)
 	assert(r == -EINVAL);
 }
 
+/* The client side's two-byte replies: method selection and RFC 1929 status. */
+static void test_cli_parse_two_byte_replies(void)
+{
+	uint8_t v;
+	int r;
+
+	v = 0xaa;
+	r = gwp_socks5_cli_parse_method("\x05", 1, &v);
+	assert(r == -EAGAIN && v == 0xaa);
+	r = gwp_socks5_cli_parse_method("\x01\x00", 2, &v);
+	assert(r == -EINVAL && v == 0xaa);
+	r = gwp_socks5_cli_parse_method("\x05\x02\xff", 3, &v);
+	assert(!r && v == 0x02);
+
+	v = 0xaa;
+	r = gwp_socks5_cli_parse_userpass("\x01", 1, &v);
+	assert(r == -EAGAIN && v == 0xaa);
+	r = gwp_socks5_cli_parse_userpass("\x05\x00", 2, &v);
+	assert(r == -EINVAL && v == 0xaa);
+	r = gwp_socks5_cli_parse_userpass("\x01\x01", 2, &v);
+	assert(!r && v == 0x01);
+}
+
 static void gwp_socks5_run_tests(void)
 {
 	size_t i;
@@ -976,6 +999,7 @@ static void gwp_socks5_run_tests(void)
 		test_udp_associate();
 		test_udp_hdr_codec();
 		test_cli_udp_associate();
+		test_cli_parse_two_byte_replies();
 		test_connect_ipv4();
 		test_connect_ipv6();
 		test_connect_domain();
