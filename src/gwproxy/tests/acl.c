@@ -1906,22 +1906,40 @@ static void inc_rmdir(char *dir)
 	free(dir);
 }
 
-/* @acl's watched files are @dir/<each of @names>, in that order. */
-static void inc_files(struct gwp_acl *acl, const char *dir,
-		      const char *const *names, size_t nr)
+/*
+ * The entries @get (gwp_acl_file or gwp_acl_dir) lists for @acl are
+ * @dir/<each of @names> ("" for @dir itself), in that order, and no more.
+ * @what names an entry in the message on a mismatch.
+ */
+static void inc_list(struct gwp_acl *acl,
+		     const char *(*get)(const struct gwp_acl *, size_t),
+		     const char *what, const char *dir,
+		     const char *const *names, size_t nr)
 {
 	char path[PATH_MAX];
 	size_t i;
 
 	for (i = 0; i < nr; i++) {
-		snprintf(path, sizeof(path), "%s/%s", dir, names[i]);
-		assert(gwp_acl_file(acl, i));
-		if (strcmp(gwp_acl_file(acl, i), path))
-			fprintf(stderr, "file %zu is %s, not %s\n", i,
-				gwp_acl_file(acl, i), path);
-		assert(!strcmp(gwp_acl_file(acl, i), path));
+		if (*names[i])
+			snprintf(path, sizeof(path), "%s/%s", dir, names[i]);
+		else
+			snprintf(path, sizeof(path), "%s", dir);
+		assert(get(acl, i));
+		if (strcmp(get(acl, i), path))
+			fprintf(stderr, "%s %zu is %s, not %s\n", what, i,
+				get(acl, i), path);
+		assert(!strcmp(get(acl, i), path));
 	}
-	assert(!gwp_acl_file(acl, nr));
+	if (get(acl, nr))
+		fprintf(stderr, "extra %s %s\n", what, get(acl, nr));
+	assert(!get(acl, nr));
+}
+
+/* @acl's watched files are @dir/<each of @names>, in that order. */
+static void inc_files(struct gwp_acl *acl, const char *dir,
+		      const char *const *names, size_t nr)
+{
+	inc_list(acl, gwp_acl_file, "file", dir, names, nr);
 }
 
 static enum gwp_acl_verdict inc_out(struct gwp_acl *a, const char *ip)
@@ -2667,23 +2685,7 @@ static noinline void test_include_optional(void)
 static void inc_dirs(struct gwp_acl *acl, const char *dir,
 		     const char *const *names, size_t nr)
 {
-	char path[PATH_MAX];
-	size_t i;
-
-	for (i = 0; i < nr; i++) {
-		if (*names[i])
-			snprintf(path, sizeof(path), "%s/%s", dir, names[i]);
-		else
-			snprintf(path, sizeof(path), "%s", dir);
-		assert(gwp_acl_dir(acl, i));
-		if (strcmp(gwp_acl_dir(acl, i), path))
-			fprintf(stderr, "dir %zu is %s, not %s\n", i,
-				gwp_acl_dir(acl, i), path);
-		assert(!strcmp(gwp_acl_dir(acl, i), path));
-	}
-	if (gwp_acl_dir(acl, nr))
-		fprintf(stderr, "extra dir %s\n", gwp_acl_dir(acl, nr));
-	assert(!gwp_acl_dir(acl, nr));
+	inc_list(acl, gwp_acl_dir, "dir", dir, names, nr);
 }
 
 /*
