@@ -53,6 +53,46 @@ enum {
 };
 
 /*
+ * Whether @c is a 'tchar' (RFC 9110 Section 5.6.2), the bytes a token such as
+ * a method or a field name is made of: any visible (VCHAR) character except
+ * delimiters, specifically "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" /
+ * "-" / "." / "^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA. Called per byte of
+ * a header, hence the switch rather than a string search.
+ */
+static inline bool gwnet_http_is_tchar(unsigned char c)
+{
+	if (c >= '0' && c <= '9')
+		return true;
+	if (c >= 'A' && c <= 'Z')
+		return true;
+	if (c >= 'a' && c <= 'z')
+		return true;
+
+	/* The 15 extra symbols from the spec */
+	switch (c) {
+	case '!': case '#': case '$': case '%': case '&':
+	case '\'': case '*': case '+': case '-': case '.':
+	case '^': case '_': case '`': case '|': case '~':
+		return true;
+	default:
+		return false;
+	}
+}
+
+/*
+ * A byte of a field value or a reason phrase: HTAB, SP, VCHAR and obs-text
+ * (RFC 9110 Section 5.5). A value is never read as text, only compared with
+ * the few names and tokens the proxy knows, so obs-text simply fails to match
+ * those. A bare CR, NUL or any other control byte is refused: it is not valid
+ * anywhere in a header, and could end the line for a peer, or let the origin
+ * split the line it is copied into.
+ */
+static inline bool gwnet_http_is_field_char(unsigned char c)
+{
+	return c == '\t' || (c >= 0x20 && c != 0x7f);
+}
+
+/*
  * One stored field: where its name and value are, as offsets into the header
  * the parser was given (struct gwnet_http_hdr_fields::base), so a field costs
  * no copy. The one exception is the value of a known list field that was

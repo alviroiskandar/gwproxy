@@ -820,14 +820,6 @@ static int classify_req(struct gwp_http_conn *hc, struct gwp_auth *auth,
 			char *buf, size_t *len, size_t cap, char **host_p,
 			char **port_p, size_t *hdr_len_p);
 
-static bool is_tchar(unsigned char c)
-{
-	if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
-	    (c >= 'a' && c <= 'z'))
-		return true;
-	return c && strchr("!#$%&'*+-.^_`|~", c);
-}
-
 /*
  * How far the client's first bytes have shown it to speak HTTP (enum
  * req_start): a request line starts, after at most one empty line (RFC 9112
@@ -864,18 +856,19 @@ static int req_start_scan(struct gwp_http_conn *hc, const char *p, size_t len)
 			else if (c == '\n')
 				st = RS_LINE;
 			else
-				st = is_tchar(c) ? RS_METHOD : RS_NOT_HTTP;
+				st = gwnet_http_is_tchar(c) ?
+				     RS_METHOD : RS_NOT_HTTP;
 			break;
 		case RS_CR:
 			st = c == '\n' ? RS_LINE : RS_NOT_HTTP;
 			break;
 		case RS_LINE:
-			st = is_tchar(c) ? RS_METHOD : RS_NOT_HTTP;
+			st = gwnet_http_is_tchar(c) ? RS_METHOD : RS_NOT_HTTP;
 			break;
 		case RS_METHOD:
 			if (c == ' ' || c == '\t')
 				st = RS_HTTP;
-			else if (!is_tchar(c))
+			else if (!gwnet_http_is_tchar(c))
 				st = RS_NOT_HTTP;
 			break;
 		}
@@ -1086,17 +1079,6 @@ static bool is_framing_field(const char *k, size_t klen)
 }
 
 /*
- * Field values and the reason phrase may hold HTAB, SP, VCHAR and obs-text
- * (RFC 9110 Section 5.5); a bare CR, NUL or any other control byte is not
- * valid anywhere in a header and would let the origin split the line it is
- * copied into.
- */
-static bool is_field_char(unsigned char c)
-{
-	return c == '\t' || (c >= 0x20 && c != 0x7f);
-}
-
-/*
  * States of the chunked body scanner (RFC 9112 Section 7.1). It only finds
  * where the body ends; the bytes themselves pass through unchanged. Line ends
  * must be CRLF: being stricter than the origin is harmless, being more lenient
@@ -1188,7 +1170,7 @@ static int scan_chunked(struct gwp_http_conn *hc, const unsigned char *p,
 		 * is refused rather than passed on for the origin to guess at.
 		 */
 		case CH_EXT:
-			if (is_tchar(c))
+			if (gwnet_http_is_tchar(c))
 				hc->chunk_st = CH_EXT_NAME;
 			else if (c != ' ' && c != '\t')
 				return -EBADMSG;
@@ -1203,13 +1185,14 @@ static int scan_chunked(struct gwp_http_conn *hc, const unsigned char *p,
 				hc->chunk_st = CH_EXT_NAME_BWS;
 			else if (c == '\r' && hc->chunk_st == CH_EXT_NAME)
 				hc->chunk_st = CH_SIZE_LF;
-			else if (!is_tchar(c) || hc->chunk_st != CH_EXT_NAME)
+			else if (!gwnet_http_is_tchar(c) ||
+				 hc->chunk_st != CH_EXT_NAME)
 				return -EBADMSG;
 			break;
 		case CH_EXT_EQ:
 			if (c == '"')
 				hc->chunk_st = CH_EXT_QSTR;
-			else if (is_tchar(c))
+			else if (gwnet_http_is_tchar(c))
 				hc->chunk_st = CH_EXT_TOKEN;
 			else if (c != ' ' && c != '\t')
 				return -EBADMSG;
@@ -1217,7 +1200,8 @@ static int scan_chunked(struct gwp_http_conn *hc, const unsigned char *p,
 		case CH_EXT_TOKEN:
 		case CH_EXT_END:
 		case CH_EXT_END_BWS:
-			if (hc->chunk_st == CH_EXT_TOKEN && is_tchar(c))
+			if (hc->chunk_st == CH_EXT_TOKEN &&
+			    gwnet_http_is_tchar(c))
 				break;
 			if (c == ';')
 				hc->chunk_st = CH_EXT;
@@ -1234,12 +1218,12 @@ static int scan_chunked(struct gwp_http_conn *hc, const unsigned char *p,
 				hc->chunk_st = CH_EXT_END;
 			else if (c == '\\')
 				hc->chunk_st = CH_EXT_QPAIR;
-			else if (!is_field_char(c))
+			else if (!gwnet_http_is_field_char(c))
 				return -EBADMSG;
 			break;
 		case CH_EXT_QPAIR:
 			/* quoted-pair: '\' then HTAB, SP, VCHAR or obs-text */
-			if (!is_field_char(c))
+			if (!gwnet_http_is_field_char(c))
 				return -EBADMSG;
 			hc->chunk_st = CH_EXT_QSTR;
 			break;
@@ -1271,7 +1255,7 @@ static int scan_chunked(struct gwp_http_conn *hc, const unsigned char *p,
 		case CH_TRAILER:
 			if (c == '\r')
 				hc->chunk_st = CH_END_LF;
-			else if (is_tchar(c))
+			else if (gwnet_http_is_tchar(c))
 				hc->chunk_st = CH_TRAILER_NAME;
 			else
 				return -EBADMSG;
@@ -1285,13 +1269,13 @@ static int scan_chunked(struct gwp_http_conn *hc, const unsigned char *p,
 			 */
 			if (c == ':')
 				hc->chunk_st = CH_TRAILER_VALUE;
-			else if (!is_tchar(c))
+			else if (!gwnet_http_is_tchar(c))
 				return -EBADMSG;
 			break;
 		case CH_TRAILER_VALUE:
 			if (c == '\r')
 				hc->chunk_st = CH_TRAILER_LF;
-			else if (!is_field_char(c))
+			else if (!gwnet_http_is_field_char(c))
 				return -EBADMSG;
 			break;
 		case CH_TRAILER_LF:
@@ -1438,7 +1422,7 @@ static noinline ssize_t rewrite_res_hdr(const char *hdr, size_t len, char *out,
 	    (n > 12 && p[12] != ' '))
 		return -EBADMSG;
 	for (i = 12; i < n; i++) {
-		if (!is_field_char(p[i]))
+		if (!gwnet_http_is_field_char(p[i]))
 			return -EBADMSG;
 	}
 	*code = (p[9] - '0') * 100 + (p[10] - '0') * 10 + (p[11] - '0');
@@ -1467,11 +1451,11 @@ static noinline ssize_t rewrite_res_hdr(const char *hdr, size_t len, char *out,
 		if (!colon || colon == p)
 			return -EBADMSG;
 		for (v = p; v < colon; v++) {
-			if (!is_tchar(*v))
+			if (!gwnet_http_is_tchar(*v))
 				return -EBADMSG;
 		}
 		for (v = colon + 1; v < p + n; v++) {
-			if (!is_field_char(*v))
+			if (!gwnet_http_is_field_char(*v))
 				return -EBADMSG;
 		}
 		lines[nr_lines].off = (uint32_t)(p - hdr);

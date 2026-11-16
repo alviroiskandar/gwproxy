@@ -25,44 +25,6 @@ static inline size_t min_st(size_t a, size_t b)
 	return (a < b) ? a : b;
 }
 
-/**
- * Checks if a character is a valid 'tchar' as defined in RFC 7230,
- * Section 3.2.6.
- *
- * Reference: https://datatracker.ietf.org/doc/html/rfc7230#section-3.2.6
- *
- * A 'tchar' is any visible (VCHAR) character except delimiters,
- * specifically: "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-"
- * / "." / "^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA.
- *
- * @param  c The character to check, represented as an int.
- * @return 1 if the character is a valid 'tchar', 0 otherwise.
- */
-static inline int is_tchar(int c)
-{
-	/* Digits. */
-	if (c >= '0' && c <= '9')
-		return 1;
-
-	/* Uppercase */
-	if (c >= 'A' && c <= 'Z')
-		return 1;
-
-	/* Lowercase */
-	if (c >= 'a' && c <= 'z')
-		return 1;
-
-	/* The 15 extra symbols from the spec */
-	switch (c) {
-	case '!': case '#': case '$': case '%': case '&':
-	case '\'': case '*': case '+': case '-': case '.':
-	case '^': case '_': case '`': case '|': case '~':
-		return 1;
-	default:
-		return 0;
-	}
-}
-
 static inline int is_space(int c)
 {
 	return (c == ' ' || c == '\t');
@@ -79,17 +41,6 @@ static inline int is_vchar(int c)
 		return 0;
 
 	return 0;
-}
-
-/*
- * A byte of a field value: HTAB, SP, VCHAR and obs-text (RFC 9110 Section
- * 5.5). A value is never read as text, only compared with the few names and
- * tokens the proxy knows, so obs-text simply fails to match those. A bare CR,
- * NUL or any other control byte is refused: it could end the line for a peer.
- */
-static inline bool is_field_char(unsigned char c)
-{
-	return c == '\t' || (c >= 0x20 && c != 0x7f);
 }
 
 static inline int is_alpha(int c)
@@ -309,7 +260,7 @@ static int parse_hdr_req_first_line(struct gwnet_http_hdr_pctx *ctx,
 	 * Any token is taken: the ones not in the table are extension
 	 * methods (WebDAV's PROPFIND, say), GWNET_HTTP_METHOD_OTHER.
 	 */
-	while (is_tchar(buf[off])) {
+	while (gwnet_http_is_tchar((unsigned char)buf[off])) {
 		if (++off >= len)
 			return -EAGAIN;
 		if (ctx->tot_len + off >= ctx->max_len)
@@ -771,7 +722,7 @@ static int parse_hdr_fields(struct gwnet_http_hdr_pctx *ctx,
 		 *
 		 * After the colon, there may be a space, but it is
 		 * optional. If it exists, it must be followed by
-		 * field value bytes, see is_field_char().
+		 * field value bytes, see gwnet_http_is_field_char().
 		 *
 		 * The value may contain trailing space characters,
 		 * they must be trimmed.
@@ -790,7 +741,7 @@ static int parse_hdr_fields(struct gwnet_http_hdr_pctx *ctx,
 			if (buf[off] == ':')
 				break;
 
-			if (!is_tchar(buf[off]))
+			if (!gwnet_http_is_tchar((unsigned char)buf[off]))
 				return -EINVAL;
 
 			kl++;
@@ -822,7 +773,7 @@ static int parse_hdr_fields(struct gwnet_http_hdr_pctx *ctx,
 			if (c == '\r' || c == '\n')
 				break;
 
-			if (!is_field_char((unsigned char)c))
+			if (!gwnet_http_is_field_char((unsigned char)c))
 				return -EINVAL;
 
 			vl++;
