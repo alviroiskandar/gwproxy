@@ -1227,21 +1227,24 @@ static bool pool_name_ok(const char *s)
  *
  *	SCHEME://[user[:pass]@]HOST[:PORT]
  *
- * SCHEME is socks5, socks5h, http or https; HOST a name, an IPv4 address
- * or a bracketed IPv6 one; PORT 1 to 65535. The credentials are split as
+ * SCHEME is socks5, socks5h, http or https; HOST a name or an IPv4 address
+ * that gwp_upstream_name_ok() takes, as gwp_parse_upstream() does, or a
+ * bracketed IPv6 address; PORT 1 to 65535. The credentials are split as
  * gwp_parse_upstream() splits them (at the last '@'), with its limits. This
  * checks the shape only: nothing is resolved, and the URL is kept as
  * written for the full parse when a connection uses it. Sets *@remote_dns
  * and *@creds, or *@why on error (-EINVAL). *@why never quotes the URL,
- * which may hold a password.
+ * which may hold a password. *@bad_host says the error is the host name:
+ * the rest of the URL has its shape then, and may be shown redacted.
  */
 static int check_server_url(const char *url, bool *remote_dns, bool *creds,
-			    const char **why)
+			    const char **why, bool *bad_host)
 {
 	const struct gwp_upstream_scheme *sc;
 	const char *rest, *host, *at, *p;
 	size_t ul, pl;
 
+	*bad_host = false;
 	sc = gwp_upstream_scheme(url, &rest);
 	if (!sc) {
 		*why = "the scheme must be socks5://, socks5h://, http:// or https://";
@@ -1287,10 +1290,32 @@ static int check_server_url(const char *url, bool *remote_dns, bool *creds,
 		}
 		p++;
 	} else {
+		char name[256];
+		struct in_addr a4;
+		bool is_v4, ok;
+		size_t n;
+
 		for (p = host; host_char(*p); p++)
 			;
-		if (p == host) {
+		n = (size_t)(p - host);
+		if (!n) {
 			*why = "the host is empty or malformed";
+			return -EINVAL;
+		}
+		/*
+		 * Only a name gwp_parse_upstream() takes, so that a load that
+		 * makes no server objects (gwp_acl_create()) refuses the same
+		 * servers as one that does.
+		 */
+		ok = n < sizeof(name);
+		if (ok) {
+			memcpy(name, host, n);
+			name[n] = '\0';
+			ok = gwp_upstream_name_ok(name, &a4, &is_v4);
+		}
+		if (!ok) {
+			*why = "the host is not a valid name or address";
+			*bad_host = true;
 			return -EINVAL;
 		}
 	}
@@ -1362,7 +1387,7 @@ static int pool_add_server(struct acl_load *ld, const char *url,
 {
 	struct gwp_acl_pool *p = ld->pool;
 	uint32_t idx = p->nr_servers + 1;
-	bool remote_dns, creds;
+	bool remote_dns, creds, bad_host;
 	struct gwp_up_opts *ov;
 	const char *why;
 	char shown[160];
@@ -1371,9 +1396,15 @@ static int pool_add_server(struct acl_load *ld, const char *url,
 	if (p->nr_servers == GWP_ACL_POOL_MAX_SERVERS)
 		return load_err(ld, "upstream pool %s has more than %u servers",
 				p->name, GWP_ACL_POOL_MAX_SERVERS);
-	if (check_server_url(url, &remote_dns, &creds, &why))
-		return load_err(ld, "upstream pool %s server %u: %s", p->name,
-				idx, why);
+	if (check_server_url(url, &remote_dns, &creds, &why, &bad_host)) {
+		if (!bad_host)
+			return load_err(ld, "upstream pool %s server %u: %s",
+					p->name, idx, why);
+		/* Worded as when the server's make() refuses it. */
+		gwp_acl_url_redact(url, shown, sizeof(shown));
+		return load_err(ld, "upstream pool %s server %u (%s): %s",
+				p->name, idx, shown, why);
+	}
 	gwp_acl_url_redact(url, shown, sizeof(shown));
 	if (p->nr_servers && remote_dns != p->remote_dns)
 		return load_err(ld, "upstream pool %s server %u (%s): resolves names %s, the servers before it %s; a pool cannot mix the two",

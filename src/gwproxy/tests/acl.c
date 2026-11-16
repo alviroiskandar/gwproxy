@@ -4422,18 +4422,114 @@ static noinline void test_upstream_url_limits(void)
 	up_refused(text, -EINVAL, "longer than 255 bytes");
 	free(text);
 
-	/* 511 bytes after "http://", then 512. */
+	/*
+	 * 511 bytes after "http://", then 512: a host name is 253 characters
+	 * at most, so the credentials take up most of it.
+	 */
 	text = malloc(700);
 	assert(text);
 	p = text + sprintf(text, "upstream p {\n server http://");
-	memset(p, 'h', 509);
-	strcpy(p + 509, ":1;\n}\n");
+	memset(p, 'u', 255);
+	p[255] = ':';
+	memset(p + 256, 'p', 251);
+	strcpy(p + 507, "@h:1;\n}\n");
+	assert(strlen(p) == 511 + strlen(";\n}\n"));
 	assert(!gwp_acl_parse_str(&a, text));
 	gwp_acl_destroy(a);
-	memset(p, 'h', 510);
-	strcpy(p + 510, ":1;\n}\n");
+	memset(p + 256, 'p', 252);
+	strcpy(p + 508, "@h:1;\n}\n");
 	up_refused(text, -EINVAL, "the URL is too long");
 	free(text);
+}
+
+/* A server line with the host @host, in "http://u:s3cret@HOST:1". */
+static char *up_host_text(const char *host)
+{
+	char *text;
+
+	assert(asprintf(&text, "upstream p {\n server http://u:s3cret@%s:1;\n}\n",
+			host) > 0);
+	return text;
+}
+
+/* Fill @buf with @n labels of @len 'a's, dot-separated, and @tail after. */
+static char *up_labels(char *buf, int n, int len, const char *tail)
+{
+	char *p = buf;
+	int i;
+
+	for (i = 0; i < n; i++) {
+		if (i)
+			*p++ = '.';
+		memset(p, 'a', (size_t)len);
+		p += len;
+	}
+	strcpy(p, tail);
+	return buf;
+}
+
+static void up_host_ok(const char *host)
+{
+	struct gwp_acl *a = NULL;
+	char *text = up_host_text(host);
+
+	if (gwp_acl_parse_str(&a, text)) {
+		fprintf(stderr, "refused the host '%s'\n", host);
+		assert(0);
+	}
+	gwp_acl_destroy(a);
+	free(text);
+}
+
+static void up_host_refused(const char *host)
+{
+	char *text = up_host_text(host), *msg;
+
+	assert(asprintf(&msg, "line 2: upstream pool p server 1 (http://%.100s",
+			host) > 0);
+	up_refused(text, -EINVAL, msg);
+	up_refused(text, -EINVAL,
+		   "): the host is not a valid name or address");
+	free(msg);
+	free(text);
+}
+
+/*
+ * A pool server's host is a name or address gwp_parse_upstream() takes: DNS
+ * labels of 1 to 63 characters with no '-' at either end, 253 characters at
+ * most, or an IPv4 address inet_aton() reads. Each refused one is reported
+ * with its line and the URL without its password, as when the server is made.
+ */
+static noinline void test_upstream_url_host(void)
+{
+	char host[300];
+
+	up_host_ok("proxy.example");
+	up_host_ok("proxy.example.");
+	up_host_ok("a-b.c_d.E9");
+	up_host_ok("127.1");
+	up_host_ok("10.0.0.1");
+	up_host_ok("[::1]");
+	up_host_ok(up_labels(host, 1, 63, ".example"));
+	up_host_ok(up_labels(host, 4, 62, ".a"));
+	assert(strlen(host) == 253);
+	up_host_ok(up_labels(host, 4, 62, ".a."));
+
+	up_host_refused(up_labels(host, 1, 64, ".example"));
+	up_host_refused(up_labels(host, 2, 64, ""));
+	up_host_refused(up_labels(host, 4, 62, ".ab"));
+	up_host_refused(up_labels(host, 4, 62, ".ab."));
+	up_host_refused(up_labels(host, 4, 63, ".a"));
+	up_host_refused("-");
+	up_host_refused("-a.example");
+	up_host_refused("a-.example");
+	up_host_refused("a.-b");
+	up_host_refused("a.b-");
+	up_host_refused(".");
+	up_host_refused(".a");
+	up_host_refused("a..b");
+	up_host_refused("999.999.1.1");
+	up_host_refused("1.2.3.4.5");
 }
 
 #ifdef CONFIG_PCRE
@@ -4502,6 +4598,7 @@ static void run_tests(void)
 	test_include_dirs();
 	test_upstream_errors();
 	test_upstream_url_limits();
+	test_upstream_url_host();
 	test_upstream_server_opts();
 	test_upstream_methods();
 	test_upstream_pool_https();
