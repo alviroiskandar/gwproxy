@@ -74,6 +74,24 @@ static enum gwp_acl_verdict out(struct gwp_acl *a, struct gwp_sockaddr *t,
 	return gwp_acl_eval_output(a, &req);
 }
 
+/* out() for a TCP connection to @ip:@port, an IPv4 or IPv6 literal. */
+static enum gwp_acl_verdict out_ip(struct gwp_acl *a, const char *ip,
+				   uint16_t port)
+{
+	struct gwp_sockaddr t = gwp_test_addr(ip, port);
+
+	return out(a, &t, NULL, port, GWP_ACL_PROTO_TCP);
+}
+
+/* out_ip() for the IPv4 @ip as the v4-mapped address sa4mapped() makes. */
+static enum gwp_acl_verdict out_mapped(struct gwp_acl *a, const char *ip,
+				       uint16_t port)
+{
+	struct gwp_sockaddr t = sa4mapped(ip, port);
+
+	return out(a, &t, NULL, port, GWP_ACL_PROTO_TCP);
+}
+
 static enum gwp_acl_verdict out_user(struct gwp_acl *a, struct gwp_sockaddr *t,
 				     const char *user, uint16_t dport)
 {
@@ -109,51 +127,36 @@ static const char DEFAULT_RULES[] =
 static noinline void test_default_ruleset(void)
 {
 	struct gwp_acl *a = NULL;
-	struct gwp_sockaddr s;
 	int r;
 
 	r = gwp_acl_parse_str(&a, DEFAULT_RULES);
 	assert(!r && a);
 
 	/* Public IP on an allowed port is accepted. */
-	s = sa4("8.8.8.8", 80);
-	assert(out(a, &s, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
-	s = sa4("8.8.8.8", 443);
-	assert(out(a, &s, NULL, 443, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
+	assert(out_ip(a, "8.8.8.8", 80) == GWP_ACL_ACCEPT);
+	assert(out_ip(a, "8.8.8.8", 443) == GWP_ACL_ACCEPT);
 
 	/* Public IP on a disallowed port is rejected (! --dports). */
-	s = sa4("8.8.8.8", 22);
-	assert(out(a, &s, NULL, 22, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+	assert(out_ip(a, "8.8.8.8", 22) == GWP_ACL_REJECT);
 
 	/* Private / loopback ranges rejected even on an allowed port. */
-	s = sa4("127.0.0.1", 80);
-	assert(out(a, &s, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
-	s = sa4("10.1.2.3", 443);
-	assert(out(a, &s, NULL, 443, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
-	s = sa4("192.168.5.5", 80);
-	assert(out(a, &s, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
-	s = sa4("172.16.0.1", 80);
-	assert(out(a, &s, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
-	s = sa4("172.31.255.255", 80);
-	assert(out(a, &s, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+	assert(out_ip(a, "127.0.0.1", 80) == GWP_ACL_REJECT);
+	assert(out_ip(a, "10.1.2.3", 443) == GWP_ACL_REJECT);
+	assert(out_ip(a, "192.168.5.5", 80) == GWP_ACL_REJECT);
+	assert(out_ip(a, "172.16.0.1", 80) == GWP_ACL_REJECT);
+	assert(out_ip(a, "172.31.255.255", 80) == GWP_ACL_REJECT);
 
 	/* 172.15/16 is just outside 172.16.0.0/12 -> allowed. */
-	s = sa4("172.15.0.1", 80);
-	assert(out(a, &s, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
+	assert(out_ip(a, "172.15.0.1", 80) == GWP_ACL_ACCEPT);
 
 	/* v4-mapped loopback must also hit the 127.0.0.0/8 rule. */
-	s = sa4mapped("127.0.0.1", 80);
-	assert(out(a, &s, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+	assert(out_mapped(a, "127.0.0.1", 80) == GWP_ACL_REJECT);
 
 	/* IPv6 link-local / ULA rejected; public v6 allowed. */
-	s = sa6("fe80::1", 80);
-	assert(out(a, &s, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
-	s = sa6("fc00::1", 80);
-	assert(out(a, &s, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
-	s = sa6("2606:4700::1", 80);
-	assert(out(a, &s, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
-	s = sa6("2606:4700::1", 22);
-	assert(out(a, &s, NULL, 22, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
+	assert(out_ip(a, "fe80::1", 80) == GWP_ACL_REJECT);
+	assert(out_ip(a, "fc00::1", 80) == GWP_ACL_REJECT);
+	assert(out_ip(a, "2606:4700::1", 80) == GWP_ACL_ACCEPT);
+	assert(out_ip(a, "2606:4700::1", 22) == GWP_ACL_REJECT);
 
 	gwp_acl_destroy(a);
 }
@@ -172,19 +175,13 @@ static noinline void test_v4mapped_cidr(void)
 		"-A OUTPUT -d ::ffff:10.0.0.0/104 -j REJECT\n"
 		"-A OUTPUT -d ::ffff:192.0.2.7 -j REJECT\n"
 		"-A INPUT -s ::ffff:198.51.100.0/120 -j REJECT\n"));
-	s = sa4("10.1.2.3", 80);
-	assert(out(a, &s, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
-	s = sa4mapped("10.1.2.3", 80);
-	assert(out(a, &s, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
-	s = sa4("11.1.2.3", 80);
-	assert(out(a, &s, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
-	s = sa4("192.0.2.7", 80);
-	assert(out(a, &s, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
-	s = sa4("192.0.2.8", 80);
-	assert(out(a, &s, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
+	assert(out_ip(a, "10.1.2.3", 80) == GWP_ACL_REJECT);
+	assert(out_mapped(a, "10.1.2.3", 80) == GWP_ACL_REJECT);
+	assert(out_ip(a, "11.1.2.3", 80) == GWP_ACL_ACCEPT);
+	assert(out_ip(a, "192.0.2.7", 80) == GWP_ACL_REJECT);
+	assert(out_ip(a, "192.0.2.8", 80) == GWP_ACL_ACCEPT);
 	/* The rule is IPv4 now: a non-mapped IPv6 target is not caught. */
-	s = sa6("::10.1.2.3", 80);
-	assert(out(a, &s, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
+	assert(out_ip(a, "::10.1.2.3", 80) == GWP_ACL_ACCEPT);
 	s = sa4mapped("198.51.100.9", 1234);
 	assert(in(a, &s, 1234, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
 	s = sa4("198.51.101.9", 1234);
@@ -193,10 +190,8 @@ static noinline void test_v4mapped_cidr(void)
 
 	/* All of ::ffff:0:0/96 is all of IPv4. */
 	assert(!gwp_acl_parse_str(&a, "-A OUTPUT -d ::ffff:0:0/96 -j REJECT\n"));
-	s = sa4("93.184.216.34", 443);
-	assert(out(a, &s, NULL, 443, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
-	s = sa6("2606:4700::1", 443);
-	assert(out(a, &s, NULL, 443, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
+	assert(out_ip(a, "93.184.216.34", 443) == GWP_ACL_REJECT);
+	assert(out_ip(a, "2606:4700::1", 443) == GWP_ACL_ACCEPT);
 	gwp_acl_destroy(a);
 }
 
@@ -208,12 +203,9 @@ static noinline void test_ports_and_negation(void)
 	/* Port ranges and lists. */
 	assert(!gwp_acl_parse_str(&a,
 		"-A OUTPUT -d 1.2.3.4 --dports 1000-2000,8080 -j REJECT\n"));
-	s = sa4("1.2.3.4", 1500);
-	assert(out(a, &s, NULL, 1500, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
-	s = sa4("1.2.3.4", 8080);
-	assert(out(a, &s, NULL, 8080, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
-	s = sa4("1.2.3.4", 3000);
-	assert(out(a, &s, NULL, 3000, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
+	assert(out_ip(a, "1.2.3.4", 1500) == GWP_ACL_REJECT);
+	assert(out_ip(a, "1.2.3.4", 8080) == GWP_ACL_REJECT);
+	assert(out_ip(a, "1.2.3.4", 3000) == GWP_ACL_ACCEPT);
 	gwp_acl_destroy(a);
 
 	/* Negated source: reject everything except 10.0.0.0/8. */
@@ -860,18 +852,12 @@ static noinline void test_index_first_match(void)
 	/* 12 + 8 OUTPUT rules in two runs, 8 INPUT rules in one. */
 	assert(gwp_acl_nr_indexed(a) == 12 + 8 + 8);
 
-	t = sa4("10.1.2.3", 80);
-	assert(out(a, &t, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
-	t = sa4("192.0.2.9", 80);
-	assert(out(a, &t, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
-	t = sa6("2001:db8::1", 80);
-	assert(out(a, &t, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
-	t = sa4mapped("198.51.100.20", 80);
-	assert(out(a, &t, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
-	t = sa4("198.51.100.20", 80);
-	assert(out(a, &t, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
-	t = sa4("198.51.101.20", 80);
-	assert(out(a, &t, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
+	assert(out_ip(a, "10.1.2.3", 80) == GWP_ACL_ACCEPT);
+	assert(out_ip(a, "192.0.2.9", 80) == GWP_ACL_REJECT);
+	assert(out_ip(a, "2001:db8::1", 80) == GWP_ACL_REJECT);
+	assert(out_mapped(a, "198.51.100.20", 80) == GWP_ACL_REJECT);
+	assert(out_ip(a, "198.51.100.20", 80) == GWP_ACL_REJECT);
+	assert(out_ip(a, "198.51.101.20", 80) == GWP_ACL_ACCEPT);
 
 	/* Domains: case-insensitive, first rule wins, none without a name. */
 	t = sa4("93.184.216.34", 80);
@@ -1331,8 +1317,7 @@ static noinline void test_number_bases(void)
 	assert(out(a, &t, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
 	assert(out(a, &t, NULL, 444, GWP_ACL_PROTO_TCP) == GWP_ACL_REJECT);
 	assert(out(a, &t, NULL, 64, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
-	t = sa4("11.1.2.3", 80);
-	assert(out(a, &t, NULL, 80, GWP_ACL_PROTO_TCP) == GWP_ACL_ACCEPT);
+	assert(out_ip(a, "11.1.2.3", 80) == GWP_ACL_ACCEPT);
 	gwp_acl_destroy(a);
 }
 
@@ -1979,9 +1964,7 @@ static void inc_files(struct gwp_acl *acl, const char *dir,
 
 static enum gwp_acl_verdict inc_out(struct gwp_acl *a, const char *ip)
 {
-	struct gwp_sockaddr t = sa4(ip, 80);
-
-	return out(a, &t, NULL, 80, GWP_ACL_PROTO_TCP);
+	return out_ip(a, ip, 80);
 }
 
 /*
