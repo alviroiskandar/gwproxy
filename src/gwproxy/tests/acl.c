@@ -2934,6 +2934,30 @@ static enum gwp_acl_verdict up_eval(struct gwp_acl *a, const char *user,
 	return gwp_acl_eval_output(a, req);
 }
 
+/*
+ * The name of the upstream choice @u in @req: the pool's name, "DIRECT",
+ * "UNSURE", or "" for none. Only a pool choice may hold a pool. It does not
+ * release @req, so a pool's name stays valid for the caller to copy.
+ */
+static const char *up_name(const struct gwp_acl_req *req,
+			   enum gwp_acl_upstream u)
+{
+	if (u == GWP_ACL_UPSTREAM_POOL) {
+		assert(req->upstream_pool);
+		return gwp_acl_pool_name(req->upstream_pool);
+	}
+	assert(!req->upstream_pool);
+	switch (u) {
+	case GWP_ACL_UPSTREAM_DIRECT:
+		return "DIRECT";
+	case GWP_ACL_UPSTREAM_UNSURE:
+		return "UNSURE";
+	default:
+		assert(u == GWP_ACL_UPSTREAM_NONE);
+		return "";
+	}
+}
+
 /* The pool name OUTPUT chose for @user, "DIRECT", or "" for none. */
 static const char *up_choice(struct gwp_acl *a, const char *user)
 {
@@ -2941,22 +2965,8 @@ static const char *up_choice(struct gwp_acl *a, const char *user)
 	struct gwp_acl_req req;
 
 	assert(up_eval(a, user, &req) == GWP_ACL_ACCEPT);
-	switch (req.upstream) {
-	case GWP_ACL_UPSTREAM_NONE:
-		assert(!req.upstream_pool);
-		strcpy(name, "");
-		break;
-	case GWP_ACL_UPSTREAM_DIRECT:
-		assert(!req.upstream_pool);
-		strcpy(name, "DIRECT");
-		break;
-	default:
-		assert(req.upstream == GWP_ACL_UPSTREAM_POOL);
-		assert(req.upstream_pool);
-		snprintf(name, sizeof(name), "%s",
-			 gwp_acl_pool_name(req.upstream_pool));
-		break;
-	}
+	assert(req.upstream != GWP_ACL_UPSTREAM_UNSURE);
+	snprintf(name, sizeof(name), "%s", up_name(&req, req.upstream));
 	gwp_acl_req_release(&req);
 	assert(!req.upstream_pool && req.upstream == GWP_ACL_UPSTREAM_NONE);
 	gwp_acl_req_release(&req);
@@ -3651,15 +3661,7 @@ static const char *up_pick(struct gwp_acl *a, const char *user,
 	req.proto = GWP_ACL_PROTO_TCP;
 	u = gwp_acl_eval_upstream(a, &req);
 	assert(u == req.upstream && !req.upstream_only);
-	if (u == GWP_ACL_UPSTREAM_POOL)
-		snprintf(name, sizeof(name), "%s",
-			 gwp_acl_pool_name(req.upstream_pool));
-	else
-		snprintf(name, sizeof(name), "%s",
-			 u == GWP_ACL_UPSTREAM_DIRECT ? "DIRECT" :
-			 u == GWP_ACL_UPSTREAM_UNSURE ? "UNSURE" : "");
-	if (u != GWP_ACL_UPSTREAM_POOL)
-		assert(!req.upstream_pool);
+	snprintf(name, sizeof(name), "%s", up_name(&req, u));
 	gwp_acl_req_release(&req);
 	return name;
 }
@@ -3765,13 +3767,7 @@ static const char *up_pick_nt(struct gwp_acl *a, const char *user)
 	req.no_target = true;
 	req.proto = GWP_ACL_PROTO_TCP;
 	u = gwp_acl_eval_upstream(a, &req);
-	if (u == GWP_ACL_UPSTREAM_POOL)
-		name = gwp_acl_pool_name(req.upstream_pool);
-	else
-		name = u == GWP_ACL_UPSTREAM_DIRECT ? "DIRECT" :
-		       u == GWP_ACL_UPSTREAM_UNSURE ? "UNSURE" : "";
-	if (u != GWP_ACL_UPSTREAM_POOL)
-		assert(!req.upstream_pool);
+	name = up_name(&req, u);
 	gwp_acl_req_release(&req);
 	return name;
 }
