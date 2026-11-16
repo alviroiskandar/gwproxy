@@ -6675,10 +6675,9 @@ static void target_connect_addr(const struct gwp_wrk *w,
 {
 	static const uint8_t any[sizeof(struct in6_addr)];
 	static const uint8_t lo4[4] = { 127, 0, 0, 1 };
-	const struct gwp_acl_bind *b = gcp->acl_sockopt.bind.set ?
-				       &gcp->acl_sockopt.bind : &w->ctx->bind_def;
+	const struct gwp_acl_bind *b;
 	const uint8_t *ip;
-	bool v4;
+	bool v4, global;
 
 	*out = *dst;
 	gwp_sockaddr_canon_ip(dst, &v4, &ip);
@@ -6690,7 +6689,9 @@ static void target_connect_addr(const struct gwp_wrk *w,
 		return;
 	}
 
-	if (b->set && b->have_src && conn_bind_src(out, &b->src, dst)) {
+	/* The source this connection's socket was bound to, if any. */
+	b = conn_pick_bind(w->ctx, &gcp->acl_sockopt, &global);
+	if (b && b->have_src && conn_bind_src(out, &b->src, dst)) {
 		gwp_sockaddr_canon_ip(out, &v4, &ip);
 		if (memcmp(ip, any, 4))
 			return;
