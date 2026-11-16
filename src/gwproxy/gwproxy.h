@@ -1429,6 +1429,29 @@ union gwp_udp_cmsg {
 size_t gwp_udp_src_cmsg(const struct gwp_udp_out *out, union gwp_udp_cmsg *cb);
 
 /*
+ * Fill @mh, @iov and @cb for the sendmsg of @out's datagram to @dst, from the
+ * source it must come from, if it has one. @dst is @out->dst or a copy of it
+ * that must stay valid until the send is done; the other three are the
+ * caller's too, for the same reason.
+ */
+static inline void gwp_udp_out_msg(struct msghdr *mh, struct iovec *iov,
+				   union gwp_udp_cmsg *cb,
+				   struct gwp_sockaddr *dst,
+				   const struct gwp_udp_out *out)
+{
+	iov->iov_base = out->buf;
+	iov->iov_len = out->len;
+	memset(mh, 0, sizeof(*mh));
+	mh->msg_name = dst;
+	mh->msg_namelen = out->dstlen;
+	mh->msg_iov = iov;
+	mh->msg_iovlen = 1;
+	mh->msg_controllen = gwp_udp_src_cmsg(out, cb);
+	if (mh->msg_controllen)
+		mh->msg_control = cb->b;
+}
+
+/*
  * SOCKS5 UDP relay per-datagram classifier, shared by both event loops. @base
  * points at a received datagram of @n bytes, with GWP_SOCKS5_UDP_HDR_MAX bytes
  * of slack before it; @src is its source. Maintain the client pin

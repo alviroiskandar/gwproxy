@@ -3726,17 +3726,9 @@ static void prep_udp_send(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	struct gwp_iou_udp *u = gcp->udp_iou;
 	struct io_uring_sqe *s = get_sqe_nofail(w);
 
+	/* The send reads the destination after this returns: keep a copy. */
 	u->dst = out->dst;
-	u->iov.iov_base = out->buf;
-	u->iov.iov_len = out->len;
-	memset(&u->mh, 0, sizeof(u->mh));
-	u->mh.msg_name = &u->dst;
-	u->mh.msg_namelen = out->dstlen;
-	u->mh.msg_iov = &u->iov;
-	u->mh.msg_iovlen = 1;
-	u->mh.msg_controllen = gwp_udp_src_cmsg(out, &u->cb);
-	if (u->mh.msg_controllen)
-		u->mh.msg_control = u->cb.b;
+	gwp_udp_out_msg(&u->mh, &u->iov, &u->cb, &u->dst, out);
 	io_uring_prep_sendmsg(s, gcp->udp_fd, &u->mh, MSG_NOSIGNAL);
 	io_uring_sqe_set_data(s, gcp);
 	s->user_data |= EV_BIT_IOU_UDP_TX;

@@ -3697,17 +3697,7 @@ static int handle_ev_udp_relay(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 			continue;
 		gcp->last_act = w->now;
 
-		/* From the source the datagram must come from, if it has one. */
-		iov.iov_base = out.buf;
-		iov.iov_len = out.len;
-		memset(&mh, 0, sizeof(mh));
-		mh.msg_name = &out.dst.sa;
-		mh.msg_namelen = out.dstlen;
-		mh.msg_iov = &iov;
-		mh.msg_iovlen = 1;
-		mh.msg_controllen = gwp_udp_src_cmsg(&out, &cb);
-		if (mh.msg_controllen)
-			mh.msg_control = cb.b;
+		gwp_udp_out_msg(&mh, &iov, &cb, &out.dst, &out);
 		n = __sys_sendmsg(fd, &mh, MSG_NOSIGNAL);
 		if (n < 0 && n != -EAGAIN)
 			pr_dbg(&w->ctx->lh, "UDP relay sendmsg: %s",
