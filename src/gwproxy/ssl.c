@@ -265,8 +265,13 @@ static int alpn_select_cb(SSL *ssl, const unsigned char **out,
 	return SSL_TLSEXT_ERR_NOACK;
 }
 
-int gwp_ssl_ctx_server_create(struct gwp_ssl_ctx **out, const char *cert_file,
-			      const char *key_file)
+/*
+ * What every context starts with: the BIO method, a TLS 1.2 floor and no
+ * renegotiation. @new_err is what a failed SSL_CTX_new() returns, which the
+ * constructors have always reported differently. Undo a later failure with
+ * gwp_ssl_ctx_free().
+ */
+static int ctx_new(struct gwp_ssl_ctx **cp, const SSL_METHOD *meth, int new_err)
 {
 	struct gwp_ssl_ctx *c;
 
@@ -277,12 +282,31 @@ int gwp_ssl_ctx_server_create(struct gwp_ssl_ctx **out, const char *cert_file,
 	if (!c)
 		return -ENOMEM;
 
-	c->ctx = SSL_CTX_new(TLS_server_method());
-	if (!c->ctx)
-		goto err;
+	c->ctx = SSL_CTX_new(meth);
+	if (!c->ctx) {
+		free(c);
+		return new_err;
+	}
 
-	SSL_CTX_set_min_proto_version(c->ctx, TLS1_2_VERSION);
+	if (SSL_CTX_set_min_proto_version(c->ctx, TLS1_2_VERSION) != 1) {
+		gwp_ssl_ctx_free(c);
+		return -EINVAL;
+	}
 	ctx_no_renegotiation(c->ctx);
+	*cp = c;
+	return 0;
+}
+
+int gwp_ssl_ctx_server_create(struct gwp_ssl_ctx **out, const char *cert_file,
+			      const char *key_file)
+{
+	struct gwp_ssl_ctx *c;
+	int r;
+
+	r = ctx_new(&c, TLS_server_method(), -EINVAL);
+	if (r)
+		return r;
+
 	SSL_CTX_set_alpn_select_cb(c->ctx, alpn_select_cb, NULL);
 	if (SSL_CTX_use_certificate_chain_file(c->ctx, cert_file) != 1)
 		goto err;
@@ -295,31 +319,19 @@ int gwp_ssl_ctx_server_create(struct gwp_ssl_ctx **out, const char *cert_file,
 	return 0;
 
 err:
-	if (c->ctx)
-		SSL_CTX_free(c->ctx);
-	free(c);
+	gwp_ssl_ctx_free(c);
 	return -EINVAL;
 }
 
 int gwp_ssl_ctx_client_create(struct gwp_ssl_ctx **out)
 {
 	struct gwp_ssl_ctx *c;
+	int r;
 
-	if (q_bio_meth_init())
-		return -ENOMEM;
+	r = ctx_new(&c, TLS_client_method(), -EINVAL);
+	if (r)
+		return r;
 
-	c = calloc(1, sizeof(*c));
-	if (!c)
-		return -ENOMEM;
-
-	c->ctx = SSL_CTX_new(TLS_client_method());
-	if (!c->ctx) {
-		free(c);
-		return -EINVAL;
-	}
-
-	SSL_CTX_set_min_proto_version(c->ctx, TLS1_2_VERSION);
-	ctx_no_renegotiation(c->ctx);
 	/* Test-only, see ssl.h: no peer verification. */
 	SSL_CTX_set_verify(c->ctx, SSL_VERIFY_NONE, NULL);
 	*out = c;
@@ -332,25 +344,10 @@ int gwp_ssl_ctx_client_verify_create(struct gwp_ssl_ctx **out,
 	struct gwp_ssl_ctx *c;
 	int r;
 
-	if (q_bio_meth_init())
-		return -ENOMEM;
+	r = ctx_new(&c, TLS_client_method(), -ENOMEM);
+	if (r)
+		return r;
 
-	c = calloc(1, sizeof(*c));
-	if (!c)
-		return -ENOMEM;
-
-	c->ctx = SSL_CTX_new(TLS_client_method());
-	if (!c->ctx) {
-		free(c);
-		return -ENOMEM;
-	}
-
-	if (SSL_CTX_set_min_proto_version(c->ctx, TLS1_2_VERSION) != 1) {
-		SSL_CTX_free(c->ctx);
-		free(c);
-		return -EINVAL;
-	}
-	ctx_no_renegotiation(c->ctx);
 	SSL_CTX_set_verify(c->ctx, SSL_VERIFY_PEER, NULL);
 	/*
 	 * A CA file that loads no certificate at all fails here, rather than
@@ -361,8 +358,7 @@ int gwp_ssl_ctx_client_verify_create(struct gwp_ssl_ctx **out,
 	else
 		r = SSL_CTX_set_default_verify_paths(c->ctx);
 	if (r != 1) {
-		SSL_CTX_free(c->ctx);
-		free(c);
+		gwp_ssl_ctx_free(c);
 		return -EINVAL;
 	}
 
