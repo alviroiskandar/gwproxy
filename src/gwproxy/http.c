@@ -1334,6 +1334,22 @@ static const char *next_line(const char *p, const char *end, size_t *n)
 }
 
 /*
+ * The status code of the status line at @p (@n bytes, without its line end),
+ * or -1 if it does not start "HTTP/1.0" or "HTTP/1.1", SP, three digits, and
+ * then a SP or the end of the line. The reason phrase after the SP is left to
+ * the caller.
+ */
+static int status_line_code(const char *p, size_t n)
+{
+	if (n < 12 || memcmp(p, "HTTP/1.", 7) || (p[7] != '0' && p[7] != '1') ||
+	    p[8] != ' ' || p[9] < '0' || p[9] > '9' || p[10] < '0' ||
+	    p[10] > '9' || p[11] < '0' || p[11] > '9' ||
+	    (n > 12 && p[12] != ' '))
+		return -1;
+	return (p[9] - '0') * 100 + (p[10] - '0') * 10 + (p[11] - '0');
+}
+
+/*
  * Most field lines accepted in one response header. Ordinary responses have
  * a few dozen; without a limit the work per header grows with the size of
  * the hold-back buffer (-T).
@@ -1411,7 +1427,7 @@ static noinline ssize_t rewrite_res_hdr(const char *hdr, size_t len, char *out,
 	struct res_line lines[RES_MAX_FIELDS];
 	struct conn_tok toks[CONN_MAX_TOKENS];
 	const char *p = hdr, *end = hdr + len, *q;
-	int nr_toks = 0, nr_lines = 0, nr_cl = 0, l, via_at = -1;
+	int nr_toks = 0, nr_lines = 0, nr_cl = 0, l, via_at = -1, c;
 	bool has_te = false, have_cl = false, cl_done = false;
 	const char *via;
 	uint64_t cl = 0;
@@ -1419,16 +1435,14 @@ static noinline ssize_t rewrite_res_hdr(const char *hdr, size_t len, char *out,
 
 	/* Status line: HTTP/1.x SP 3DIGIT [ SP reason-phrase ] */
 	q = next_line(p, end, &n);
-	if (n < 12 || memcmp(p, "HTTP/1.", 7) || (p[7] != '0' && p[7] != '1') ||
-	    p[8] != ' ' || p[9] < '1' || p[9] > '5' || p[10] < '0' ||
-	    p[10] > '9' || p[11] < '0' || p[11] > '9' ||
-	    (n > 12 && p[12] != ' '))
+	c = status_line_code(p, n);
+	if (c < 100 || c > 599)
 		return -EBADMSG;
 	for (i = 12; i < n; i++) {
 		if (!gwnet_http_is_field_char(p[i]))
 			return -EBADMSG;
 	}
-	*code = (p[9] - '0') * 100 + (p[10] - '0') * 10 + (p[11] - '0');
+	*code = c;
 	via = via_hop(p[7] == '0');
 	if (n + 2 > out_cap)
 		return -E2BIG;
@@ -1993,6 +2007,7 @@ int gwp_http_cli_parse_connect_reply(const void *buf, size_t len,
 {
 	const char *p = buf;
 	size_t end, n;
+	int c;
 
 	/* Need the full header block. */
 	if (*scan > len)
@@ -2002,13 +2017,11 @@ int gwp_http_cli_parse_connect_reply(const void *buf, size_t len,
 		return -EAGAIN;
 
 	next_line(p, p + end, &n);
-	if (n < 12 || memcmp(p, "HTTP/1.", 7) || (p[7] != '0' && p[7] != '1') ||
-	    p[8] != ' ' || p[9] < '0' || p[9] > '9' || p[10] < '0' ||
-	    p[10] > '9' || p[11] < '0' || p[11] > '9' ||
-	    (n > 12 && p[12] != ' '))
+	c = status_line_code(p, n);
+	if (c < 0)
 		return -EINVAL;
 
-	*status = (p[9] - '0') * 100 + (p[10] - '0') * 10 + (p[11] - '0');
+	*status = c;
 	*consumed = end;
 	return 0;
 }
