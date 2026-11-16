@@ -1079,6 +1079,46 @@ static void cancel_attempt(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 		slot, gcp->attempt_fd[slot], gcp->idx);
 }
 
+/* Cancel the connect of every attempt still in the race. */
+static void cancel_attempts(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	uint8_t i;
+
+	for (i = 0; i < GWP_MAX_CONN_CAND; i++) {
+		if (gcp->attempt_fd[i] >= 0)
+			cancel_attempt(w, gcp, i);
+	}
+}
+
+/*
+ * Give up on the race: cancel the connects of the attempts still in it, and
+ * the attempt timeout. Their sockets are first marked to be reset on close
+ * where a cut stream must be seen (gwp_conn_pair_abort_attempts()).
+ */
+static void retire_attempts(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	gwp_conn_pair_abort_attempts(gcp);
+	cancel_attempts(w, gcp);
+	prep_attempt_timer_del(w, gcp);
+}
+
+/*
+ * Give up on a lookup still pending, or its reference would hold the pair
+ * and its descriptors until the name resolves, past the protocol timeout, and
+ * the resolver would run it for nobody. The resolver frees the entry from here
+ * on. The caller must hold a reference of its own, so this put does not free
+ * the pair. On this loop @gde is always the live member of the union:
+ * --raw-dns is refused here.
+ */
+static void cancel_lookup(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	if (gcp->gde) {
+		gwp_dns_entry_cancel(gcp->gde);
+		gcp->gde = NULL;
+		put_gcp(w, gcp);
+	}
+}
+
 static void shutdown_gcp(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_ctx *ctx = w->ctx;
@@ -1096,12 +1136,7 @@ static void shutdown_gcp(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	 * Their sockets are closed as those completions come in, ahead of
 	 * gwp_free_conn_pair(), so a cut stream has to be seen to here.
 	 */
-	gwp_conn_pair_abort_attempts(gcp);
-	for (i = 0; i < GWP_MAX_CONN_CAND; i++) {
-		if (gcp->attempt_fd[i] >= 0)
-			cancel_attempt(w, gcp, i);
-	}
-	prep_attempt_timer_del(w, gcp);
+	retire_attempts(w, gcp);
 
 	/*
 	 * The protocol and connect timeouts hold a reference too. Left armed,
@@ -1147,19 +1182,8 @@ static void shutdown_gcp(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 	gcp->flags |= GWP_CONN_FLAG_IS_CANCEL;
 
-	/*
-	 * Give up on a lookup still pending, or its reference would hold the
-	 * pair and its descriptors until the name resolves, past the protocol
-	 * timeout, and the resolver would run it for nobody. The resolver frees
-	 * the entry from here on. The caller holds a reference of its own, so
-	 * this put does not free the pair. On this loop @gde is always the live
-	 * member of the union: --raw-dns is refused here.
-	 */
-	if (gcp->gde) {
-		gwp_dns_entry_cancel(gcp->gde);
-		gcp->gde = NULL;
-		put_gcp(w, gcp);
-	}
+	/* The caller holds a reference of its own (cancel_lookup()). */
+	cancel_lookup(w, gcp);
 }
 
 static int prep_recv_client_prot(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
@@ -2575,8 +2599,6 @@ parse:
 static void adopt_winning_attempt(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 				  uint8_t slot)
 {
-	uint8_t i;
-
 	gcp->target.fd = gcp->attempt_fd[slot];
 	gcp->attempt_fd[slot] = -1;
 	/*
@@ -2587,11 +2609,7 @@ static void adopt_winning_attempt(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	 * re-deriving from cand[] would silently undo.
 	 */
 	gcp->target_addr = gcp->attempt_addr[slot];
-
-	for (i = 0; i < GWP_MAX_CONN_CAND; i++) {
-		if (gcp->attempt_fd[i] >= 0)
-			cancel_attempt(w, gcp, i);
-	}
+	cancel_attempts(w, gcp);
 
 	/* The race is over; no further candidate should join it. */
 	gcp->next_cand = gcp->nr_cand;
@@ -3782,18 +3800,9 @@ static bool hold_for_fail_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 
 	gcp->fail_err = err;
 
-	gwp_conn_pair_abort_attempts(gcp);
-	for (i = 0; i < GWP_MAX_CONN_CAND; i++) {
-		if (gcp->attempt_fd[i] >= 0)
-			cancel_attempt(w, gcp, i);
-	}
-	prep_attempt_timer_del(w, gcp);
-	/* The caller holds a reference of its own, as for shutdown_gcp(). */
-	if (gcp->gde) {
-		gwp_dns_entry_cancel(gcp->gde);
-		gcp->gde = NULL;
-		put_gcp(w, gcp);
-	}
+	retire_attempts(w, gcp);
+	/* The caller holds a reference of its own (cancel_lookup()). */
+	cancel_lookup(w, gcp);
 
 	/*
 	 * Each removal takes one live timer, and the one armed behind them
