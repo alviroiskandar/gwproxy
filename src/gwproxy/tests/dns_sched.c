@@ -131,6 +131,14 @@ static void settle_down(void)
 	usleep(200000);
 }
 
+/* Wait for @want lookups to have started, and for no more to follow. */
+static void wait_started_exactly(uint32_t want)
+{
+	wait_started(want);
+	settle_down();
+	assert(count_started() == want);
+}
+
 static bool was_started(const char *name)
 {
 	bool found = false;
@@ -167,6 +175,36 @@ static void ask(struct gwp_dns_ctx *ctx, uint32_t client, const char *fmt,
 	snprintf(name, sizeof(name), fmt, i);
 	r->done = false;
 	assert(gwp_dns_queue(ctx, 0, name, 80, &k, r));
+}
+
+/* Ask for @nr names, @fmt with 0 to @nr - 1, all for @client, into @r[]. */
+static void ask_n(struct gwp_dns_ctx *ctx, uint32_t client, const char *fmt,
+		  uint32_t nr, struct req *r)
+{
+	uint32_t i;
+
+	for (i = 0; i < nr; i++)
+		ask(ctx, client, fmt, i, &r[i]);
+}
+
+/*
+ * Lower the thread limit before the worker has started anything, under the
+ * lock the worker reads it with.
+ */
+static void set_max_threads(struct gwp_dns_ctx *ctx, uint32_t n)
+{
+	pthread_mutex_lock(&ctx->lock);
+	ctx->max_threads = n;
+	pthread_mutex_unlock(&ctx->lock);
+}
+
+/* The lookup queued for @name, if any; the caller holds ctx->lock. */
+static struct dns_lookup *lookup_of(struct gwp_dns_ctx *ctx, const char *name)
+{
+	size_t len = strlen(name);
+
+	return find_lookup(ctx, name, len,
+			   gwp_siphash13(ctx->hash_key, name, len));
 }
 
 /* Take what has finished; true when @nr requests have, in total. */
@@ -256,11 +294,8 @@ static void test_client_share(void)
 	struct req a[PER_CLIENT + 8], b;
 	uint32_t i;
 
-	for (i = 0; i < PER_CLIENT + 8; i++)
-		ask(ctx, 1, "hold-a-%u", i, &a[i]);
-	wait_started(PER_CLIENT);
-	settle_down();
-	assert(count_started() == PER_CLIENT);
+	ask_n(ctx, 1, "hold-a-%u", PER_CLIENT + 8, a);
+	wait_started_exactly(PER_CLIENT);
 
 	/* Answered with all of the other client's lookups still blocked. */
 	ask(ctx, 2, "other-%u", 0, &b);
@@ -286,28 +321,20 @@ static void test_kept_threads(void)
 	struct req a[PER_CLIENT + 4], b[PER_CLIENT + 4], c[2], d[KEPT - 1], e;
 	uint32_t i;
 
-	for (i = 0; i < PER_CLIENT + 4; i++)
-		ask(ctx, 1, "hold-a-%u", i, &a[i]);
-	for (i = 0; i < PER_CLIENT + 4; i++)
-		ask(ctx, 2, "hold-b-%u", i, &b[i]);
-	wait_started(NOT_KEPT);
-	settle_down();
-	assert(count_started() == NOT_KEPT);
+	ask_n(ctx, 1, "hold-a-%u", PER_CLIENT + 4, a);
+	ask_n(ctx, 2, "hold-b-%u", PER_CLIENT + 4, b);
+	wait_started_exactly(NOT_KEPT);
 
 	/* A client's first lookup goes ahead, and its second does not. */
 	ask(ctx, 3, "hold-c-%u", 0, &c[0]);
 	ask(ctx, 3, "hold-c-%u", 1, &c[1]);
-	wait_started(NOT_KEPT + 1);
-	settle_down();
-	assert(count_started() == NOT_KEPT + 1);
+	wait_started_exactly(NOT_KEPT + 1);
 	assert(was_started("hold-c-0"));
 
 	/* It takes one more client per thread to use up the rest. */
 	for (i = 0; i < KEPT - 1; i++)
 		ask(ctx, 4 + i, "hold-d-%u", i, &d[i]);
-	wait_started(GWP_DNS_MAX_THREADS);
-	settle_down();
-	assert(count_started() == GWP_DNS_MAX_THREADS);
+	wait_started_exactly(GWP_DNS_MAX_THREADS);
 
 	ask(ctx, 100, "hold-e-%u", 0, &e);
 	settle_down();
@@ -332,18 +359,12 @@ static void test_first_goes_first(void)
 {
 	struct gwp_dns_ctx *ctx = new_ctx();
 	struct req a[8], b;
-	uint32_t i;
 
 	/* Two threads at most, and the worker has not gone near this yet. */
-	pthread_mutex_lock(&ctx->lock);
-	ctx->max_threads = 2;
-	pthread_mutex_unlock(&ctx->lock);
+	set_max_threads(ctx, 2);
 
-	for (i = 0; i < 8; i++)
-		ask(ctx, 1, "hold-a-%u", i, &a[i]);
-	wait_started(2);
-	settle_down();
-	assert(count_started() == 2);
+	ask_n(ctx, 1, "hold-a-%u", 8, a);
+	wait_started_exactly(2);
 
 	ask(ctx, 2, "hold-b-%u", 0, &b);
 	let_through(1);
@@ -367,9 +388,7 @@ static void test_turns(void)
 	uint32_t i;
 
 	/* All the threads there are, with two clients left with one each. */
-	pthread_mutex_lock(&ctx->lock);
-	ctx->max_threads = 5;
-	pthread_mutex_unlock(&ctx->lock);
+	set_max_threads(ctx, 5);
 
 	for (i = 0; i < 2; i++) {
 		ask(ctx, 1, "hold-a-%u", i, &hold[2 * i]);
@@ -418,9 +437,7 @@ static void test_limits(void)
 	assert(over.done && over.res == -EHOSTUNREACH);
 	assert(!was_started("hold-over-0"));
 	pthread_mutex_lock(&ctx->lock);
-	assert(!find_lookup(ctx, "hold-over-0", strlen("hold-over-0"),
-			    gwp_siphash13(ctx->hash_key, "hold-over-0",
-					  strlen("hold-over-0"))));
+	assert(!lookup_of(ctx, "hold-over-0"));
 	pthread_mutex_unlock(&ctx->lock);
 
 	/* A name already queued costs nothing more, so it is not limited. */
@@ -489,10 +506,8 @@ static void test_attach_moves(void)
 	uint32_t i;
 	struct dns_lookup *l;
 	const char *name = "hold-b-32";
-	size_t len = strlen(name);
 
-	for (i = 0; i < PER_CLIENT + 8; i++)
-		ask(ctx, 1, "hold-a-%u", i, &a[i]);
+	ask_n(ctx, 1, "hold-a-%u", PER_CLIENT + 8, a);
 	wait_started(PER_CLIENT);
 	settle_down();
 	assert(!was_started(moved));
@@ -513,7 +528,7 @@ static void test_attach_moves(void)
 	/* Client 1 has more outstanding, so the name stays where it is. */
 	ask(ctx, 1, name, 0, &w);
 	pthread_mutex_lock(&ctx->lock);
-	l = find_lookup(ctx, name, len, gwp_siphash13(ctx->hash_key, name, len));
+	l = lookup_of(ctx, name);
 	assert(l && !l->running);
 	{
 		struct gwp_iplim_key k = client_key(2);
@@ -558,8 +573,7 @@ static void test_cancelled_never_runs(void)
 	uint32_t i;
 	char name[32];
 
-	for (i = 0; i < PER_CLIENT; i++)
-		ask(ctx, 1, "hold-a-%u", i, &a[i]);
+	ask_n(ctx, 1, "hold-a-%u", PER_CLIENT, a);
 	wait_started(PER_CLIENT);
 
 	for (i = 0; i < 4; i++) {
@@ -586,10 +600,8 @@ static void test_free_with_queued(void)
 {
 	struct gwp_dns_ctx *ctx = new_ctx();
 	static struct req a[PER_CLIENT + 100];
-	uint32_t i;
 
-	for (i = 0; i < PER_CLIENT + 100; i++)
-		ask(ctx, 1, "hold-a-%u", i, &a[i]);
+	ask_n(ctx, 1, "hold-a-%u", PER_CLIENT + 100, a);
 	wait_started(PER_CLIENT);
 	let_all_through();
 	gwp_dns_ctx_free(ctx);
