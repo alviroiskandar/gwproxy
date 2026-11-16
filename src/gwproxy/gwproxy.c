@@ -3097,6 +3097,20 @@ static const char *up_ms_str(uint32_t ms, char *buf, size_t size)
 }
 
 /*
+ * Log that the upstream @name was ejected under the health settings @h.
+ * @suffix ends the line: "" or a note on whose settings those are.
+ */
+static void up_log_ejected(struct gwp_ctx *ctx, const char *name,
+			   const struct gwp_up_health *h, const char *suffix)
+{
+	char e[24], w[24];
+
+	pr_warn(&ctx->lh, "Upstream %s ejected for %s after %u failures in %s%s",
+		name, up_ms_str(h->eject_ms, e, sizeof(e)), h->max_fails,
+		up_ms_str(h->window_ms, w, sizeof(w)), suffix);
+}
+
+/*
  * Log that @up, the @idx-th server of @pool (or the default), is back, and
  * on what slow start.
  */
@@ -4596,12 +4610,9 @@ struct up_fail_env {
 static void up_ejected_other(void *arg, const struct gwp_up_health *h)
 {
 	struct up_fail_env *env = arg;
-	struct gwp_upstream *up = env->up;
-	char e[24], w[24];
 
-	pr_warn(&env->ctx->lh, "Upstream %s ejected for %s after %u failures in %s, in the pools that list it with these settings",
-		ip_to_str(&up->addr), up_ms_str(h->eject_ms, e, sizeof(e)),
-		h->max_fails, up_ms_str(h->window_ms, w, sizeof(w)));
+	up_log_ejected(env->ctx, ip_to_str(&env->up->addr), h,
+		       ", in the pools that list it with these settings");
 }
 
 /*
@@ -4704,19 +4715,16 @@ bool gwp_conn_upstream_failed(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	if (cls == GWP_UPSTREAM_FAIL_UPSTREAM) {
 		struct up_fail_env env = { .ctx = w->ctx, .up = up };
 		uint64_t now = gwp_now_ms();
-		char desc[320], e[24], wd[24];
+		char desc[320];
 
 		/* An ejection that ran out is ended (and logged) first. */
 		up_ejected(w->ctx, gcp->up_pool, gcp->up_srv, up, &now);
 		if (gwp_up_state_fail(up->state, up->health, (uint32_t)now,
 				      up_ejected_other, &env))
-			pr_warn(&w->ctx->lh, "Upstream %s ejected for %s after %u failures in %s",
-				up_desc(gcp->up_pool, gcp->up_srv, up, desc,
-					sizeof(desc)),
-				up_ms_str(up->health->eject_ms, e, sizeof(e)),
-				up->health->max_fails,
-				up_ms_str(up->health->window_ms, wd,
-					  sizeof(wd)));
+			up_log_ejected(w->ctx,
+				       up_desc(gcp->up_pool, gcp->up_srv, up,
+					       desc, sizeof(desc)),
+				       up->health, "");
 	}
 
 	if ((cls != GWP_UPSTREAM_FAIL_UPSTREAM && !udp_refused) || !may_retry ||
