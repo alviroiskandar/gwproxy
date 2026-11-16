@@ -730,13 +730,11 @@ static bool pick_turn_taken(struct pick *c, uint32_t i)
 static uint32_t pick_next(struct pick *c, const struct gwp_up_tier *t,
 			  uint32_t p)
 {
-	const struct gwp_up_pick *pk = c->pk;
 	uint32_t ramping = UINT32_MAX, i, k;
 
 	for (k = 0; k < t->n; k++, p = p + 1 < t->n ? p + 1 : 0) {
 		i = tier_member(t, p);
-		if (i == pk->skip || !pk->m[i].st || pick_full(pk, i) ||
-		    pick_ejected(c, i))
+		if (!pick_usable(c, i))
 			continue;
 		if (pick_ramp(c, i) >= GWP_UP_RAMP_ONE)
 			return i;
