@@ -90,6 +90,28 @@ static void expect_code(const char *buf, bool whole, int want)
 	gwp_http_conn_free(hc);
 }
 
+/*
+ * Check that @in, on a fresh connection, is forwarded as exactly @want, and
+ * say what came out instead when it is not.
+ */
+static void expect_forward(const char *in, const char *want)
+{
+	struct gwp_http_conn *hc = gwp_http_conn_alloc();
+	char *host, *port;
+	const char *req;
+	size_t req_len;
+	bool same;
+
+	assert(hc);
+	assert(run(hc, NULL, in, &host, &port, &req, &req_len) ==
+	       GWP_HTTP_FORWARD);
+	same = req_len == strlen(want) && !memcmp(req, want, req_len);
+	if (!same)
+		fprintf(stderr, "%s: got %.*s\n", in, (int)req_len, req);
+	assert(same);
+	gwp_http_conn_free(hc);
+}
+
 static void test_connect_ipv4(void)
 {
 	static const char buf[] =
@@ -207,17 +229,8 @@ static void test_forward_drops_proxy(void)
 		"X-Before: 1\r\nProxys: s\r\nProxy-Foo: f\r\n"
 		"Proxy_: u\r\nX-After: 2\r\n"
 		"Via: 1.1 gwproxy\r\nConnection: close\r\n\r\n";
-	struct gwp_http_conn *hc = gwp_http_conn_alloc();
-	char *host, *port;
-	const char *req = NULL;
-	size_t req_len = 0;
 
-	assert(hc);
-	assert(run(hc, NULL, buf, &host, &port, &req, &req_len) ==
-	       GWP_HTTP_FORWARD);
-	assert(req_len == sizeof(want) - 1);
-	assert(!memcmp(req, want, req_len));
-	gwp_http_conn_free(hc);
+	expect_forward(buf, want);
 	PRTEST_OK();
 }
 
@@ -449,11 +462,12 @@ static int req_body(const char *hdr, const char *body, size_t step,
  */
 static void test_forward_conn_limit(void)
 {
+	static const char want[] =
+		"GET / HTTP/1.1\r\nHost: example.com\r\n"
+		"X-32: c\r\nVia: 1.1 gwproxy\r\n"
+		"Connection: close\r\n\r\n";
 	static char buf[4096];
-	struct gwp_http_conn *hc;
-	char *host, *port;
-	const char *req = NULL;
-	size_t req_len = 0, n;
+	size_t n;
 	int i;
 
 	n = (size_t)sprintf(buf, "GET http://example.com/ HTTP/1.1\r\n"
@@ -461,19 +475,7 @@ static void test_forward_conn_limit(void)
 	for (i = 0; i < 32; i++)
 		n += (size_t)sprintf(buf + n, "x-%d, X-%d,", i, i);
 	n += (size_t)sprintf(buf + n, "\r\nX-31: b\r\nX-32: c\r\n\r\n");
-	hc = gwp_http_conn_alloc();
-	assert(hc);
-	assert(run(hc, NULL, buf, &host, &port, &req, &req_len) ==
-	       GWP_HTTP_FORWARD);
-	{
-		static const char want[] =
-			"GET / HTTP/1.1\r\nHost: example.com\r\n"
-			"X-32: c\r\nVia: 1.1 gwproxy\r\n"
-			"Connection: close\r\n\r\n";
-
-		assert(req_len == strlen(want) && !memcmp(req, want, req_len));
-	}
-	gwp_http_conn_free(hc);
+	expect_forward(buf, want);
 
 	sprintf(buf + n - 2, "Connection: X-32\r\n\r\n");
 	expect_code(buf, true, GWP_HTTP_BAD_REQUEST);
@@ -909,20 +911,11 @@ static void test_via(void)
 		  "HTTP/1.1 100 Continue\r\nVia: 1.1 a\r\n\r\n" },
 	};
 	struct gwp_http_conn *hc;
-	const char *req;
-	char *host, *port, out[1024];
-	size_t i, req_len, out_len;
+	char out[1024];
+	size_t i, out_len;
 
-	for (i = 0; i < sizeof(req_cases) / sizeof(req_cases[0]); i++) {
-		hc = gwp_http_conn_alloc();
-		assert(hc);
-		assert(run(hc, NULL, req_cases[i].in, &host, &port, &req,
-			   &req_len) == GWP_HTTP_FORWARD);
-		if (strcmp(req, req_cases[i].out))
-			fprintf(stderr, "request %zu: %s\n", i, req);
-		assert(!strcmp(req, req_cases[i].out));
-		gwp_http_conn_free(hc);
-	}
+	for (i = 0; i < sizeof(req_cases) / sizeof(req_cases[0]); i++)
+		expect_forward(req_cases[i].in, req_cases[i].out);
 
 	for (i = 0; i < sizeof(res_cases) / sizeof(res_cases[0]); i++) {
 		hc = gwp_http_conn_alloc();
@@ -1195,31 +1188,16 @@ static void test_errors(void)
 		"PROPFIND http://example.com/dav/ HTTP/1.1\r\nDepth: 1\r\n\r\n";
 	static const char lcmethod[] =
 		"get http://example.com/ HTTP/1.1\r\n\r\n";
-	struct gwp_http_conn *hc;
-	char *host, *port;
-	const char *req = NULL;
-	size_t req_len = 0;
 
 	expect_code(https, true, GWP_HTTP_NOT_IMPLEMENTED);
 	expect_code(bare, false, GWP_HTTP_BAD_REQUEST);
 
 	/* Any method token is forwarded, spelt as the client sent it. */
-	hc = gwp_http_conn_alloc();
-	assert(hc);
-	assert(run(hc, NULL, extmethod, &host, &port, &req, &req_len) ==
-	       GWP_HTTP_FORWARD);
-	assert(!strcmp(req, "PROPFIND /dav/ HTTP/1.1\r\n"
-			    "Host: example.com\r\nDepth: 1\r\n"
-			    "Via: 1.1 gwproxy\r\nConnection: close\r\n\r\n"));
-	gwp_http_conn_free(hc);
-
-	hc = gwp_http_conn_alloc();
-	assert(hc);
-	assert(run(hc, NULL, lcmethod, &host, &port, &req, &req_len) ==
-	       GWP_HTTP_FORWARD);
-	assert(!strcmp(req, "get / HTTP/1.1\r\nHost: example.com\r\n"
-			    "Via: 1.1 gwproxy\r\nConnection: close\r\n\r\n"));
-	gwp_http_conn_free(hc);
+	expect_forward(extmethod, "PROPFIND /dav/ HTTP/1.1\r\n"
+		       "Host: example.com\r\nDepth: 1\r\n"
+		       "Via: 1.1 gwproxy\r\nConnection: close\r\n\r\n");
+	expect_forward(lcmethod, "get / HTTP/1.1\r\nHost: example.com\r\n"
+		       "Via: 1.1 gwproxy\r\nConnection: close\r\n\r\n");
 
 	PRTEST_OK();
 }
@@ -1371,20 +1349,16 @@ static void test_max_forwards(void)
 		  "GET / HTTP/1.1\r\nHost: h\r\n"
 		  "Via: 1.1 gwproxy\r\nConnection: close\r\n\r\n" },
 	};
-	struct gwp_http_conn *hc;
-	char *host, *port;
-	const char *req;
-	size_t i, req_len;
-	int r;
+	size_t i;
 
 	for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-		hc = gwp_http_conn_alloc();
-		assert(hc);
-		r = run(hc, NULL, cases[i].in, &host, &port, &req, &req_len);
-		assert(r == cases[i].want);
-		if (cases[i].out)
-			assert(!strcmp(req, cases[i].out));
-		gwp_http_conn_free(hc);
+		/* Only a forwarded request has an output to compare. */
+		if (cases[i].out) {
+			assert(cases[i].want == GWP_HTTP_FORWARD);
+			expect_forward(cases[i].in, cases[i].out);
+		} else {
+			expect_code(cases[i].in, true, cases[i].want);
+		}
 	}
 	PRTEST_OK();
 }
@@ -1536,20 +1510,11 @@ static void test_field_obs_text(void)
 	static const char want[] =
 		"GET / HTTP/1.1\r\nHost: e\r\nX-N: caf\xc3\xa9 \xff\r\n"
 		"Via: 1.1 gwproxy\r\nConnection: close\r\n\r\n";
-	struct gwp_http_conn *hc;
-	char *host, *port;
-	const char *req = NULL;
-	size_t req_len = 0, i;
+	size_t i;
 
 	for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++)
 		expect_code(bad[i], false, GWP_HTTP_BAD_REQUEST);
-
-	hc = gwp_http_conn_alloc();
-	assert(hc);
-	assert(run(hc, NULL, good, &host, &port, &req, &req_len) ==
-	       GWP_HTTP_FORWARD);
-	assert(req_len == strlen(want) && !memcmp(req, want, req_len));
-	gwp_http_conn_free(hc);
+	expect_forward(good, want);
 	PRTEST_OK();
 }
 
@@ -1682,10 +1647,8 @@ static void test_underscore_alias(void)
 		"Content_Lengthx: 1\r\nXContent_Length: 1\r\n"
 		"Host_: h\r\nTE_: x\r\nContent-Length: 4\r\n"
 		"Via: 1.1 gwproxy\r\nConnection: close\r\n\r\n";
-	struct gwp_http_conn *hc;
-	char *host, *port, buf[256];
-	const char *req;
-	size_t req_len, i;
+	char buf[256];
+	size_t i;
 
 	for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
 		snprintf(buf, sizeof(buf), "POST http://e/ HTTP/1.1\r\n"
@@ -1694,13 +1657,7 @@ static void test_underscore_alias(void)
 		expect_code(buf, true, GWP_HTTP_BAD_REQUEST);
 	}
 
-	hc = gwp_http_conn_alloc();
-	assert(hc);
-	assert(run(hc, NULL, good, &host, &port, &req, &req_len) ==
-	       GWP_HTTP_FORWARD);
-	assert(req_len == sizeof(good_want) - 1);
-	assert(!memcmp(req, good_want, req_len));
-	gwp_http_conn_free(hc);
+	expect_forward(good, good_want);
 
 	/* A CONNECT's fields go nowhere: nothing to refuse there. */
 	expect_code("CONNECT e:443 HTTP/1.1\r\nContent_Length: 4\r\n\r\n",
@@ -1772,14 +1729,7 @@ static void test_duplicate_field(void)
 	assert(memmem(req, req_len, "\r\nAccept: a, b\r\n", 16));
 	gwp_http_conn_free(hc);
 
-	hc = gwp_http_conn_alloc();
-	assert(hc);
-	assert(run(hc, NULL, other, &host, &port, &req, &req_len) ==
-	       GWP_HTTP_FORWARD);
-	assert(req_len == strlen(other_want) &&
-	       !memcmp(req, other_want, req_len));
-	gwp_http_conn_free(hc);
-
+	expect_forward(other, other_want);
 	expect_code(tunnel, true, GWP_HTTP_CONNECT);
 	PRTEST_OK();
 }
