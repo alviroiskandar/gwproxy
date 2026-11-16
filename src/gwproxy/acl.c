@@ -1475,9 +1475,9 @@ static int pool_add_server(struct acl_load *ld, const char *url,
 }
 
 /*
- * The arguments of a directive in a pool block, which ends in ';': the ';'
- * may stand alone as the last word or end it. Strips it and returns the
- * number of words left, or -1 when it is missing.
+ * The arguments of a directive that ends in ';' (in a pool block, or an
+ * include line): the ';' may stand alone as the last word or end it.
+ * Strips it and returns the number of words left, or -1 when it is missing.
  */
 static int directive_words(char **tok, int n)
 {
@@ -2863,18 +2863,12 @@ static int parse_include(struct acl_load *ld, char **tok, int n,
 	struct inc_list res = { 0 };
 	char *inc, *pat, *path;
 	const char *why;
-	size_t len, i;
+	size_t i;
 	int r;
 
-	if (n == 3 && !strcmp(tok[2], ";")) {
-		inc = tok[1];
-	} else if (n == 2 && (len = strlen(tok[1])) > 1 &&
-		   tok[1][len - 1] == ';') {
-		tok[1][len - 1] = '\0';
-		inc = tok[1];
-	} else {
+	if (directive_words(tok, n) != 2)
 		return -EINVAL;
-	}
+	inc = tok[1];
 	if (strchr(inc, ';'))
 		return -EINVAL;
 
