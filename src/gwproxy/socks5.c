@@ -587,6 +587,61 @@ static int handle_state_cmd(struct data_arg *d)
 }
 
 /*
+ * Decode the ATYP + ADDR + PORT field at @b, with @len bytes there from the
+ * ATYP byte on, into @a, or only check and size it when @a is NULL. The field
+ * is laid out the same in a request (DST), a reply (BND) and a UDP relay
+ * header. @a is written only once the whole field is there, and is not cleared
+ * first: the UDP relay decodes one per datagram. Returns the field's length,
+ * -EAGAIN if incomplete, or -EAFNOSUPPORT for an unknown ATYP.
+ */
+static inline int socks5_addr_decode(const uint8_t *b, size_t len,
+				     struct gwp_socks5_addr *a)
+{
+	uint8_t domlen;
+	size_t need;
+
+	switch (b[0]) {
+	case GWP_SOCKS5_ATYP_IPV4:
+		need = 1 + 4 + 2;
+		if (len < need)
+			return -EAGAIN;
+		if (a) {
+			a->ver = GWP_SOCKS5_ATYP_IPV4;
+			memcpy(a->ip4, &b[1], 4);
+			memcpy(&a->port, &b[5], 2);
+		}
+		return (int)need;
+	case GWP_SOCKS5_ATYP_IPV6:
+		need = 1 + 16 + 2;
+		if (len < need)
+			return -EAGAIN;
+		if (a) {
+			a->ver = GWP_SOCKS5_ATYP_IPV6;
+			memcpy(a->ip6, &b[1], 16);
+			memcpy(&a->port, &b[17], 2);
+		}
+		return (int)need;
+	case GWP_SOCKS5_ATYP_DOMAIN:
+		if (len < 2)
+			return -EAGAIN;
+		domlen = b[1];
+		need = 1 + 1 + domlen + 2;
+		if (len < need)
+			return -EAGAIN;
+		if (a) {
+			a->ver = GWP_SOCKS5_ATYP_DOMAIN;
+			a->domain.len = domlen;
+			memcpy(a->domain.str, &b[2], domlen);
+			a->domain.str[domlen] = '\0';
+			memcpy(&a->port, &b[2 + domlen], 2);
+		}
+		return (int)need;
+	default:
+		return -EAFNOSUPPORT;
+	}
+}
+
+/*
  * Parse the ATYP + ADDR + PORT tail shared by the CONNECT and UDP ASSOCIATE
  * requests into @da, advancing the input buffer past it. @buf points at the
  * ATYP byte's request (index 3). Returns 0, -EAGAIN if incomplete, or a
@@ -594,54 +649,17 @@ static int handle_state_cmd(struct data_arg *d)
  */
 static int parse_request_addr(struct data_arg *d, struct gwp_socks5_addr *da)
 {
-	size_t len = *d->in_len, exp_len;
 	const uint8_t *buf = d->in_buf;
-	uint8_t atyp, domlen = 0;
+	int r;
 
-	exp_len = 4;
-	atyp = buf[3];
-	switch (atyp) {
-	case GWP_SOCKS5_ATYP_IPV4:
-		exp_len += 4 + 2;
-		break;
-	case GWP_SOCKS5_ATYP_IPV6:
-		exp_len += 16 + 2;
-		break;
-	case GWP_SOCKS5_ATYP_DOMAIN:
-		exp_len += 1; /* Length of domain name */
-		if (len < exp_len)
-			return -EAGAIN;
-		domlen = buf[4];
-		exp_len += domlen + 2;
-		break;
-	default:
+	/* The caller has checked that VER + CMD + RSV + ATYP are there. */
+	r = socks5_addr_decode(&buf[3], *d->in_len - 3, da);
+	if (r == -EAFNOSUPPORT)
 		return set_err_reply(d, GWP_SOCKS5_REP_ATYP_NOT_SUPPORTED);
-	}
+	if (r < 0)
+		return r;
 
-	if (len < exp_len)
-		return -EAGAIN;
-
-	switch (atyp) {
-	case GWP_SOCKS5_ATYP_IPV4:
-		da->ver = GWP_SOCKS5_ATYP_IPV4;
-		memcpy(da->ip4, &buf[4], 4);
-		memcpy(&da->port, &buf[8], 2);
-		break;
-	case GWP_SOCKS5_ATYP_IPV6:
-		da->ver = GWP_SOCKS5_ATYP_IPV6;
-		memcpy(da->ip6, &buf[4], 16);
-		memcpy(&da->port, &buf[20], 2);
-		break;
-	case GWP_SOCKS5_ATYP_DOMAIN:
-		da->ver = GWP_SOCKS5_ATYP_DOMAIN;
-		da->domain.len = domlen;
-		memcpy(da->domain.str, &buf[5], domlen);
-		da->domain.str[domlen] = '\0';
-		memcpy(&da->port, &buf[5 + domlen], 2);
-		break;
-	}
-
-	advance_in_buf(d, exp_len);
+	advance_in_buf(d, 3 + (size_t)r);
 	return 0;
 }
 
@@ -995,57 +1013,27 @@ int gwp_socks5_cli_parse_reply(const void *buf, size_t len, uint8_t *rep,
 				struct gwp_socks5_addr *bnd, size_t *consumed)
 {
 	const uint8_t *b = buf;
-	size_t need = 4; /* VER + REP + RSV + ATYP */
-	size_t alen;
+	int r;
 
-	if (len < need)
+	/* VER + REP + RSV + ATYP */
+	if (len < 4)
 		return -EAGAIN;
 
 	if (b[0] != 0x05)
 		return -EINVAL;
 
-	switch (b[3]) {
-	case GWP_SOCKS5_ATYP_IPV4:
-		alen = 4;
-		break;
-	case GWP_SOCKS5_ATYP_IPV6:
-		alen = 16;
-		break;
-	case GWP_SOCKS5_ATYP_DOMAIN:
-		need += 1;
-		if (len < need)
-			return -EAGAIN;
-		alen = b[4];
-		break;
-	default:
+	r = socks5_addr_decode(&b[3], len - 3, NULL);
+	if (r == -EAFNOSUPPORT)
 		return -EINVAL;
-	}
-
-	need += alen + 2;
-	if (len < need)
-		return -EAGAIN;
+	if (r < 0)
+		return r;
 
 	*rep = b[1];
-	*consumed = need;
-	if (!bnd)
-		return 0;
-
-	memset(bnd, 0, sizeof(*bnd));
-	bnd->ver = b[3];
-	switch (b[3]) {
-	case GWP_SOCKS5_ATYP_IPV4:
-		memcpy(bnd->ip4, &b[4], 4);
-		break;
-	case GWP_SOCKS5_ATYP_IPV6:
-		memcpy(bnd->ip6, &b[4], 16);
-		break;
-	default:
-		bnd->domain.len = (uint8_t)alen;
-		memcpy(bnd->domain.str, &b[5], alen);
-		bnd->domain.str[alen] = '\0';
-		break;
+	*consumed = 3 + (size_t)r;
+	if (bnd) {
+		memset(bnd, 0, sizeof(*bnd));
+		socks5_addr_decode(&b[3], len - 3, bnd);
 	}
-	memcpy(&bnd->port, &b[need - 2], 2);
 	return 0;
 }
 
@@ -1059,8 +1047,7 @@ int gwp_socks5_udp_parse_hdr(const void *buf, size_t len,
 			     struct gwp_socks5_addr *addr, size_t *hdr_len)
 {
 	const uint8_t *b = buf;
-	uint8_t atyp;
-	size_t need;
+	int r;
 
 	/* RSV(2) + FRAG(1) + ATYP(1). */
 	if (len < 4)
@@ -1068,45 +1055,13 @@ int gwp_socks5_udp_parse_hdr(const void *buf, size_t len,
 	if (b[2] != 0x00)
 		return -ENOTSUP;	/* we do not reassemble fragments */
 
-	atyp = b[3];
-	switch (atyp) {
-	case GWP_SOCKS5_ATYP_IPV4:
-		need = 4 + 4 + 2;
-		if (len < need)
-			return -EAGAIN;
-		addr->ver = GWP_SOCKS5_ATYP_IPV4;
-		memcpy(addr->ip4, &b[4], 4);
-		memcpy(&addr->port, &b[8], 2);
-		break;
-	case GWP_SOCKS5_ATYP_IPV6:
-		need = 4 + 16 + 2;
-		if (len < need)
-			return -EAGAIN;
-		addr->ver = GWP_SOCKS5_ATYP_IPV6;
-		memcpy(addr->ip6, &b[4], 16);
-		memcpy(&addr->port, &b[20], 2);
-		break;
-	case GWP_SOCKS5_ATYP_DOMAIN: {
-		uint8_t domlen;
-
-		if (len < 5)
-			return -EAGAIN;
-		domlen = b[4];
-		need = 4 + 1 + domlen + 2;
-		if (len < need)
-			return -EAGAIN;
-		addr->ver = GWP_SOCKS5_ATYP_DOMAIN;
-		addr->domain.len = domlen;
-		memcpy(addr->domain.str, &b[5], domlen);
-		addr->domain.str[domlen] = '\0';
-		memcpy(&addr->port, &b[5 + domlen], 2);
-		break;
-	}
-	default:
+	r = socks5_addr_decode(&b[3], len - 3, addr);
+	if (r == -EAFNOSUPPORT)
 		return -EINVAL;
-	}
+	if (r < 0)
+		return r;
 
-	*hdr_len = need;
+	*hdr_len = 3 + (size_t)r;
 	return 0;
 }
 
