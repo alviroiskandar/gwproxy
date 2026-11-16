@@ -2030,15 +2030,45 @@ static noinline void test_include_order(void)
 	inc_rmdir(dir);
 }
 
+static void up_capture(void);
+static char *up_captured(void);
+
+/*
+ * @text as main.acl in @dir must fail to load with @err and, unless @msg is
+ * NULL, say @msg (with "%s" standing for main.acl's path). What the load says
+ * is shown only on a mismatch.
+ */
+static void inc_refused_msg(const char *dir, const char *text, int err,
+			    const char *msg)
+{
+	struct gwp_acl *a = NULL;
+	char *path = inc_write(dir, "main.acl", text), *said, *want = NULL;
+	int r;
+
+	if (msg)
+		assert(asprintf(&want, msg, path) > 0);
+	up_capture();
+	r = gwp_acl_create(&a, path);
+	said = up_captured();
+	if (r != err || (want && !strstr(said, want))) {
+		if (want)
+			fprintf(stderr, "returned %d, not %d; want \"%s\", it said:\n%s",
+				r, err, want, said);
+		else
+			fprintf(stderr, "returned %d, not %d; it said:\n%s",
+				r, err, said);
+		assert(0);
+	}
+	assert(!a);
+	free(said);
+	free(want);
+	free(path);
+}
+
 /* @text as main.acl in @dir must fail to load with @err. */
 static void inc_refused(const char *dir, const char *text, int err)
 {
-	struct gwp_acl *a = NULL;
-	char *path = inc_write(dir, "main.acl", text);
-
-	assert(gwp_acl_create(&a, path) == err);
-	assert(!a);
-	free(path);
+	inc_refused_msg(dir, text, err, NULL);
 }
 
 /*
@@ -2244,8 +2274,6 @@ static noinline void test_include_reload(void)
  * ------------------------------------------------------------------------
  */
 
-static void up_capture(void);
-static char *up_captured(void);
 static char *up_create_said(struct gwp_acl **a, const char *path, int want);
 
 /* mkdir @dir/@name; returns the malloc'd path. */
@@ -2261,32 +2289,6 @@ static char *inc_mkdir(const char *dir, const char *name)
 static void inc_mkdir_put(const char *dir, const char *name)
 {
 	free(inc_mkdir(dir, name));
-}
-
-/*
- * @text as main.acl in @dir must fail to load with @err, and say @msg (with
- * "%s" standing for main.acl's path).
- */
-static void inc_refused_msg(const char *dir, const char *text, int err,
-			    const char *msg)
-{
-	struct gwp_acl *a = NULL;
-	char *path = inc_write(dir, "main.acl", text), *said, *want;
-	int r;
-
-	assert(asprintf(&want, msg, path) > 0);
-	up_capture();
-	r = gwp_acl_create(&a, path);
-	said = up_captured();
-	if (r != err || !strstr(said, want)) {
-		fprintf(stderr, "returned %d, not %d; want \"%s\", it said:\n%s",
-			r, err, want, said);
-		assert(0);
-	}
-	assert(!a);
-	free(said);
-	free(want);
-	free(path);
 }
 
 /* @text as main.acl in @dir loads, and its files are @names in order. */
