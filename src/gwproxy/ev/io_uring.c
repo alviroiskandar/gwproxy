@@ -3859,8 +3859,7 @@ static int chk_prot_result(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int r)
 {
 	int ct = gcp->conn_state;
 
-	if (r == -EINPROGRESS &&
-	    (ct == CONN_STATE_SOCKS5_DNS_QUERY || ct == CONN_STATE_HTTP_DNS_QUERY))
+	if (r == -EINPROGRESS && gwp_in_dns_lookup(gcp))
 		return prep_domain_resolution(w, gcp);
 
 	if (r == 0 &&

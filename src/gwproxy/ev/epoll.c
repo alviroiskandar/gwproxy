@@ -3581,8 +3581,7 @@ static int handle_ev_dns_query(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	int r;
 
 	assert(gde);
-	assert(gcp->conn_state == CONN_STATE_SOCKS5_DNS_QUERY ||
-	       gcp->conn_state == CONN_STATE_HTTP_DNS_QUERY);
+	assert(gwp_in_dns_lookup(gcp));
 
 	log_dns_query(w, gcp, gde);
 	if (likely(!gde->res)) {
@@ -3865,10 +3864,7 @@ static bool client_past_handshake(const struct gwp_conn_pair *gcp)
  */
 static int client_prot_eof(const struct gwp_conn_pair *gcp)
 {
-	int cs = gcp->conn_state;
-
-	if (cs == CONN_STATE_SOCKS5_DNS_QUERY || cs == CONN_STATE_HTTP_DNS_QUERY ||
-	    client_past_handshake(gcp))
+	if (gwp_in_dns_lookup(gcp) || client_past_handshake(gcp))
 		return 0;
 	return -ECONNRESET;
 }
