@@ -1211,6 +1211,19 @@ static inline void iou_tls_encrypt(struct gwp_ssl *ssl, struct gwp_conn *src)
 }
 
 /*
+ * Take the next ciphertext @ssl's engine has to send into @t's tx scratch.
+ * Returns whether there is any.
+ */
+static inline bool tls_cipher_next(struct gwp_iou_tls *t, struct gwp_ssl *ssl)
+{
+	int n = gwp_ssl_bio_read(ssl, t->tx, sizeof(t->tx));
+
+	t->tx_len = (n > 0) ? (uint32_t)n : 0;
+	t->tx_sent = 0;
+	return t->tx_len > 0;
+}
+
+/*
  * Encrypt as much of target.buf as the engine accepts, pull the resulting
  * ciphertext into the tx scratch, and queue it. With an in-memory write queue
  * SSL_write() never blocks, so target.buf drains fully; a record never exceeds
@@ -1221,7 +1234,6 @@ static void send_client_tls(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_iou_tls *t = gcp->tls_io;
 	struct gwp_ssl *ssl = gcp->client.tls;
-	int n;
 
 	/*
 	 * The tx scratch is still being sent. Its completion
@@ -1243,11 +1255,7 @@ static void send_client_tls(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		t->closing = true;
 	}
 
-	n = gwp_ssl_bio_read(ssl, t->tx, sizeof(t->tx));
-	t->tx_len = (n > 0) ? (uint32_t)n : 0;
-	t->tx_sent = 0;
-
-	if (t->tx_len)
+	if (tls_cipher_next(t, ssl))
 		prep_send_client_cipher(w, gcp, EV_BIT_IOU_CLIENT_SEND);
 	else if (gcp->target.fd >= 0 && !target_rx_done(gcp))
 		prep_recv_target(w, gcp);
@@ -1335,13 +1343,7 @@ static void prep_send_target_cipher(struct gwp_wrk *w, struct gwp_conn_pair *gcp
 /* Take the next ciphertext the target's engine has to send into the scratch. */
 static bool target_cipher_next(struct gwp_conn_pair *gcp)
 {
-	struct gwp_iou_tls *t = gcp->up_tls_io;
-	int n;
-
-	n = gwp_ssl_bio_read(gcp->target.tls, t->tx, sizeof(t->tx));
-	t->tx_len = (n > 0) ? (uint32_t)n : 0;
-	t->tx_sent = 0;
-	return t->tx_len > 0;
+	return tls_cipher_next(gcp->up_tls_io, gcp->target.tls);
 }
 
 /*
@@ -1697,14 +1699,9 @@ static int tls_hs_step(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		return -ECONNRESET;
 	}
 
-	if (gwp_ssl_bio_pending(ssl) > 0) {
-		n = gwp_ssl_bio_read(ssl, t->tx, sizeof(t->tx));
-		t->tx_len = (n > 0) ? (uint32_t)n : 0;
-		t->tx_sent = 0;
-		if (t->tx_len) {
-			prep_send_client_cipher(w, gcp, EV_BIT_IOU_TLS_HS_SEND);
-			return 0;
-		}
+	if (gwp_ssl_bio_pending(ssl) > 0 && tls_cipher_next(t, ssl)) {
+		prep_send_client_cipher(w, gcp, EV_BIT_IOU_TLS_HS_SEND);
+		return 0;
 	}
 
 	if (hs == GWP_SSL_OK)
