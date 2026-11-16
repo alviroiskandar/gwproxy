@@ -1051,6 +1051,19 @@ static bool wait_for_fd(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int err)
 }
 
 /*
+ * Cancel every request in flight on @fd, one of the pair's sockets, with a
+ * request tagged @ev_bit that holds a pair reference until it completes.
+ */
+static void prep_cancel_fd_gcp(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
+			       int fd, uint64_t ev_bit)
+{
+	struct io_uring_sqe *s = get_sqe_nofail(w);
+
+	io_uring_prep_cancel_fd(s, fd, IORING_ASYNC_CANCEL_ALL);
+	iou_own_sqe(s, gcp, ev_bit);
+}
+
+/*
  * Retire an attempt socket that is not going to be the winner. The fd is not
  * closed here: its connect is still in flight and io_uring holds a reference to
  * the file, so the close is queued from the cancelled completion instead (see
@@ -1060,11 +1073,8 @@ static bool wait_for_fd(struct gwp_wrk *w, struct gwp_conn_pair *gcp, int err)
 static void cancel_attempt(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			   uint8_t slot)
 {
-	struct io_uring_sqe *s = get_sqe_nofail(w);
-
-	io_uring_prep_cancel_fd(s, gcp->attempt_fd[slot],
-				IORING_ASYNC_CANCEL_ALL);
-	iou_own_sqe(s, gcp, EV_BIT_IOU_ATTEMPT_CANCEL);
+	prep_cancel_fd_gcp(w, gcp, gcp->attempt_fd[slot],
+			   EV_BIT_IOU_ATTEMPT_CANCEL);
 	pr_dbg(&w->ctx->lh, "Cancelling losing attempt %u (fd=%d, idx=%u)",
 		slot, gcp->attempt_fd[slot], gcp->idx);
 }
@@ -1072,7 +1082,6 @@ static void cancel_attempt(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 static void shutdown_gcp(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_ctx *ctx = w->ctx;
-	struct io_uring_sqe *s;
 	uint8_t i;
 
 	if (gcp->flags & GWP_CONN_FLAG_IS_CANCEL)
@@ -1119,25 +1128,21 @@ static void shutdown_gcp(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	if (gcp->target.fd >= 0 && gcp->nr_ops_target) {
 		pr_dbg(&ctx->lh, "Cancelling target I/O (fd=%d, nr=%u)",
 		       gcp->target.fd, gcp->nr_ops_target);
-		s = get_sqe_nofail(w);
-		io_uring_prep_cancel_fd(s, gcp->target.fd, IORING_ASYNC_CANCEL_ALL);
-		iou_own_sqe(s, gcp, EV_BIT_IOU_TARGET_CANCEL);
+		prep_cancel_fd_gcp(w, gcp, gcp->target.fd,
+				   EV_BIT_IOU_TARGET_CANCEL);
 	}
 
 	if (gcp->client.fd >= 0 && gcp->nr_ops_client) {
 		pr_dbg(&ctx->lh, "Cancelling client I/O (fd=%d, nr=%u)",
 		       gcp->client.fd, gcp->nr_ops_client);
-		s = get_sqe_nofail(w);
-		io_uring_prep_cancel_fd(s, gcp->client.fd, IORING_ASYNC_CANCEL_ALL);
-		iou_own_sqe(s, gcp, EV_BIT_IOU_CLIENT_CANCEL);
+		prep_cancel_fd_gcp(w, gcp, gcp->client.fd,
+				   EV_BIT_IOU_CLIENT_CANCEL);
 	}
 
 	if (gcp->udp_fd >= 0 && gcp->nr_ops_udp) {
 		pr_dbg(&ctx->lh, "Cancelling UDP relay (fd=%d, nr=%u)",
 		       gcp->udp_fd, gcp->nr_ops_udp);
-		s = get_sqe_nofail(w);
-		io_uring_prep_cancel_fd(s, gcp->udp_fd, IORING_ASYNC_CANCEL_ALL);
-		iou_own_sqe(s, gcp, EV_BIT_IOU_UDP_CANCEL);
+		prep_cancel_fd_gcp(w, gcp, gcp->udp_fd, EV_BIT_IOU_UDP_CANCEL);
 	}
 
 	gcp->flags |= GWP_CONN_FLAG_IS_CANCEL;
@@ -2456,8 +2461,6 @@ static void timeout_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
  */
 static bool upstream_tmo(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
-	struct io_uring_sqe *s;
-
 	if (!gwp_in_upstream_hs(gcp) || !gcp->nr_ops_target)
 		return false;
 #ifdef CONFIG_HTTPS
@@ -2468,9 +2471,7 @@ static bool upstream_tmo(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 		return true;
 
 	gcp->flags |= GWP_CONN_FLAG_UP_TMO_WAIT;
-	s = get_sqe_nofail(w);
-	io_uring_prep_cancel_fd(s, gcp->target.fd, IORING_ASYNC_CANCEL_ALL);
-	iou_own_sqe(s, gcp, EV_BIT_IOU_UPSTREAM_CANCEL);
+	prep_cancel_fd_gcp(w, gcp, gcp->target.fd, EV_BIT_IOU_UPSTREAM_CANCEL);
 	pr_dbg(&w->ctx->lh,
 	       "Cancelling the upstream handshake before the timeout reply (idx=%u, fd=%d)",
 	       gcp->idx, gcp->target.fd);
