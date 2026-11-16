@@ -5273,6 +5273,28 @@ static bool conn_bind_src(struct gwp_sockaddr *out,
 }
 
 /*
+ * The bind spec for a connection or a datagram: a matching ACL -j BIND rule
+ * in @so, else the --bind-source/--bind-iface default (*@global set), else
+ * NULL. The rule replaces the default wholesale, exactly as -j MARK replaces
+ * --mark: a rule that names only an interface must not silently inherit the
+ * global source address, which would apply a policy neither the rule nor the
+ * default describes.
+ */
+static inline const struct gwp_acl_bind *
+conn_pick_bind(const struct gwp_ctx *ctx, const struct gwp_conn_sockopt *so,
+	       bool *global)
+{
+	*global = false;
+	if (so && so->bind.set)
+		return &so->bind;
+	if (ctx->bind_def.set) {
+		*global = true;
+		return &ctx->bind_def;
+	}
+	return NULL;
+}
+
+/*
  * Apply a bind spec to socket @fd before connect: pin the outgoing interface
  * (SO_BINDTODEVICE) and/or source address (bind()). Strict -- any failure is
  * returned so the caller drops the connection rather than proceeding on the
@@ -5396,7 +5418,9 @@ int gwp_create_sock_target(struct gwp_wrk *w, struct gwp_sockaddr *addr,
 			   bool *is_target_alive, bool non_block)
 {
 	int t = SOCK_STREAM | SOCK_CLOEXEC | (non_block ? SOCK_NONBLOCK : 0);
+	const struct gwp_acl_bind *b;
 	socklen_t len;
+	bool global;
 	int fd, r;
 
 	/*
@@ -5439,20 +5463,11 @@ int gwp_create_sock_target(struct gwp_wrk *w, struct gwp_sockaddr *addr,
 	/*
 	 * Pin the source interface/address before connect. Strict -- a failure
 	 * drops the connection rather than falling back to the wrong source
-	 * (see apply_conn_bind). A matching ACL -j BIND rule replaces the
-	 * global --bind-source/--bind-iface default wholesale, exactly as -j
-	 * MARK replaces --mark: a rule that names only an interface must not
-	 * silently inherit the global source address, which would apply a
-	 * policy neither the rule nor the default describes.
+	 * (see apply_conn_bind). Which spec applies: see conn_pick_bind().
 	 */
-	if (so && so->bind.set) {
-		r = apply_conn_bind(w, fd, addr, &so->bind, false);
-		if (unlikely(r)) {
-			__sys_close(fd);
-			return r;
-		}
-	} else if (w->ctx->bind_def.set) {
-		r = apply_conn_bind(w, fd, addr, &w->ctx->bind_def, true);
+	b = conn_pick_bind(w->ctx, so, &global);
+	if (b) {
+		r = apply_conn_bind(w, fd, addr, b, global);
 		if (unlikely(r)) {
 			__sys_close(fd);
 			return r;
@@ -6752,9 +6767,9 @@ static bool udp_egress(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	struct gwp_ctx *ctx = w->ctx;
 	struct gwp_udp_egress *eg = gcp->udp_eg;
 	const struct gwp_conn_sockopt *so = (eg && ctx->acl) ? &eg->so : NULL;
-	const struct gwp_acl_bind *b = NULL;
+	const struct gwp_acl_bind *b;
 	uint32_t mark = ctx->cfg.mark;
-	bool global = false;
+	bool global;
 	const char *why;
 	uint8_t bit;
 
@@ -6767,12 +6782,7 @@ static bool udp_egress(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	}
 
 	/* A -j BIND replaces --bind-source and --bind-iface wholesale. */
-	if (so && so->bind.set) {
-		b = &so->bind;
-	} else if (ctx->bind_def.set) {
-		b = &ctx->bind_def;
-		global = true;
-	}
+	b = conn_pick_bind(ctx, so, &global);
 	if (!b)
 		return true;
 	/* Allocated whenever there is a bind to apply, see the caller. */
