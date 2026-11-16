@@ -1412,6 +1412,28 @@ static int __adjust_epl_mask(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 
 #ifdef CONFIG_HTTPS
 /*
+ * Receive ciphertext from @c's socket straight into its engine's input queue,
+ * at least one whole record's worth of room. Returns what recv() returned, or
+ * -ENOMEM if the queue cannot grow; what an EOF, -EAGAIN or an error means is
+ * the caller's to decide.
+ */
+static inline ssize_t tls_recv_cipher(struct gwp_conn *c)
+{
+	size_t len;
+	ssize_t n;
+	void *p;
+
+	p = gwp_ssl_rx_space(c->tls, GWP_SSL_RECORD_MAX, &len);
+	if (unlikely(!p))
+		return -ENOMEM;
+
+	n = __sys_recv(c->fd, p, len, MSG_NOSIGNAL);
+	/* Committing 0 gives the space back, see gwp_ssl_rx_space(). */
+	gwp_ssl_rx_commit(c->tls, n > 0 ? (size_t)n : 0);
+	return n;
+}
+
+/*
  * Decrypt as much of what the TLS engine holds as fits into src->buf, without
  * touching the socket. Returns the number of plaintext bytes produced, or <0
  * on error.
@@ -1462,8 +1484,6 @@ static ssize_t tls_decrypt(struct gwp_conn *src)
 static ssize_t do_recv_tls(struct gwp_conn *src)
 {
 	ssize_t got = 0, n;
-	size_t len;
-	void *p;
 
 	if (unlikely(src->len == src->cap))
 		return 0;
@@ -1477,13 +1497,13 @@ static ssize_t do_recv_tls(struct gwp_conn *src)
 	if (src->rd_eof)
 		return got;
 
-	p = gwp_ssl_rx_space(src->tls, GWP_SSL_RECORD_MAX, &len);
-	if (unlikely(!p))
-		return -ENOMEM;
-
-	n = __sys_recv(src->fd, p, len, MSG_NOSIGNAL);
-	/* Committing 0 gives the space back, see gwp_ssl_rx_space(). */
-	gwp_ssl_rx_commit(src->tls, n > 0 ? (size_t)n : 0);
+	/*
+	 * The engine's queue could not grow. recv() on a TCP socket does not
+	 * fail with -ENOMEM, so that is all -ENOMEM can mean here.
+	 */
+	n = tls_recv_cipher(src);
+	if (unlikely(n == -ENOMEM))
+		return n;
 	if (n == 0) {
 		src->rd_eof = true;
 	} else if (n < 0 && n != -EAGAIN && n != -EINTR) {
@@ -2066,16 +2086,10 @@ static int upstream_tls_io(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	struct gwp_conn *t = &gcp->target;
 	uint32_t mask = EPOLLIN | EPOLLRDHUP;
 	ssize_t n;
-	size_t len;
-	void *p;
 	int hs, r;
 
 	if (events & (EPOLLIN | EPOLLRDHUP | EPOLLHUP)) {
-		p = gwp_ssl_rx_space(t->tls, GWP_SSL_RECORD_MAX, &len);
-		if (unlikely(!p))
-			return -ENOMEM;
-		n = __sys_recv(t->fd, p, len, MSG_NOSIGNAL);
-		gwp_ssl_rx_commit(t->tls, n > 0 ? (size_t)n : 0);
+		n = tls_recv_cipher(t);
 		if (n == 0)
 			return -ECONNRESET;
 		if (n < 0 && n != -EAGAIN && n != -EINTR)
@@ -3829,18 +3843,10 @@ static int handle_ev_tls_handshake(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_conn *c = &gcp->client;
 	uint32_t mask;
-	size_t len;
 	ssize_t n;
 	int hs, r;
-	void *p;
 
-	p = gwp_ssl_rx_space(c->tls, GWP_SSL_RECORD_MAX, &len);
-	if (unlikely(!p))
-		return -ENOMEM;
-
-	n = __sys_recv(c->fd, p, len, MSG_NOSIGNAL);
-	/* Committing 0 gives the space back, see gwp_ssl_rx_space(). */
-	gwp_ssl_rx_commit(c->tls, n > 0 ? (size_t)n : 0);
+	n = tls_recv_cipher(c);
 	if (n == 0)
 		return -ECONNRESET;		/* peer closed mid-handshake */
 	if (n < 0 && n != -EAGAIN && n != -EINTR)
