@@ -10,6 +10,7 @@
 /* Before common.h: musl's struct stat has a field named __unused. */
 #include <sys/stat.h>
 #include <gwproxy/acl.h>
+#include <gwproxy/upstream_lb.h>
 #include <gwproxy/common.h>
 #include <arpa/inet.h>
 #include <assert.h>
@@ -927,10 +928,7 @@ static uint32_t rnd_state;
 
 static uint32_t rnd(uint32_t n)
 {
-	rnd_state ^= rnd_state << 13;
-	rnd_state ^= rnd_state >> 17;
-	rnd_state ^= rnd_state << 5;
-	return rnd_state % n;
+	return gwp_up_rand(&rnd_state) % n;
 }
 
 static const char *const rnd_v4_nets[] = {
