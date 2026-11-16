@@ -1951,10 +1951,7 @@ static int udp_up_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	ssize_t sr;
 	int r;
 
-	gcp->up_tx = false;
-	gcp->is_target_alive = true;
-	gcp->conn_state = CONN_STATE_SOCKS5_UDP_ASSOCIATE;
-	gwp_conn_upstream_up(gcp);
+	gwp_conn_upstream_established(gcp, CONN_STATE_SOCKS5_UDP_ASSOCIATE);
 	gcp->client.len = 0;
 	if (gcp->client.rd_eof)
 		return -ECONNRESET;
@@ -1983,7 +1980,6 @@ static int udp_up_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 /* The upstream tunnel is up (reply already spliced); start forwarding. */
 static int upstream_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
-	struct gwp_ctx *ctx = w->ctx;
 	ssize_t sr;
 	int r;
 
@@ -1998,18 +1994,13 @@ static int upstream_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	 * target.ep_mask is left as upstream_arm() registered it, so that
 	 * forward_progress() below changes only what actually differs.
 	 */
-	gcp->up_tx = false;
-	gcp->is_target_alive = true;
-	gcp->conn_state = CONN_STATE_FORWARDING;
-	gwp_conn_upstream_up(gcp);
+	gwp_conn_upstream_established(gcp, CONN_STATE_FORWARDING);
 
 	r = gwp_http_fwd_begin(w, gcp);
 	if (unlikely(r))
 		return r;
 
-	pr_info(&ctx->lh, "Upstream tunnel established (idx=%u, ca=%s, dst=%s)",
-		gcp->idx, ip_to_str(&gcp->client_addr),
-		gwp_upstream_dst_str(gcp));
+	gwp_log_upstream_established(w, gcp);
 
 	/* Flush downstream reply (+ early data) to the client. */
 	if (gcp->target.len) {

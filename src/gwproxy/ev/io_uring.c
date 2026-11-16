@@ -2190,10 +2190,7 @@ static int udp_up_iou_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	prep_timer_del_target(w, gcp);
 	prep_client_watch_del(w, gcp);
-	gcp->up_tx = false;
-	gcp->is_target_alive = true;
-	gcp->conn_state = CONN_STATE_SOCKS5_UDP_ASSOCIATE;
-	gwp_conn_upstream_up(gcp);
+	gwp_conn_upstream_established(gcp, CONN_STATE_SOCKS5_UDP_ASSOCIATE);
 	gcp->client.len = 0;
 	prep_send_client(w, gcp);
 #ifdef CONFIG_HTTPS
@@ -2213,7 +2210,6 @@ static int udp_up_iou_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 /* The upstream tunnel is up (reply already spliced); start forwarding. */
 static int upstream_iou_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
-	struct gwp_ctx *ctx = w->ctx;
 	int r;
 
 	if (gcp->flags & GWP_CONN_FLAG_UDP_UP)
@@ -2222,18 +2218,13 @@ static int upstream_iou_finish(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	prep_timer_del_target(w, gcp);
 	prep_client_watch_del(w, gcp);
 	arm_idle_timer(w, gcp);
-	gcp->up_tx = false;
-	gcp->is_target_alive = true;
-	gcp->conn_state = CONN_STATE_FORWARDING;
-	gwp_conn_upstream_up(gcp);
+	gwp_conn_upstream_established(gcp, CONN_STATE_FORWARDING);
 
 	r = gwp_http_fwd_begin(w, gcp);
 	if (r)
 		return r;
 
-	pr_info(&ctx->lh, "Upstream tunnel established (idx=%u, ca=%s, dst=%s)",
-		gcp->idx, ip_to_str(&gcp->client_addr),
-		gwp_upstream_dst_str(gcp));
+	gwp_log_upstream_established(w, gcp);
 
 	/* Start forwarding. */
 	if (gcp->target.len)

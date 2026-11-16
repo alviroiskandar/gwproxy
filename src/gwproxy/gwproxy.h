@@ -1329,6 +1329,21 @@ bool gwp_conn_upstream_failed(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
  * (the pool reference) goes.
  */
 void gwp_conn_upstream_up(struct gwp_conn_pair *gcp);
+
+/*
+ * The upstream granted the tunnel (or the UDP ASSOCIATE): no request of ours
+ * is in flight any more, the target counts as up, and the pair goes to
+ * @state, CONN_STATE_FORWARDING or CONN_STATE_SOCKS5_UDP_ASSOCIATE. What each
+ * loop does around it (timers, watches, the client's reply) stays there.
+ */
+static inline void gwp_conn_upstream_established(struct gwp_conn_pair *gcp,
+						 int state)
+{
+	gcp->up_tx = false;
+	gcp->is_target_alive = true;
+	gcp->conn_state = state;
+	gwp_conn_upstream_up(gcp);
+}
 int gwp_create_sock_target(struct gwp_wrk *w, struct gwp_sockaddr *addr,
 			   const struct gwp_conn_sockopt *so,
 			   bool *is_target_alive, bool non_block);
@@ -1878,6 +1893,15 @@ int gwp_upstream_splice_reply(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 /* "host:port" for a domain upstream target, else its resolved IP. Returns a
  * thread-local buffer valid until the next call on the same thread. */
 const char *gwp_upstream_dst_str(struct gwp_conn_pair *gcp);
+
+/* Both loops log every TCP tunnel through an upstream once it is up. */
+static inline
+void gwp_log_upstream_established(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
+{
+	pr_info(&w->ctx->lh, "Upstream tunnel established (idx=%u, ca=%s, dst=%s)",
+		gcp->idx, ip_to_str(&gcp->client_addr),
+		gwp_upstream_dst_str(gcp));
+}
 
 /*
  * The next I/O step in the transport-agnostic upstream-proxy handshake state
