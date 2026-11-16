@@ -1624,15 +1624,21 @@ static size_t find_hdr_end(const char *buf, size_t len, size_t *scan)
 	return 0;
 }
 
+/* Free the hold-back buffer, with what it held, and move to @state. */
+static inline void res_buf_release(struct gwp_http_conn *hc, uint8_t state)
+{
+	free(hc->res_buf);
+	hc->res_buf = NULL;
+	hc->res_len = 0;
+	hc->res_state = state;
+}
+
 int gwp_http_fwd_res_init(struct gwp_http_conn *hc, size_t max_hdr)
 {
 	/* The hold-back buffer is allocated only if a header spans reads. */
-	free(hc->res_buf);
-	hc->res_buf = NULL;
+	res_buf_release(hc, GWP_HTTP_RES_HDR);
 	hc->res_cap = max_hdr;
-	hc->res_len = 0;
 	hc->res_scan = 0;
-	hc->res_state = GWP_HTTP_RES_HDR;
 	return 0;
 }
 
@@ -1694,9 +1700,8 @@ static int res_input_fast(struct gwp_http_conn *hc, const char *in,
 		return -E2BIG;
 	memmove(out + w, in + end, body);
 	memcpy(out, tmp, (size_t)w);
-	free(hc->res_buf);	/* Left from an interim response, if any. */
-	hc->res_buf = NULL;
-	hc->res_state = GWP_HTTP_RES_BODY;
+	/* Left from an interim response, if any. */
+	res_buf_release(hc, GWP_HTTP_RES_BODY);
 	*out_len = (size_t)w + body;
 	return 0;
 }
@@ -1778,10 +1783,7 @@ static int res_input(struct gwp_http_conn *hc, const void *in, size_t len,
 			return -E2BIG;
 		memcpy(out + o, hdr + end, rest);
 		o += rest;
-		free(hc->res_buf);
-		hc->res_buf = NULL;
-		hc->res_len = 0;
-		hc->res_state = GWP_HTTP_RES_BODY;
+		res_buf_release(hc, GWP_HTTP_RES_BODY);
 		*out_len = o;
 		return 0;
 	}
@@ -1800,10 +1802,7 @@ int gwp_http_fwd_res_input(struct gwp_http_conn *hc, const void *in,
 	r = res_input(hc, in, len, eof, out, out_cap, out_len);
 	if (r < 0) {
 		*out_len = 0;
-		free(hc->res_buf);
-		hc->res_buf = NULL;
-		hc->res_len = 0;
-		hc->res_state = GWP_HTTP_RES_FAILED;
+		res_buf_release(hc, GWP_HTTP_RES_FAILED);
 	}
 	return r;
 }
