@@ -3003,7 +3003,6 @@ static bool drop_for_reset(struct gwp_conn *src, struct gwp_conn *dst)
 static bool tls_close_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 {
 	struct gwp_iou_tls *t = gcp->tls_io;
-	int n;
 
 	if (t->tx_sent < t->tx_len)
 		return false;
@@ -3012,12 +3011,9 @@ static bool tls_close_client(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 
 	t->closing = true;
 	gwp_ssl_shutdown(gcp->client.tls);
-	n = gwp_ssl_bio_read(gcp->client.tls, t->tx, sizeof(t->tx));
-	if (n <= 0)
+	if (!tls_cipher_next(t, gcp->client.tls))
 		return true;
 
-	t->tx_len = (uint32_t)n;
-	t->tx_sent = 0;
 	prep_send_client_cipher(w, gcp, EV_BIT_IOU_CLIENT_SEND);
 	return false;
 }
