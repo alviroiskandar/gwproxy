@@ -1156,19 +1156,7 @@ static int __handle_ev_accept(struct gwp_wrk *w)
 	pr_dbg(&ctx->lh, "New connection from %s (fd=%d)", ip_to_str(&addr),
 		fd);
 
-	/*
-	 * Evaluate the INPUT chain before allocating anything, as the
-	 * io_uring loop does: when it is used to shed unwanted clients, a
-	 * flood of them should cost no more than an accept and a close.
-	 */
-	if (!gwp_ctx_acl_client_allowed(ctx, &addr, GWP_ACL_PROTO_TCP)) {
-		gwp_wrk_acl_denied(w, &addr);
-		__sys_close(fd);
-		return 0;
-	}
-
-	/* --max-conns-per-ip: likewise before anything is read or set up. */
-	if (unlikely(ctx->iplim) && !gwp_ctx_iplim_get(w, &addr)) {
+	if (!gwp_wrk_admit_client(w, &addr)) {
 		__sys_close(fd);
 		return 0;
 	}

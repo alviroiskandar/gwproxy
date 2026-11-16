@@ -1517,6 +1517,33 @@ int gwp_conn_pair_linger(struct gwp_wrk *w, struct gwp_conn_pair *gcp);
 bool gwp_ctx_acl_client_allowed(struct gwp_ctx *ctx,
 				const struct gwp_sockaddr *client,
 				enum gwp_acl_proto proto);
+
+/*
+ * The admission gate for a TCP client just accepted from @addr: the ACL
+ * INPUT chain (a refusal is logged), then --max-conns-per-ip. Both run
+ * before anything is allocated, so a flood of unwanted clients costs no
+ * more than an accept and a close. False means the caller closes the
+ * socket; true with ctx->iplim set means an iplimit slot is now held for
+ * @addr.
+ */
+static inline bool gwp_wrk_admit_client(struct gwp_wrk *w,
+					const struct gwp_sockaddr *addr)
+{
+	struct gwp_ctx *ctx = w->ctx;
+
+	if (!gwp_ctx_acl_client_allowed(ctx, addr, GWP_ACL_PROTO_TCP)) {
+		gwp_wrk_acl_denied(w, addr);
+		return false;
+	}
+	/*
+	 * unlikely(), spelled out: this header does not include common.h,
+	 * whose __unused would clash with musl's struct stat in files that
+	 * include <sys/stat.h> after it.
+	 */
+	if (__builtin_expect(!!ctx->iplim, 0) && !gwp_ctx_iplim_get(w, addr))
+		return false;
+	return true;
+}
 /*
  * True when @a may be dialled under --outgoing-family. v4-mapped aware, so a
  * ::ffff:a.b.c.d target from the UDP relay counts as IPv4.

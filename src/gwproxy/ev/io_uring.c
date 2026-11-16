@@ -1937,16 +1937,7 @@ static int __handle_ev_accept(struct gwp_wrk *w, struct io_uring_cqe *cqe)
 		return fd;
 	}
 
-	if (!gwp_ctx_acl_client_allowed(ctx, &w->iou->accept_addr,
-					GWP_ACL_PROTO_TCP)) {
-		gwp_wrk_acl_denied(w, &w->iou->accept_addr);
-		prep_close(w, fd);
-		return 0;
-	}
-
-	/* --max-conns-per-ip: before anything is read or set up. */
-	if (unlikely(ctx->iplim) &&
-	    !gwp_ctx_iplim_get(w, &w->iou->accept_addr)) {
+	if (!gwp_wrk_admit_client(w, &w->iou->accept_addr)) {
 		prep_close(w, fd);
 		return 0;
 	}
