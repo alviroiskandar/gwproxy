@@ -6991,6 +6991,23 @@ static void udp_pin_declared(struct gwp_conn_pair *gcp, int family)
 }
 
 /*
+ * Read the local address of UDP ASSOCIATE socket @fd into @sa, logging a
+ * failure with @what naming the socket.
+ */
+static int udp_sockname(struct gwp_ctx *ctx, int fd, const char *what,
+			struct gwp_sockaddr *sa)
+{
+	socklen_t slen = sizeof(*sa);
+	int r;
+
+	r = __sys_getsockname(fd, &sa->sa, &slen);
+	if (r < 0)
+		pr_err(&ctx->lh, "UDP associate: getsockname(%s) failed: %s",
+			what, strerror(-r));
+	return r;
+}
+
+/*
  * What the client is told its relay is: BND.ADDR from the control
  * connection, the address the client reached the proxy at, and BND.PORT
  * from the relay socket. An IPv4 client of a dual-stack listener is told an
@@ -7008,24 +7025,16 @@ static int udp_client_bnd(struct gwp_ctx *ctx, struct gwp_conn_pair *gcp,
 			  struct gwp_socks5_addr *bnd)
 {
 	struct gwp_sockaddr local, ra;
-	socklen_t slen = sizeof(local);
 	int r;
 
-	r = __sys_getsockname(gcp->client.fd, &local.sa, &slen);
-	if (r < 0) {
-		pr_err(&ctx->lh, "UDP associate: getsockname(client) failed: %s",
-			strerror(-r));
+	r = udp_sockname(ctx, gcp->client.fd, "client", &local);
+	if (r < 0)
 		return r;
-	}
 	gcp->udp_local = local;
 	if (!relay) {
-		slen = sizeof(ra);
-		r = __sys_getsockname(gcp->udp_fd, &ra.sa, &slen);
-		if (r < 0) {
-			pr_err(&ctx->lh, "UDP associate: getsockname(relay) failed: %s",
-				strerror(-r));
+		r = udp_sockname(ctx, gcp->udp_fd, "relay", &ra);
+		if (r < 0)
 			return r;
-		}
 		relay = &ra;
 	}
 
@@ -7057,7 +7066,6 @@ int gwp_socks5_udp_associate_setup(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	struct gwp_ctx *ctx = w->ctx;
 	struct gwp_socks5_addr bnd;
 	struct gwp_sockaddr relay;
-	socklen_t slen;
 	socklen_t relay_len;
 	int fd = -1, r, rep = GWP_SOCKS5_REP_SUCCESS;
 	size_t out_len;
@@ -7137,30 +7145,16 @@ int gwp_socks5_udp_associate_setup(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	r = __sys_bind(fd, &relay.sa, relay_len);
 	if (r < 0) {
 		pr_err(&ctx->lh, "UDP associate: bind() failed: %s", strerror(-r));
-		__sys_close(fd);
-		fd = -1;
-		rep = GWP_SOCKS5_REP_FAILURE;
-		goto reply;
+		goto out_close;
 	}
 
-	slen = sizeof(relay);
-	r = __sys_getsockname(fd, &relay.sa, &slen);
-	if (r < 0) {
-		pr_err(&ctx->lh, "UDP associate: getsockname(relay) failed: %s",
-			strerror(-r));
-		__sys_close(fd);
-		fd = -1;
-		rep = GWP_SOCKS5_REP_FAILURE;
-		goto reply;
-	}
+	r = udp_sockname(ctx, fd, "relay", &relay);
+	if (r < 0)
+		goto out_close;
 
 	r = udp_client_bnd(ctx, gcp, &relay, &bnd);
-	if (r < 0) {
-		__sys_close(fd);
-		fd = -1;
-		rep = GWP_SOCKS5_REP_FAILURE;
-		goto reply;
-	}
+	if (r < 0)
+		goto out_close;
 
 	udp_pin_declared(gcp, relay.sa.sa_family);
 	gcp->udp_fd = fd;
@@ -7200,6 +7194,12 @@ reply:
 	gcp->target.len += (uint32_t)out_len;
 
 	return (rep == GWP_SOCKS5_REP_SUCCESS) ? 0 : -ECONNREFUSED;
+
+	/* After the return, as the success path falls through into reply. */
+out_close:
+	__sys_close(fd);
+	rep = GWP_SOCKS5_REP_FAILURE;
+	goto reply;
 }
 
 size_t gwp_udp_src_cmsg(const struct gwp_udp_out *out, union gwp_udp_cmsg *cb)
@@ -7332,28 +7332,21 @@ int gwp_upstream_udp_ready(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	struct gwp_udp_up *u = gcp->udp_up;
 	struct gwp_socks5_addr a = *bnd, up, cb;
 	struct gwp_sockaddr relay;
-	socklen_t slen = sizeof(relay);
 	size_t out_len;
 	int r;
 
-	r = __sys_getsockname(gcp->udp_fd, &relay.sa, &slen);
-	if (r < 0) {
-		pr_err(&ctx->lh, "UDP associate: getsockname(relay) failed: %s",
-			strerror(-r));
+	r = udp_sockname(ctx, gcp->udp_fd, "relay", &relay);
+	if (r < 0)
 		return r;
-	}
 
 	/*
 	 * An unspecified BND.ADDR is the server's own address, the one the
 	 * control connection went to (a server bound to the wildcard knows
 	 * no better), with the port it gave.
 	 */
-	if (a.ver == GWP_SOCKS5_ATYP_IPV4 && !memcmp(a.ip4, "\0\0\0\0", 4)) {
-		gwp_socks5_reply_addr_from_sockaddr(&gcp->upstream->addr, &up);
-		memcpy(a.ip6, up.ip6, sizeof(a.ip6));
-		a.ver = up.ver;
-	} else if (a.ver == GWP_SOCKS5_ATYP_IPV6 &&
-		   IN6_IS_ADDR_UNSPECIFIED((const struct in6_addr *)a.ip6)) {
+	if ((a.ver == GWP_SOCKS5_ATYP_IPV4 && !memcmp(a.ip4, "\0\0\0\0", 4)) ||
+	    (a.ver == GWP_SOCKS5_ATYP_IPV6 &&
+	     IN6_IS_ADDR_UNSPECIFIED((const struct in6_addr *)a.ip6))) {
 		gwp_socks5_reply_addr_from_sockaddr(&gcp->upstream->addr, &up);
 		memcpy(a.ip6, up.ip6, sizeof(a.ip6));
 		a.ver = up.ver;
