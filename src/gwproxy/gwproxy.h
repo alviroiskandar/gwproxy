@@ -1701,6 +1701,14 @@ int gwp_upstream_authority(const struct gwp_socks5_addr *dst, char *buf,
 			   size_t cap);
 
 /*
+ * Format @a as text after the prefix @pfx: "host:port", "1.2.3.4:port" or
+ * "[ipv6]:port". Returns 0, or -EINVAL for an address type it does not know
+ * or a result that does not fit @cap bytes.
+ */
+int gwp_socks5_addr_str(const struct gwp_socks5_addr *a, const char *pfx,
+			char *buf, size_t cap);
+
+/*
  * The upstream proxy handshake succeeded: build our downstream CONNECT reply
  * (SOCKS5 or HTTP), drop the proxy's @consumed reply bytes from the target
  * buffer while keeping any early destination data, and splice our reply ahead

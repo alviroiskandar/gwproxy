@@ -5845,33 +5845,26 @@ static bool req_host_valid(const char *host)
 	return dns_name_ok(host, n, false);
 }
 
-/*
- * Format gcp->up_dst as an HTTP authority ("host:port" or "[ipv6]:port") for an
- * upstream CONNECT request. Returns 0 on success, -EINVAL on a bad address.
- */
-int gwp_upstream_authority(const struct gwp_socks5_addr *dst, char *buf,
-			   size_t cap)
+int gwp_socks5_addr_str(const struct gwp_socks5_addr *a, const char *pfx,
+			char *buf, size_t cap)
 {
-	uint16_t port = ntohs(dst->port);
+	uint16_t port = ntohs(a->port);
 	char ip[INET6_ADDRSTRLEN];
 	int n;
 
-	switch (dst->ver) {
+	switch (a->ver) {
 	case GWP_SOCKS5_ATYP_DOMAIN:
-		/* It goes into a request line: never let it end one early. */
-		if (!req_host_valid(dst->domain.str))
-			return -EINVAL;
-		n = snprintf(buf, cap, "%s:%u", dst->domain.str, port);
+		n = snprintf(buf, cap, "%s%s:%u", pfx, a->domain.str, port);
 		break;
 	case GWP_SOCKS5_ATYP_IPV4:
-		if (!inet_ntop(AF_INET, dst->ip4, ip, sizeof(ip)))
+		if (!inet_ntop(AF_INET, a->ip4, ip, sizeof(ip)))
 			return -EINVAL;
-		n = snprintf(buf, cap, "%s:%u", ip, port);
+		n = snprintf(buf, cap, "%s%s:%u", pfx, ip, port);
 		break;
 	case GWP_SOCKS5_ATYP_IPV6:
-		if (!inet_ntop(AF_INET6, dst->ip6, ip, sizeof(ip)))
+		if (!inet_ntop(AF_INET6, a->ip6, ip, sizeof(ip)))
 			return -EINVAL;
-		n = snprintf(buf, cap, "[%s]:%u", ip, port);
+		n = snprintf(buf, cap, "%s[%s]:%u", pfx, ip, port);
 		break;
 	default:
 		return -EINVAL;
@@ -5880,6 +5873,20 @@ int gwp_upstream_authority(const struct gwp_socks5_addr *dst, char *buf,
 	if (n < 0 || (size_t)n >= cap)
 		return -EINVAL;
 	return 0;
+}
+
+/*
+ * Format gcp->up_dst as an HTTP authority ("host:port" or "[ipv6]:port") for an
+ * upstream CONNECT request. Returns 0 on success, -EINVAL on a bad address.
+ */
+int gwp_upstream_authority(const struct gwp_socks5_addr *dst, char *buf,
+			   size_t cap)
+{
+	/* It goes into a request line: never let it end one early. */
+	if (dst->ver == GWP_SOCKS5_ATYP_DOMAIN &&
+	    !req_host_valid(dst->domain.str))
+		return -EINVAL;
+	return gwp_socks5_addr_str(dst, "", buf, cap);
 }
 
 /*
