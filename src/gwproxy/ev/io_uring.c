@@ -1194,6 +1194,23 @@ static void prep_send_client_cipher(struct gwp_wrk *w, struct gwp_conn_pair *gcp
 }
 
 /*
+ * Encrypt as much of @src as @ssl's engine takes, dropping what it took from
+ * @src. Stops at the first write the engine refuses: the ciphertext it holds
+ * must drain first.
+ */
+static inline void iou_tls_encrypt(struct gwp_ssl *ssl, struct gwp_conn *src)
+{
+	while (src->len) {
+		size_t consumed = 0;
+		int sr = gwp_ssl_write(ssl, src->buf, src->len, &consumed);
+
+		if (sr != GWP_SSL_OK || !consumed)
+			break;
+		gwp_conn_buf_advance(src, consumed);
+	}
+}
+
+/*
  * Encrypt as much of target.buf as the engine accepts, pull the resulting
  * ciphertext into the tx scratch, and queue it. With an in-memory write queue
  * SSL_write() never blocks, so target.buf drains fully; a record never exceeds
@@ -1214,19 +1231,7 @@ static void send_client_tls(struct gwp_wrk *w, struct gwp_conn_pair *gcp)
 	if (t->tx_sent < t->tx_len)
 		return;
 
-	while (gcp->target.len) {
-		size_t consumed = 0;
-		int sr = gwp_ssl_write(ssl, gcp->target.buf, gcp->target.len,
-				       &consumed);
-
-		if (sr == GWP_SSL_OK) {
-			gwp_conn_buf_advance(&gcp->target, consumed);
-			if (!consumed)
-				break;
-		} else {
-			break;	/* ciphertext must drain first */
-		}
-	}
+	iou_tls_encrypt(ssl, &gcp->target);
 
 	/*
 	 * The proxy's last reply to the client is all in the engine now: its
@@ -1358,15 +1363,8 @@ static void send_target_tls(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 	if (t->tx_sent < t->tx_len)
 		return;
 
-	while (t->tx_fwd && gcp->client.len) {
-		size_t consumed = 0;
-		int sr = gwp_ssl_write(gcp->target.tls, gcp->client.buf,
-				       gcp->client.len, &consumed);
-
-		if (sr != GWP_SSL_OK || !consumed)
-			break;
-		gwp_conn_buf_advance(&gcp->client, consumed);
-	}
+	if (t->tx_fwd)
+		iou_tls_encrypt(gcp->target.tls, &gcp->client);
 
 	if (target_cipher_next(gcp))
 		prep_send_target_cipher(w, gcp, EV_BIT_IOU_TARGET_SEND);
@@ -2118,15 +2116,7 @@ static struct io_uring_sqe *prep_upstream_send(struct gwp_wrk *w,
 	 * from the scratch; handle_ev_upstream_s5() sends the rest.
 	 */
 	if (target_is_tls(gcp)) {
-		while (gcp->target.len) {
-			size_t consumed = 0;
-			int sr = gwp_ssl_write(gcp->target.tls, gcp->target.buf,
-					       gcp->target.len, &consumed);
-
-			if (sr != GWP_SSL_OK || !consumed)
-				break;
-			gwp_conn_buf_advance(&gcp->target, consumed);
-		}
+		iou_tls_encrypt(gcp->target.tls, &gcp->target);
 		target_cipher_next(gcp);
 		prep_send_target_cipher(w, gcp, EV_BIT_IOU_UPSTREAM_S5);
 		return NULL;
