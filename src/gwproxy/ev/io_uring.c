@@ -2764,31 +2764,15 @@ static int finish_target_connect(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 }
 
 /*
- * Whether the result @res of a connect says that the target accepted and then
- * reset the connection: a refused SYN gives ECONNREFUSED, one that is never
- * answered ETIMEDOUT. What it sent before the reset can still be read, so the
- * connect counts as a success. Not for an upstream proxy, whose reset fails
- * the handshake that is yet to run on the connection.
- */
-static bool target_was_up(const struct gwp_conn_pair *gcp, int res)
-{
-	return (res == -ECONNRESET || res == -EPIPE) && !gcp->upstream;
-}
-
-/*
- * A connect that target_was_up() took as a success. Its result has taken the
- * error off the socket, and nothing more can be sent to the target: its write
- * side counts as shut, and what the client sent for it is dropped. Forwarding
- * reads what the target sent, then the end of stream, and the pair ends once
- * that is delivered.
+ * A connect that gwp_conn_target_was_up() took as a success, by its result
+ * @res. What the client sent for the target is dropped too: nothing more can
+ * be sent to it. Forwarding reads what the target sent, then the end of
+ * stream, and the pair ends once that is delivered.
  */
 static void target_note_reset(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			      int res)
 {
-	pr_dbg(&w->ctx->lh, "Target connected, then ended: %s (idx=%u, fd=%d)",
-		strerror(-res), gcp->idx, gcp->target.fd);
-	gcp->target.rst = true;
-	gcp->target.wr_shut = true;
+	gwp_conn_target_note_reset(w, gcp, -res);
 	gwp_conn_buf_consume(&gcp->client, gcp->client.len);
 }
 
@@ -2811,8 +2795,8 @@ static int handle_ev_target_attempt(struct gwp_wrk *w, void *udata,
 	if (unlikely(fd < 0))
 		return 0;		/* already retired */
 
-	/* Connected, then reset; see target_was_up(). */
-	if (target_was_up(gcp, res)) {
+	/* Connected, then reset; see gwp_conn_target_was_up(). */
+	if (gwp_conn_target_was_up(gcp, -res)) {
 		up_res = res;
 		res = 0;
 	}

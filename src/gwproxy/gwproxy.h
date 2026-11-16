@@ -1535,6 +1535,37 @@ bool gwp_conn_note_reset(struct gwp_wrk *w, struct gwp_conn_pair *gcp,
 			 struct gwp_conn *c, int err, bool rx);
 
 /*
+ * Whether the error @err (a positive errno: SO_ERROR on epoll, the negated
+ * result on io_uring) of a connect says that the target accepted and then
+ * reset the connection: a refused SYN gives ECONNREFUSED, one that is never
+ * answered ETIMEDOUT. What it sent before the reset can still be read, so the
+ * connect counts as a success. Not for an upstream proxy, whose reset fails
+ * the handshake that is yet to run on the connection.
+ */
+static inline bool gwp_conn_target_was_up(const struct gwp_conn_pair *gcp,
+					  int err)
+{
+	return (err == ECONNRESET || err == EPIPE) && !gcp->upstream;
+}
+
+/*
+ * A connect that gwp_conn_target_was_up() took as a success, by @err (a
+ * positive errno). Reading the connect's result has taken the error off the
+ * socket, so it is recorded here, as gwp_conn_note_reset() would: nothing
+ * more can be sent to the target, so its write side counts as shut, and
+ * forwarding reads what the target sent, and ends there.
+ */
+static inline void gwp_conn_target_note_reset(struct gwp_wrk *w,
+					      struct gwp_conn_pair *gcp,
+					      int err)
+{
+	pr_dbg(&w->ctx->lh, "Target connected, then ended: %s (idx=%u, fd=%d)",
+		strerror(err), gcp->idx, gcp->target.fd);
+	gcp->target.rst = true;
+	gcp->target.wr_shut = true;
+}
+
+/*
  * The other side of @c was reset (gwp_conn_reset_passed()), and @c, the
  * plaintext survivor, is to be reset in turn once it has taken what it is
  * owed, so that the cut shows: the end of the pair gives it no FIN, and
