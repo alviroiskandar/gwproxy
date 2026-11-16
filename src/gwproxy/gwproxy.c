@@ -3759,6 +3759,28 @@ static bool upstream_host_ok(struct gwp_upstream *up)
 }
 
 /*
+ * Give @up the user name of @ul bytes at @user and the password of @pl bytes
+ * at @pass, as an upstream URL or auth file has them: -EINVAL, and @up left
+ * alone, when the user name is empty or either is too long for SOCKS5.
+ */
+static int upstream_set_auth(struct gwp_upstream *up, const char *user,
+			     size_t ul, const char *pass, size_t pl)
+{
+	if (ul == 0 || ul > GWP_UPSTREAM_CRED_MAX || pl > GWP_UPSTREAM_CRED_MAX)
+		return -EINVAL;
+
+	up->has_auth = true;
+	up->ulen = (uint8_t)ul;
+	up->plen = (uint8_t)pl;
+	memcpy(up->user, user, ul);
+	up->user[ul] = '\0';
+	if (pl)
+		memcpy(up->pass, pass, pl);
+	up->pass[pl] = '\0';
+	return 0;
+}
+
+/*
  * Parse a --upstream-proxy URL of the form:
  *
  *    socks5://[user:pass@]host:port     (gwproxy resolves the target)
@@ -3792,17 +3814,8 @@ int gwp_parse_upstream(const char *url, struct gwp_upstream *up)
 
 	/* Optional "user:pass@" credentials. */
 	if (gwp_upstream_split_creds(rest, &at, &ul, &pl)) {
-		if (ul == 0 || ul > GWP_UPSTREAM_CRED_MAX ||
-		    pl > GWP_UPSTREAM_CRED_MAX)
+		if (upstream_set_auth(up, rest, ul, rest + ul + 1, pl))
 			return -EINVAL;
-
-		up->has_auth = true;
-		up->ulen = (uint8_t)ul;
-		up->plen = (uint8_t)pl;
-		memcpy(up->user, rest, ul);
-		up->user[ul] = '\0';
-		memcpy(up->pass, rest + ul + 1, pl);
-		up->pass[pl] = '\0';
 		host = at + 1;
 	} else {
 		host = rest;
@@ -3831,7 +3844,7 @@ __cold
 static int upstream_read_auth(const char *path, struct gwp_upstream *up)
 {
 	/* "user:pass", CRLF, and one byte more to tell an overlong line. */
-	char buf[255 + 1 + 255 + 3], *line_end, *colon;
+	char buf[GWP_UPSTREAM_CRED_MAX * 2 + 1 + 3], *line_end, *colon;
 	size_t n = 0, len, ul, pl;
 	ssize_t rd;
 	int fd, r = -EINVAL;
@@ -3865,18 +3878,7 @@ static int upstream_read_auth(const char *path, struct gwp_upstream *up)
 	colon = memchr(buf, ':', len);
 	ul = colon ? (size_t)(colon - buf) : len;
 	pl = colon ? len - ul - 1 : 0;
-	if (ul == 0 || ul > 255 || pl > 255)
-		goto out;
-
-	up->has_auth = true;
-	up->ulen = (uint8_t)ul;
-	up->plen = (uint8_t)pl;
-	memcpy(up->user, buf, ul);
-	up->user[ul] = '\0';
-	if (pl)
-		memcpy(up->pass, colon + 1, pl);
-	up->pass[pl] = '\0';
-	r = 0;
+	r = upstream_set_auth(up, buf, ul, colon ? colon + 1 : NULL, pl);
 out:
 	explicit_bzero(buf, sizeof(buf));
 	close(fd);
