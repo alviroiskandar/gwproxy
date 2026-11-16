@@ -1039,17 +1039,34 @@ static int tokenise(char *line, char **tok)
 }
 
 /*
- * Report a problem at the line being parsed: "acl: FILE: line N: ...", or
- * "acl: line N: ..." for text.
+ * Report a problem at line @line of @path: "acl: FILE: line N: ...", or
+ * "acl: line N: ..." for text (@path NULL).
  */
-static void load_vmsg(const struct acl_load *ld, const char *fmt, va_list ap)
+static void acl_vmsg(const char *path, unsigned line, const char *fmt,
+		     va_list ap)
 {
-	if (ld->path)
-		fprintf(stderr, "acl: %s: line %u: ", ld->path, ld->lineno);
+	if (path)
+		fprintf(stderr, "acl: %s: line %u: ", path, line);
 	else
-		fprintf(stderr, "acl: line %u: ", ld->lineno);
+		fprintf(stderr, "acl: line %u: ", line);
 	vfprintf(stderr, fmt, ap);
 	fputc('\n', stderr);
+}
+
+static void __attribute__((__format__(printf, 3, 4)))
+acl_msg(const char *path, unsigned line, const char *fmt, ...)
+{
+	va_list ap;
+
+	va_start(ap, fmt);
+	acl_vmsg(path, line, fmt, ap);
+	va_end(ap);
+}
+
+/* The same at the line being parsed. */
+static void load_vmsg(const struct acl_load *ld, const char *fmt, va_list ap)
+{
+	acl_vmsg(ld->path, ld->lineno, fmt, ap);
 }
 
 static void __attribute__((__format__(printf, 2, 3)))
@@ -1755,13 +1772,9 @@ static int resolve_pools(struct acl_load *ld)
 			p = bsearch(r->act.up.name, rs->pools, rs->nr_pools,
 				    sizeof(*rs->pools), pool_key_cmp);
 		if (!p) {
-			if (ld->refs[i].path)
-				fprintf(stderr, "acl: %s: line %u: upstream pool %s is not defined\n",
-					ld->refs[i].path, ld->refs[i].line,
-					r->act.up.name);
-			else
-				fprintf(stderr, "acl: line %u: upstream pool %s is not defined\n",
-					ld->refs[i].line, r->act.up.name);
+			acl_msg(ld->refs[i].path, ld->refs[i].line,
+				"upstream pool %s is not defined",
+				r->act.up.name);
 			return -EINVAL;
 		}
 		free(r->act.up.name);
@@ -3410,8 +3423,7 @@ static int parse_lines(struct acl_load *ld, char *text)
 		if (ld->reported)
 			;	/* the line's own message said it all */
 		else if (ld->include_failed)
-			fprintf(stderr, "acl: %s: line %u: failed to include a file\n",
-				ld->path, lineno);
+			acl_msg(ld->path, lineno, "failed to include a file");
 		else if (ld->path)
 			fprintf(stderr, "acl: %s: parse error on line %u: %s\n",
 				ld->path, lineno, strerror(-r));
