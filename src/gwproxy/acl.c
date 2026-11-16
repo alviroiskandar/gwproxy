@@ -131,6 +131,14 @@ struct gwp_acl_up {
 	struct gwp_acl_pool	*pool;
 };
 
+/* A -m domain or -m user value: an exact .str, or a compiled .re (PCRE). */
+union acl_name {
+	char		*str;
+#ifdef CONFIG_PCRE
+	pcre2_code	*re;
+#endif
+};
+
 /*
  * The rules of a chain are kept in one array, in file order.
  *
@@ -148,19 +156,9 @@ struct gwp_acl_up {
  */
 struct gwp_acl_rule {
 	/* -m domain: exact .str, or compiled .re when @domain_is_re (PCRE). */
-	union {
-		char		*str;
-#ifdef CONFIG_PCRE
-		pcre2_code	*re;
-#endif
-	} domain;
+	union acl_name		domain;
 	/* -m user: exact .str, or compiled .re when @user_is_re (PCRE). */
-	union {
-		char		*str;
-#ifdef CONFIG_PCRE
-		pcre2_code	*re;
-#endif
-	} user;
+	union acl_name		user;
 	struct gwp_acl_ports	sports, dports;
 	struct gwp_acl_cidr	src, dst;
 	/*
@@ -855,22 +853,42 @@ static int parse_dnat(const char *s, struct gwp_acl_dnat *d)
  * ------------------------------------------------------------------------
  */
 
+/*
+ * Compile the regexp @v into @n. Returns 0, -EINVAL for a bad pattern, or
+ * -ENOSYS on a build without PCRE.
+ */
+static int acl_name_compile(union acl_name *n, const char *v, bool caseless)
+{
+#ifdef CONFIG_PCRE
+	n->re = regex_compile(v, caseless);
+	return n->re ? 0 : -EINVAL;
+#else
+	(void)n;
+	(void)v;
+	(void)caseless;
+	return -ENOSYS;
+#endif
+}
+
+/* Free the value of @n, a compiled regexp if @is_re. */
+static inline void acl_name_free(union acl_name *n, bool is_re)
+{
+#ifdef CONFIG_PCRE
+	if (is_re) {
+		pcre2_code_free(n->re);
+		return;
+	}
+#else
+	(void)is_re;
+#endif
+	free(n->str);
+}
+
 /* Free what @r points to; @r itself lives in its chain's array. */
 static void free_rule(struct gwp_acl_rule *r)
 {
-#ifdef CONFIG_PCRE
-	if (r->domain_is_re)
-		pcre2_code_free(r->domain.re);
-	else
-		free(r->domain.str);
-	if (r->user_is_re)
-		pcre2_code_free(r->user.re);
-	else
-		free(r->user.str);
-#else
-	free(r->domain.str);
-	free(r->user.str);
-#endif
+	acl_name_free(&r->domain, r->domain_is_re);
+	acl_name_free(&r->user, r->user_is_re);
 	free(r->sports.v);
 	free(r->dports.v);
 	/* The pool belongs to the ruleset; only a name not resolved yet is ours. */
@@ -1855,7 +1873,7 @@ static int parse_rule(struct acl_load *ld, char **tok, int n)
 	char *up_name = NULL;		/* -j UPSTREAM --to NAME */
 	const char *v;
 	size_t l;
-	int i, ret = -EINVAL;
+	int i, e, ret = -EINVAL;
 
 	if (n < 2)
 		return -EINVAL;
@@ -1934,18 +1952,15 @@ static int parse_rule(struct acl_load *ld, char **tok, int n)
 			if (chain != GWP_ACL_OUTPUT || !m_domain || !v ||
 			    r->has_domain || r->has_dst)
 				goto out;
-#ifdef CONFIG_PCRE
-			r->domain.re = regex_compile(v, /*caseless=*/true);
-			if (!r->domain.re)
+			/* -ENOSYS without a --use-pcre build. */
+			e = acl_name_compile(&r->domain, v, /*caseless=*/true);
+			if (e) {
+				ret = e;
 				goto out;
+			}
 			r->domain_is_re = true;
 			r->has_domain = true;
 			r->neg_domain = neg;
-#else
-			/* --domain-regexp requires a --use-pcre build. */
-			ret = -ENOSYS;
-			goto out;
-#endif
 		} else if (!strcmp(o, "--user")) {
 			v = next_val(tok, n, &i);
 			if (chain != GWP_ACL_OUTPUT || !m_user || !v ||
@@ -1963,19 +1978,15 @@ static int parse_rule(struct acl_load *ld, char **tok, int n)
 			if (chain != GWP_ACL_OUTPUT || !m_user || !v ||
 			    r->has_user)
 				goto out;
-#ifdef CONFIG_PCRE
 			/* Usernames are case-sensitive, unlike hostnames. */
-			r->user.re = regex_compile(v, /*caseless=*/false);
-			if (!r->user.re)
+			e = acl_name_compile(&r->user, v, /*caseless=*/false);
+			if (e) {
+				ret = e;
 				goto out;
+			}
 			r->user_is_re = true;
 			r->has_user = true;
 			r->neg_user = neg;
-#else
-			/* --user-regexp requires a --use-pcre build. */
-			ret = -ENOSYS;
-			goto out;
-#endif
 		} else if (!strcmp(o, "--mode")) {
 			v = next_val(tok, n, &i);
 			/*
@@ -4131,19 +4142,34 @@ void gwp_acl_destroy(struct gwp_acl *acl)
 #define CRIT_FAILS(r, has, neg, matched) ((r)->has && ((matched) == (r)->neg))
 
 /*
+ * True if @s matches @n: the regexp if @is_re, else the string, compared
+ * ignoring ASCII case if @caseless. A NULL @s never matches.
+ */
+static inline bool acl_name_match(const union acl_name *n, bool is_re,
+				  bool caseless, const char *s)
+{
+	if (!s)
+		return false;
+#ifdef CONFIG_PCRE
+	if (is_re)
+		return n->re && regex_match(n->re, s);
+#else
+	(void)is_re;
+#endif
+	if (!n->str)
+		return false;
+	return caseless ? !ascii_casecmp(s, n->str) : !strcmp(s, n->str);
+}
+
+/*
  * True if rule @r's -m domain criterion matches the requested hostname @dom
  * (exact, case-insensitive; or PCRE when --domain-regexp was used). Returns
  * false for a NULL @dom so a literal-IP request never matches a domain rule.
  */
 static bool domain_match(const struct gwp_acl_rule *r, const char *dom)
 {
-	if (!dom)
-		return false;
-#ifdef CONFIG_PCRE
-	if (r->domain_is_re)
-		return r->domain.re && regex_match(r->domain.re, dom);
-#endif
-	return r->domain.str && !ascii_casecmp(dom, r->domain.str);
+	return acl_name_match(&r->domain, r->domain_is_re, /*caseless=*/true,
+			      dom);
 }
 
 /*
@@ -4154,13 +4180,8 @@ static bool domain_match(const struct gwp_acl_rule *r, const char *dom)
  */
 static bool user_match(const struct gwp_acl_rule *r, const char *user)
 {
-	if (!user)
-		return false;
-#ifdef CONFIG_PCRE
-	if (r->user_is_re)
-		return r->user.re && regex_match(r->user.re, user);
-#endif
-	return r->user.str && !strcmp(user, r->user.str);
+	return acl_name_match(&r->user, r->user_is_re, /*caseless=*/false,
+			      user);
 }
 
 /*
