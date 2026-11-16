@@ -343,6 +343,18 @@ static bool conn_toks_have(const struct conn_tok *toks, int nr, const char *k,
 }
 
 /*
+ * Whether the name @k (@klen bytes) is the literal @lit, case-insensitively,
+ * and whether the options in @t (@nr) name @lit. Macros, not functions: the
+ * length is the sizeof of the literal, and the "" in front makes anything but
+ * a literal fail to compile.
+ */
+#define NAME_IS(k, klen, lit)						\
+	((klen) == sizeof("" lit) - 1 &&				\
+	 !strncasecmp((k), (lit), sizeof(lit) - 1))
+#define CONN_TOKS_HAVE_LIT(t, nr, lit)					\
+	conn_toks_have((t), (nr), ("" lit), sizeof(lit) - 1)
+
+/*
  * What a forwarded message adds to its Via (RFC 9110 Section 7.6.3): the
  * version of HTTP it was received with, and this proxy's pseudonym. Both
  * versions take the same room.
@@ -411,9 +423,9 @@ static ssize_t build_forward_request(struct gwp_http_conn *hc,
 	 * past the rewrite above. Host is replaced anyway, and listing it is
 	 * just as meaningless. Nothing legitimate does this; refuse it.
 	 */
-	if (conn_toks_have(toks, nr_toks, "Content-Length", 14) ||
-	    conn_toks_have(toks, nr_toks, "Transfer-Encoding", 17) ||
-	    conn_toks_have(toks, nr_toks, "Host", 4))
+	if (CONN_TOKS_HAVE_LIT(toks, nr_toks, "Content-Length") ||
+	    CONN_TOKS_HAVE_LIT(toks, nr_toks, "Transfer-Encoding") ||
+	    CONN_TOKS_HAVE_LIT(toks, nr_toks, "Host"))
 		return -EBADMSG;
 
 	ok = buf_add(buf, cap, &n, method, req->method_len) &&
@@ -464,7 +476,7 @@ static ssize_t build_forward_request(struct gwp_http_conn *hc,
 		const struct gwnet_http_hdr_field *f = &ff->ff[i];
 		const char *k = gwnet_http_hdr_field_key(ff, f);
 
-		if (f->klen == 3 && !strncasecmp(k, "Via", 3) &&
+		if (NAME_IS(k, f->klen, "Via") &&
 		    !conn_toks_have(toks, nr_toks, k, f->klen))
 			via_at = i;
 	}
@@ -477,12 +489,11 @@ static ssize_t build_forward_request(struct gwp_http_conn *hc,
 		 * client's Host -- ours is already in place above. */
 		if (is_hop_by_hop(k, f->klen) ||
 		    conn_toks_have(toks, nr_toks, k, f->klen) ||
-		    (f->klen == 4 && !strncasecmp(k, "Host", 4)))
+		    NAME_IS(k, f->klen, "Host"))
 			continue;
 
 		/* Never longer than the value it replaces. */
-		if (hc->max_fwd >= 0 && f->klen == 12 &&
-		    !strncasecmp(k, "Max-Forwards", 12)) {
+		if (hc->max_fwd >= 0 && NAME_IS(k, f->klen, "Max-Forwards")) {
 			char v[24];
 			int vl = snprintf(v, sizeof(v), "%" PRId64,
 					  hc->max_fwd);
@@ -607,7 +618,7 @@ static int set_req_framing(struct gwp_http_conn *hc)
 
 	if (te) {
 		if (hc->req_hdr.version == GWNET_HTTP_VER_1_0 ||
-		    tel != 7 || strncasecmp(te, "chunked", 7))
+		    !NAME_IS(te, tel, "chunked"))
 			return -EBADMSG;
 		hc->req_body = REQ_BODY_CHUNKED;
 		return 0;
@@ -1066,8 +1077,8 @@ static bool is_res_hop_by_hop(const char *k, size_t klen)
 
 static bool is_framing_field(const char *k, size_t klen)
 {
-	return (klen == 14 && !strncasecmp(k, "Content-Length", 14)) ||
-	       (klen == 17 && !strncasecmp(k, "Transfer-Encoding", 17));
+	return NAME_IS(k, klen, "Content-Length") ||
+	       NAME_IS(k, klen, "Transfer-Encoding");
 }
 
 /*
@@ -1454,7 +1465,7 @@ static noinline ssize_t rewrite_res_hdr(const char *hdr, size_t len, char *out,
 		lines[nr_lines].len = (uint32_t)n;
 		lines[nr_lines].klen = (uint32_t)(colon - p);
 		nr_lines++;
-		if (colon - p == 10 && !strncasecmp(p, "Connection", 10)) {
+		if (NAME_IS(p, (size_t)(colon - p), "Connection")) {
 			nr_toks = conn_tokenise(colon + 1, n - 11, toks,
 						nr_toks);
 			if (nr_toks < 0)
@@ -1471,16 +1482,14 @@ static noinline ssize_t rewrite_res_hdr(const char *hdr, size_t len, char *out,
 	 */
 	if (*code >= 200) {
 		for (l = 0; l < nr_lines; l++) {
-			if (lines[l].klen == 17 &&
-			    !strncasecmp(hdr + lines[l].off,
-					 "Transfer-Encoding", 17))
+			if (NAME_IS(hdr + lines[l].off, lines[l].klen,
+				    "Transfer-Encoding"))
 				has_te = true;
 		}
 		for (l = 0; !has_te && l < nr_lines; l++) {
 			const char *k = hdr + lines[l].off;
 
-			if (lines[l].klen != 14 ||
-			    strncasecmp(k, "Content-Length", 14))
+			if (!NAME_IS(k, lines[l].klen, "Content-Length"))
 				continue;
 			if (res_cl_value(k + 15, lines[l].len - 15, &have_cl,
 					 &cl, &nr_cl) < 0)
@@ -1492,8 +1501,8 @@ static noinline ssize_t rewrite_res_hdr(const char *hdr, size_t len, char *out,
 		for (l = 0; l < nr_lines; l++) {
 			const char *k = hdr + lines[l].off;
 
-			if (lines[l].klen == 3 && !strncasecmp(k, "Via", 3) &&
-			    !conn_toks_have(toks, nr_toks, k, 3))
+			if (NAME_IS(k, lines[l].klen, "Via") &&
+			    !conn_toks_have(toks, nr_toks, k, lines[l].klen))
 				via_at = l;
 		}
 	}
@@ -1508,8 +1517,8 @@ static noinline ssize_t rewrite_res_hdr(const char *hdr, size_t len, char *out,
 		if (!is_framing_field(k, klen) &&
 		    conn_toks_have(toks, nr_toks, k, klen))
 			continue;
-		if (*code >= 200 && (has_te || nr_cl > 1) && klen == 14 &&
-		    !strncasecmp(k, "Content-Length", 14)) {
+		if (*code >= 200 && (has_te || nr_cl > 1) &&
+		    NAME_IS(k, klen, "Content-Length")) {
 			char v[24];
 			int vl;
 
