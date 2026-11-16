@@ -4270,6 +4270,19 @@ static int upstream_attach_state(struct gwp_ctx *ctx, struct gwp_upstream *up,
 }
 
 /*
+ * Free the server @up with its state entry and health, either of which may
+ * be NULL (a server that failed to be made). The struct holds the upstream's
+ * password, so it is wiped before it goes back to the allocator.
+ */
+static void upstream_free(struct gwp_upstream *up)
+{
+	gwp_up_health_put(up->health);
+	gwp_up_state_put(up->state);
+	explicit_bzero(up, sizeof(*up));
+	free(up);
+}
+
+/*
  * --upstream-proxy and --upstream-proxy-auth-file: build the default upstream
  * pool, of the one server they name. The pool owns that server's first
  * reference; every connection through it takes one more.
@@ -4368,8 +4381,7 @@ static int gwp_ctx_init_upstream(struct gwp_ctx *ctx)
 
 out_free:
 	upstream_free_tls(ctx);
-	explicit_bzero(up, sizeof(*up));
-	free(up);
+	upstream_free(up);
 	free(pool->srv);
 	pool->srv = NULL;
 	return r;
@@ -4427,10 +4439,7 @@ void gwp_upstream_put(struct gwp_upstream *up)
 	if (atomic_fetch_sub_explicit(&up->refcnt, 1, memory_order_acq_rel) != 1)
 		return;
 	live = up->live;
-	gwp_up_health_put(up->health);
-	gwp_up_state_put(up->state);
-	explicit_bzero(up, sizeof(*up));
-	free(up);
+	upstream_free(up);
 	if (live)
 		atomic_fetch_sub_explicit(live, 1, memory_order_release);
 }
@@ -4473,16 +4482,14 @@ static int acl_srv_make(void *arg, const char *url,
 		r = upstream_acl_srv_tls(ctx, up, why, size);
 	}
 	if (r) {
-		explicit_bzero(up, sizeof(*up));
-		free(up);
+		upstream_free(up);
 		return r;
 	}
 
 	r = upstream_attach_state(ctx, up, opts);
 	if (r) {
 		snprintf(why, size, "out of memory");
-		explicit_bzero(up, sizeof(*up));
-		free(up);
+		upstream_free(up);
 		return r;
 	}
 	/*
