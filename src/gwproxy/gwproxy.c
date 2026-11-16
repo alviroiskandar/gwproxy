@@ -2551,6 +2551,14 @@ static int acl_srv_make(void *arg, const char *url,
 static void acl_srv_put(void *arg, void *srv);
 static void acl_srv_member(void *arg, void *srv, struct gwp_up_member *m);
 
+/* Free the list of ACL files gwp_ctx_init_acl() builds, and reset it. */
+static void gwp_ctx_drop_acl_files(struct gwp_ctx *ctx)
+{
+	gwp_acl_files_free(ctx->acl_files, ctx->nr_acl_files);
+	ctx->acl_files = NULL;
+	ctx->nr_acl_files = 0;
+}
+
 static int gwp_ctx_init_acl(struct gwp_ctx *ctx)
 {
 	struct gwp_cfg *cfg = &ctx->cfg;
@@ -2619,9 +2627,7 @@ static int gwp_ctx_init_acl(struct gwp_ctx *ctx)
 	return 0;
 
 out_err:
-	gwp_acl_files_free(ctx->acl_files, ctx->nr_acl_files);
-	ctx->acl_files = NULL;
-	ctx->nr_acl_files = 0;
+	gwp_ctx_drop_acl_files(ctx);
 	return r;
 }
 
@@ -2643,9 +2649,7 @@ static void gwp_ctx_free_acl(struct gwp_ctx *ctx)
 		pr_dbg(&ctx->lh, "Upstream pool servers: all connection references dropped");
 	ctx->acl = NULL;
 	ctx->acl_watched = false;
-	gwp_acl_files_free(ctx->acl_files, ctx->nr_acl_files);
-	ctx->acl_files = NULL;
-	ctx->nr_acl_files = 0;
+	gwp_ctx_drop_acl_files(ctx);
 }
 
 /*
