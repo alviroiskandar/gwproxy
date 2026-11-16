@@ -783,10 +783,14 @@ static int __gwp_socks5_conn_cmd_connect_res(struct data_arg *arg,
 	return 0;
 }
 
-int gwp_socks5_conn_cmd_connect_res(struct gwp_socks5_conn *conn,
-				    const struct gwp_socks5_addr *bind_addr,
-				    uint8_t rep, void *out_buf,
-				    size_t *out_len)
+/*
+ * Build the reply to a CONNECT or UDP ASSOCIATE command into @out_buf and move
+ * the connection on: to @ok_state when @rep is a success, else to the error
+ * state. A reply that does not fit leaves the state as it was.
+ */
+static int socks5_cmd_res(struct gwp_socks5_conn *conn,
+			  const struct gwp_socks5_addr *bind_addr, uint8_t rep,
+			  void *out_buf, size_t *out_len, int ok_state)
 {
 	struct data_arg arg = {
 		.ctx = conn->ctx,
@@ -802,10 +806,18 @@ int gwp_socks5_conn_cmd_connect_res(struct gwp_socks5_conn *conn,
 	*out_len = arg.tot_out_len;
 
 	if (r != -ENOBUFS)
-		conn->state = (rep == 0x00) ? GWP_SOCKS5_ST_FORWARDING
-					    : GWP_SOCKS5_ST_ERR;
+		conn->state = (rep == 0x00) ? ok_state : GWP_SOCKS5_ST_ERR;
 
 	return r;
+}
+
+int gwp_socks5_conn_cmd_connect_res(struct gwp_socks5_conn *conn,
+				    const struct gwp_socks5_addr *bind_addr,
+				    uint8_t rep, void *out_buf,
+				    size_t *out_len)
+{
+	return socks5_cmd_res(conn, bind_addr, rep, out_buf, out_len,
+			      GWP_SOCKS5_ST_FORWARDING);
 }
 
 int gwp_socks5_conn_cmd_udp_associate_res(struct gwp_socks5_conn *conn,
@@ -813,24 +825,8 @@ int gwp_socks5_conn_cmd_udp_associate_res(struct gwp_socks5_conn *conn,
 					  uint8_t rep, void *out_buf,
 					  size_t *out_len)
 {
-	struct data_arg arg = {
-		.ctx = conn->ctx,
-		.conn = conn,
-		.in_buf = NULL,
-		.in_len = NULL,
-		.out_buf = out_buf,
-		.out_len = out_len,
-		.tot_out_len = 0,
-		.tot_advance = 0
-	};
-	int r = __gwp_socks5_conn_cmd_connect_res(&arg, bind_addr, rep);
-	*out_len = arg.tot_out_len;
-
-	if (r != -ENOBUFS)
-		conn->state = (rep == 0x00) ? GWP_SOCKS5_ST_UDP_ASSOCIATED
-					    : GWP_SOCKS5_ST_ERR;
-
-	return r;
+	return socks5_cmd_res(conn, bind_addr, rep, out_buf, out_len,
+			      GWP_SOCKS5_ST_UDP_ASSOCIATED);
 }
 
 /*
