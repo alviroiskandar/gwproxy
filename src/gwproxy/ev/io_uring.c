@@ -714,6 +714,21 @@ static struct io_uring_sqe *prep_recv_target(struct gwp_wrk *w,
 	if (gcp->target_rx)
 		return NULL;
 
+	/*
+	 * Never while the upstream handshake runs: its own requests take
+	 * turns on target.buf (up_tx), and a forwarding recv armed beside them
+	 * would race the handshake's recv and take the upstream's reply for
+	 * payload. No path gets here then, since nothing reads the client
+	 * during the handshake, so no send to it completes but a failure
+	 * reply's; this keeps it so if that changes.
+	 */
+	if (unlikely(gwp_in_upstream_hs(gcp))) {
+		pr_err(&w->ctx->lh,
+		       "BUG: target recv asked for during the upstream handshake (idx=%u, state=%d)",
+		       gcp->idx, gcp->conn_state);
+		return NULL;
+	}
+
 	s = get_sqe_nofail(w);
 #ifdef CONFIG_HTTPS
 	/*
